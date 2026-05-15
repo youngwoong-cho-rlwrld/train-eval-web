@@ -20,7 +20,6 @@ from collections import defaultdict
 from pydantic import BaseModel
 
 
-SANCTIONED_NODE = "h200-03-w-3a18"
 GPUS_PER_H200_NODE = 8
 
 
@@ -29,7 +28,6 @@ class MlxpNode(BaseModel):
     gpu_used: int
     gpu_total: int
     gpu_free: int
-    sanctioned: bool
 
 
 async def list_nodes() -> list[MlxpNode]:
@@ -60,8 +58,6 @@ async def list_nodes() -> list[MlxpNode]:
             except (TypeError, ValueError):
                 pass
 
-    used.setdefault(SANCTIONED_NODE, 0)
-
     out: list[MlxpNode] = []
     for name in sorted(used):
         # H200 GPU nodes only. CPU/control-plane nodes show up if we have a
@@ -74,6 +70,5 @@ async def list_nodes() -> list[MlxpNode]:
             gpu_used=u,
             gpu_total=GPUS_PER_H200_NODE,
             gpu_free=max(0, GPUS_PER_H200_NODE - u),
-            sanctioned=(name == SANCTIONED_NODE),
         ))
     return out

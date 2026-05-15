@@ -64,6 +64,10 @@ class SubmitRequest(BaseModel):
     partition: str | None = None
     # MLXP-only: how many H200 GPUs to request (1/2/4/8).
     num_gpus: int | None = None
+    # MLXP-only: which k8s node to pin via nodeAffinity (each rlwrld team
+    # member is assigned a specific h200-03-w-XXXX in the GPU Resource
+    # Schedule sheet). None falls back to mlxp_submit.DEFAULT_NODE.
+    node: str | None = None
     # Per-submit dataset override. Two shapes accepted:
     #   - single string  → replaces DATASET_NAME in single-task variants
     #   - list of "name|cfg|weight" entries → replaces DATASETS array

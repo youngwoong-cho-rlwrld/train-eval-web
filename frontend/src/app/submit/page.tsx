@@ -23,7 +23,17 @@ export default function SubmitPage() {
   const [variantName, setVariantName] = useState<string>("");
   const [phase, setPhase] = useState<Phase>("train");
   const [partition, setPartition] = useState<string>("");
-  const [numGpus, setNumGpus] = useState<string>("2");  // MLXP-only
+  const [numGpus, setNumGpus] = useState<string>("2");        // MLXP-only
+  // MLXP-only. Persisted to localStorage so each teammate's sanctioned
+  // node sticks across sessions (each user is assigned a different
+  // h200-03-w-XXXX per the GPU Resource Schedule spreadsheet).
+  const [mlxpNode, setMlxpNode] = useState<string>(() => {
+    if (typeof window === "undefined") return "";
+    return localStorage.getItem("mlxpNode") || "h200-03-w-3a18";
+  });
+  useEffect(() => {
+    if (mlxpNode) localStorage.setItem("mlxpNode", mlxpNode);
+  }, [mlxpNode]);
   const [extraArgs, setExtraArgs] = useState<string>("");
 
   // Dataset override state. For single-task variants, `singleDataset` holds
@@ -108,6 +118,7 @@ export default function SubmitPage() {
           phase,
           partition: isSlurm ? partition : null,
           num_gpus: isSlurm ? null : Number(numGpus),
+          node: isSlurm ? null : mlxpNode,
           dataset_override,
           extra_args: extraArgs.split(/\s+/).filter(Boolean),
         }),
@@ -121,7 +132,7 @@ export default function SubmitPage() {
     onError: (err: Error) => toast.error(`Submit failed: ${err.message}`),
   });
 
-  const canSubmit = !!variantName && (isSlurm ? !!partition : !!numGpus) && !submit.isPending;
+  const canSubmit = !!variantName && (isSlurm ? !!partition : (!!numGpus && !!mlxpNode)) && !submit.isPending;
   const selectedPartition = partitions.data?.find((p) => p.name === partition);
 
   return (
@@ -237,6 +248,31 @@ export default function SubmitPage() {
                 <p className="text-xs text-slate-500">MLXP currently supports <code>train</code> only.</p>
               </Field>
 
+              <Field label="Node">
+                <Select value={mlxpNode} onValueChange={setMlxpNode}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="select your sanctioned node…" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {mlxp.data?.map((n) => (
+                      <SelectItem key={n.name} value={n.name}>
+                        <span className="flex items-center gap-2">
+                          <span className="font-mono">{n.name}</span>
+                          <span className={`text-xs ${n.gpu_free > 0 ? "text-green-600 dark:text-green-400" : "text-slate-500"}`}>
+                            {n.gpu_free}/{n.gpu_total} free
+                          </span>
+                        </span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-slate-500">
+                  Each rlwrld member is sanctioned for a specific node — check the GPU Resource Schedule
+                  sheet. Wrong-node submission has triggered admin job deletions. Your selection is saved
+                  locally for next time.
+                </p>
+              </Field>
+
               <Field label="GPUs">
                 <Select value={numGpus} onValueChange={setNumGpus}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
@@ -248,8 +284,7 @@ export default function SubmitPage() {
                   </SelectContent>
                 </Select>
                 <p className="text-xs text-slate-500">
-                  Per-GPU CPU/RAM matches the Notion guide's table. <code>nodeAffinity</code> pins to{" "}
-                  <code>h200-03-w-3a18</code>.
+                  Per-GPU CPU/RAM matches the Notion guide's table.
                 </p>
               </Field>
 
@@ -285,14 +320,14 @@ export default function SubmitPage() {
             ? "Submitting…"
             : isSlurm
               ? `Submit ${phase} → ${cluster}/${partition || "?"}`
-              : `Submit train → mlxp/${numGpus}×H200`}
+              : `Submit train → mlxp/${mlxpNode}/${numGpus}×H200`}
         </Button>
       </div>
         </div>
 
         <aside className="space-y-4 lg:sticky lg:top-6 lg:self-start">
           {isSlurm && partitions.data && <AvailabilityCard cluster={cluster} partitions={partitions.data} />}
-          {!isSlurm && mlxp.data && <MlxpCard nodes={mlxp.data} />}
+          {!isSlurm && mlxp.data && <MlxpCard nodes={mlxp.data} yoursNode={mlxpNode} />}
         </aside>
       </div>
     </div>
@@ -423,7 +458,7 @@ function DatasetField({
   );
 }
 
-function MlxpCard({ nodes }: { nodes: MlxpNode[] }) {
+function MlxpCard({ nodes, yoursNode }: { nodes: MlxpNode[]; yoursNode: string }) {
   const [open, setOpen] = useState(true);
   const idle = nodes.reduce((s, n) => s + n.gpu_free, 0);
   const total = nodes.reduce((s, n) => s + n.gpu_total, 0);
@@ -441,8 +476,7 @@ function MlxpCard({ nodes }: { nodes: MlxpNode[] }) {
           </span>
         </div>
         <CardDescription className="text-xs">
-          h200 nodes (8 GPU each) · only{" "}
-          <code>h200-03-w-3a18</code> is sanctioned for our team
+          h200 nodes (8 GPU each) · your node: <code>{yoursNode || "—"}</code>
         </CardDescription>
       </CardHeader>
       {open && (
@@ -452,7 +486,7 @@ function MlxpCard({ nodes }: { nodes: MlxpNode[] }) {
               <div key={n.name} className="flex items-center justify-between gap-3 text-xs">
                 <div className="min-w-0 flex-1 truncate font-mono">
                   {n.name}
-                  {n.sanctioned && <Badge variant="default" className="ml-1 text-[10px]">yours</Badge>}
+                  {n.name === yoursNode && <Badge variant="default" className="ml-1 text-[10px]">yours</Badge>}
                 </div>
                 <div className="shrink-0 font-mono">
                   <span className={n.gpu_free > 0 ? "text-green-600 dark:text-green-400" : "text-slate-500"}>

@@ -88,7 +88,6 @@ export type MlxpNode = {
   gpu_used: number;
   gpu_total: number;
   gpu_free: number;
-  sanctioned: boolean;
 };
 
 export type Partition = {

@@ -34,7 +34,7 @@ _GPU_RESOURCES = {
     8: ("100", "1500Gi"),
 }
 
-SANCTIONED_NODE = "h200-03-w-3a18"
+DEFAULT_NODE = "h200-03-w-3a18"
 DDN_MOUNT = "/data"
 USER_HOME_ON_DDN = "/data/youngwoong"
 GR00T_DIR = f"{USER_HOME_ON_DDN}/workspace/gr00t"
@@ -43,6 +43,11 @@ GR00T_DIR = f"{USER_HOME_ON_DDN}/workspace/gr00t"
 class MlxpSubmitRequest(BaseModel):
     variant: str
     num_gpus: int = 2
+    # The k8s node to pin via nodeAffinity. Each rlwrld team member is
+    # sanctioned for a specific node (see the GPU Resource Schedule sheet);
+    # using anyone else's node has triggered admin deletions in the past.
+    # Leave None to fall back to DEFAULT_NODE.
+    node: str | None = None
     dataset_override: str | list[str] | None = None
     extra_args: list[str] = []
     wandb_secret: str = "youngwoong-wandb"
@@ -69,8 +74,9 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
     safe_variant = re.sub(r"[^a-z0-9-]+", "-", req.variant.lower())
     job_name = f"youngwoong-train-{safe_variant}-{timestamp}"[:63]  # k8s name limit
 
+    node = req.node or DEFAULT_NODE
     body_script = _render_body_script(variant, req, job_name)
-    spec = _render_job_yaml(job_name, body_script, req.num_gpus, cpu, mem, req.wandb_secret)
+    spec = _render_job_yaml(job_name, body_script, req.num_gpus, cpu, mem, req.wandb_secret, node)
     yaml_text = yaml.safe_dump(spec, sort_keys=False)
 
     proc = await asyncio.create_subprocess_exec(
@@ -186,7 +192,8 @@ torchrun --nproc_per_node={req.num_gpus} scripts/gr00t_finetune.py \\
 """
 
 
-def _render_job_yaml(job_name: str, body: str, num_gpus: int, cpu: str, mem: str, wandb_secret: str) -> dict:
+def _render_job_yaml(job_name: str, body: str, num_gpus: int, cpu: str, mem: str,
+                     wandb_secret: str, node: str) -> dict:
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -220,7 +227,7 @@ def _render_job_yaml(job_name: str, body: str, num_gpus: int, cpu: str, mem: str
                                     "matchExpressions": [{
                                         "key": "kubernetes.io/hostname",
                                         "operator": "In",
-                                        "values": [SANCTIONED_NODE],
+                                        "values": [node],
                                     }],
                                 }],
                             },

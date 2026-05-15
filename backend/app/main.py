@@ -94,6 +94,7 @@ async def post_submit(req: submit.SubmitRequest):
             mlxp_req = mlxp_submit.MlxpSubmitRequest(
                 variant=req.variant,
                 num_gpus=req.num_gpus or 2,
+                node=req.node,
                 dataset_override=req.dataset_override,
                 extra_args=req.extra_args,
             )

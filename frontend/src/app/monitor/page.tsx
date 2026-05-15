@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { RefreshCw } from "lucide-react";
 import { api, type MlxpNode, type Partition } from "@/lib/api";
@@ -127,6 +128,11 @@ function MlxpPanel() {
     retry: false,
   });
   const nodes = q.data ?? [];
+  // Reflect the same node the user picked on /submit (persisted in localStorage).
+  const [yoursNode, setYoursNode] = useState<string>("");
+  useEffect(() => {
+    if (typeof window !== "undefined") setYoursNode(localStorage.getItem("mlxpNode") || "");
+  }, []);
   const idle = nodes.reduce((s, n) => s + n.gpu_free, 0);
   const total = nodes.reduce((s, n) => s + n.gpu_total, 0);
 
@@ -161,7 +167,7 @@ function MlxpPanel() {
                   <tr key={n.name} className="border-b border-slate-100 last:border-0 dark:border-slate-900">
                     <td className="py-2 pr-4 font-mono text-xs">
                       {n.name}
-                      {n.sanctioned && <Badge variant="default" className="ml-1 text-[10px]">yours</Badge>}
+                      {n.name === yoursNode && <Badge variant="default" className="ml-1 text-[10px]">yours</Badge>}
                     </td>
                     <td className="py-2 pr-4 font-mono text-xs">
                       <span className={n.gpu_free > 0 ? "text-green-600 dark:text-green-400" : "text-slate-500"}>
