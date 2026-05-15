@@ -8,7 +8,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { RefreshButton } from "@/components/refresh-button";
 import { useMyMlxpNode } from "@/hooks/use-my-mlxp-node";
 
-const REFRESH_MS = 10_000;
+const REFRESH_MS = 60_000;
 
 export default function MonitorPage() {
   const qc = useQueryClient();

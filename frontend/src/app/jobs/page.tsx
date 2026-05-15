@@ -10,7 +10,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { CopyButton } from "@/components/copy-button";
 import { RefreshButton } from "@/components/refresh-button";
 
-const REFRESH_MS = 10_000;
+const REFRESH_MS = 60_000;
 
 const ACTIVE_STATES = new Set(["RUNNING", "PENDING", "COMPLETING", "CONFIGURING", "SUSPENDED"]);
 
