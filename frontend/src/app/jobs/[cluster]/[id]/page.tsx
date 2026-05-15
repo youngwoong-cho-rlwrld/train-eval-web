@@ -6,6 +6,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ArrowLeft, ExternalLink } from "lucide-react";
 import { api, logStreamUrl, type JobDetails, type Variant } from "@/lib/api";
+import { formatDuration, parseSlurmDuration } from "@/lib/duration";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -188,6 +189,17 @@ function ProgressCard({ d }: { d: JobDetails }) {
   const isTrain = d.phase === "train" || d.phase === "resume";
   const wandbMissing = isTrain && wandbStatus.data && !wandbStatus.data.logged_in;
 
+  // ETA from elapsed × steps-remaining / current-step. Same linear model the
+  // /jobs table uses.
+  let etaLabel: string | null = null;
+  if (p.current_step && p.max_steps && p.current_step < p.max_steps) {
+    const elapsedSec = parseSlurmDuration(d.elapsed);
+    if (elapsedSec > 0) {
+      const etaSec = (elapsedSec * (p.max_steps - p.current_step)) / p.current_step;
+      etaLabel = formatDuration(etaSec);
+    }
+  }
+
   return (
     <Card>
       <CardHeader className="flex flex-row items-center justify-between">
@@ -227,6 +239,11 @@ function ProgressCard({ d }: { d: JobDetails }) {
                 style={{ width: `${Math.max(0, Math.min(100, percent))}%` }}
               />
             </div>
+            {etaLabel && (
+              <div className="mt-2 text-xs text-slate-500">
+                ~{etaLabel} left
+              </div>
+            )}
           </>
         )}
       </CardContent>
