@@ -53,6 +53,8 @@ async def get_mlxp_gpus():
 
 @app.get("/api/clusters/{name}/datasets", response_model=list[datasets.DatasetInfo])
 async def get_cluster_datasets(name: str):
+    if name not in clusters.list_clusters():
+        raise HTTPException(404, f"cluster {name} not found")
     try:
         return await datasets.list_datasets(name)
     except FileNotFoundError:

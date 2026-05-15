@@ -58,7 +58,7 @@ export default function SubmitPage() {
   const datasets = useQuery({
     queryKey: ["datasets", cluster],
     queryFn: () => api<Dataset[]>(`/api/clusters/${cluster}/datasets`),
-    enabled: !!cluster && isSlurm,
+    enabled: !!cluster,
   });
   const mlxp = useQuery({
     queryKey: ["mlxp-gpus"],
@@ -256,7 +256,7 @@ export default function SubmitPage() {
               {variant.data && (
                 <DatasetField
                   variant={variant.data}
-                  datasets={[]}  /* MLXP datasets live on DDN, not enumerated yet */
+                  datasets={datasets.data ?? []}
                   single={singleDataset}
                   multi={multiDatasets}
                   onSingleChange={(v) => { setSingleDataset(v); setDatasetTouched(true); }}

@@ -53,6 +53,8 @@ for p in sorted(glob.glob(os.path.expanduser("~/datasets/*/meta/info.json"))):
 
 
 async def list_datasets(cluster: str) -> list[DatasetInfo]:
+    if cluster == "mlxp":
+        return await _list_datasets_mlxp()
     env = await load_cluster(cluster)
     r = await ssh_run(env.ssh_alias, f"python3 -c {_quote(_LIST_PY)}", timeout=30.0)
     if r.returncode != 0:
@@ -78,3 +80,22 @@ def _quote(s: str) -> str:
     """Shell-quote a string for inline use in `python3 -c '...'`."""
     # We use single quotes around the python and replace any embedded ' with '"'"'.
     return "'" + s.replace("'", "'\"'\"'") + "'"
+
+
+async def _list_datasets_mlxp() -> list[DatasetInfo]:
+    """List MLXP DDN datasets at /data/youngwoong/datasets/.
+
+    `kubectl exec` into a live pod with DDN mounted would be authoritative,
+    but the data-pod isn't always running. Instead we infer from kakao's
+    parallel symlink tree (~/datasets/v4_*_480 → /rlwrld-dataset/.../V4/480/),
+    since the names and contents we synced to MLXP are identical. Filter to
+    *_480 — that's what currently exists on DDN per today's sync.
+    """
+    kakao = await list_datasets("kakao")
+    out: list[DatasetInfo] = []
+    for d in kakao:
+        if not d.name.endswith("_480"):
+            continue
+        # Rewrite the path to where it lives on DDN.
+        out.append(d.model_copy(update={"path": f"/data/youngwoong/datasets/{d.name}"}))
+    return out
