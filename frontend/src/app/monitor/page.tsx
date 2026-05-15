@@ -1,12 +1,11 @@
 "use client";
 
-import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { RefreshCw } from "lucide-react";
+import { useIsFetching, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type MlxpNode, type Partition } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { RefreshButton } from "@/components/refresh-button";
 import { useMyMlxpNode } from "@/hooks/use-my-mlxp-node";
 
 const REFRESH_MS = 10_000;
@@ -27,6 +26,14 @@ export default function MonitorPage() {
     qc.invalidateQueries({ queryKey: ["mlxp-gpus"] });
   };
 
+  const isFetching =
+    useIsFetching({
+      predicate: (q) => {
+        const k = q.queryKey[0];
+        return k === "clusters" || k === "partitions" || k === "mlxp-gpus";
+      },
+    }) > 0;
+
   return (
     <div className="mx-auto max-w-7xl px-8 py-12">
       <div className="flex items-center justify-between">
@@ -36,9 +43,7 @@ export default function MonitorPage() {
             All clusters in one view. Auto-refresh every {REFRESH_MS / 1000}s.
           </p>
         </div>
-        <Button variant="outline" size="sm" onClick={refreshAll} className="gap-2">
-          <RefreshCw className="h-3.5 w-3.5" /> Refresh now
-        </Button>
+        <RefreshButton isFetching={isFetching} onRefresh={refreshAll} />
       </div>
 
       <div className="mt-8 space-y-6">

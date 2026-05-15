@@ -2,25 +2,41 @@
 
 import Link from "next/link";
 import { useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-// (useQuery referenced again in ProgressCell below — same import)
+import { useIsFetching, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Job, type JobDetails } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { CopyButton } from "@/components/copy-button";
+import { RefreshButton } from "@/components/refresh-button";
+
+const REFRESH_MS = 10_000;
 
 const ACTIVE_STATES = new Set(["RUNNING", "PENDING", "COMPLETING", "CONFIGURING", "SUSPENDED"]);
 
 export default function JobsPage() {
+  const qc = useQueryClient();
   const [hours, setHours] = useState<string>("24");
 
   const { data, isLoading, error } = useQuery({
     queryKey: ["jobs", hours],
     queryFn: () =>
       api<{ jobs: Job[] }>(`/api/jobs?hours=${hours}`).then((d) => d.jobs),
-    refetchInterval: 5000,
+    refetchInterval: REFRESH_MS,
   });
+
+  const refreshAll = () => {
+    qc.invalidateQueries({ queryKey: ["jobs"] });
+    qc.invalidateQueries({ queryKey: ["job-details"] });
+  };
+
+  const isFetching =
+    useIsFetching({
+      predicate: (q) => {
+        const k = q.queryKey[0];
+        return k === "jobs" || k === "job-details";
+      },
+    }) > 0;
 
   const { active, finished } = useMemo(() => {
     const all = data ?? [];
@@ -37,21 +53,10 @@ export default function JobsPage() {
     <div className="mx-auto max-w-6xl px-8 py-12">
       <div className="flex items-baseline justify-between">
         <h1 className="text-2xl font-semibold tracking-tight">Jobs</h1>
-        <div className="flex items-center gap-2 text-sm">
-          <span className="text-slate-500">history window:</span>
-          <Select value={hours} onValueChange={setHours}>
-            <SelectTrigger className="h-8 w-[120px]"><SelectValue /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="6">6 hours</SelectItem>
-              <SelectItem value="24">24 hours</SelectItem>
-              <SelectItem value="72">3 days</SelectItem>
-              <SelectItem value="168">1 week</SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
+        <RefreshButton isFetching={isFetching} onRefresh={refreshAll} />
       </div>
       <p className="mt-2 text-slate-600 dark:text-slate-400">
-        Auto-refreshing every 5s. Active jobs from <code className="text-xs">squeue</code>; finished from <code className="text-xs">sacct</code>.
+        Auto-refreshing every {REFRESH_MS / 1000}s. Active jobs from <code className="text-xs">squeue</code>; finished from <code className="text-xs">sacct</code>.
       </p>
 
       <Card className="mt-8">
@@ -68,9 +73,23 @@ export default function JobsPage() {
       </Card>
 
       <Card className="mt-6">
-        <CardHeader>
-          <CardTitle>Recent</CardTitle>
-          <CardDescription>{finished.length} finished {finished.length === 1 ? "job" : "jobs"} in the last {hours}h.</CardDescription>
+        <CardHeader className="flex flex-row items-start justify-between gap-4">
+          <div>
+            <CardTitle>Recent</CardTitle>
+            <CardDescription>{finished.length} finished {finished.length === 1 ? "job" : "jobs"} in the last {hours}h.</CardDescription>
+          </div>
+          <div className="flex items-center gap-2 text-sm">
+            <span className="text-slate-500">history window:</span>
+            <Select value={hours} onValueChange={setHours}>
+              <SelectTrigger className="h-8 w-[120px]"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="6">6 hours</SelectItem>
+                <SelectItem value="24">24 hours</SelectItem>
+                <SelectItem value="72">3 days</SelectItem>
+                <SelectItem value="168">1 week</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
         </CardHeader>
         <CardContent>
           {finished.length === 0 ? (
