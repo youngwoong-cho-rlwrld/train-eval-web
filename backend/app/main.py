@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
-from . import clusters, datasets, details, jobs, partitions, submit, variants
+from . import clusters, datasets, details, jobs, mlxp, partitions, submit, variants
 from .ssh import ssh_tail_lines
 
 
@@ -41,6 +41,14 @@ async def get_cluster_partitions(name: str):
         raise HTTPException(404, f"cluster {name} not found")
     except RuntimeError as e:
         raise HTTPException(500, str(e))
+
+
+@app.get("/api/mlxp/gpus", response_model=list[mlxp.MlxpNode])
+async def get_mlxp_gpus():
+    try:
+        return await mlxp.list_nodes()
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
 
 
 @app.get("/api/clusters/{name}/datasets", response_model=list[datasets.DatasetInfo])

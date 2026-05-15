@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
-import { api, type Variant, type SubmitResponse, type Partition, type Dataset } from "@/lib/api";
+import { api, type Variant, type SubmitResponse, type Partition, type Dataset, type MlxpNode } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -56,6 +56,12 @@ export default function SubmitPage() {
     queryKey: ["datasets", cluster],
     queryFn: () => api<Dataset[]>(`/api/clusters/${cluster}/datasets`),
     enabled: !!cluster,
+  });
+  const mlxp = useQuery({
+    queryKey: ["mlxp-gpus"],
+    queryFn: () => api<MlxpNode[]>("/api/mlxp/gpus"),
+    refetchInterval: 60_000,
+    retry: false,  // surfaces "kubectl not available" without retry storm
   });
 
   // Whenever a new variant loads (or the user picks a different one), reset
@@ -221,8 +227,9 @@ export default function SubmitPage() {
       </div>
         </div>
 
-        <aside className="lg:sticky lg:top-6 lg:self-start">
+        <aside className="space-y-4 lg:sticky lg:top-6 lg:self-start">
           {partitions.data && <AvailabilityCard cluster={cluster} partitions={partitions.data} />}
+          {mlxp.data && mlxp.data.length > 0 && <MlxpCard nodes={mlxp.data} />}
         </aside>
       </div>
     </div>
@@ -350,6 +357,52 @@ function DatasetField({
         <code>config.sh</code>; changes apply to this submission only.
       </p>
     </div>
+  );
+}
+
+function MlxpCard({ nodes }: { nodes: MlxpNode[] }) {
+  const [open, setOpen] = useState(true);
+  const idle = nodes.reduce((s, n) => s + n.gpu_free, 0);
+  const total = nodes.reduce((s, n) => s + n.gpu_total, 0);
+  return (
+    <Card>
+      <CardHeader className="cursor-pointer select-none" onClick={() => setOpen((o) => !o)}>
+        <div className="flex items-center justify-between">
+          <CardTitle className="flex items-center gap-2 text-base">
+            {open ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+            MLXP (Naver, k8s)
+          </CardTitle>
+          <span className="font-mono text-xs text-slate-500">
+            <span className={idle > 0 ? "text-green-600 dark:text-green-400" : ""}>{idle}</span>
+            <span className="text-slate-400"> / {total}</span>
+          </span>
+        </div>
+        <CardDescription className="text-xs">
+          h200 nodes (8 GPU each) · only{" "}
+          <code>h200-03-w-3a18</code> is sanctioned for our team
+        </CardDescription>
+      </CardHeader>
+      {open && (
+        <CardContent>
+          <div className="space-y-2">
+            {nodes.map((n) => (
+              <div key={n.name} className="flex items-center justify-between gap-3 text-xs">
+                <div className="min-w-0 flex-1 truncate font-mono">
+                  {n.name}
+                  {n.sanctioned && <Badge variant="default" className="ml-1 text-[10px]">yours</Badge>}
+                </div>
+                <div className="shrink-0 font-mono">
+                  <span className={n.gpu_free > 0 ? "text-green-600 dark:text-green-400" : "text-slate-500"}>
+                    {n.gpu_free}
+                  </span>
+                  <span className="text-slate-400"> / {n.gpu_total} GPU free</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </CardContent>
+      )}
+    </Card>
   );
 }
 

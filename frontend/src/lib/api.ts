@@ -83,6 +83,14 @@ export type Dataset = {
   codec: string | null;
 };
 
+export type MlxpNode = {
+  name: string;
+  gpu_used: number;
+  gpu_total: number;
+  gpu_free: number;
+  sanctioned: boolean;
+};
+
 export type Partition = {
   name: string;
   is_default: boolean;
