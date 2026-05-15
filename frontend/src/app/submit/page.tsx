@@ -23,6 +23,7 @@ export default function SubmitPage() {
   const [variantName, setVariantName] = useState<string>("");
   const [phase, setPhase] = useState<Phase>("train");
   const [partition, setPartition] = useState<string>("");
+  const [numGpus, setNumGpus] = useState<string>("2");  // MLXP-only
   const [extraArgs, setExtraArgs] = useState<string>("");
 
   // Dataset override state. For single-task variants, `singleDataset` holds
@@ -105,7 +106,8 @@ export default function SubmitPage() {
           cluster,
           variant: variantName,
           phase,
-          partition,
+          partition: isSlurm ? partition : null,
+          num_gpus: isSlurm ? null : Number(numGpus),
           dataset_override,
           extra_args: extraArgs.split(/\s+/).filter(Boolean),
         }),
@@ -119,7 +121,7 @@ export default function SubmitPage() {
     onError: (err: Error) => toast.error(`Submit failed: ${err.message}`),
   });
 
-  const canSubmit = !!variantName && !!partition && !submit.isPending;
+  const canSubmit = !!variantName && (isSlurm ? !!partition : !!numGpus) && !submit.isPending;
   const selectedPartition = partitions.data?.find((p) => p.name === partition);
 
   return (
@@ -224,24 +226,68 @@ export default function SubmitPage() {
           )}
 
           {!isSlurm && (
-            <p className="text-sm text-slate-500">
-              <span className="font-medium text-slate-700 dark:text-slate-300">MLXP is read-only here for now.</span>{" "}
-              Submission lands via <code>kubectl apply</code> against a Job YAML —
-              see <code>docs/naver_mlxp_3a18_quickstart.md</code>. Use the sidebar to monitor availability while you wait.
-            </p>
+            <>
+              <Field label="Phase">
+                <Select value="train" onValueChange={() => {}}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="train">train</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-slate-500">MLXP currently supports <code>train</code> only.</p>
+              </Field>
+
+              <Field label="GPUs">
+                <Select value={numGpus} onValueChange={setNumGpus}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="1">1 H200  · 14 CPU · 220Gi RAM</SelectItem>
+                    <SelectItem value="2">2 H200 · 28 CPU · 440Gi RAM</SelectItem>
+                    <SelectItem value="4">4 H200 · 56 CPU · 880Gi RAM</SelectItem>
+                    <SelectItem value="8">8 H200 · 100 CPU · 1500Gi RAM</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-slate-500">
+                  Per-GPU CPU/RAM matches the Notion guide's table. <code>nodeAffinity</code> pins to{" "}
+                  <code>h200-03-w-3a18</code>.
+                </p>
+              </Field>
+
+              {variant.data && (
+                <DatasetField
+                  variant={variant.data}
+                  datasets={[]}  /* MLXP datasets live on DDN, not enumerated yet */
+                  single={singleDataset}
+                  multi={multiDatasets}
+                  onSingleChange={(v) => { setSingleDataset(v); setDatasetTouched(true); }}
+                  onMultiChange={(v) => { setMultiDatasets(v); setDatasetTouched(true); }}
+                  touched={datasetTouched}
+                />
+              )}
+
+              <Field label="Extra gr00t_finetune.py args (optional)">
+                <Input
+                  placeholder="--tune-visual --random-diffusion"
+                  value={extraArgs}
+                  onChange={(e) => setExtraArgs(e.target.value)}
+                />
+              </Field>
+            </>
           )}
         </CardContent>
       </Card>
 
-      {isSlurm && variant.data && <VariantPreview variant={variant.data} />}
+      {variant.data && <VariantPreview variant={variant.data} />}
 
-      {isSlurm && (
-        <div className="flex justify-end">
-          <Button onClick={() => submit.mutate()} disabled={!canSubmit}>
-            {submit.isPending ? "Submitting…" : `Submit ${phase} → ${cluster}/${partition || "?"}`}
-          </Button>
-        </div>
-      )}
+      <div className="flex justify-end">
+        <Button onClick={() => submit.mutate()} disabled={!canSubmit}>
+          {submit.isPending
+            ? "Submitting…"
+            : isSlurm
+              ? `Submit ${phase} → ${cluster}/${partition || "?"}`
+              : `Submit train → mlxp/${numGpus}×H200`}
+        </Button>
+      </div>
         </div>
 
         <aside className="space-y-4 lg:sticky lg:top-6 lg:self-start">

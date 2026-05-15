@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
-from . import clusters, datasets, details, jobs, mlxp, partitions, submit, variants
+from . import clusters, datasets, details, jobs, mlxp, mlxp_submit, partitions, submit, variants
 from .ssh import ssh_tail_lines
 
 
@@ -78,9 +78,32 @@ async def get_variant(name: str):
 
 # ── submit ──
 
-@app.post("/api/submit", response_model=submit.SubmitResponse)
+@app.post("/api/submit")
 async def post_submit(req: submit.SubmitRequest):
+    """Dispatches to the per-cluster submitter.
+
+    - kakao / skt → slurm sbatch over SSH (submit.submit)
+    - mlxp        → render+apply a k8s Job (mlxp_submit.submit_mlxp)
+    """
     try:
+        if req.cluster == "mlxp":
+            if req.phase != "train":
+                raise ValueError("MLXP currently supports phase=train only (no resume/eval yet)")
+            mlxp_req = mlxp_submit.MlxpSubmitRequest(
+                variant=req.variant,
+                num_gpus=req.num_gpus or 2,
+                dataset_override=req.dataset_override,
+                extra_args=req.extra_args,
+            )
+            r = await mlxp_submit.submit_mlxp(mlxp_req)
+            return {
+                "job_id": r.job_name,
+                "job_name": r.job_name,
+                "partition": f"mlxp/{mlxp_req.num_gpus}gpu",
+                "sbatch_cmd": "kubectl apply (rendered Job YAML)",
+                "rsync_stdout": "",
+                "sbatch_stdout": r.apply_stdout,
+            }
         return await submit.submit(req)
     except (FileNotFoundError, ValueError) as e:
         raise HTTPException(400, str(e))

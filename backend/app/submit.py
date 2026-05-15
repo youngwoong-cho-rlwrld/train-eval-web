@@ -60,7 +60,10 @@ class SubmitRequest(BaseModel):
     cluster: str
     variant: str
     phase: str                  # "train" | "resume" | "eval"
-    partition: str | None = None  # if None, fall back to cluster.env PARTITION
+    # Slurm-only: partition name (None → fall back to cluster.env default).
+    partition: str | None = None
+    # MLXP-only: how many H200 GPUs to request (1/2/4/8).
+    num_gpus: int | None = None
     # Per-submit dataset override. Two shapes accepted:
     #   - single string  → replaces DATASET_NAME in single-task variants
     #   - list of "name|cfg|weight" entries → replaces DATASETS array
