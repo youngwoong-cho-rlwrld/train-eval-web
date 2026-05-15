@@ -30,9 +30,16 @@ async def list_jobs(clusters: list[str] | None = None, hours: int = 24) -> list[
     squeue takes precedence on overlap (its state is fresher than sacct's
     for jobs that just finished).
     """
+    from . import mlxp_jobs
     target_clusters = clusters or list_clusters()
     out: list[Job] = []
     for c in target_clusters:
+        if c == "mlxp":
+            try:
+                out.extend(await mlxp_jobs.list_jobs())
+            except Exception:
+                pass
+            continue
         try:
             env = await load_cluster(c)
         except FileNotFoundError:
@@ -93,9 +100,10 @@ _SQUEUE_DETAIL_FMT = "%i|%j|%P|%T|%V|%S|%M|%R"
 
 
 async def get_job(cluster: str, job_id: str) -> dict:
-    """Return a flat dict of job fields. Prefer sacct (more complete history);
-    fall back to squeue for jobs slurm hasn't yet started accounting for
-    (e.g. fresh PENDING jobs)."""
+    """Return a flat dict of job fields. Dispatches on cluster type."""
+    if cluster == "mlxp":
+        from . import mlxp_jobs
+        return await mlxp_jobs.get_job(job_id)
     env = await load_cluster(cluster)
     r = await ssh_run(env.ssh_alias,
                       f'sacct -j {job_id} -X --parsable2 --format={_SACCT_FMT}',
@@ -126,6 +134,10 @@ async def get_job(cluster: str, job_id: str) -> dict:
 
 
 async def cancel_job(cluster: str, job_id: str) -> None:
+    if cluster == "mlxp":
+        from . import mlxp_jobs
+        await mlxp_jobs.cancel_job(job_id)
+        return
     env = await load_cluster(cluster)
     r = await ssh_run(env.ssh_alias, f"scancel {job_id}", timeout=15.0)
     if r.returncode != 0:

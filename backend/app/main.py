@@ -153,11 +153,22 @@ async def delete_job(cluster: str, job_id: str):
 async def stream_logs(cluster: str, job_id: str, stream: str = "out"):
     """Server-Sent Events stream of log lines.
 
-    stream:
+    stream (slurm clusters):
       out  — slurm stdout (.out)
       err  — slurm stderr (.err)
-      isaac — Isaac Sim server logs from the eval body's $EXP_DIR/logs/server_*.log
+      isaac — Isaac Sim server logs ($EXP_DIR/logs/server_*.log)
+    MLXP has a single container log, so `stream` is ignored.
     """
+    if cluster == "mlxp":
+        from . import mlxp_jobs
+        async def gen_mlxp():
+            try:
+                async for line in mlxp_jobs.tail_logs(job_id):
+                    yield {"event": "line", "data": line}
+            except RuntimeError as e:
+                yield {"event": "line", "data": f"(kubectl error: {e})"}
+        return EventSourceResponse(gen_mlxp())
+
     if stream not in ("out", "err", "isaac"):
         raise HTTPException(400, "stream must be 'out', 'err', or 'isaac'")
     try:

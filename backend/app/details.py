@@ -61,10 +61,29 @@ class JobDetails(BaseModel):
 
 
 def parse_phase_and_variant(job_name: str, cluster: str) -> tuple[str, str | None]:
-    """Job names: '<phase>_<variant>_<cluster>_<partition>_<timestamp>'.
+    """Slurm job names: '<phase>_<variant>_<cluster>_<partition>_<timestamp>'.
+    MLXP job names: 'youngwoong-<phase>-<variant-slug>-<timestamp>'.
 
-    Variant names can contain underscores, so we anchor on the cluster token.
+    For MLXP the variant slug has hyphens substituted for underscores, so
+    we walk the existing experiments dir to find the longest match.
     """
+    if cluster == "mlxp":
+        m = re.match(r"^youngwoong-(train|resume|eval)-(.+)-(\d{8}-\d{6})$", job_name)
+        if not m:
+            return "unknown", None
+        phase = m.group(1)
+        slug = m.group(2)
+        # Try to recover the original underscore-bearing variant name by
+        # scanning available variants.
+        from .variants import list_variants
+        try:
+            for v in sorted(list_variants(), key=len, reverse=True):
+                if v.lower().replace("_", "-") == slug.lower():
+                    return phase, v
+        except Exception:
+            pass
+        return phase, slug.replace("-", "_")
+
     phase_match = re.match(r"^(train|resume|eval)_", job_name)
     if not phase_match:
         return "unknown", None
@@ -85,6 +104,9 @@ async def get_details(cluster: str, job_id: str) -> JobDetails:
     elapsed = sacct.get("Elapsed", "")
 
     phase, variant = parse_phase_and_variant(job_name, cluster)
+
+    if cluster == "mlxp":
+        return await _mlxp_details(job_id, job_name, state, elapsed, phase, variant)
 
     env = await load_cluster(cluster)
     log_dir = env.vars["LOG_DIR"]
@@ -117,6 +139,44 @@ async def get_details(cluster: str, job_id: str) -> JobDetails:
 
     return JobDetails(
         cluster=cluster, job_id=job_id, job_name=job_name,
+        phase=phase, variant=variant, state=state, elapsed=elapsed,
+        wandb_url=wandb_url, paths=paths, progress=progress,
+    )
+
+
+async def _mlxp_details(job_id: str, job_name: str, state: str, elapsed: str,
+                        phase: str, variant: str | None) -> JobDetails:
+    """MLXP runs train via `kubectl apply` on a pod. All paths live on DDN."""
+    exp_dir = f"/data/youngwoong/experiments/{variant}" if variant else "/data/youngwoong/experiments"
+    ckpt_dir = f"{exp_dir}/checkpoints" if phase in ("train", "resume") else None
+    paths = Paths(
+        stdout=f"kubectl logs -n p-rlwrld -l job-name={job_id}",
+        stderr=f"kubectl logs -n p-rlwrld -l job-name={job_id}  (k8s merges stdout+stderr)",
+        exp_dir=exp_dir,
+        ckpt_dir=ckpt_dir,
+        eval_dir=None,
+        isaac_logs_glob=None,
+    )
+    # MLXP training writes WANDB_RUN_ID via env from the Job spec; not yet
+    # pinned to job_id like slurm, so omit the wandb URL until we add that.
+    wandb_url = None
+
+    # Progress: count latest checkpoint dir on DDN. Re-uses the same logic
+    # we have for pending slurm jobs but via kubectl exec into the running
+    # pod. For MVP we just count checkpoints by listing the dir from a fresh
+    # short-lived pod... too heavy. Skip MLXP progress for now and let the
+    # log tail show tqdm directly.
+    progress = Progress(phase=phase)
+    if variant:
+        try:
+            v = await load_variant(variant)
+            if "MAX_STEPS" in v.vars:
+                progress.max_steps = int(v.vars["MAX_STEPS"])
+        except Exception:
+            pass
+
+    return JobDetails(
+        cluster="mlxp", job_id=job_id, job_name=job_name,
         phase=phase, variant=variant, state=state, elapsed=elapsed,
         wandb_url=wandb_url, paths=paths, progress=progress,
     )
