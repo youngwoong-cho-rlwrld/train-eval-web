@@ -53,7 +53,7 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
   const cancelLabel = cluster === "mlxp" ? "kubectl delete job" : "scancel";
 
   return (
-    <div className="mx-auto max-w-5xl px-8 py-12">
+    <div className="mx-auto max-w-7xl px-8 py-12">
       <Link
         href="/jobs"
         className="inline-flex items-center gap-1 text-sm text-slate-500 transition-colors hover:text-slate-900 dark:hover:text-slate-50"
@@ -173,6 +173,16 @@ function ProgressCard({ d }: { d: JobDetails }) {
   const p = d.progress;
   const percent = p.percent ?? 0;
   const showBar = (p.current_step !== null && p.max_steps) || (p.completed_runs !== null && p.total_runs);
+  // Surface wandb-not-configured as the actionable cause of empty progress,
+  // rather than the generic "No progress yet" which looks like a backend bug.
+  const wandbStatus = useQuery({
+    queryKey: ["wandb-status"],
+    queryFn: () => api<{ logged_in: boolean; entity: string | null; project: string; error: string | null }>("/api/wandb/status"),
+    staleTime: 60_000,
+  });
+  const isTrain = d.phase === "train" || d.phase === "resume";
+  const wandbMissing = isTrain && wandbStatus.data && !wandbStatus.data.logged_in;
+
   return (
     <Card className="mt-6">
       <CardHeader className="flex flex-row items-center justify-between">
@@ -189,7 +199,17 @@ function ProgressCard({ d }: { d: JobDetails }) {
         )}
       </CardHeader>
       <CardContent>
-        {!showBar && <p className="text-sm text-slate-500">{p.current_label ?? "No progress yet."}</p>}
+        {!showBar && wandbMissing && (
+          <p className="text-sm text-slate-600 dark:text-slate-400">
+            <Link href="/settings" className="text-blue-600 hover:underline">
+              Sign in
+            </Link>{" "}
+            to see live progress
+          </p>
+        )}
+        {!showBar && !wandbMissing && (
+          <p className="text-sm text-slate-500">{p.current_label ?? "No progress yet."}</p>
+        )}
         {showBar && (
           <>
             <div className="flex items-baseline justify-between text-sm">
@@ -242,21 +262,32 @@ function PathsCard({ d }: { d: JobDetails }) {
 function LogStream({ cluster, jobId, stream }: { cluster: string; jobId: string; stream: "out" | "err" | "isaac" }) {
   const [lines, setLines] = useState<string[]>([]);
   const preRef = useRef<HTMLPreElement>(null);
+  // Whether the user was at the bottom *before* the next line arrived. If
+  // they scrolled up to read history, we don't yank them back down.
+  const stickToBottomRef = useRef(true);
 
   useEffect(() => {
     setLines([]);
+    stickToBottomRef.current = true;
     const es = new EventSource(logStreamUrl(cluster, jobId, stream));
     es.addEventListener("line", (e: MessageEvent) => {
-      setLines((prev) => {
-        const next = prev.concat(e.data as string);
-        return next.length > 2000 ? next.slice(-2000) : next;
-      });
+      // Sample scroll position before the state update — once React
+      // re-renders with the new line, scrollHeight has already grown and
+      // we can't tell whether the user was at the bottom.
+      const el = preRef.current;
+      if (el) {
+        stickToBottomRef.current =
+          el.scrollHeight - el.scrollTop - el.clientHeight < 8;
+      }
+      setLines((prev) => prev.concat(e.data as string));
     });
     return () => es.close();
   }, [cluster, jobId, stream]);
 
   useEffect(() => {
-    if (preRef.current) preRef.current.scrollTop = preRef.current.scrollHeight;
+    if (preRef.current && stickToBottomRef.current) {
+      preRef.current.scrollTop = preRef.current.scrollHeight;
+    }
   }, [lines]);
 
   return (

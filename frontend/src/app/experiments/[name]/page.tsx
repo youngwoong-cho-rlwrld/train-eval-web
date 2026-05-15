@@ -14,7 +14,7 @@ export default function ExperimentDetail({ params }: { params: Promise<{ name: s
   });
 
   return (
-    <div className="mx-auto max-w-3xl px-8 py-12">
+    <div className="mx-auto max-w-7xl px-8 py-12">
       <h1 className="font-mono text-2xl font-semibold tracking-tight">{name}</h1>
 
       {variant.isLoading && <p className="mt-4 text-sm text-slate-500">Loading…</p>}

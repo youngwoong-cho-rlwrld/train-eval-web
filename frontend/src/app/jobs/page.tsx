@@ -50,14 +50,15 @@ export default function JobsPage() {
   }, [data]);
 
   return (
-    <div className="mx-auto max-w-6xl px-8 py-12">
+    <div className="mx-auto max-w-7xl px-8 py-12">
       <div className="flex items-baseline justify-between">
         <h1 className="text-2xl font-semibold tracking-tight">Jobs</h1>
-        <RefreshButton isFetching={isFetching} onRefresh={refreshAll} />
+        <RefreshButton
+          isFetching={isFetching}
+          onRefresh={refreshAll}
+          intervalMs={REFRESH_MS}
+        />
       </div>
-      <p className="mt-2 text-slate-600 dark:text-slate-400">
-        Auto-refreshing every {REFRESH_MS / 1000}s. Active jobs from <code className="text-xs">squeue</code>; finished from <code className="text-xs">sacct</code>.
-      </p>
 
       <Card className="mt-8">
         <CardHeader>
@@ -128,7 +129,7 @@ function JobTable({ rows, kind }: { rows: Job[]; kind: "active" | "recent" }) {
             const phase = phaseOf(j.job_name);
             return (
               <tr key={`${j.cluster}-${j.job_id}`} className="border-b border-slate-100 last:border-0 hover:bg-slate-50 dark:border-slate-900 dark:hover:bg-slate-900/40">
-                <td className="py-2 pr-4 font-mono">
+                <td className="py-2 pr-4 font-mono min-w-[260px]">
                   <Link href={`/jobs/${j.cluster}/${j.job_id}`} className="text-blue-600 hover:underline">
                     {j.job_id}
                   </Link>
@@ -158,7 +159,7 @@ function JobTable({ rows, kind }: { rows: Job[]; kind: "active" | "recent" }) {
                     <CopyButton value={j.job_name} title="Copy job name" />
                   </div>
                 </td>
-                <Td className="font-mono text-xs text-slate-500">{j.nodelist}</Td>
+                <Td className="font-mono text-xs text-slate-500 min-w-[180px]">{j.nodelist}</Td>
               </tr>
             );
           })}

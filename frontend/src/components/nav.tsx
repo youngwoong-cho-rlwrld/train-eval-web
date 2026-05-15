@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Activity, Cpu, FileCog, Send, Trophy } from "lucide-react";
+import { Activity, Cpu, FileCog, Send, Settings, Trophy } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const items = [
@@ -11,6 +11,7 @@ const items = [
   { href: "/monitor", label: "GPU monitor", icon: Cpu },
   { href: "/experiments", label: "Experiments", icon: FileCog },
   { href: "/results", label: "Results", icon: Trophy },
+  { href: "/settings", label: "Settings", icon: Settings },
 ] as const;
 
 export function Nav() {

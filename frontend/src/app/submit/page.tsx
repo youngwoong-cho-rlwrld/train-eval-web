@@ -170,9 +170,6 @@ export default function SubmitPage() {
   return (
     <div className="mx-auto max-w-7xl px-8 py-12">
       <h1 className="text-2xl font-semibold tracking-tight">Submit a job</h1>
-      <p className="mt-2 text-slate-600 dark:text-slate-400">
-        Pick cluster + variant + partition, send to sbatch.
-      </p>
 
       <div className="mt-8 grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
         <div className="space-y-6">

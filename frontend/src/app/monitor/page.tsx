@@ -37,13 +37,12 @@ export default function MonitorPage() {
   return (
     <div className="mx-auto max-w-7xl px-8 py-12">
       <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">GPU monitor</h1>
-          <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
-            All clusters in one view. Auto-refresh every {REFRESH_MS / 1000}s.
-          </p>
-        </div>
-        <RefreshButton isFetching={isFetching} onRefresh={refreshAll} />
+        <h1 className="text-2xl font-semibold tracking-tight">GPU monitor</h1>
+        <RefreshButton
+          isFetching={isFetching}
+          onRefresh={refreshAll}
+          intervalMs={REFRESH_MS}
+        />
       </div>
 
       <div className="mt-8 space-y-6">
