@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { RefreshCw } from "lucide-react";
 import { api, type MlxpNode, type Partition } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { useMyMlxpNode } from "@/hooks/use-my-mlxp-node";
 
 const REFRESH_MS = 10_000;
 
@@ -128,11 +129,8 @@ function MlxpPanel() {
     retry: false,
   });
   const nodes = q.data ?? [];
-  // Reflect the same node the user picked on /submit (persisted in localStorage).
-  const [yoursNode, setYoursNode] = useState<string>("");
-  useEffect(() => {
-    if (typeof window !== "undefined") setYoursNode(localStorage.getItem("mlxpNode") || "");
-  }, []);
+  // Same source of truth as the /submit page's Node picker.
+  const [yoursNode, setYoursNode] = useMyMlxpNode();
   const idle = nodes.reduce((s, n) => s + n.gpu_free, 0);
   const total = nodes.reduce((s, n) => s + n.gpu_total, 0);
 
@@ -146,8 +144,24 @@ function MlxpPanel() {
             <span className="text-slate-400"> / {total} GPU free</span>
           </span>
         </div>
-        <CardDescription className="text-xs">
-          h200 nodes only · only <code>h200-03-w-3a18</code> sanctioned for our team
+        <CardDescription className="flex items-center gap-2 text-xs">
+          <span>your node:</span>
+          <Select value={yoursNode} onValueChange={setYoursNode}>
+            <SelectTrigger className="h-7 w-auto min-w-[200px] gap-1 px-2 text-xs">
+              <SelectValue placeholder="select…" />
+            </SelectTrigger>
+            <SelectContent>
+              {nodes.map((n) => (
+                <SelectItem key={n.name} value={n.name}>
+                  <span className="font-mono">{n.name}</span>
+                  <span className={`ml-2 text-[10px] ${n.gpu_free > 0 ? "text-green-600 dark:text-green-400" : "text-slate-500"}`}>
+                    {n.gpu_free}/{n.gpu_total} free
+                  </span>
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <span className="text-slate-400">(persists across sessions + syncs with the Submit page)</span>
         </CardDescription>
       </CardHeader>
       <CardContent>

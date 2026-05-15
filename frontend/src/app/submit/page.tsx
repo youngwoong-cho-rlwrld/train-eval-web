@@ -12,6 +12,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { ChevronDown, ChevronRight, Plus, X } from "lucide-react";
+import { useMyMlxpNode } from "@/hooks/use-my-mlxp-node";
 
 type Phase = "train" | "resume" | "eval";
 
@@ -24,16 +25,8 @@ export default function SubmitPage() {
   const [phase, setPhase] = useState<Phase>("train");
   const [partition, setPartition] = useState<string>("");
   const [numGpus, setNumGpus] = useState<string>("2");        // MLXP-only
-  // MLXP-only. Persisted to localStorage so each teammate's sanctioned
-  // node sticks across sessions (each user is assigned a different
-  // h200-03-w-XXXX per the GPU Resource Schedule spreadsheet).
-  const [mlxpNode, setMlxpNode] = useState<string>(() => {
-    if (typeof window === "undefined") return "";
-    return localStorage.getItem("mlxpNode") || "h200-03-w-3a18";
-  });
-  useEffect(() => {
-    if (mlxpNode) localStorage.setItem("mlxpNode", mlxpNode);
-  }, [mlxpNode]);
+  // Persisted across sessions + synced across pages via useMyMlxpNode.
+  const [mlxpNode, setMlxpNode] = useMyMlxpNode();
   const [extraArgs, setExtraArgs] = useState<string>("");
 
   // Dataset override state. For single-task variants, `singleDataset` holds
