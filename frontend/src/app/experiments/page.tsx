@@ -40,11 +40,6 @@ export default function ExperimentsPage() {
           )}
         </CardContent>
       </Card>
-
-      <p className="mt-6 text-sm text-slate-500">
-        Editing variants in the UI is on the v1.5 roadmap. For now, edit{" "}
-        <code className="text-xs">configs/experiments/&lt;name&gt;/config.sh</code> directly.
-      </p>
     </div>
   );
 }
