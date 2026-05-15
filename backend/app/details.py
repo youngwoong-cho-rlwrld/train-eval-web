@@ -157,29 +157,64 @@ async def _mlxp_details(job_id: str, job_name: str, state: str, elapsed: str,
         eval_dir=None,
         isaac_logs_glob=None,
     )
-    # MLXP training writes WANDB_RUN_ID via env from the Job spec; not yet
-    # pinned to job_id like slurm, so omit the wandb URL until we add that.
-    wandb_url = None
+    # mlxp_submit body pins WANDB_RUN_ID=<job_name>, so the wandb URL is
+    # the job_name itself.
+    wandb_url = f"https://wandb.ai/{WANDB_ENTITY}/{WANDB_PROJECT}/runs/{job_id}"
 
-    # Progress: count latest checkpoint dir on DDN. Re-uses the same logic
-    # we have for pending slurm jobs but via kubectl exec into the running
-    # pod. For MVP we just count checkpoints by listing the dir from a fresh
-    # short-lived pod... too heavy. Skip MLXP progress for now and let the
-    # log tail show tqdm directly.
-    progress = Progress(phase=phase)
-    if variant:
-        try:
-            v = await load_variant(variant)
-            if "MAX_STEPS" in v.vars:
-                progress.max_steps = int(v.vars["MAX_STEPS"])
-        except Exception:
-            pass
+    progress = await _mlxp_progress(job_id, variant, phase)
 
     return JobDetails(
         cluster="mlxp", job_id=job_id, job_name=job_name,
         phase=phase, variant=variant, state=state, elapsed=elapsed,
         wandb_url=wandb_url, paths=paths, progress=progress,
     )
+
+
+async def _mlxp_progress(job_id: str, variant: str | None, phase: str) -> Progress:
+    """Pull latest tqdm step from kubectl logs and combine with MAX_STEPS."""
+    import asyncio
+    import shutil
+
+    progress = Progress(phase=phase)
+    if not variant:
+        return progress
+
+    # MAX_STEPS from variant config (denominator).
+    try:
+        v = await load_variant(variant)
+        if "MAX_STEPS" in v.vars:
+            progress.max_steps = int(v.vars["MAX_STEPS"])
+    except Exception:
+        pass
+
+    if shutil.which("kubectl") is None or phase not in ("train", "resume"):
+        return progress
+
+    # Stream the last chunk of the container log, normalize CRs to newlines,
+    # then take the most recent "<num>/<max> [..." line tqdm prints.
+    cmd = (
+        f"kubectl logs -n p-rlwrld --tail=400 -l job-name={job_id} 2>/dev/null "
+        f"| tr '\\r' '\\n' | grep -oE '[0-9]+/[0-9]+ \\[' | tail -1"
+    )
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+    except Exception:
+        return progress
+
+    m = _TQDM_STEP_RE.search(stdout.decode(errors="replace") or "")
+    if m:
+        cur, total = int(m.group(1)), int(m.group(2))
+        progress.current_step = cur
+        progress.max_steps = total
+        progress.current_label = f"step {cur:,}/{total:,}"
+        if total > 0:
+            progress.percent = round(100.0 * cur / total, 1)
+    return progress
 
 
 _BODY_SUFFIX_RE = re.compile(r"/lib/(train|eval)_body(?:_n16)?\.sh$")

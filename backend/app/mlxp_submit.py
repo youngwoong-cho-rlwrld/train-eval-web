@@ -69,7 +69,7 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
     safe_variant = re.sub(r"[^a-z0-9-]+", "-", req.variant.lower())
     job_name = f"youngwoong-train-{safe_variant}-{timestamp}"[:63]  # k8s name limit
 
-    body_script = _render_body_script(variant, req)
+    body_script = _render_body_script(variant, req, job_name)
     spec = _render_job_yaml(job_name, body_script, req.num_gpus, cpu, mem, req.wandb_secret)
     yaml_text = yaml.safe_dump(spec, sort_keys=False)
 
@@ -91,7 +91,7 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
     )
 
 
-def _render_body_script(variant, req: MlxpSubmitRequest) -> str:
+def _render_body_script(variant, req: MlxpSubmitRequest, job_name: str) -> str:
     """Render the inline bash that the container will run.
 
     Renders a data_config.yaml on the fly from the variant's DATASETS array,
@@ -143,6 +143,10 @@ def _render_body_script(variant, req: MlxpSubmitRequest) -> str:
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 export WANDB_PROJECT=gr00t
+# Pin the wandb run-id to the k8s Job name so requeues continue the same
+# run (HF Trainer otherwise spawns a fresh run on each container start).
+export WANDB_RUN_ID="{job_name}"
+export WANDB_RESUME=allow
 export NO_ALBUMENTATIONS_UPDATE=1
 export TOKENIZERS_PARALLELISM=false
 
