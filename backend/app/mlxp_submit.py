@@ -72,9 +72,14 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
     cpu, mem = _GPU_RESOURCES[req.num_gpus]
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    # k8s names: lowercase, alphanumeric + '-'. Replace '_' with '-'.
+    # k8s names: ≤63 chars, lowercase, alphanumeric + '-', no leading/trailing '-'.
     safe_variant = re.sub(r"[^a-z0-9-]+", "-", req.variant.lower())
-    job_name = f"youngwoong-train-{safe_variant}-{timestamp}"[:63]  # k8s name limit
+    prefix = "youngwoong-train-"
+    suffix = f"-{timestamp}"
+    max_variant = 63 - len(prefix) - len(suffix)
+    if len(safe_variant) > max_variant:
+        safe_variant = safe_variant[:max_variant].rstrip("-")
+    job_name = f"{prefix}{safe_variant}{suffix}"
 
     node = req.node or DEFAULT_NODE
     body_script = _render_body_script(variant, req, job_name)
@@ -258,6 +263,7 @@ export TOKENIZERS_PARALLELISM=false
 export OMNI_KIT_ACCEPT_EULA=Y
 
 cd {GR00T_N16_DIR}
+source .venv/bin/activate
 
 mkdir -p {ckpt_dir}
 
@@ -271,7 +277,7 @@ if compgen -G "{ckpt_dir}/checkpoint-*" > /dev/null; then
     RESUME_FLAG="--resume"
 fi
 
-uv run torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/launch_finetune.py \\
+torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/launch_finetune.py \\
     --base-model-path nvidia/GR00T-N1.6-3B \\
     --dataset-path \\
         {dataset_paths_arg} \\
