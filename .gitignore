@@ -16,6 +16,12 @@ frontend/.env
 # after each cluster job.
 configs/experiments/*/data_config.yaml
 
+# Variant configs are per-user / per-experiment; only the _sample/ template
+# ships in git so newcomers have a starting reference.
+configs/experiments/*
+!configs/experiments/_sample/
+!configs/experiments/_sample/**
+
 # Local scratch
 .DS_Store
 *.bak

@@ -26,10 +26,17 @@ class Variant(BaseModel):
 
 
 def list_variants() -> list[str]:
+    """Variants directly under configs/experiments/.
+
+    Skip names starting with `_` — those are templates / scratch (notably
+    `_sample/`, which is the on-repo reference variant for new users).
+    """
     return sorted(
         p.name
         for p in EXPERIMENTS_DIR.iterdir()
-        if p.is_dir() and (p / "config.sh").is_file()
+        if p.is_dir()
+        and not p.name.startswith("_")
+        and (p / "config.sh").is_file()
     )
 
 
