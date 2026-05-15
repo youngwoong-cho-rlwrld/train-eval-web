@@ -19,9 +19,18 @@ from .ssh import ssh_run
 from .variants import load_variant
 
 
-# Wandb entity defaults to current user; override with TRAIN_EVAL_WEB_WANDB_ENTITY.
-WANDB_ENTITY = os.environ.get("TRAIN_EVAL_WEB_WANDB_ENTITY", "youngwoong")
-WANDB_PROJECT = os.environ.get("TRAIN_EVAL_WEB_WANDB_PROJECT", "gr00t")
+# Wandb config. We can infer two of three pieces from submission state:
+#   - run id: WANDB_RUN_ID pinned by the body script (k8s job_name for
+#     mlxp, slurm_<jobid> for slurm). Already in hand.
+#   - entity: wandb.Api().default_entity after `wandb login` on this
+#     laptop. Resolved lazily in _wandb_step.
+#   - project: launch_finetune.py / gr00t_finetune.py overrides our
+#     exported WANDB_PROJECT internally — no submission-side signal
+#     reveals which project the run actually lands in. So project is
+#     the only piece that has to come from config.
+# Override either via env var.
+WANDB_ENTITY_OVERRIDE = os.environ.get("TRAIN_EVAL_WEB_WANDB_ENTITY")
+WANDB_PROJECT = os.environ.get("TRAIN_EVAL_WEB_WANDB_PROJECT", "finetune-gr00t-n1d6")
 
 KNOWN_CLUSTERS = ("kakao", "skt")
 
@@ -72,14 +81,24 @@ def parse_phase_and_variant(job_name: str, cluster: str) -> tuple[str, str | Non
         if not m:
             return "unknown", None
         phase = m.group(1)
-        slug = m.group(2)
-        # Try to recover the original underscore-bearing variant name by
-        # scanning available variants.
+        slug = m.group(2).lower()
+        # Recover the original underscore variant name from the hyphen slug.
+        # k8s caps job names at 63 chars, so mlxp_submit truncates the slug —
+        # exact match may fail. Fall back to unique prefix match.
         from .variants import list_variants
         try:
-            for v in sorted(list_variants(), key=len, reverse=True):
-                if v.lower().replace("_", "-") == slug.lower():
+            available = list_variants()
+            hyphen_map = {v: v.lower().replace("_", "-") for v in available}
+            for v, vh in hyphen_map.items():
+                if vh == slug:
                     return phase, v
+            prefix_matches = [v for v, vh in hyphen_map.items() if vh.startswith(slug)]
+            if len(prefix_matches) == 1:
+                return phase, prefix_matches[0]
+            if len(prefix_matches) > 1:
+                # Multiple variants share this prefix — fall back to the
+                # longest (most-specific name), but this is ambiguous.
+                return phase, max(prefix_matches, key=len)
         except Exception:
             pass
         return phase, slug.replace("-", "_")
@@ -133,7 +152,9 @@ async def get_details(cluster: str, job_id: str) -> JobDetails:
     wandb_url: str | None = None
     if phase in ("train", "resume"):
         # train_body.sh exports WANDB_RUN_ID=slurm_$SLURM_JOB_ID with WANDB_RESUME=allow.
-        wandb_url = f"https://wandb.ai/{WANDB_ENTITY}/{WANDB_PROJECT}/runs/slurm_{job_id}"
+        entity = await _wandb_entity()
+        if entity:
+            wandb_url = f"https://wandb.ai/{entity}/{WANDB_PROJECT}/runs/slurm_{job_id}"
 
     progress = await _compute_progress(cluster, job_id, phase, variant, stdout_path, stderr_path, ckpt_dir, eval_dir)
 
@@ -159,7 +180,11 @@ async def _mlxp_details(job_id: str, job_name: str, state: str, elapsed: str,
     )
     # mlxp_submit body pins WANDB_RUN_ID=<job_name>, so the wandb URL is
     # the job_name itself.
-    wandb_url = f"https://wandb.ai/{WANDB_ENTITY}/{WANDB_PROJECT}/runs/{job_id}"
+    entity = await _wandb_entity()
+    wandb_url = (
+        f"https://wandb.ai/{entity}/{WANDB_PROJECT}/runs/{job_id}"
+        if entity else None
+    )
 
     progress = await _mlxp_progress(job_id, variant, phase)
 
@@ -171,15 +196,18 @@ async def _mlxp_details(job_id: str, job_name: str, state: str, elapsed: str,
 
 
 async def _mlxp_progress(job_id: str, variant: str | None, phase: str) -> Progress:
-    """Pull latest tqdm step from kubectl logs and combine with MAX_STEPS."""
+    """Progress for an MLXP training job.
+
+    Primary source: the run's wandb summary (its `_step` field is updated
+    every logging tick — i.e. every 10 training steps for gr00t-n16).
+    Fallback: highest `checkpoint-N` dir on DDN (SAVE_STEPS granularity).
+    """
     import asyncio
-    import shutil
 
     progress = Progress(phase=phase)
     if not variant:
         return progress
 
-    # MAX_STEPS from variant config (denominator).
     try:
         v = await load_variant(variant)
         if "MAX_STEPS" in v.vars:
@@ -187,34 +215,111 @@ async def _mlxp_progress(job_id: str, variant: str | None, phase: str) -> Progre
     except Exception:
         pass
 
-    if shutil.which("kubectl") is None or phase not in ("train", "resume"):
+    if phase not in ("train", "resume"):
         return progress
 
-    # Stream the last chunk of the container log, normalize CRs to newlines,
-    # then take the most recent "<num>/<max> [..." line tqdm prints.
-    cmd = (
-        f"kubectl logs -n p-rlwrld --tail=400 -l job-name={job_id} 2>/dev/null "
-        f"| tr '\\r' '\\n' | grep -oE '[0-9]+/[0-9]+ \\[' | tail -1"
-    )
+    # 1. wandb — fine-grained (per logging tick).
+    step = await _wandb_step(job_id)
+    if step is not None:
+        progress.current_step = step
+        if progress.max_steps:
+            progress.percent = round(100.0 * step / progress.max_steps, 1)
+            progress.current_label = f"step {step:,}/{progress.max_steps:,}"
+        else:
+            progress.current_label = f"step {step:,}"
+        return progress
+
+    # 2. checkpoint dir count — coarse (SAVE_STEPS granularity).
+    import shutil
+    if shutil.which("kubectl") is None:
+        return progress
+    ckpt_dir = f"/data/youngwoong/experiments/{variant}/checkpoints"
+    from .mlxp_data_pod import ensure_listing_pod, NAMESPACE
     try:
-        proc = await asyncio.create_subprocess_shell(
-            cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+        pod = await ensure_listing_pod()
     except Exception:
         return progress
 
-    m = _TQDM_STEP_RE.search(stdout.decode(errors="replace") or "")
-    if m:
-        cur, total = int(m.group(1)), int(m.group(2))
-        progress.current_step = cur
-        progress.max_steps = total
-        progress.current_label = f"step {cur:,}/{total:,}"
-        if total > 0:
-            progress.percent = round(100.0 * cur / total, 1)
+    cmd = (
+        f"ls -d {ckpt_dir}/checkpoint-* 2>/dev/null "
+        "| sed 's:.*checkpoint-::' | sort -n | tail -1"
+    )
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "kubectl", "exec", "-n", NAMESPACE, pod, "--", "bash", "-c", cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+    except Exception:
+        if proc is not None and proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        return progress
+
+    latest = stdout.decode(errors="replace").strip()
+    if not latest.isdigit():
+        return progress
+    cur = int(latest)
+    progress.current_step = cur
+    if progress.max_steps:
+        progress.percent = round(100.0 * cur / progress.max_steps, 1)
+        progress.current_label = f"step {cur:,}/{progress.max_steps:,}"
+    else:
+        progress.current_label = f"step {cur:,}"
     return progress
+
+
+_wandb_entity_cache: str | None = None
+
+
+async def _wandb_entity() -> str | None:
+    """Resolve the wandb entity once. Order: env override → API default."""
+    global _wandb_entity_cache
+    if WANDB_ENTITY_OVERRIDE:
+        return WANDB_ENTITY_OVERRIDE
+    if _wandb_entity_cache is not None:
+        return _wandb_entity_cache or None
+    import asyncio
+
+    def _default() -> str:
+        try:
+            import wandb
+            return wandb.Api(timeout=10).default_entity or ""
+        except Exception:
+            return ""
+
+    _wandb_entity_cache = await asyncio.to_thread(_default)
+    return _wandb_entity_cache or None
+
+
+async def _wandb_step(run_id: str) -> int | None:
+    """Return the run's latest step (None if API unreachable / run not found)."""
+    import asyncio
+
+    entity = await _wandb_entity()
+    if not entity:
+        return None
+
+    def _query() -> int | None:
+        try:
+            import wandb
+            api = wandb.Api(timeout=10)
+            run = api.run(f"{entity}/{WANDB_PROJECT}/{run_id}")
+            # train/global_step is the actual training-loop step. wandb's
+            # built-in `_step` counts wandb.log() calls, which is
+            # global_step / logging_steps — off by ~10× for gr00t-n16.
+            s = run.summary.get("train/global_step")
+            if s is None:
+                s = run.summary.get("global_step")
+            if s is None:
+                s = run.summary.get("_step")
+            return int(s) if s is not None else None
+        except Exception:
+            return None
+
+    return await asyncio.to_thread(_query)
 
 
 _BODY_SUFFIX_RE = re.compile(r"/lib/(train|eval)_body(?:_n16)?\.sh$")

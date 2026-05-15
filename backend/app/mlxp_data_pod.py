@@ -69,23 +69,56 @@ spec:
 """
 
 
+_CACHE_TTL = 5.0  # seconds
+_pods_cache: tuple[float, dict] | None = None
+_pods_lock = asyncio.Lock()
+
+
+def _label_matches(item: dict, label: str | None) -> bool:
+    if not label or "=" not in label:
+        return True
+    k, v = label.split("=", 1)
+    return (item.get("metadata", {}).get("labels") or {}).get(k) == v
+
+
 async def _kubectl_get_pods_json(label: str | None = None) -> dict:
-    args = ["kubectl", "get", "pods", "-n", NAMESPACE]
-    if label:
-        args += ["-l", label]
-    args += ["-o", "json"]
-    proc = await asyncio.create_subprocess_exec(
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
-    if proc.returncode != 0:
-        return {}
-    try:
-        return json.loads(stdout.decode())
-    except json.JSONDecodeError:
-        return {}
+    """Fetch all pods in the namespace, with a small shared TTL cache.
+
+    Many endpoints (each ProgressCell, ensure_listing_pod, mlxp_jobs.list_jobs)
+    call this in rapid bursts. One kubectl per 5s window is plenty; the lock
+    keeps concurrent callers from firing duplicates while the first is still
+    in flight against MLXP's sometimes-slow API.
+    """
+    global _pods_cache
+    async with _pods_lock:
+        now = asyncio.get_event_loop().time()
+        if _pods_cache and now - _pods_cache[0] < _CACHE_TTL:
+            data = _pods_cache[1]
+        else:
+            proc = await asyncio.create_subprocess_exec(
+                "kubectl", "get", "pods", "-n", NAMESPACE, "-o", "json",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                # MLXP API server is occasionally slow on TLS handshake.
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                return {"items": []}
+            if proc.returncode != 0:
+                return {"items": []}
+            try:
+                data = json.loads(stdout.decode())
+            except json.JSONDecodeError:
+                return {"items": []}
+            _pods_cache = (now, data)
+
+    if not label:
+        return data
+    items = [it for it in data.get("items", []) if _label_matches(it, label)]
+    return {**data, "items": items}
 
 
 async def _find_running_with_ddn() -> str | None:

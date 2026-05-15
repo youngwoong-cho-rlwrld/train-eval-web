@@ -2,12 +2,17 @@
 
 We shell out to the system `ssh` and `rsync` binaries instead of using
 asyncssh directly. That way we inherit the user's `~/.ssh/config` (host
-aliases, key paths, control-master settings) for free — same behavior as
-running `ssh kakao-login-1 ...` from a terminal.
+aliases, key paths) for free — same behavior as running
+`ssh kakao-login-1 ...` from a terminal.
+
+We add `ControlMaster=auto` ourselves so the second-through-Nth call to
+the same host reuses an existing TCP+SSH session (sub-second). Without
+it each call is its own handshake, which on slow links (skt) was costing
+5-12s per command — the dominant factor in /api/jobs latency.
 """
 
 import asyncio
-import shlex
+import os
 from dataclasses import dataclass
 
 
@@ -23,12 +28,26 @@ class SSHResult:
 _SLURM_PATH_PREFIX = "export PATH=/opt/slurm/bin:$PATH; "
 
 
+# ── SSH connection multiplexing ───────────────────────────────────────
+# %C is a hash of (host, port, user, local user) — uniquely identifies
+# a connection. ControlPersist keeps the master alive for 10 min after
+# the last client exits, so polling endpoints (jobs/monitor) reuse it.
+_CM_DIR = os.path.expanduser("~/.train-eval-web/ssh-cm")
+os.makedirs(_CM_DIR, exist_ok=True)
+_CM_OPTS = (
+    "-o", "ControlMaster=auto",
+    "-o", f"ControlPath={_CM_DIR}/%C",
+    "-o", "ControlPersist=600",
+)
+
+
 async def ssh_run(host: str, cmd: str, timeout: float = 60.0) -> SSHResult:
     """Run `cmd` on `host` over ssh and return its output."""
     proc = await asyncio.create_subprocess_exec(
         "ssh",
         "-o", "BatchMode=yes",
         "-o", "ConnectTimeout=10",
+        *_CM_OPTS,
         host,
         _SLURM_PATH_PREFIX + cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -50,7 +69,9 @@ async def ssh_run(host: str, cmd: str, timeout: float = 60.0) -> SSHResult:
 async def rsync_to(host: str, local_path: str, remote_path: str,
                    *, delete: bool = False, timeout: float = 120.0) -> SSHResult:
     """rsync local_path to host:remote_path. Creates parent dirs."""
-    args = ["rsync", "-az"]
+    # Reuse the multiplexed ssh master rather than negotiating a new session.
+    ssh_e = "ssh -o BatchMode=yes " + " ".join(_CM_OPTS)
+    args = ["rsync", "-az", "-e", ssh_e]
     if delete:
         args.append("--delete")
     args.extend([local_path, f"{host}:{remote_path}"])
@@ -83,22 +104,50 @@ async def ssh_tail_lines(host: str, remote_pattern: str):
     job, eval mid-startup) the loop sleeps and retries until it does, then
     `tail -F` follows-by-name forever.
     """
+    # Stream the entire file from the start, then follow forever. Frontend
+    # owns the scrollback policy.
     cmd = (
         f'while ! ls {remote_pattern} >/dev/null 2>&1; do sleep 2; done; '
-        f'exec tail -n 200 -F {remote_pattern}'
+        f'exec tail -n +1 -F {remote_pattern}'
     )
+    # 1MB stream limit + split on both \n and \r so tqdm progress lines
+    # don't overflow asyncio's default 64KB readline buffer.
     proc = await asyncio.create_subprocess_exec(
-        "ssh", "-o", "BatchMode=yes", host, cmd,
+        "ssh", "-o", "BatchMode=yes", *_CM_OPTS, host, cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=1 << 20,
     )
     assert proc.stdout is not None
     try:
+        buf = b""
         while True:
-            line = await proc.stdout.readline()
-            if not line:
+            try:
+                chunk = await proc.stdout.read(8192)
+            except Exception:
                 break
-            yield line.decode(errors="replace").rstrip("\n")
+            if not chunk:
+                if buf:
+                    yield buf.decode(errors="replace")
+                break
+            buf += chunk
+            while True:
+                i_n = buf.find(b"\n")
+                i_r = buf.find(b"\r")
+                idx = (
+                    min(i for i in (i_n, i_r) if i != -1)
+                    if (i_n != -1 or i_r != -1)
+                    else -1
+                )
+                if idx == -1:
+                    if len(buf) > (1 << 19):
+                        yield buf.decode(errors="replace")
+                        buf = b""
+                    break
+                line = buf[:idx]
+                buf = buf[idx + 1:]
+                if line:
+                    yield line.decode(errors="replace")
     finally:
         if proc.returncode is None:
             proc.kill()

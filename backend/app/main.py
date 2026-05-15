@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
-from . import clusters, datasets, details, jobs, mlxp, mlxp_submit, partitions, submit, variants
+from . import clusters, datasets, details, jobs, mlxp, mlxp_submit, partitions, submit, variants, wandb_auth
 from .ssh import ssh_tail_lines
 
 
@@ -203,3 +203,17 @@ async def stream_logs(cluster: str, job_id: str, stream: str = "out"):
             yield {"event": "line", "data": line}
 
     return EventSourceResponse(gen())
+
+
+# ── wandb ──
+
+@app.get("/api/wandb/status", response_model=wandb_auth.WandbStatus)
+async def get_wandb_status():
+    return await wandb_auth.get_status()
+
+
+@app.post("/api/wandb/login", response_model=wandb_auth.WandbStatus)
+async def post_wandb_login(req: wandb_auth.LoginRequest):
+    if not req.key.strip():
+        raise HTTPException(400, "key must not be empty")
+    return await wandb_auth.login(req.key)

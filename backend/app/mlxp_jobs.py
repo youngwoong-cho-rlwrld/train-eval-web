@@ -192,22 +192,53 @@ async def tail_logs(job_name: str, follow: bool = True):
         return
     pod_name = pods[0]["metadata"]["name"]
 
-    args = ["kubectl", "logs", "-n", _NS, pod_name, "--tail=200"]
+    # No --tail: stream the full log from the start. Frontend handles the
+    # scrollback; backend just delivers everything kubectl will emit.
+    args = ["kubectl", "logs", "-n", _NS, pod_name]
     if follow:
         args.append("-f")
+    # 1MB stream limit: tqdm progress lines use \r instead of \n, and at
+    # 64KB (asyncio's default) a long-running tqdm bar overflows readline.
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=1 << 20,
     )
     assert proc.stdout is not None
     try:
-        while True:
-            line = await proc.stdout.readline()
-            if not line:
-                break
-            yield line.decode(errors="replace").rstrip("\n")
+        async for line in _iter_logical_lines(proc.stdout):
+            yield line
     finally:
         if proc.returncode is None:
             proc.kill()
             await proc.wait()
+
+
+async def _iter_logical_lines(reader):
+    """Yield logical lines, splitting on either \\n or \\r so tqdm progress
+    bars (which use \\r) don't accumulate into one giant buffer."""
+    buf = b""
+    while True:
+        try:
+            chunk = await reader.read(8192)
+        except Exception:
+            return
+        if not chunk:
+            if buf:
+                yield buf.decode(errors="replace")
+            return
+        buf += chunk
+        while True:
+            i_n = buf.find(b"\n")
+            i_r = buf.find(b"\r")
+            idx = min(i for i in (i_n, i_r) if i != -1) if (i_n != -1 or i_r != -1) else -1
+            if idx == -1:
+                if len(buf) > (1 << 19):  # 512KB safety flush
+                    yield buf.decode(errors="replace")
+                    buf = b""
+                break
+            line = buf[:idx]
+            buf = buf[idx + 1:]
+            if line:
+                yield line.decode(errors="replace")
