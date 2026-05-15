@@ -525,7 +525,6 @@ function AvailabilityCard({ cluster, partitions }: { cluster: string; partitions
                 <div className="min-w-0 flex-1 truncate font-mono" title={p.name}>
                   {p.name}
                   {p.is_default && <Badge variant="secondary" className="ml-1 text-[10px]">def</Badge>}
-                  {p.is_background && <Badge variant="outline" className="ml-1 text-[10px]">bg</Badge>}
                 </div>
                 <div className="shrink-0 font-mono">
                   <span className={p.gpu_idle > 0 ? "text-green-600 dark:text-green-400" : "text-slate-500"}>

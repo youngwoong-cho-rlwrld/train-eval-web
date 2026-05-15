@@ -93,7 +93,6 @@ function SlurmClusterPanel({ cluster }: { cluster: string }) {
                     <td className="py-2 pr-4 font-mono text-xs">
                       {p.name}
                       {p.is_default && <Badge variant="secondary" className="ml-1 text-[10px]">default</Badge>}
-                      {p.is_background && <Badge variant="outline" className="ml-1 text-[10px]">bg</Badge>}
                     </td>
                     <td className="py-2 pr-4 font-mono text-xs">
                       <span className={p.gpu_idle > 0 ? "text-green-600 dark:text-green-400" : "text-slate-500"}>
