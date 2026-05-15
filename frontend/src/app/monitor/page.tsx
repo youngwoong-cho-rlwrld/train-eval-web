@@ -18,7 +18,8 @@ export default function MonitorPage() {
     queryKey: ["clusters"],
     queryFn: () => api<{ clusters: string[] }>("/api/clusters").then((d) => d.clusters),
   });
-  const slurm = clusters.data ?? [];
+  // mlxp is k8s, not slurm — it has its own panel below.
+  const slurm = (clusters.data ?? []).filter((c) => c !== "mlxp");
 
   const refreshAll = () => {
     qc.invalidateQueries({ queryKey: ["clusters"] });
