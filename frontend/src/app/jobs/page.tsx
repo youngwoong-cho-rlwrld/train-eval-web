@@ -172,13 +172,12 @@ function ProgressCell({ cluster, jobId, state }: { cluster: string; jobId: strin
   // Fetch for all active states. PENDING jobs that were preempted may have
   // prior checkpoints / results.json files — the backend surfaces those so
   // the user can see how far the previous run got while it waits in queue.
-  // Running jobs refetch on a shorter interval so live progress feels current;
-  // pending jobs poll slower since nothing's actively changing.
+  // Matches the page-level REFRESH_MS so the user only sees one cadence.
   const isRunning = state === "RUNNING" || state === "COMPLETING";
   const q = useQuery({
     queryKey: ["job-details", cluster, jobId],
     queryFn: () => api<JobDetails>(`/api/jobs/${cluster}/${jobId}/details`),
-    refetchInterval: isRunning ? 15_000 : 60_000,
+    refetchInterval: isRunning ? REFRESH_MS : REFRESH_MS * 5,
   });
   if (q.isLoading || !q.data) return <span className="text-xs text-slate-400">…</span>;
   const p = q.data.progress;
