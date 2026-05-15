@@ -22,8 +22,8 @@ from datetime import datetime
 import yaml
 from pydantic import BaseModel
 
-from .details import WANDB_PROJECT
 from .paths import EXPERIMENTS_DIR
+from .wandb_config import get_project as _wandb_project
 from .variants import load_variant
 
 
@@ -294,7 +294,7 @@ torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/launch_finetune.py \\
     --dataloader-num-workers 8 \\
     --experiment-name "{job_name}" \\
     --use-wandb \\
-    --wandb-project {WANDB_PROJECT} \\
+    --wandb-project {_wandb_project()} \\
     $RESUME_FLAG {train_extra} {user_extra}
 """
 

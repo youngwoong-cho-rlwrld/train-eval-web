@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ArrowLeft, ExternalLink } from "lucide-react";
-import { api, logStreamUrl, type JobDetails } from "@/lib/api";
+import { api, logStreamUrl, type JobDetails, type Variant } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -120,31 +120,36 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
         </DialogContent>
       </Dialog>
 
-      {details.data && <ProgressCard d={details.data} />}
+      <div className="mt-6 grid gap-6 lg:grid-cols-2">
+        {details.data && <ProgressCard d={details.data} />}
+        <Card>
+          <CardHeader>
+            <CardTitle>sacct</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {sacct.isLoading && <p className="text-sm text-slate-500">Loading…</p>}
+            {sacct.error && <p className="text-sm text-red-600">{(sacct.error as Error).message}</p>}
+            {sacct.data && (
+              <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
+                {["State", "ExitCode", "Elapsed", "Start", "End", "Partition", "NodeList", "Reason"].map((k) =>
+                  sacct.data[k] ? (
+                    <div key={k} className="flex flex-col">
+                      <dt className="text-xs uppercase tracking-wide text-slate-500">{k}</dt>
+                      <dd className="font-mono text-xs">
+                        {k === "State" ? <Badge>{sacct.data[k]}</Badge> : sacct.data[k]}
+                      </dd>
+                    </div>
+                  ) : null,
+                )}
+              </dl>
+            )}
+          </CardContent>
+        </Card>
+      </div>
 
-      <Card className="mt-6">
-        <CardHeader>
-          <CardTitle>sacct</CardTitle>
-        </CardHeader>
-        <CardContent>
-          {sacct.isLoading && <p className="text-sm text-slate-500">Loading…</p>}
-          {sacct.error && <p className="text-sm text-red-600">{(sacct.error as Error).message}</p>}
-          {sacct.data && (
-            <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm sm:grid-cols-3">
-              {["State", "ExitCode", "Elapsed", "Start", "End", "Partition", "NodeList", "Reason"].map((k) =>
-                sacct.data[k] ? (
-                  <div key={k} className="flex flex-col">
-                    <dt className="text-xs uppercase tracking-wide text-slate-500">{k}</dt>
-                    <dd className="font-mono text-xs">
-                      {k === "State" ? <Badge>{sacct.data[k]}</Badge> : sacct.data[k]}
-                    </dd>
-                  </div>
-                ) : null,
-              )}
-            </dl>
-          )}
-        </CardContent>
-      </Card>
+      {details.data?.variant && (
+        <ConfigCard cluster={cluster} jobId={id} variantName={details.data.variant} />
+      )}
 
       {details.data && <PathsCard d={details.data} />}
 
@@ -184,7 +189,7 @@ function ProgressCard({ d }: { d: JobDetails }) {
   const wandbMissing = isTrain && wandbStatus.data && !wandbStatus.data.logged_in;
 
   return (
-    <Card className="mt-6">
+    <Card>
       <CardHeader className="flex flex-row items-center justify-between">
         <CardTitle>Progress</CardTitle>
         {d.wandb_url && (
@@ -226,6 +231,70 @@ function ProgressCard({ d }: { d: JobDetails }) {
         )}
       </CardContent>
     </Card>
+  );
+}
+
+function ConfigCard({
+  cluster,
+  jobId,
+  variantName,
+}: {
+  cluster: string;
+  jobId: string;
+  variantName: string;
+}) {
+  const flags = useQuery({
+    queryKey: ["job-flags", cluster, jobId],
+    queryFn: () =>
+      api<{ flags: { flag: string; value: string }[] }>(
+        `/api/jobs/${cluster}/${jobId}/flags`,
+      ),
+  });
+  const configPath = `configs/experiments/${variantName}/config.sh`;
+
+  return (
+    <Card className="mt-6">
+      <CardHeader>
+        <CardTitle>
+          Config{" "}
+          <span className="text-xs font-normal text-slate-500">
+            {variantName}
+          </span>
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <ConfigPathRow label="config" value={configPath} />
+        {flags.data && (
+          <div className="divide-y divide-slate-100 dark:divide-slate-900">
+            {flags.data.flags.map((f, i) => (
+              <div
+                key={`${f.flag}-${i}`}
+                className="flex items-baseline gap-4 py-1.5 text-xs"
+              >
+                <code className="min-w-[220px] font-mono text-slate-600 dark:text-slate-300">
+                  {f.flag}
+                </code>
+                <code className="flex-1 break-all font-mono text-slate-500">
+                  {f.value || <span className="text-slate-400">(flag)</span>}
+                </code>
+              </div>
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function ConfigPathRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-center justify-between gap-4 py-2">
+      <div className="min-w-[110px] text-xs uppercase tracking-wide text-slate-500">
+        {label}
+      </div>
+      <div className="flex-1 truncate font-mono text-xs">{value}</div>
+      <CopyButton value={value} />
+    </div>
   );
 }
 

@@ -1,13 +1,15 @@
-"""Wandb credentials endpoints.
+"""Wandb credentials and project settings endpoints.
 
-Lets the user paste their wandb API key once via the UI. The key is
-persisted to `~/.netrc` (wandb's standard location) by calling
-`wandb.login(key=...)`. After that, the backend's wandb.Api() picks it
-up on next import.
+The API key is persisted to `~/.netrc` via `wandb.login(key=...)`. The
+project name is persisted to `~/.train-eval-web/wandb.json` (see
+wandb_config) and is used both for the backend's run lookup and for
+the `--wandb-project` flag we pass to launch_finetune.py.
 """
 
 import asyncio
 from pydantic import BaseModel
+
+from .wandb_config import get_project, set_project
 
 
 class WandbStatus(BaseModel):
@@ -21,9 +23,13 @@ class LoginRequest(BaseModel):
     key: str
 
 
+class ProjectRequest(BaseModel):
+    project: str
+
+
 async def get_status() -> WandbStatus:
     """Probe wandb to see whether the local netrc/key works."""
-    from .details import WANDB_PROJECT, WANDB_ENTITY_OVERRIDE
+    from .details import WANDB_ENTITY_OVERRIDE
 
     def _probe() -> tuple[str | None, str | None]:
         try:
@@ -38,7 +44,7 @@ async def get_status() -> WandbStatus:
     return WandbStatus(
         logged_in=entity is not None,
         entity=entity,
-        project=WANDB_PROJECT,
+        project=get_project(),
         error=err,
     )
 
@@ -65,6 +71,11 @@ async def login(key: str) -> WandbStatus:
     return WandbStatus(
         logged_in=entity is not None,
         entity=entity,
-        project=details.WANDB_PROJECT,
+        project=get_project(),
         error=err,
     )
+
+
+async def set_project_endpoint(project: str) -> WandbStatus:
+    set_project(project)
+    return await get_status()

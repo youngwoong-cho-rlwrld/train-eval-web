@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ExternalLink } from "lucide-react";
@@ -30,11 +30,18 @@ export default function SettingsPage() {
 function WandbCard() {
   const qc = useQueryClient();
   const [key, setKey] = useState("");
+  const [project, setProject] = useState("");
 
   const status = useQuery({
     queryKey: ["wandb-status"],
     queryFn: () => api<WandbStatus>("/api/wandb/status"),
   });
+
+  // Keep the project input in sync with the saved value, but don't clobber
+  // a user edit in progress.
+  useEffect(() => {
+    if (status.data && project === "") setProject(status.data.project);
+  }, [status.data, project]);
 
   const login = useMutation({
     mutationFn: () =>
@@ -54,6 +61,22 @@ function WandbCard() {
     onError: (e: Error) => toast.error(e.message),
   });
 
+  const saveProject = useMutation({
+    mutationFn: () =>
+      api<WandbStatus>("/api/wandb/project", {
+        method: "POST",
+        body: JSON.stringify({ project }),
+      }),
+    onSuccess: (res) => {
+      toast.success(`Project set to ${res.project}`);
+      qc.invalidateQueries({ queryKey: ["wandb-status"] });
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+
+  const savedProject = status.data?.project ?? "";
+  const projectDirty = project.trim() !== "" && project.trim() !== savedProject;
+
   return (
     <Card className="mt-8">
       <CardHeader>
@@ -70,7 +93,7 @@ function WandbCard() {
           )}
         </CardTitle>
       </CardHeader>
-      <CardContent className="space-y-3">
+      <CardContent className="space-y-4">
         <div className="space-y-2">
           <Label className="flex items-center justify-between">
             <span>API key</span>
@@ -99,6 +122,29 @@ function WandbCard() {
               {login.isPending ? "Saving…" : "Save"}
             </Button>
           </div>
+        </div>
+
+        <div className="space-y-2">
+          <Label>Project</Label>
+          <div className="flex gap-2">
+            <Input
+              value={project}
+              onChange={(e) => setProject(e.target.value)}
+              placeholder="finetune-gr00t-n1d6"
+              className="flex-1 font-mono text-xs"
+              autoComplete="off"
+            />
+            <Button
+              onClick={() => saveProject.mutate()}
+              disabled={!projectDirty || saveProject.isPending}
+            >
+              {saveProject.isPending ? "Saving…" : "Save"}
+            </Button>
+          </div>
+          <p className="text-xs text-slate-500">
+            Used for both the wandb API lookup and the{" "}
+            <code>--wandb-project</code> flag passed to MLXP jobs.
+          </p>
         </div>
       </CardContent>
     </Card>

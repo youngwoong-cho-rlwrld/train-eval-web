@@ -19,18 +19,19 @@ from .ssh import ssh_run
 from .variants import load_variant
 
 
+from .wandb_config import get_project
+
 # Wandb config. We can infer two of three pieces from submission state:
 #   - run id: WANDB_RUN_ID pinned by the body script (k8s job_name for
 #     mlxp, slurm_<jobid> for slurm). Already in hand.
 #   - entity: wandb.Api().default_entity after `wandb login` on this
 #     laptop. Resolved lazily in _wandb_step.
-#   - project: launch_finetune.py / gr00t_finetune.py overrides our
+#   - project: configurable in Settings (persisted via wandb_config),
+#     since launch_finetune.py / gr00t_finetune.py override our
 #     exported WANDB_PROJECT internally — no submission-side signal
-#     reveals which project the run actually lands in. So project is
-#     the only piece that has to come from config.
-# Override either via env var.
+#     reveals which project the run actually lands in.
+# Entity override still env-only.
 WANDB_ENTITY_OVERRIDE = os.environ.get("TRAIN_EVAL_WEB_WANDB_ENTITY")
-WANDB_PROJECT = os.environ.get("TRAIN_EVAL_WEB_WANDB_PROJECT", "finetune-gr00t-n1d6")
 
 KNOWN_CLUSTERS = ("kakao", "skt")
 
@@ -154,7 +155,7 @@ async def get_details(cluster: str, job_id: str) -> JobDetails:
         # train_body.sh exports WANDB_RUN_ID=slurm_$SLURM_JOB_ID with WANDB_RESUME=allow.
         entity = await _wandb_entity()
         if entity:
-            wandb_url = f"https://wandb.ai/{entity}/{WANDB_PROJECT}/runs/slurm_{job_id}"
+            wandb_url = f"https://wandb.ai/{entity}/{get_project()}/runs/slurm_{job_id}"
 
     progress = await _compute_progress(cluster, job_id, phase, variant, stdout_path, stderr_path, ckpt_dir, eval_dir)
 
@@ -182,7 +183,7 @@ async def _mlxp_details(job_id: str, job_name: str, state: str, elapsed: str,
     # the job_name itself.
     entity = await _wandb_entity()
     wandb_url = (
-        f"https://wandb.ai/{entity}/{WANDB_PROJECT}/runs/{job_id}"
+        f"https://wandb.ai/{entity}/{get_project()}/runs/{job_id}"
         if entity else None
     )
 
@@ -306,7 +307,7 @@ async def _wandb_step(run_id: str) -> int | None:
         try:
             import wandb
             api = wandb.Api(timeout=10)
-            run = api.run(f"{entity}/{WANDB_PROJECT}/{run_id}")
+            run = api.run(f"{entity}/{get_project()}/{run_id}")
             # train/global_step is the actual training-loop step. wandb's
             # built-in `_step` counts wandb.log() calls, which is
             # global_step / logging_steps — off by ~10× for gr00t-n16.

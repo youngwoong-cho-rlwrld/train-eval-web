@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
-from . import clusters, datasets, details, jobs, mlxp, mlxp_submit, partitions, submit, variants, wandb_auth
+from . import clusters, datasets, details, flags, jobs, mlxp, mlxp_submit, partitions, submit, variants, wandb_auth
 from .ssh import ssh_tail_lines
 
 
@@ -217,3 +217,26 @@ async def post_wandb_login(req: wandb_auth.LoginRequest):
     if not req.key.strip():
         raise HTTPException(400, "key must not be empty")
     return await wandb_auth.login(req.key)
+
+
+@app.post("/api/wandb/project", response_model=wandb_auth.WandbStatus)
+async def post_wandb_project(req: wandb_auth.ProjectRequest):
+    if not req.project.strip():
+        raise HTTPException(400, "project must not be empty")
+    return await wandb_auth.set_project_endpoint(req.project)
+
+
+# ── flags ──
+
+@app.get("/api/jobs/{cluster}/{job_id}/flags")
+async def get_job_flags(cluster: str, job_id: str):
+    """All flags the training/eval entrypoint receives for this job."""
+    det = await details.get_details(cluster, job_id)
+    if not det.variant:
+        return {"flags": []}
+    try:
+        v = await variants.load_variant(det.variant)
+    except FileNotFoundError:
+        raise HTTPException(404, f"variant {det.variant} not found")
+    out = flags.flags_for(v, cluster, det.phase)
+    return {"flags": [{"flag": f, "value": val} for f, val in out]}
