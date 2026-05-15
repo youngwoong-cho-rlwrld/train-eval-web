@@ -1,0 +1,17 @@
+[project]
+name = "train-eval-web-backend"
+version = "0.1.0"
+description = "Local FastAPI backend that submits gr00t train/eval jobs to remote slurm clusters over SSH."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "asyncssh>=2.18",
+    "pydantic>=2.9",
+    "sqlmodel>=0.0.22",
+    "sse-starlette>=2.1",
+    "python-multipart>=0.0.18",
+]
+
+[tool.uv]
+package = false

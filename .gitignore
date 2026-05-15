@@ -1,0 +1,22 @@
+# Backend
+backend/.venv/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/*.db
+backend/.env
+
+# Frontend
+frontend/node_modules/
+frontend/.next/
+frontend/.env.local
+frontend/.env
+
+# Runtime artifacts: train_body.sh regenerates these on every run, so they
+# should never be tracked — would just create constant noise in `git status`
+# after each cluster job.
+configs/experiments/*/data_config.yaml
+
+# Local scratch
+.DS_Store
+*.bak
+*.bak.*
