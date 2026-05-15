@@ -35,18 +35,28 @@ async def _kubectl_json(*args: str, timeout: float = 20.0) -> dict[str, Any]:
     return json.loads(stdout.decode())
 
 
-def _state_from_job_status(status: dict) -> str:
-    """Map k8s Job status counters to a slurm-like state string."""
-    active = int(status.get("active") or 0)
-    succeeded = int(status.get("succeeded") or 0)
-    failed = int(status.get("failed") or 0)
-    if active > 0:
-        return "RUNNING"
+def _state_from_pod_and_job(job_status: dict, pod: dict | None) -> str:
+    """Derive a slurm-like state. Pod phase is authoritative when a pod
+    exists: k8s Job's `status.active` counts both Pending and Running pods,
+    so it shows 1 even when the pod is unscheduled — bad for the UI.
+    Falls back to job counters only when no pod is present."""
+    if pod:
+        phase = ((pod.get("status") or {}).get("phase") or "").strip()
+        if phase == "Pending":
+            return "PENDING"
+        if phase == "Running":
+            return "RUNNING"
+        if phase == "Succeeded":
+            return "COMPLETED"
+        if phase == "Failed":
+            return "FAILED"
+        # Unknown / empty: drop to job-level
+    succeeded = int(job_status.get("succeeded") or 0)
+    failed = int(job_status.get("failed") or 0)
     if succeeded > 0:
         return "COMPLETED"
     if failed > 0:
         return "FAILED"
-    # Job exists but no pods yet → pending
     return "PENDING"
 
 
@@ -92,13 +102,13 @@ async def list_jobs() -> list[Job]:
     for j in data.get("items", []):
         name = j["metadata"]["name"]
         status = j.get("status", {}) or {}
-        state = _state_from_job_status(status)
+        pod = pods_by_job.get(name)
+        state = _state_from_pod_and_job(status, pod)
         start = status.get("startTime")
         end = status.get("completionTime")
         elapsed = _elapsed(start, end)
 
-        pod = pods_by_job.get(name) or {}
-        nodelist = pod.get("spec", {}).get("nodeName") or "(unscheduled)"
+        nodelist = (pod or {}).get("spec", {}).get("nodeName") or "(unscheduled)"
 
         out.append(Job(
             cluster="mlxp", job_id=name, job_name=name, partition="mlxp",
@@ -115,7 +125,6 @@ async def get_job(name: str) -> dict[str, Any]:
     except RuntimeError as e:
         raise FileNotFoundError(f"mlxp job not found: {name}: {e}")
     status = job_data.get("status", {}) or {}
-    state = _state_from_job_status(status)
     start = status.get("startTime") or ""
     end = status.get("completionTime") or ""
 
@@ -125,6 +134,7 @@ async def get_job(name: str) -> dict[str, Any]:
     pod_status = pod.get("status", {}) or {}
     pod_name = pod.get("metadata", {}).get("name", "")
     node = pod.get("spec", {}).get("nodeName", "") or ""
+    state = _state_from_pod_and_job(status, pod if pods else None)
 
     # Per-container exit code if available
     exit_code = ""
