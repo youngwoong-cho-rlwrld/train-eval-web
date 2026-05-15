@@ -9,6 +9,14 @@ import { api, logStreamUrl, type JobDetails } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { CopyButton } from "@/components/copy-button";
 
 export default function JobDetail({ params }: { params: Promise<{ cluster: string; id: string }> }) {
@@ -30,7 +38,7 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
   const cancel = useMutation({
     mutationFn: () => api(`/api/jobs/${cluster}/${id}`, { method: "DELETE" }),
     onSuccess: () => {
-      toast.success(`scancel sent to ${id}`);
+      toast.success(`cancel sent to ${id}`);
       qc.invalidateQueries({ queryKey: ["job", cluster, id] });
       qc.invalidateQueries({ queryKey: ["jobs"] });
     },
@@ -40,6 +48,9 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
   const phase = details.data?.phase;
   const isEval = phase === "eval";
   const [stream, setStream] = useState<"out" | "err" | "isaac">("out");
+  const [confirmCancel, setConfirmCancel] = useState(false);
+
+  const cancelLabel = cluster === "mlxp" ? "kubectl delete job" : "scancel";
 
   return (
     <div className="mx-auto max-w-5xl px-8 py-12">
@@ -66,10 +77,48 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
             </div>
           )}
         </div>
-        <Button variant="destructive" size="sm" onClick={() => cancel.mutate()} disabled={cancel.isPending}>
-          {cancel.isPending ? "Cancelling…" : "scancel"}
+        <Button
+          variant="destructive"
+          size="sm"
+          onClick={() => setConfirmCancel(true)}
+          disabled={cancel.isPending}
+        >
+          {cancel.isPending ? "Cancelling…" : cancelLabel}
         </Button>
       </div>
+
+      <Dialog open={confirmCancel} onOpenChange={setConfirmCancel}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Cancel this job?</DialogTitle>
+            <DialogDescription>
+              This will run <code className="font-mono">{cancelLabel}</code> on
+              job <span className="font-mono">{id}</span>{" "}
+              {details.data?.variant && (
+                <>
+                  (<span className="font-mono">{details.data.variant}</span>){" "}
+                </>
+              )}
+              on <span className="font-mono">{cluster}</span>. In-progress steps
+              will be lost; checkpoints already on disk are preserved.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmCancel(false)}>
+              Keep running
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() => {
+                setConfirmCancel(false);
+                cancel.mutate();
+              }}
+            >
+              Yes, {cancelLabel}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {details.data && <ProgressCard d={details.data} />}
 
