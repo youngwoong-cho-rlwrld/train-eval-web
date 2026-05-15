@@ -48,7 +48,7 @@ export function AvailabilityCard({
             <span className="text-slate-400"> / {totalGpu}</span>
           </span>
         </div>
-        <CardDescription className="text-xs">
+        <CardDescription>
           {cluster} · refreshes every 30s
         </CardDescription>
       </CardHeader>

@@ -46,7 +46,7 @@ export function MlxpCard({
             <span className="text-slate-400"> / {total}</span>
           </span>
         </div>
-        <CardDescription className="text-xs">
+        <CardDescription>
           h200 nodes (8 GPU each) · your node: <code>{yoursNode || "—"}</code>
         </CardDescription>
       </CardHeader>

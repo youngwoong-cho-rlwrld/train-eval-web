@@ -5,9 +5,6 @@ export default function Home() {
   return (
     <div className="mx-auto max-w-7xl px-8 py-12">
       <h1 className="text-2xl font-semibold tracking-tight">train-eval-web</h1>
-      <p className="mt-2 text-slate-600 dark:text-slate-400">
-        Configure experiments, submit to slurm (kakao / skt), monitor jobs, browse results.
-      </p>
       <div className="mt-8 grid gap-4 sm:grid-cols-2">
         <Tile href="/submit" icon={Send} title="Submit a job" desc="Pick cluster + variant, send to sbatch" />
         <Tile href="/jobs" icon={Activity} title="Jobs" desc="Active and recent jobs across both clusters" />

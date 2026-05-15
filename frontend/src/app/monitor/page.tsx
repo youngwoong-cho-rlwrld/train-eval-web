@@ -75,7 +75,7 @@ function SlurmClusterPanel({ cluster }: { cluster: string }) {
             <span className="text-slate-400"> / {total} GPU free</span>
           </span>
         </div>
-        <CardDescription className="text-xs">{ps.length} partitions</CardDescription>
+        <CardDescription>{ps.length} partitions</CardDescription>
       </CardHeader>
       <CardContent>
         {q.isLoading && <p className="text-sm text-slate-500">Loading…</p>}
@@ -148,7 +148,7 @@ function MlxpPanel() {
             <span className="text-slate-400"> / {total} GPU free</span>
           </span>
         </div>
-        <CardDescription className="flex items-center gap-2 text-xs">
+        <CardDescription className="flex items-center gap-2">
           <span>your node:</span>
           <Select value={yoursNode} onValueChange={setYoursNode}>
             <SelectTrigger className="h-7 w-auto min-w-[200px] gap-1 px-2 text-xs">

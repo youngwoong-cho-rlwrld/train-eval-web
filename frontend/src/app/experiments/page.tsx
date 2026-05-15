@@ -14,9 +14,6 @@ export default function ExperimentsPage() {
   return (
     <div className="mx-auto max-w-7xl px-8 py-12">
       <h1 className="text-2xl font-semibold tracking-tight">Experiments</h1>
-      <p className="mt-2 text-slate-600 dark:text-slate-400">
-        Variants under <code className="text-xs">configs/experiments/</code> in this repo. Click to view.
-      </p>
 
       <Card className="mt-8">
         <CardHeader>

@@ -22,7 +22,7 @@ export default function ExperimentDetail({ params }: { params: Promise<{ name: s
 
       {variant.data && (
         <>
-          <Card className="mt-6">
+          <Card className="mt-8">
             <CardHeader>
               <CardTitle>Variables</CardTitle>
               <CardDescription>{variant.data.vars.TRAIN_NOTE ?? "—"}</CardDescription>
