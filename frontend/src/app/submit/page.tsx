@@ -392,11 +392,10 @@ function MlxpCard({ nodes }: { nodes: MlxpNode[] }) {
                   {n.sanctioned && <Badge variant="default" className="ml-1 text-[10px]">yours</Badge>}
                 </div>
                 <div className="shrink-0 font-mono">
-                  <span className="text-slate-400">free </span>
                   <span className={n.gpu_free > 0 ? "text-green-600 dark:text-green-400" : "text-slate-500"}>
                     {n.gpu_free}
                   </span>
-                  <span className="text-slate-400">/{n.gpu_total}</span>
+                  <span className="text-slate-400"> / {n.gpu_total} GPU free</span>
                 </div>
               </div>
             ))}
@@ -439,11 +438,10 @@ function AvailabilityCard({ cluster, partitions }: { cluster: string; partitions
                   {p.is_background && <Badge variant="outline" className="ml-1 text-[10px]">bg</Badge>}
                 </div>
                 <div className="shrink-0 font-mono">
-                  <span className="text-slate-400">free </span>
                   <span className={p.gpu_idle > 0 ? "text-green-600 dark:text-green-400" : "text-slate-500"}>
                     {p.gpu_idle}
                   </span>
-                  <span className="text-slate-400">/{p.gpu_total}</span>
+                  <span className="text-slate-400"> / {p.gpu_total} GPU</span>
                 </div>
               </div>
             ))}
