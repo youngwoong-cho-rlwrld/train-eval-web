@@ -1,9 +1,18 @@
 "use client";
 
-import { Plus, X } from "lucide-react";
+import { useState } from "react";
+import { Plus, Settings, X } from "lucide-react";
 import type { Variant, Dataset } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -22,6 +31,10 @@ export type DatasetFieldProps = {
   onSingleChange: (v: string) => void;
   onMultiChange: (v: string[]) => void;
   touched: boolean;
+  cluster: string;
+  datasetDir: string;
+  onDatasetDirChange: (v: string) => void;
+  datasetsError: Error | null;
 };
 
 export function DatasetField({
@@ -32,6 +45,10 @@ export function DatasetField({
   onSingleChange,
   onMultiChange,
   touched,
+  cluster,
+  datasetDir,
+  onDatasetDirChange,
+  datasetsError,
 }: DatasetFieldProps) {
   // Multi-task variants come in two shapes:
   //   - N1.5: DATASETS=("name|cfg|weight" ...) — three editable fields per row
@@ -45,43 +62,135 @@ export function DatasetField({
       ? "datasets"
       : null;
 
-  const labelSuffix = touched ? (
-    <Badge variant="warning" className="ml-2 text-[10px]">
-      override
-    </Badge>
+  const dirSuffix = (
+    <DatasetDirControl
+      cluster={cluster}
+      datasetDir={datasetDir}
+      onChange={onDatasetDirChange}
+    />
+  );
+  const labelSuffix = (
+    <>
+      {touched && (
+        <Badge variant="warning" className="ml-2 text-[10px]">
+          override
+        </Badge>
+      )}
+      {dirSuffix}
+    </>
+  );
+
+  const errorBanner = datasetsError ? (
+    <p className="text-xs text-red-600 dark:text-red-400">
+      Failed to list datasets at <code>{datasetDir}</code>: {datasetsError.message}
+    </p>
   ) : null;
 
   if (multiKind === null) {
     return (
-      <SingleDatasetPicker
-        variant={variant}
-        datasets={datasets}
-        value={single}
-        onChange={onSingleChange}
-        labelSuffix={labelSuffix}
-      />
+      <>
+        <SingleDatasetPicker
+          variant={variant}
+          datasets={datasets}
+          value={single}
+          onChange={onSingleChange}
+          labelSuffix={labelSuffix}
+        />
+        {errorBanner}
+      </>
     );
   }
 
   if (multiKind === "names") {
     return (
-      <NamesOnlyPicker
+      <>
+        <NamesOnlyPicker
+          datasets={datasets}
+          values={multi}
+          onChange={onMultiChange}
+          labelSuffix={labelSuffix}
+        />
+        {errorBanner}
+      </>
+    );
+  }
+
+  return (
+    <>
+      <NameCfgWeightPicker
+        variant={variant}
         datasets={datasets}
         values={multi}
         onChange={onMultiChange}
         labelSuffix={labelSuffix}
       />
-    );
-  }
+      {errorBanner}
+    </>
+  );
+}
 
+function DatasetDirControl({
+  cluster,
+  datasetDir,
+  onChange,
+}: {
+  cluster: string;
+  datasetDir: string;
+  onChange: (v: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState(datasetDir);
   return (
-    <NameCfgWeightPicker
-      variant={variant}
-      datasets={datasets}
-      values={multi}
-      onChange={onMultiChange}
-      labelSuffix={labelSuffix}
-    />
+    <>
+      <button
+        type="button"
+        onClick={() => {
+          setDraft(datasetDir);
+          setOpen(true);
+        }}
+        title={`Dataset directory: ${datasetDir}`}
+        className="ml-2 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-slate-500 hover:bg-slate-100 hover:text-slate-900 dark:hover:bg-slate-800 dark:hover:text-slate-50"
+      >
+        <Settings className="h-3 w-3" />
+        <code className="font-mono">{datasetDir}</code>
+      </button>
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              Dataset directory on <code className="font-mono">{cluster}</code>
+            </DialogTitle>
+            <DialogDescription>
+              Absolute path on the cluster (slurm: a path or <code>~/</code>;
+              mlxp: under <code>/data/</code>). The submit page lists every
+              subdir of this path that contains <code>meta/info.json</code>.
+              Saved per-cluster in this browser.
+            </DialogDescription>
+          </DialogHeader>
+          <Input
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            placeholder="/data/youngwoong/datasets"
+            className="font-mono text-xs"
+            autoFocus
+          />
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              onClick={() => {
+                onChange(draft.trim());
+                setOpen(false);
+              }}
+              disabled={!draft.trim() || draft.trim() === datasetDir}
+            >
+              Save
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
   );
 }
 

@@ -52,15 +52,15 @@ async def get_mlxp_gpus():
 
 
 @app.get("/api/clusters/{name}/datasets", response_model=list[datasets.DatasetInfo])
-async def get_cluster_datasets(name: str):
+async def get_cluster_datasets(name: str, path: str | None = None):
     if name not in clusters.list_clusters():
         raise HTTPException(404, f"cluster {name} not found")
     try:
-        return await datasets.list_datasets(name)
+        return await datasets.list_datasets(name, path)
     except FileNotFoundError:
         raise HTTPException(404, f"cluster {name} not found")
     except RuntimeError as e:
-        raise HTTPException(500, str(e))
+        raise HTTPException(503, str(e))
 
 
 # ── variants ──
@@ -91,9 +91,19 @@ async def post_submit(req: submit.SubmitRequest):
         if req.cluster == "mlxp":
             if req.phase != "train":
                 raise ValueError("MLXP currently supports phase=train only (no resume/eval yet)")
+            # GPU count comes from the variant's TRAIN_NUM_GPUS, same source of
+            # truth slurm uses. The MLXP submit then maps it to CPU/RAM per the
+            # Notion guide's table.
+            v = await variants.load_variant(req.variant)
+            try:
+                num_gpus = int(v.vars.get("TRAIN_NUM_GPUS", "2"))
+            except ValueError:
+                raise ValueError(
+                    f"variant {req.variant}: TRAIN_NUM_GPUS must be an integer"
+                )
             mlxp_req = mlxp_submit.MlxpSubmitRequest(
                 variant=req.variant,
-                num_gpus=req.num_gpus or 2,
+                num_gpus=num_gpus,
                 node=req.node,
                 dataset_override=req.dataset_override,
                 extra_args=req.extra_args,

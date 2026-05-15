@@ -66,8 +66,6 @@ class SubmitRequest(BaseModel):
     phase: str                  # "train" | "resume" | "eval"
     # Slurm-only: partition name (None → fall back to cluster.env default).
     partition: str | None = None
-    # MLXP-only: how many H200 GPUs to request (1/2/4/8).
-    num_gpus: int | None = None
     # MLXP-only: which k8s node to pin via nodeAffinity (each rlwrld team
     # member is assigned a specific h200-03-w-XXXX in the GPU Resource
     # Schedule sheet). None falls back to mlxp_submit.DEFAULT_NODE.

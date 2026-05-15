@@ -35,6 +35,7 @@ import { DatasetField } from "@/components/submit/dataset-field";
 import { MlxpCard } from "@/components/submit/mlxp-card";
 import { AvailabilityCard } from "@/components/submit/availability-card";
 import { VariantPreview } from "@/components/submit/variant-preview";
+import { useDatasetDir } from "@/hooks/use-dataset-dir";
 
 type Phase = "train" | "resume" | "eval";
 
@@ -46,7 +47,6 @@ export default function SubmitPage() {
   const [variantName, setVariantName] = useState<string>("");
   const [phase, setPhase] = useState<Phase>("train");
   const [partition, setPartition] = useState<string>("");
-  const [numGpus, setNumGpus] = useState<string>("2");        // MLXP-only
   // Persisted across sessions + synced across pages via useMyMlxpNode.
   const [mlxpNode, setMlxpNode] = useMyMlxpNode();
   const [extraArgs, setExtraArgs] = useState<string>("");
@@ -84,10 +84,15 @@ export default function SubmitPage() {
   });
   const isSlurm = cluster !== "mlxp";
 
+  const [datasetDir, setDatasetDir] = useDatasetDir(cluster);
   const datasets = useQuery({
-    queryKey: ["datasets", cluster],
-    queryFn: () => api<Dataset[]>(`/api/clusters/${cluster}/datasets`),
+    queryKey: ["datasets", cluster, datasetDir],
+    queryFn: () =>
+      api<Dataset[]>(
+        `/api/clusters/${cluster}/datasets?path=${encodeURIComponent(datasetDir)}`,
+      ),
     enabled: !!cluster,
+    retry: false,
   });
   const mlxp = useQuery({
     queryKey: ["mlxp-gpus"],
@@ -142,7 +147,6 @@ export default function SubmitPage() {
           variant: variantName,
           phase,
           partition: isSlurm ? partition : null,
-          num_gpus: isSlurm ? null : Number(numGpus),
           node: isSlurm ? null : mlxpNode,
           dataset_override,
           extra_args: extraArgs.split(/\s+/).filter(Boolean),
@@ -159,7 +163,7 @@ export default function SubmitPage() {
 
   const canSubmit =
     !!variantName &&
-    (isSlurm ? !!partition : !!numGpus && !!mlxpNode) &&
+    (isSlurm ? !!partition : !!mlxpNode) &&
     !submit.isPending;
   const selectedPartition = partitions.data?.find((p) => p.name === partition);
 
@@ -288,6 +292,10 @@ export default function SubmitPage() {
                         setDatasetTouched(true);
                       }}
                       touched={datasetTouched}
+                      cluster={cluster}
+                      datasetDir={datasetDir}
+                      onDatasetDirChange={setDatasetDir}
+                      datasetsError={datasets.error as Error | null}
                     />
                   )}
 
@@ -345,31 +353,6 @@ export default function SubmitPage() {
                     </p>
                   </Field>
 
-                  <Field label="GPUs">
-                    <Select value={numGpus} onValueChange={setNumGpus}>
-                      <SelectTrigger>
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="1">
-                          1 H200  · 14 CPU · 220Gi RAM
-                        </SelectItem>
-                        <SelectItem value="2">
-                          2 H200 · 28 CPU · 440Gi RAM
-                        </SelectItem>
-                        <SelectItem value="4">
-                          4 H200 · 56 CPU · 880Gi RAM
-                        </SelectItem>
-                        <SelectItem value="8">
-                          8 H200 · 100 CPU · 1500Gi RAM
-                        </SelectItem>
-                      </SelectContent>
-                    </Select>
-                    <p className="text-xs text-slate-500">
-                      Per-GPU CPU/RAM matches the Notion guide's table.
-                    </p>
-                  </Field>
-
                   {variant.data && (
                     <DatasetField
                       variant={variant.data}
@@ -385,6 +368,10 @@ export default function SubmitPage() {
                         setDatasetTouched(true);
                       }}
                       touched={datasetTouched}
+                      cluster={cluster}
+                      datasetDir={datasetDir}
+                      onDatasetDirChange={setDatasetDir}
+                      datasetsError={datasets.error as Error | null}
                     />
                   )}
 
@@ -408,7 +395,7 @@ export default function SubmitPage() {
                 ? "Submitting…"
                 : isSlurm
                   ? `Submit ${phase} → ${cluster}/${partition || "?"}`
-                  : `Submit train → mlxp/${mlxpNode}/${numGpus}×H200`}
+                  : `Submit train → mlxp/${mlxpNode}/${variant.data?.vars.TRAIN_NUM_GPUS ?? "?"}×H200`}
             </Button>
           </div>
         </div>
