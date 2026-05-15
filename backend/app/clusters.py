@@ -53,12 +53,18 @@ class ClusterEnv(BaseModel):
                 return other
 
 
+# Non-slurm clusters that the web app knows about but don't have a
+# clusters/<name>.env file (k8s, future targets). They appear in the
+# Submit page's cluster dropdown but the submit flow is gated to slurm
+# until per-cluster submission paths are implemented.
+NON_SLURM_CLUSTERS = ["mlxp"]
+
+
 def list_clusters() -> list[str]:
-    return sorted(
-        p.stem
-        for p in CLUSTERS_DIR.glob("*.env")
-        if p.is_file()
+    slurm = sorted(
+        p.stem for p in CLUSTERS_DIR.glob("*.env") if p.is_file()
     )
+    return slurm + NON_SLURM_CLUSTERS
 
 
 async def load_cluster(name: str) -> ClusterEnv:

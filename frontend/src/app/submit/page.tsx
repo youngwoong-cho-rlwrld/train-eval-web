@@ -50,18 +50,21 @@ export default function SubmitPage() {
     queryKey: ["partitions", cluster],
     queryFn: () => api<Partition[]>(`/api/clusters/${cluster}/partitions`),
     refetchInterval: 30_000,
-    enabled: !!cluster,
+    enabled: !!cluster && cluster !== "mlxp",
   });
+  const isSlurm = cluster !== "mlxp";
+
   const datasets = useQuery({
     queryKey: ["datasets", cluster],
     queryFn: () => api<Dataset[]>(`/api/clusters/${cluster}/datasets`),
-    enabled: !!cluster,
+    enabled: !!cluster && isSlurm,
   });
   const mlxp = useQuery({
     queryKey: ["mlxp-gpus"],
     queryFn: () => api<MlxpNode[]>("/api/mlxp/gpus"),
     refetchInterval: 60_000,
-    retry: false,  // surfaces "kubectl not available" without retry storm
+    retry: false,
+    enabled: !isSlurm,
   });
 
   // Whenever a new variant loads (or the user picks a different one), reset
@@ -158,78 +161,92 @@ export default function SubmitPage() {
             </Select>
           </Field>
 
-          <Field label="Phase">
-            <Select value={phase} onValueChange={(v) => setPhase(v as Phase)}>
-              <SelectTrigger><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="train">train</SelectItem>
-                <SelectItem value="resume">resume (requires existing checkpoint)</SelectItem>
-                <SelectItem value="eval">eval</SelectItem>
-              </SelectContent>
-            </Select>
-          </Field>
+          {isSlurm && (
+            <>
+              <Field label="Phase">
+                <Select value={phase} onValueChange={(v) => setPhase(v as Phase)}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="train">train</SelectItem>
+                    <SelectItem value="resume">resume (requires existing checkpoint)</SelectItem>
+                    <SelectItem value="eval">eval</SelectItem>
+                  </SelectContent>
+                </Select>
+              </Field>
 
-          <Field label="Partition">
-            <Select value={partition} onValueChange={setPartition}>
-              <SelectTrigger>
-                <SelectValue placeholder="loading partitions…" />
-              </SelectTrigger>
-              <SelectContent>
-                {partitions.data?.map((p) => (
-                  <SelectItem key={p.name} value={p.name}>
-                    <span className="flex items-center gap-2">
-                      <span>{p.name}</span>
-                      {p.is_default && <Badge variant="secondary" className="text-[10px]">default</Badge>}
-                      {p.is_background && <Badge variant="outline" className="text-[10px]">preemptible</Badge>}
-                      <span className="ml-2 text-xs text-slate-500">
-                        {p.gpu_idle}/{p.gpu_total} GPU
-                      </span>
-                    </span>
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            {selectedPartition?.is_background && (
-              <p className="text-xs text-slate-500">
-                Preemptible partition — submit auto-adds <code>--requeue</code>; train_body resumes from latest checkpoint after preemption.
-              </p>
-            )}
-          </Field>
+              <Field label="Partition">
+                <Select value={partition} onValueChange={setPartition}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="loading partitions…" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {partitions.data?.map((p) => (
+                      <SelectItem key={p.name} value={p.name}>
+                        <span className="flex items-center gap-2">
+                          <span>{p.name}</span>
+                          {p.is_default && <Badge variant="secondary" className="text-[10px]">default</Badge>}
+                          {p.is_background && <Badge variant="outline" className="text-[10px]">preemptible</Badge>}
+                          <span className="ml-2 text-xs text-slate-500">
+                            {p.gpu_idle}/{p.gpu_total} GPU
+                          </span>
+                        </span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {selectedPartition?.is_background && (
+                  <p className="text-xs text-slate-500">
+                    Preemptible partition — submit auto-adds <code>--requeue</code>; train_body resumes from latest checkpoint after preemption.
+                  </p>
+                )}
+              </Field>
 
-          {variant.data && (
-            <DatasetField
-              variant={variant.data}
-              datasets={datasets.data ?? []}
-              single={singleDataset}
-              multi={multiDatasets}
-              onSingleChange={(v) => { setSingleDataset(v); setDatasetTouched(true); }}
-              onMultiChange={(v) => { setMultiDatasets(v); setDatasetTouched(true); }}
-              touched={datasetTouched}
-            />
+              {variant.data && (
+                <DatasetField
+                  variant={variant.data}
+                  datasets={datasets.data ?? []}
+                  single={singleDataset}
+                  multi={multiDatasets}
+                  onSingleChange={(v) => { setSingleDataset(v); setDatasetTouched(true); }}
+                  onMultiChange={(v) => { setMultiDatasets(v); setDatasetTouched(true); }}
+                  touched={datasetTouched}
+                />
+              )}
+
+              <Field label="Extra sbatch args (optional)">
+                <Input
+                  placeholder="--exclusive --nice=100"
+                  value={extraArgs}
+                  onChange={(e) => setExtraArgs(e.target.value)}
+                />
+              </Field>
+            </>
           )}
 
-          <Field label="Extra sbatch args (optional)">
-            <Input
-              placeholder="--exclusive --nice=100"
-              value={extraArgs}
-              onChange={(e) => setExtraArgs(e.target.value)}
-            />
-          </Field>
+          {!isSlurm && (
+            <p className="text-sm text-slate-500">
+              <span className="font-medium text-slate-700 dark:text-slate-300">MLXP is read-only here for now.</span>{" "}
+              Submission lands via <code>kubectl apply</code> against a Job YAML —
+              see <code>docs/naver_mlxp_3a18_quickstart.md</code>. Use the sidebar to monitor availability while you wait.
+            </p>
+          )}
         </CardContent>
       </Card>
 
-      {variant.data && <VariantPreview variant={variant.data} />}
+      {isSlurm && variant.data && <VariantPreview variant={variant.data} />}
 
-      <div className="flex justify-end">
-        <Button onClick={() => submit.mutate()} disabled={!canSubmit}>
-          {submit.isPending ? "Submitting…" : `Submit ${phase} → ${cluster}/${partition || "?"}`}
-        </Button>
-      </div>
+      {isSlurm && (
+        <div className="flex justify-end">
+          <Button onClick={() => submit.mutate()} disabled={!canSubmit}>
+            {submit.isPending ? "Submitting…" : `Submit ${phase} → ${cluster}/${partition || "?"}`}
+          </Button>
+        </div>
+      )}
         </div>
 
         <aside className="space-y-4 lg:sticky lg:top-6 lg:self-start">
-          {partitions.data && <AvailabilityCard cluster={cluster} partitions={partitions.data} />}
-          {mlxp.data && mlxp.data.length > 0 && <MlxpCard nodes={mlxp.data} />}
+          {isSlurm && partitions.data && <AvailabilityCard cluster={cluster} partitions={partitions.data} />}
+          {!isSlurm && mlxp.data && <MlxpCard nodes={mlxp.data} />}
         </aside>
       </div>
     </div>
