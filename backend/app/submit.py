@@ -29,9 +29,10 @@ def _is_background_partition(name: str) -> bool:
 def _apply_dataset_override(config_text: str, override: str | list[str]) -> str:
     """Rewrite a variant config.sh to use the requested dataset(s).
 
-    - If `override` is a string, replace the DATASET_NAME=... line (single-task).
-    - If `override` is a list of "name|cfg|weight" strings, replace the
-      DATASETS=( ... ) block (multi-task).
+    - String override → replaces DATASET_NAME=... (single-task).
+    - List override → replaces whichever multi-dataset block the variant
+      already uses: TRAIN_DATASET_NAMES (N1.6, name-only) or DATASETS
+      (N1.5, "name|cfg|weight"). Block shape is detected from the entries.
     """
     if isinstance(override, str):
         new_line = f"DATASET_NAME={override}"
@@ -42,13 +43,16 @@ def _apply_dataset_override(config_text: str, override: str | list[str]) -> str:
             flags=re.MULTILINE,
         )
 
-    # Array override.
-    new_block_lines = ["DATASETS=("]
+    # N1.6 (name-only): entries have no `|` → TRAIN_DATASET_NAMES.
+    is_names_only = all("|" not in e for e in override)
+    block_name = "TRAIN_DATASET_NAMES" if is_names_only else "DATASETS"
+    new_block_lines = [f"{block_name}=("]
     new_block_lines.extend(f'    "{entry}"' for entry in override)
     new_block_lines.append(")")
     new_block = "\n".join(new_block_lines)
+    pattern = rf"^{block_name}=\(.*?^\)\s*$"
     return re.sub(
-        r"^DATASETS=\(.*?^\)\s*$",
+        pattern,
         new_block,
         config_text,
         count=1,

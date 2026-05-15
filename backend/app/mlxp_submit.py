@@ -22,6 +22,7 @@ from datetime import datetime
 import yaml
 from pydantic import BaseModel
 
+from .paths import EXPERIMENTS_DIR
 from .variants import load_variant
 
 
@@ -38,6 +39,7 @@ DEFAULT_NODE = "h200-03-w-3a18"
 DDN_MOUNT = "/data"
 USER_HOME_ON_DDN = "/data/youngwoong"
 GR00T_DIR = f"{USER_HOME_ON_DDN}/workspace/gr00t"
+GR00T_N16_DIR = f"{USER_HOME_ON_DDN}/workspace/gr00t-n16"
 
 
 class MlxpSubmitRequest(BaseModel):
@@ -98,29 +100,67 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
 
 
 def _render_body_script(variant, req: MlxpSubmitRequest, job_name: str) -> str:
-    """Render the inline bash that the container will run.
+    """Render the inline bash the container runs.
 
-    Renders a data_config.yaml on the fly from the variant's DATASETS array,
-    then invokes torchrun → gr00t_finetune.py with the variant's hyperparams.
+    Resolves the variant's dataset list, then dispatches to the right gr00t
+    entrypoint based on MODEL_VERSION:
+      - n1.5 → gr00t_finetune.py with /tmp/data_config.yaml
+      - n1.6 → launch_finetune.py with --dataset-path + --modality-config-path
     """
-    # Build the data_config rows.
-    rows: list[str] = []
-    datasets_decl = variant.arrays.get("DATASETS")
-    if req.dataset_override is not None:
-        # Override: list[str] for multi, str for single.
-        if isinstance(req.dataset_override, list):
-            datasets_decl = req.dataset_override
+    model = (variant.vars.get("MODEL_VERSION") or "n1.5").strip()
+
+    # ── Resolve dataset name list (model-agnostic) ──
+    names: list[str] = []
+    override = req.dataset_override
+    if override is not None:
+        if isinstance(override, list):
+            # Either "name" or "name|cfg|weight" entries.
+            names = [e.split("|", 1)[0] for e in override]
+            override_full = override  # preserve N1.5 cfg/weight if present
         else:
-            datasets_decl = [
-                f"{req.dataset_override}|{variant.vars.get('DATA_CONFIG', 'allex_thetwo_ck40_egostereo')}|1.0"
-            ]
-    if not datasets_decl:
-        # Single-dataset variant: synthesize from DATASET_NAME + DATA_CONFIG.
-        name = variant.vars.get("DATASET_NAME")
+            names = [override]
+            override_full = [override]
+    else:
+        if variant.arrays.get("TRAIN_DATASET_NAMES"):
+            names = list(variant.arrays["TRAIN_DATASET_NAMES"])
+            override_full = None
+        elif variant.arrays.get("DATASETS"):
+            names = [e.split("|", 1)[0] for e in variant.arrays["DATASETS"]]
+            override_full = None
+        elif variant.vars.get("DATASET_NAME"):
+            names = [variant.vars["DATASET_NAME"]]
+            override_full = None
+        else:
+            raise ValueError(
+                f"variant {variant.name} has no DATASET_NAME / DATASETS / TRAIN_DATASET_NAMES"
+            )
+
+    max_steps = variant.vars.get("MAX_STEPS", "30000")
+    save_steps = variant.vars.get("SAVE_STEPS", "1000")
+    batch_size = variant.vars.get("TRAIN_BATCH_SIZE", "64")
+    train_extra = " ".join(variant.arrays.get("TRAIN_EXTRA_ARGS") or [])
+    user_extra = " ".join(req.extra_args)
+
+    ckpt_dir = f"{USER_HOME_ON_DDN}/experiments/{variant.name}/checkpoints"
+
+    if model == "n1.6":
+        return _render_body_n16(
+            variant=variant, req=req, job_name=job_name, names=names,
+            max_steps=max_steps, save_steps=save_steps, batch_size=batch_size,
+            train_extra=train_extra, user_extra=user_extra, ckpt_dir=ckpt_dir,
+        )
+
+    # ── N1.5: build the data_config.yaml rows ──
+    if override_full is not None and isinstance(override, list) and any("|" in e for e in override):
+        datasets_decl = override_full
+    elif override_full is not None and isinstance(override, str):
         cfg = variant.vars.get("DATA_CONFIG", "allex_thetwo_ck40_egostereo")
-        if not name:
-            raise ValueError(f"variant {variant.name} has no DATASETS and no DATASET_NAME")
-        datasets_decl = [f"{name}|{cfg}|1.0"]
+        datasets_decl = [f"{override}|{cfg}|1.0"]
+    elif variant.arrays.get("DATASETS"):
+        datasets_decl = variant.arrays["DATASETS"]
+    else:
+        cfg = variant.vars.get("DATA_CONFIG", "allex_thetwo_ck40_egostereo")
+        datasets_decl = [f"{names[0]}|{cfg}|1.0"]
 
     yaml_rows = []
     for entry in datasets_decl:
@@ -135,14 +175,6 @@ def _render_body_script(variant, req: MlxpSubmitRequest, job_name: str) -> str:
             f"      weight: {weight}"
         )
     data_config_yaml = "train:\n  datasets:\n" + "\n".join(yaml_rows)
-
-    max_steps = variant.vars.get("MAX_STEPS", "30000")
-    save_steps = variant.vars.get("SAVE_STEPS", "1000")
-    batch_size = variant.vars.get("TRAIN_BATCH_SIZE", "64")
-    train_extra = " ".join(variant.arrays.get("TRAIN_EXTRA_ARGS") or [])
-    user_extra = " ".join(req.extra_args)
-
-    ckpt_dir = f"{USER_HOME_ON_DDN}/experiments/{variant.name}/checkpoints"
 
     # No leading indentation — keeps the embedded heredoc YAML well-formed.
     return f"""\
@@ -188,6 +220,73 @@ torchrun --nproc_per_node={req.num_gpus} scripts/gr00t_finetune.py \\
     --pin_memory \\
     --run_name "{variant.name}" \\
     --seed 42 \\
+    $RESUME_FLAG {train_extra} {user_extra}
+"""
+
+
+def _render_body_n16(*, variant, req: MlxpSubmitRequest, job_name: str,
+                     names: list[str], max_steps: str, save_steps: str,
+                     batch_size: str, train_extra: str, user_extra: str,
+                     ckpt_dir: str) -> str:
+    """Body script for GR00T N1.6 (launch_finetune.py).
+
+    Unlike N1.5, N1.6 takes --dataset-path (multiple) + --modality-config-path
+    (a Python file). We inline the modality config from the local variant
+    directory so MLXP doesn't need a rsync step.
+    """
+    modality_rel = variant.vars.get("TRAIN_MODALITY_CONFIG")
+    if not modality_rel:
+        raise ValueError(f"variant {variant.name}: TRAIN_MODALITY_CONFIG missing")
+    modality_path = EXPERIMENTS_DIR / variant.name / modality_rel
+    if not modality_path.is_file():
+        raise FileNotFoundError(f"modality config not found: {modality_path}")
+    modality_text = modality_path.read_text()
+
+    dataset_paths_arg = " \\\n        ".join(
+        f"{USER_HOME_ON_DDN}/datasets/{n}" for n in names
+    )
+    global_batch = int(batch_size) * req.num_gpus
+
+    return f"""\
+set -euo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+export WANDB_PROJECT=gr00t
+export WANDB_RUN_ID="{job_name}"
+export WANDB_RESUME=allow
+export NO_ALBUMENTATIONS_UPDATE=1
+export TOKENIZERS_PARALLELISM=false
+export OMNI_KIT_ACCEPT_EULA=Y
+
+cd {GR00T_N16_DIR}
+
+mkdir -p {ckpt_dir}
+
+cat > /tmp/modality_config.py <<'PY_EOF'
+{modality_text}
+PY_EOF
+
+RESUME_FLAG=""
+if compgen -G "{ckpt_dir}/checkpoint-*" > /dev/null; then
+    echo "[mlxp] existing checkpoint detected — will resume"
+    RESUME_FLAG="--resume"
+fi
+
+uv run torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/launch_finetune.py \\
+    --base-model-path nvidia/GR00T-N1.6-3B \\
+    --dataset-path \\
+        {dataset_paths_arg} \\
+    --embodiment-tag NEW_EMBODIMENT \\
+    --modality-config-path /tmp/modality_config.py \\
+    --num-gpus {req.num_gpus} \\
+    --output-dir {ckpt_dir} \\
+    --global-batch-size {global_batch} \\
+    --learning-rate 1e-4 \\
+    --max-steps {max_steps} \\
+    --save-steps {save_steps} \\
+    --save-total-limit 5 \\
+    --dataloader-num-workers 8 \\
+    --experiment-name "{job_name}" \\
+    --use-wandb \\
     $RESUME_FLAG {train_extra} {user_extra}
 """
 
