@@ -160,7 +160,10 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
                 Path(tmp_path).unlink(missing_ok=True)
 
     # ── Build sbatch command ──
-    job_name = f"{req.phase}_{req.variant}_{req.cluster}_{partition}_{datetime.now():%Y%m%d_%H%M%S}"
+    # Unified shape across slurm + MLXP. The cluster/partition were
+    # cosmetic in the slurm filename — drop them; the table column shows
+    # both, and `parse_phase_and_variant` now expects this exact format.
+    job_name = f"{req.phase}_{req.variant}_{datetime.now():%Y%m%d_%H%M%S}"
     log_dir = cluster.vars["LOG_DIR"]
     resume_expected = "1" if req.phase == "resume" else "0"
 
@@ -177,7 +180,10 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         f"--output={log_dir}/{job_name}_%j.out",
         f"--error={log_dir}/{job_name}_%j.err",
         f"--export=ALL,VARIANT={shlex.quote(req.variant)},CLUSTER={shlex.quote(req.cluster)},"
-        f"REPO_ROOT={repo_root_remote},RESUME_EXPECTED={resume_expected}"
+        f"REPO_ROOT={repo_root_remote},RESUME_EXPECTED={resume_expected},"
+        # Pin wandb run id to the slurm display name so the URL is stable
+        # and matches MLXP's run-id format.
+        f"WANDB_RUN_ID={shlex.quote(job_name)}"
         + (
             f",EVAL_CHECKPOINT={shlex.quote(req.checkpoint_path)}"
             if req.phase == "eval" and req.checkpoint_path else ""

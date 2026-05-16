@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
-from . import clusters, datasets, details, flags, jobs, mlxp, mlxp_submit, move_checkpoint, partitions, submit, variants, wandb_auth
+from . import clusters, copy_checkpoint, datasets, details, flags, jobs, mlxp, mlxp_submit, partitions, submit, variants, wandb_auth
 from .ssh import ssh_tail_lines
 
 
@@ -281,15 +281,15 @@ async def get_job_flags(cluster: str, job_id: str):
     return {"flags": [{"flag": f, "value": val} for f, val in out]}
 
 
-# ── move checkpoint ──
+# ── copy checkpoint ──
 
 @app.get(
     "/api/jobs/{cluster}/{job_id}/checkpoints",
-    response_model=list[move_checkpoint.CheckpointEntry],
+    response_model=list[copy_checkpoint.CheckpointEntry],
 )
 async def get_checkpoints(cluster: str, job_id: str):
     try:
-        return await move_checkpoint.list_checkpoints(cluster, job_id)
+        return await copy_checkpoint.list_checkpoints(cluster, job_id)
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
     except RuntimeError as e:
@@ -297,14 +297,14 @@ async def get_checkpoints(cluster: str, job_id: str):
 
 
 @app.post(
-    "/api/jobs/{cluster}/{job_id}/move-checkpoint",
-    response_model=move_checkpoint.MoveCheckpointStartResponse,
+    "/api/jobs/{cluster}/{job_id}/copy-checkpoint",
+    response_model=copy_checkpoint.CopyCheckpointStartResponse,
 )
-async def post_move_checkpoint(
-    cluster: str, job_id: str, req: move_checkpoint.MoveCheckpointRequest
+async def post_copy_checkpoint(
+    cluster: str, job_id: str, req: copy_checkpoint.CopyCheckpointRequest
 ):
     try:
-        move_id = await move_checkpoint.start_move(
+        copy_id = await copy_checkpoint.start_copy(
             src_cluster=cluster,
             src_job=job_id,
             dest_cluster=req.dest_cluster,
@@ -314,22 +314,22 @@ async def post_move_checkpoint(
         )
     except (ValueError, FileNotFoundError) as e:
         raise HTTPException(400, str(e))
-    return move_checkpoint.MoveCheckpointStartResponse(move_id=move_id)
+    return copy_checkpoint.CopyCheckpointStartResponse(copy_id=copy_id)
 
 
 @app.get(
-    "/api/move-jobs/{move_id}",
-    response_model=move_checkpoint.MoveJobStatus,
+    "/api/copy-jobs/{copy_id}",
+    response_model=copy_checkpoint.CopyJobStatus,
 )
-async def get_move_status(move_id: str):
-    status = move_checkpoint.get_move_status(move_id)
+async def get_copy_status(copy_id: str):
+    status = copy_checkpoint.get_copy_status(copy_id)
     if not status:
-        raise HTTPException(404, f"move job {move_id} not found")
+        raise HTTPException(404, f"copy job {copy_id} not found")
     return status
 
 
-@app.post("/api/move-jobs/{move_id}/cancel")
-async def post_cancel_move(move_id: str):
-    if not move_checkpoint.cancel_move(move_id):
-        raise HTTPException(404, f"move job {move_id} not running")
+@app.post("/api/copy-jobs/{copy_id}/cancel")
+async def post_cancel_copy(copy_id: str):
+    if not copy_checkpoint.cancel_copy(copy_id):
+        raise HTTPException(404, f"copy job {copy_id} not running")
     return {"status": "cancelled"}

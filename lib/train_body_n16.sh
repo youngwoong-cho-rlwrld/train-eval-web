@@ -60,6 +60,13 @@ fi
 export PATH="$HOME/.local/bin:$PATH"
 export WANDB_PROJECT=gr00t
 export WANDB_DIR="$EXP_DIR"
+# WANDB_RUN_ID is normally passed via sbatch --export; fall back to
+# slurm_<job_id> for legacy bash ./submit invocations.
+if [ -n "${SLURM_JOB_ID:-}" ]; then
+    : "${WANDB_RUN_ID:=slurm_${SLURM_JOB_ID}}"
+    export WANDB_RUN_ID
+    export WANDB_RESUME=allow
+fi
 
 cd "$GROOT_N16_DIR"
 

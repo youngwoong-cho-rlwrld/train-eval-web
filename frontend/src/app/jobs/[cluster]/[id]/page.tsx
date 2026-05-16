@@ -35,7 +35,7 @@ import {
 import { ConfigCard } from "@/components/config-card";
 import { CopyButton } from "@/components/copy-button";
 import { RefreshButton } from "@/components/refresh-button";
-import { startMoveWatcher } from "@/lib/move-watcher";
+import { startCopyWatcher } from "@/lib/copy-watcher";
 
 const REFRESH_MS = 60_000;
 
@@ -109,10 +109,10 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
   const isEval = phase === "eval";
   const isTrainPhase = phase === "train" || phase === "resume";
   const isComplete = (sacct.data?.State ?? "").toUpperCase().startsWith("COMPLET");
-  const canMove = isTrainPhase && isComplete;
+  const canCopy = isTrainPhase && isComplete;
   const [stream, setStream] = useState<"out" | "err" | "isaac">("out");
   const [confirmCancel, setConfirmCancel] = useState(false);
-  const [moveOpen, setMoveOpen] = useState(false);
+  const [copyOpen, setCopyOpen] = useState(false);
 
   const cancelLabel = cluster === "mlxp" ? "kubectl delete job" : "scancel";
 
@@ -149,13 +149,13 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
               intervalMs={REFRESH_MS}
             />
           )}
-          {canMove && (
+          {canCopy && (
             <Button
               variant="outline"
               size="sm"
-              onClick={() => setMoveOpen(true)}
+              onClick={() => setCopyOpen(true)}
             >
-              Move checkpoint
+              Copy checkpoint
             </Button>
           )}
           <Button
@@ -169,9 +169,9 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
         </div>
       </div>
 
-      <MoveCheckpointDialog
-        open={moveOpen}
-        onOpenChange={setMoveOpen}
+      <CopyCheckpointDialog
+        open={copyOpen}
+        onOpenChange={setCopyOpen}
         cluster={cluster}
         jobId={id}
       />
@@ -448,7 +448,7 @@ function LogStream({
 
 type CheckpointEntry = { path: string; job_name: string; step: number };
 
-function MoveCheckpointDialog({
+function CopyCheckpointDialog({
   open,
   onOpenChange,
   cluster,
@@ -475,10 +475,10 @@ function MoveCheckpointDialog({
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [deleteSource, setDeleteSource] = useState<boolean>(false);
 
-  const move = useMutation({
+  const copy = useMutation({
     mutationFn: () =>
-      api<{ move_id: string }>(
-        `/api/jobs/${cluster}/${jobId}/move-checkpoint`,
+      api<{ copy_id: string }>(
+        `/api/jobs/${cluster}/${jobId}/copy-checkpoint`,
         {
           method: "POST",
           body: JSON.stringify({
@@ -490,12 +490,11 @@ function MoveCheckpointDialog({
         },
       ),
     onSuccess: (r) => {
-      const verb = deleteSource ? "Move" : "Copy";
       const dest = destCluster;
       // Close the dialog immediately; track progress as a toast. The
-      // watcher writes the move-id to localStorage so a refresh resumes it.
+      // watcher writes the copy-id to localStorage so a refresh resumes it.
       resetAndClose();
-      startMoveWatcher(r.move_id, verb, dest);
+      startCopyWatcher(r.copy_id, dest);
     },
     onError: (e: Error) => toast.error(e.message),
   });
@@ -521,7 +520,7 @@ function MoveCheckpointDialog({
     <Dialog open={open} onOpenChange={(v) => (v ? onOpenChange(true) : resetAndClose())}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Move checkpoint</DialogTitle>
+          <DialogTitle>Copy checkpoint</DialogTitle>
           <DialogDescription>
             Copies the selected <code>checkpoint-N</code> dirs from{" "}
             <span className="font-mono">{cluster}</span> to another cluster.
@@ -603,16 +602,14 @@ function MoveCheckpointDialog({
             Cancel
           </Button>
           <Button
-            onClick={() => move.mutate()}
-            disabled={!destCluster || selected.size === 0 || move.isPending}
+            onClick={() => copy.mutate()}
+            disabled={!destCluster || selected.size === 0 || copy.isPending}
           >
-            {move.isPending
+            {copy.isPending
               ? "Starting…"
               : selected.size > 1
-                ? `${deleteSource ? "Move" : "Copy"} ${selected.size}`
-                : deleteSource
-                  ? "Move"
-                  : "Copy"}
+                ? `Copy ${selected.size}`
+                : "Copy"}
           </Button>
         </DialogFooter>
       </DialogContent>

@@ -71,21 +71,24 @@ class JobDetails(BaseModel):
 
 
 def parse_phase_and_variant(job_name: str, cluster: str) -> tuple[str, str | None]:
-    """Slurm job names: '<phase>_<variant>_<cluster>_<partition>_<timestamp>'.
-    MLXP job names: 'youngwoong-<phase>-<variant-slug>-<timestamp>'.
+    """Pull (phase, variant) out of a display name.
 
-    For MLXP the variant slug has hyphens substituted for underscores, so
-    we walk the existing experiments dir to find the longest match.
+    Today's shape (both clusters): `{train|eval|resume}_{variant}_{YYYYMMDD}_{HHMMSS}`.
+    The variant itself contains underscores (e.g. `n16_cube_stack_3cm_right_480`),
+    so we anchor on the trailing timestamp `_\\d{8}_\\d{6}` to find the boundary.
     """
+    # New unified shape.
+    m = re.match(r"^(train|resume|eval)_(.+)_(\d{8}_\d{6})$", job_name)
+    if m:
+        return m.group(1), m.group(2)
+
+    # ── legacy: pre-refactor MLXP names `youngwoong-<phase>-<slug>-<ts>` ──
     if cluster == "mlxp":
         m = re.match(r"^youngwoong-(train|resume|eval)-(.+)-(\d{8}-\d{6})$", job_name)
         if not m:
             return "unknown", None
         phase = m.group(1)
         slug = m.group(2).lower()
-        # Recover the original underscore variant name from the hyphen slug.
-        # k8s caps job names at 63 chars, so mlxp_submit truncates the slug —
-        # exact match may fail. Fall back to unique prefix match.
         from .variants import list_variants
         try:
             available = list_variants()
@@ -97,19 +100,17 @@ def parse_phase_and_variant(job_name: str, cluster: str) -> tuple[str, str | Non
             if len(prefix_matches) == 1:
                 return phase, prefix_matches[0]
             if len(prefix_matches) > 1:
-                # Multiple variants share this prefix — fall back to the
-                # longest (most-specific name), but this is ambiguous.
                 return phase, max(prefix_matches, key=len)
         except Exception:
             pass
         return phase, slug.replace("-", "_")
 
+    # ── legacy slurm: `{phase}_{variant}_{cluster}_{partition}_{ts}` ──
     phase_match = re.match(r"^(train|resume|eval)_", job_name)
     if not phase_match:
         return "unknown", None
     phase = phase_match.group(1)
     after_phase = job_name[len(phase) + 1:]
-    # Find '_<cluster>_' and take what's before it as the variant.
     needle = f"_{cluster}_"
     idx = after_phase.find(needle)
     if idx < 0:
@@ -155,7 +156,14 @@ async def get_details(cluster: str, job_id: str) -> JobDetails:
         # train_body.sh exports WANDB_RUN_ID=slurm_$SLURM_JOB_ID with WANDB_RESUME=allow.
         entity = await _wandb_entity()
         if entity:
-            wandb_url = f"https://wandb.ai/{entity}/{get_project()}/runs/slurm_{job_id}"
+            # Two run-id shapes:
+            #  - Legacy: name shaped `<phase>_<v>_<cluster>_<partition>_<ts>`;
+            #    body fell back to WANDB_RUN_ID=slurm_<jobid>.
+            #  - New: name `<phase>_<v>_<ts>`; submit.py pins WANDB_RUN_ID
+            #    to that. Discriminate on the embedded `_<cluster>_`.
+            legacy = bool(re.search(r"_(kakao|skt)_", job_name or ""))
+            run_id = f"slurm_{job_id}" if legacy else job_name
+            wandb_url = f"https://wandb.ai/{entity}/{get_project()}/runs/{run_id}"
 
     progress = await _compute_progress(cluster, job_id, phase, variant, stdout_path, stderr_path, ckpt_dir, eval_dir)
 

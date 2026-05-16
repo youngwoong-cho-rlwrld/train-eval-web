@@ -114,6 +114,8 @@ async def _list_live_jobs() -> list[Job]:
     out: list[Job] = []
     for j in data.get("items", []):
         name = j["metadata"]["name"]
+        annotations = (j["metadata"].get("annotations") or {})
+        display_name = annotations.get("train-eval-web/display-name") or name
         status = j.get("status", {}) or {}
         pod = pods_by_job.get(name)
         state = _state_from_pod_and_job(status, pod)
@@ -124,7 +126,7 @@ async def _list_live_jobs() -> list[Job]:
         nodelist = (pod or {}).get("spec", {}).get("nodeName") or "(unscheduled)"
 
         out.append(Job(
-            cluster="mlxp", job_id=name, job_name=name, partition="mlxp",
+            cluster="mlxp", job_id=name, job_name=display_name, partition="mlxp",
             state=state, elapsed=elapsed, nodelist=nodelist,
             start=start, end=end,
         ))
@@ -235,9 +237,13 @@ async def get_job(name: str) -> dict[str, Any]:
             reason = c["reason"]
             break
 
+    display_name = (
+        ((job_data.get("metadata") or {}).get("annotations") or {})
+        .get("train-eval-web/display-name") or name
+    )
     return {
         "JobID": name,
-        "JobName": name,
+        "JobName": display_name,
         "Partition": "mlxp",
         "State": state,
         "ExitCode": exit_code,

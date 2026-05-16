@@ -1,4 +1,4 @@
-"""Move a job's final checkpoint to another server.
+"""Copy a job's final checkpoint to another server.
 
 Source layouts:
 - mlxp:   /data/youngwoong/experiments/<variant>/checkpoints/<job_name>/checkpoint-N
@@ -30,7 +30,7 @@ from .mlxp_data_pod import ensure_listing_pod, NAMESPACE as MLXP_NS
 from .ssh import ssh_run, _CM_OPTS
 
 
-class MoveCheckpointRequest(BaseModel):
+class CopyCheckpointRequest(BaseModel):
     dest_cluster: str
     # Absolute directory on dest. Each source's basename is appended.
     # None → mirrors source layout per cluster.
@@ -47,27 +47,27 @@ class CheckpointEntry(BaseModel):
     step: int
 
 
-class MoveResult(BaseModel):
+class CopyResult(BaseModel):
     source: str
     dest: str
 
 
-class MoveCheckpointResponse(BaseModel):
+class CopyCheckpointResponse(BaseModel):
     dest_cluster: str
-    moves: list[MoveResult]
+    copies: list[CopyResult]
     stdout: str = ""
 
 
-class MoveCheckpointStartResponse(BaseModel):
-    move_id: str
+class CopyCheckpointStartResponse(BaseModel):
+    copy_id: str
 
 
-class MoveJobStatus(BaseModel):
-    move_id: str
+class CopyJobStatus(BaseModel):
+    copy_id: str
     status: str  # "running" | "done" | "error"
     error: str | None = None
-    moves_total: int
-    moves_done: int
+    copies_total: int
+    copies_done: int
     current_source: str | None = None
     current_dest: str | None = None
     src_size_bytes: int | None = None
@@ -76,24 +76,24 @@ class MoveJobStatus(BaseModel):
     finished_at: float | None = None
 
 
-# In-memory registry of background transfer tasks. Keyed by move_id.
+# In-memory registry of background transfer tasks. Keyed by copy_id.
 # Lost on uvicorn restart — fine for the user's solo workflow.
-_MOVE_JOBS: dict[str, MoveJobStatus] = {}
+_COPY_JOBS: dict[str, CopyJobStatus] = {}
 # Parallel registry for runtime handles (asyncio Task + current subprocess).
-# Lets `cancel_move` interrupt an in-flight transfer.
-_MOVE_HANDLES: dict[str, dict] = {}
+# Lets `cancel_copy` interrupt an in-flight transfer.
+_COPY_HANDLES: dict[str, dict] = {}
 
 
-def _track_proc(move_id: str, proc: asyncio.subprocess.Process) -> None:
-    h = _MOVE_HANDLES.get(move_id)
+def _track_proc(copy_id: str, proc: asyncio.subprocess.Process) -> None:
+    h = _COPY_HANDLES.get(copy_id)
     if h is not None:
         h["proc"] = proc
 
 
-def cancel_move(move_id: str) -> bool:
+def cancel_copy(copy_id: str) -> bool:
     """Kill the in-flight subprocess (if any) and cancel the asyncio task.
-    Returns True if a running move was found."""
-    h = _MOVE_HANDLES.get(move_id)
+    Returns True if a running copy was found."""
+    h = _COPY_HANDLES.get(copy_id)
     if not h:
         return False
     proc = h.get("proc")
@@ -105,7 +105,7 @@ def cancel_move(move_id: str) -> bool:
     task = h.get("task")
     if task is not None and not task.done():
         task.cancel()
-    state = _MOVE_JOBS.get(move_id)
+    state = _COPY_JOBS.get(copy_id)
     if state and state.status == "running":
         state.status = "error"
         state.error = "cancelled"
@@ -191,13 +191,13 @@ def _parse_paths(stdout: str, *, nested: bool, fallback_job: str = "") -> list[C
 
 # ── transfer ────────────────────────────────────────────────────────────
 
-async def start_move(
+async def start_copy(
     src_cluster: str, src_job: str, dest_cluster: str,
     sources: list[str], dest_path_root: str | None = None,
     delete_source: bool = False,
 ) -> str:
-    """Kick the transfer off in a background task. Returns move_id; the
-    client polls /api/move-jobs/<id> for progress."""
+    """Kick the transfer off in a background task. Returns copy_id; the
+    client polls /api/copy-jobs/<id> for progress."""
     if not sources:
         raise ValueError("no checkpoints selected")
 
@@ -212,24 +212,24 @@ async def start_move(
         else:
             dest_path_root = f"$HOME/.train-eval-web/experiments/{variant}/checkpoints"
 
-    move_id = uuid.uuid4().hex[:12]
-    _MOVE_JOBS[move_id] = MoveJobStatus(
-        move_id=move_id, status="running",
-        moves_total=len(sources), moves_done=0,
+    copy_id = uuid.uuid4().hex[:12]
+    _COPY_JOBS[copy_id] = CopyJobStatus(
+        copy_id=copy_id, status="running",
+        copies_total=len(sources), copies_done=0,
         started_at=time.time(),
     )
-    _MOVE_HANDLES[move_id] = {"task": None, "proc": None}
+    _COPY_HANDLES[copy_id] = {"task": None, "proc": None}
     task = asyncio.create_task(
-        _run_move(
-            move_id, src_cluster, dest_cluster, sources, dest_path_root, delete_source,
+        _run_copy(
+            copy_id, src_cluster, dest_cluster, sources, dest_path_root, delete_source,
         )
     )
-    _MOVE_HANDLES[move_id]["task"] = task
-    return move_id
+    _COPY_HANDLES[copy_id]["task"] = task
+    return copy_id
 
 
-def get_move_status(move_id: str) -> MoveJobStatus | None:
-    return _MOVE_JOBS.get(move_id)
+def get_copy_status(copy_id: str) -> CopyJobStatus | None:
+    return _COPY_JOBS.get(copy_id)
 
 
 async def _children_of(cluster: str, path: str) -> list[str]:
@@ -283,11 +283,11 @@ def _selective_tar_files(parent_basename: str, names: list[str], latest: str) ->
     return items
 
 
-async def _run_move(
-    move_id: str, src_cluster: str, dest_cluster: str,
+async def _run_copy(
+    copy_id: str, src_cluster: str, dest_cluster: str,
     sources: list[str], dest_path_root: str, delete_source: bool,
 ) -> None:
-    state = _MOVE_JOBS[move_id]
+    state = _COPY_JOBS[copy_id]
     try:
         for i, src_path in enumerate(sources):
             leaf = Path(src_path).name
@@ -312,24 +312,33 @@ async def _run_move(
             else:
                 state.src_size_bytes = await _size(src_cluster, src_path)
 
-            poll_task = asyncio.create_task(
+            # Tar-pipe transports update dest_size_bytes directly from the
+            # Python pump (accurate "bytes streamed this run"). Skip the
+            # du-based poller for those — otherwise it'd overwrite the live
+            # counter with the destination's apparent size (which includes
+            # stale bytes from a prior killed run).
+            is_tar_pipe = (
+                (src_cluster == "mlxp") != (dest_cluster == "mlxp")
+            )
+            poll_task = None if is_tar_pipe else asyncio.create_task(
                 _poll_dest_size(state, dest_cluster, dest_path)
             )
             try:
                 if src_cluster == "mlxp" and dest_cluster == "mlxp":
-                    await _mlxp_to_mlxp(move_id, src_path, dest_path, include_only)
+                    await _mlxp_to_mlxp(copy_id, src_path, dest_path, include_only)
                 elif src_cluster == "mlxp":
-                    await _mlxp_to_slurm(move_id, src_path, dest_cluster, dest_path, include_only)
+                    await _mlxp_to_slurm(copy_id, src_path, dest_cluster, dest_path, include_only)
                 elif dest_cluster == "mlxp":
-                    await _slurm_to_mlxp(move_id, src_cluster, src_path, dest_path, include_only)
+                    await _slurm_to_mlxp(copy_id, src_cluster, src_path, dest_path, include_only)
                 else:
-                    await _slurm_to_slurm(move_id, src_cluster, src_path, dest_cluster, dest_path, include_only)
+                    await _slurm_to_slurm(copy_id, src_cluster, src_path, dest_cluster, dest_path, include_only)
             finally:
-                poll_task.cancel()
+                if poll_task is not None:
+                    poll_task.cancel()
 
             # Snapshot final size before the next source overwrites state.
             state.dest_size_bytes = state.src_size_bytes
-            state.moves_done = i + 1
+            state.copies_done = i + 1
 
             if delete_source:
                 await _delete_source(src_cluster, src_path)
@@ -337,17 +346,49 @@ async def _run_move(
         state.status = "done"
         state.finished_at = time.time()
     except asyncio.CancelledError:
-        # cancel_move set status to error/cancelled already; just exit.
+        # cancel_copy set status to error/cancelled already; just exit.
         return
     except Exception as e:
         state.status = "error"
-        state.error = str(e)
+        msg = str(e).strip()
+        # Many asyncio exceptions (TimeoutError, CancelledError) stringify
+        # to "" — always include the type so the UI shows *something*.
+        state.error = f"{type(e).__name__}: {msg}" if msg else type(e).__name__
         state.finished_at = time.time()
     finally:
-        _MOVE_HANDLES.pop(move_id, None)
+        _COPY_HANDLES.pop(copy_id, None)
 
 
-async def _poll_dest_size(state: MoveJobStatus, cluster: str, path: str) -> None:
+async def _pump_bytes(copy_id: str, src: asyncio.subprocess.Process,
+                       dst: asyncio.subprocess.Process) -> None:
+    """Pipe src.stdout → dst.stdin, counting bytes into state.dest_size_bytes.
+    That gives an accurate 'bytes shipped this run' counter instead of
+    `du` on the destination (which sees leftover bytes from prior runs)."""
+    state = _COPY_JOBS.get(copy_id)
+    assert src.stdout is not None and dst.stdin is not None
+    sent = 0
+    try:
+        while True:
+            chunk = await src.stdout.read(65536)
+            if not chunk:
+                break
+            dst.stdin.write(chunk)
+            try:
+                await dst.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                break
+            sent += len(chunk)
+            if state is not None:
+                state.dest_size_bytes = sent
+    finally:
+        try:
+            dst.stdin.close()
+        except Exception:
+            pass
+        await asyncio.gather(src.wait(), dst.wait(), return_exceptions=True)
+
+
+async def _poll_dest_size(state: CopyJobStatus, cluster: str, path: str) -> None:
     """Stat the destination periodically while the transfer runs."""
     try:
         while True:
@@ -362,28 +403,38 @@ async def _poll_dest_size(state: MoveJobStatus, cluster: str, path: str) -> None
 
 
 async def _size(cluster: str, path: str) -> int:
-    """Return the byte size of a directory (or file). 0 if missing."""
+    """Return the byte size of a directory (or file).
+    Returns 0 on any error — size is only used for progress display, so a
+    flaky probe must NOT kill the actual transfer."""
     cmd = f"du -sb {shlex.quote(path)} 2>/dev/null | awk '{{print $1}}'"
-    if cluster == "mlxp":
-        pod = await ensure_listing_pod()
-        proc = await asyncio.create_subprocess_exec(
-            "kubectl", "exec", "-n", MLXP_NS, pod, "--", "bash", "-c", cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
-        s = out.decode().strip()
-    else:
-        env = await load_cluster(cluster)
-        r = await ssh_run(env.ssh_alias, cmd, timeout=15.0)
-        s = r.stdout.strip()
+    try:
+        if cluster == "mlxp":
+            pod = await ensure_listing_pod()
+            proc = await asyncio.create_subprocess_exec(
+                "kubectl", "exec", "-n", MLXP_NS, pod, "--", "bash", "-c", cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                return 0
+            s = out.decode().strip()
+        else:
+            env = await load_cluster(cluster)
+            r = await ssh_run(env.ssh_alias, cmd, timeout=15.0)
+            s = r.stdout.strip()
+    except Exception:
+        return 0
     try:
         return int(s)
     except ValueError:
         return 0
 
 
-async def _mlxp_to_mlxp(move_id: str, src: str, dest: str,
+async def _mlxp_to_mlxp(copy_id: str, src: str, dest: str,
                          include_only: list[str] | None = None) -> str:
     pod = await ensure_listing_pod()
     src_parent = str(Path(src).parent)
@@ -410,14 +461,14 @@ async def _mlxp_to_mlxp(move_id: str, src: str, dest: str,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    _track_proc(move_id, proc)
+    _track_proc(copy_id, proc)
     out, err = await asyncio.wait_for(proc.communicate(), timeout=3600.0)
     if proc.returncode != 0:
         raise RuntimeError(f"cp failed: {err.decode(errors='replace').strip()}")
     return out.decode(errors="replace")
 
 
-async def _slurm_to_slurm(move_id: str, src_cluster: str, src_path: str,
+async def _slurm_to_slurm(copy_id: str, src_cluster: str, src_path: str,
                            dest_cluster: str, dest_path: str,
                            include_only: list[str] | None = None) -> str:
     src_env = await load_cluster(src_cluster)
@@ -451,64 +502,91 @@ async def _slurm_to_slurm(move_id: str, src_cluster: str, src_path: str,
     return r.stdout
 
 
-async def _mlxp_to_slurm(move_id: str, src_path: str, dest_cluster: str, dest_path: str,
+async def _mlxp_to_slurm(copy_id: str, src_path: str, dest_cluster: str, dest_path: str,
                           include_only: list[str] | None = None) -> str:
     pod = await ensure_listing_pod()
     dest_env = await load_cluster(dest_cluster)
     src_parent = str(Path(src_path).parent)
     src_leaf = Path(src_path).name
     dest_parent = str(Path(dest_path).parent.as_posix())
+    tar_args = list(include_only or [src_leaf])
 
-    tar_items = " ".join(shlex.quote(it) for it in (include_only or [src_leaf]))
-    ssh_opts = " ".join(_CM_OPTS)
-    pipeline = (
-        f"kubectl exec -i -n {shlex.quote(MLXP_NS)} {shlex.quote(pod)} -- "
-        f"tar c -C {shlex.quote(src_parent)} {tar_items} | "
-        f"ssh -o BatchMode=yes {ssh_opts} {shlex.quote(dest_env.ssh_alias)} "
-        f"\"mkdir -p {shlex.quote(dest_parent)} && tar x -C {shlex.quote(dest_parent)}\""
-    )
-    proc = await asyncio.create_subprocess_shell(
-        f"set -o pipefail; {pipeline}",
+    src_proc = await asyncio.create_subprocess_exec(
+        "kubectl", "exec", "-i", "-n", MLXP_NS, pod, "--",
+        "tar", "c", "-C", src_parent, *tar_args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=1 << 22,
     )
-    _track_proc(move_id, proc)
-    _, err = await asyncio.wait_for(proc.communicate(), timeout=3600.0)
-    if proc.returncode != 0:
+    dst_proc = await asyncio.create_subprocess_exec(
+        "ssh", "-o", "BatchMode=yes", *_CM_OPTS, dest_env.ssh_alias,
+        f"mkdir -p {shlex.quote(dest_parent)} && tar x -C {shlex.quote(dest_parent)}",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        limit=1 << 22,
+    )
+    _track_proc(copy_id, src_proc)
+    try:
+        await _pump_bytes(copy_id, src_proc, dst_proc)
+    finally:
+        if src_proc.returncode is None:
+            src_proc.kill()
+            await src_proc.wait()
+        if dst_proc.returncode is None:
+            await dst_proc.wait()
+    if src_proc.returncode != 0 or dst_proc.returncode != 0:
+        src_err = (await src_proc.stderr.read()).decode(errors="replace").strip() if src_proc.stderr else ""
+        dst_err = (await dst_proc.stderr.read()).decode(errors="replace").strip() if dst_proc.stderr else ""
         raise RuntimeError(
-            f"mlxp→slurm tar pipe failed (rc={proc.returncode}): "
-            f"{err.decode(errors='replace').strip()}"
+            f"mlxp→slurm tar pipe failed "
+            f"(src rc={src_proc.returncode}, dst rc={dst_proc.returncode}): "
+            f"{src_err or dst_err or 'no stderr'}"
         )
     return f"copied {src_path} → {dest_env.ssh_alias}:{dest_path}"
 
 
-async def _slurm_to_mlxp(move_id: str, src_cluster: str, src_path: str, dest_path: str,
+async def _slurm_to_mlxp(copy_id: str, src_cluster: str, src_path: str, dest_path: str,
                           include_only: list[str] | None = None) -> str:
     src_env = await load_cluster(src_cluster)
     pod = await ensure_listing_pod()
     src_parent = str(Path(src_path).parent.as_posix())
     src_leaf = Path(src_path).name
     dest_parent = str(Path(dest_path).parent)
+    tar_args = " ".join(shlex.quote(it) for it in (include_only or [src_leaf]))
 
-    tar_items = " ".join(shlex.quote(it) for it in (include_only or [src_leaf]))
-    ssh_opts = " ".join(_CM_OPTS)
-    pipeline = (
-        f"ssh -o BatchMode=yes {ssh_opts} {shlex.quote(src_env.ssh_alias)} "
-        f"\"tar c -C {shlex.quote(src_parent)} {tar_items}\" | "
-        f"kubectl exec -i -n {shlex.quote(MLXP_NS)} {shlex.quote(pod)} -- "
-        f"bash -c \"mkdir -p {shlex.quote(dest_parent)} && tar x -C {shlex.quote(dest_parent)}\""
-    )
-    proc = await asyncio.create_subprocess_shell(
-        f"set -o pipefail; {pipeline}",
+    src_proc = await asyncio.create_subprocess_exec(
+        "ssh", "-o", "BatchMode=yes", *_CM_OPTS, src_env.ssh_alias,
+        f"tar c -C {shlex.quote(src_parent)} {tar_args}",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=1 << 22,
     )
-    _track_proc(move_id, proc)
-    _, err = await asyncio.wait_for(proc.communicate(), timeout=3600.0)
-    if proc.returncode != 0:
+    dst_proc = await asyncio.create_subprocess_exec(
+        "kubectl", "exec", "-i", "-n", MLXP_NS, pod, "--",
+        "bash", "-c",
+        f"mkdir -p {shlex.quote(dest_parent)} && tar x -C {shlex.quote(dest_parent)}",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        limit=1 << 22,
+    )
+    _track_proc(copy_id, src_proc)
+    try:
+        await _pump_bytes(copy_id, src_proc, dst_proc)
+    finally:
+        if src_proc.returncode is None:
+            src_proc.kill()
+            await src_proc.wait()
+        if dst_proc.returncode is None:
+            await dst_proc.wait()
+    if src_proc.returncode != 0 or dst_proc.returncode != 0:
+        src_err = (await src_proc.stderr.read()).decode(errors="replace").strip() if src_proc.stderr else ""
+        dst_err = (await dst_proc.stderr.read()).decode(errors="replace").strip() if dst_proc.stderr else ""
         raise RuntimeError(
-            f"slurm→mlxp tar pipe failed (rc={proc.returncode}): "
-            f"{err.decode(errors='replace').strip()}"
+            f"slurm→mlxp tar pipe failed "
+            f"(src rc={src_proc.returncode}, dst rc={dst_proc.returncode}): "
+            f"{src_err or dst_err or 'no stderr'}"
         )
     return f"copied {src_env.ssh_alias}:{src_path} → mlxp:{dest_path}"
 

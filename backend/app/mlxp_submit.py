@@ -17,6 +17,7 @@ import asyncio
 import json
 import re
 import shutil
+import uuid
 from datetime import datetime
 
 import yaml
@@ -57,7 +58,9 @@ class MlxpSubmitRequest(BaseModel):
 
 
 class MlxpSubmitResponse(BaseModel):
-    job_name: str
+    job_id: str             # 6-char k8s Job name, used in /jobs/<cluster>/<id>
+    display_name: str       # human-readable {phase}_{variant}_{ts}
+    job_name: str           # alias for job_id (frontend compatibility)
     pod_name: str | None = None
     yaml: str
     apply_stdout: str
@@ -72,19 +75,16 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
     variant = await load_variant(req.variant)
     cpu, mem = _GPU_RESOURCES[req.num_gpus]
 
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    # k8s names: ≤63 chars, lowercase, alphanumeric + '-', no leading/trailing '-'.
-    safe_variant = re.sub(r"[^a-z0-9-]+", "-", req.variant.lower())
-    prefix = "youngwoong-train-"
-    suffix = f"-{timestamp}"
-    max_variant = 63 - len(prefix) - len(suffix)
-    if len(safe_variant) > max_variant:
-        safe_variant = safe_variant[:max_variant].rstrip("-")
-    job_name = f"{prefix}{safe_variant}{suffix}"
+    # Two names: the underlying k8s Job uses a 6-char id so URLs are short
+    # and DNS-safe; the display name (logged + used as wandb run name) is
+    # the human-readable `{phase}_{variant}_{YYYYMMDD}_{HHMMSS}`.
+    job_id = "m" + uuid.uuid4().hex[:5]  # 6 chars, always alpha-leading
+    display_name = f"train_{req.variant}_{datetime.now():%Y%m%d_%H%M%S}"
+    job_name = job_id  # what kubectl sees
 
     node = req.node or DEFAULT_NODE
-    body_script = _render_body_script(variant, req, job_name)
-    spec = _render_job_yaml(job_name, body_script, req.num_gpus, cpu, mem, req.wandb_secret, node)
+    body_script = _render_body_script(variant, req, display_name)
+    spec = _render_job_yaml(job_name, display_name, body_script, req.num_gpus, cpu, mem, req.wandb_secret, node)
     yaml_text = yaml.safe_dump(spec, sort_keys=False)
 
     proc = await asyncio.create_subprocess_exec(
@@ -98,14 +98,19 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
         raise RuntimeError(f"kubectl apply failed: {stderr.decode(errors='replace').strip()}")
 
     return MlxpSubmitResponse(
-        job_name=job_name,
+        job_id=job_id,
+        display_name=display_name,
+        job_name=job_id,
         pod_name=None,
         yaml=yaml_text,
         apply_stdout=stdout.decode(errors="replace").strip(),
     )
 
 
-def _render_body_script(variant, req: MlxpSubmitRequest, job_name: str) -> str:
+def _render_body_script(variant, req: MlxpSubmitRequest, display_name: str) -> str:
+    # `display_name` flows into WANDB_RUN_ID, --experiment-name, and the
+    # checkpoint sub-dir launch_finetune.py creates on DDN.
+    job_name = display_name
     """Render the inline bash the container runs.
 
     Resolves the variant's dataset list, then dispatches to the right gr00t
@@ -299,7 +304,7 @@ torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/launch_finetune.py \\
 """
 
 
-def _render_job_yaml(job_name: str, body: str, num_gpus: int, cpu: str, mem: str,
+def _render_job_yaml(job_name: str, display_name: str, body: str, num_gpus: int, cpu: str, mem: str,
                      wandb_secret: str, node: str) -> dict:
     return {
         "apiVersion": "batch/v1",
@@ -308,6 +313,9 @@ def _render_job_yaml(job_name: str, body: str, num_gpus: int, cpu: str, mem: str
             "name": job_name,
             "namespace": "p-rlwrld",
             "labels": {"owner": "youngwoong", "tool": "train-eval-web"},
+            # display-name carries the human-readable {phase}_{variant}_{ts}
+            # with underscores — invalid in k8s resource names but fine here.
+            "annotations": {"train-eval-web/display-name": display_name},
         },
         "spec": {
             "ttlSecondsAfterFinished": 604800,  # 7 days — Jobs page keeps showing them

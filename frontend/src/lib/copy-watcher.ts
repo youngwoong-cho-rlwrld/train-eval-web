@@ -3,14 +3,14 @@
 import { toast } from "sonner";
 import { api } from "@/lib/api";
 
-const STORAGE_KEY = "move-checkpoint.active";
+const STORAGE_KEY = "copy-checkpoint.active";
 
-export type MoveJobStatus = {
-  move_id: string;
+export type CopyJobStatus = {
+  copy_id: string;
   status: "running" | "done" | "error";
   error: string | null;
-  moves_total: number;
-  moves_done: number;
+  copies_total: number;
+  copies_done: number;
   current_source: string | null;
   current_dest: string | null;
   src_size_bytes: number | null;
@@ -19,14 +19,13 @@ export type MoveJobStatus = {
   finished_at: number | null;
 };
 
-type ActiveMove = {
-  moveId: string;
-  verb: "Move" | "Copy";
+type ActiveCopy = {
+  copyId: string;
   destCluster: string;
 };
 
 // Some browsers fire multiple events for the same tab; dedupe in-process so
-// we don't end up with N toasts for the same move on hot-reload or remount.
+// we don't end up with N toasts for the same copy on hot-reload or remount.
 const watched = new Set<string>();
 
 function formatBytes(b: number | null): string {
@@ -42,7 +41,7 @@ function formatBytes(b: number | null): string {
   return `${v.toFixed(1)}${u[i]}`;
 }
 
-function readActive(): ActiveMove[] {
+function readActive(): ActiveCopy[] {
   if (typeof window === "undefined") return [];
   try {
     return JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
@@ -51,91 +50,86 @@ function readActive(): ActiveMove[] {
   }
 }
 
-function writeActive(list: ActiveMove[]) {
+function writeActive(list: ActiveCopy[]) {
   if (typeof window === "undefined") return;
   localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
 }
 
-function addActive(m: ActiveMove) {
-  const list = readActive().filter((x) => x.moveId !== m.moveId);
+function addActive(m: ActiveCopy) {
+  const list = readActive().filter((x) => x.copyId !== m.copyId);
   list.push(m);
   writeActive(list);
 }
 
-function removeActive(moveId: string) {
-  writeActive(readActive().filter((x) => x.moveId !== moveId));
+function removeActive(copyId: string) {
+  writeActive(readActive().filter((x) => x.copyId !== copyId));
 }
 
-export function startMoveWatcher(
-  moveId: string,
-  verb: "Move" | "Copy",
-  destCluster: string,
-) {
-  addActive({ moveId, verb, destCluster });
-  void watch({ moveId, verb, destCluster });
+export function startCopyWatcher(copyId: string, destCluster: string) {
+  addActive({ copyId, destCluster });
+  void watch({ copyId, destCluster });
 }
 
-/** Resume any moves that were in flight when the page was loaded/refreshed. */
-export function resumeActiveMoves() {
+/** Resume any copies that were in flight when the page was loaded/refreshed. */
+export function resumeActiveCopies() {
   for (const m of readActive()) {
-    if (watched.has(m.moveId)) continue;
+    if (watched.has(m.copyId)) continue;
     void watch(m);
   }
 }
 
-async function watch({ moveId, verb, destCluster }: ActiveMove) {
-  if (watched.has(moveId)) return;
-  watched.add(moveId);
-
-  const past = verb === "Move" ? "Moved" : "Copied";
-  const present = verb === "Move" ? "Moving" : "Copying";
+async function watch({ copyId, destCluster }: ActiveCopy) {
+  if (watched.has(copyId)) return;
+  watched.add(copyId);
 
   let cancelled = false;
   const cancelAction = {
     label: "Cancel",
     onClick: () => {
       cancelled = true;
-      void api(`/api/move-jobs/${moveId}/cancel`, { method: "POST" }).catch(() => {});
+      void api(`/api/copy-jobs/${copyId}/cancel`, { method: "POST" }).catch(() => {});
     },
   };
 
-  const toastId = toast.loading(`${present} checkpoint…`, {
+  const toastId = toast.loading("Copying checkpoint…", {
     duration: Infinity,
     action: cancelAction,
   });
   try {
     while (true) {
-      let s: MoveJobStatus;
+      let s: CopyJobStatus;
       try {
-        s = await api<MoveJobStatus>(`/api/move-jobs/${moveId}`);
+        s = await api<CopyJobStatus>(`/api/copy-jobs/${copyId}`);
       } catch (e) {
-        // 404 means the backend forgot about this move (process restart).
+        // 404 means the backend forgot about this copy (process restart).
         // Drop it silently — the toast clears below.
         if (/^404/.test((e as Error).message)) {
           toast.dismiss(toastId);
-          removeActive(moveId);
+          removeActive(copyId);
           return;
         }
         throw e;
       }
       if (s.status === "done") {
         toast.success(
-          `${past} ${s.moves_done} checkpoint${s.moves_done === 1 ? "" : "s"} to ${destCluster}`,
+          `Copied ${s.copies_done} checkpoint${s.copies_done === 1 ? "" : "s"} to ${destCluster}`,
           { id: toastId, duration: 6000 },
         );
-        removeActive(moveId);
+        removeActive(copyId);
         return;
       }
       if (s.status === "error") {
+        // Dismiss the loading toast first — sonner with `richColors`
+        // sometimes renders just the icon (no text) when a `loading` toast
+        // is replaced in-place by `error` / `info`.
+        toast.dismiss(toastId);
         if (cancelled || s.error === "cancelled") {
-          toast.info(`${verb} cancelled`, { id: toastId, duration: 4000 });
+          toast("Copy cancelled", { duration: 4000 });
         } else {
-          toast.error(s.error ?? `${verb} failed`, {
-            id: toastId,
-            duration: 10_000,
-          });
+          const msg = (s.error && s.error.trim()) || "Copy failed";
+          toast.error(msg, { duration: 10_000 });
         }
-        removeActive(moveId);
+        removeActive(copyId);
         return;
       }
       const src = s.src_size_bytes;
@@ -144,13 +138,13 @@ async function watch({ moveId, verb, destCluster }: ActiveMove) {
         src && src > 0 && dst != null
           ? Math.min(100, Math.round((dst / src) * 100))
           : null;
-      const summary = `${s.moves_done + 1}/${s.moves_total}`;
+      const summary = `${s.copies_done + 1}/${s.copies_total}`;
       const name = s.current_source
         ? s.current_source.split("/").filter(Boolean).pop()
         : null;
       const prefix = name
-        ? `${present} ${name} (${summary})`
-        : `${present} ${summary}`;
+        ? `Copying ${name} (${summary})`
+        : `Copying ${summary}`;
       toast.loading(
         pct != null
           ? `${prefix} — ${pct}% (${formatBytes(dst)} / ${formatBytes(src)})`
@@ -161,11 +155,11 @@ async function watch({ moveId, verb, destCluster }: ActiveMove) {
     }
   } catch (e) {
     toast.error(
-      `Lost connection while ${present.toLowerCase()}: ${(e as Error).message}`,
+      `Lost connection while copying: ${(e as Error).message}`,
       { id: toastId, duration: 10_000 },
     );
     // Keep the entry — the user can refresh and we'll try again.
   } finally {
-    watched.delete(moveId);
+    watched.delete(copyId);
   }
 }

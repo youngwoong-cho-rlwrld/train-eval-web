@@ -92,8 +92,11 @@ source "$GROOT_DIR/.venv/bin/activate"
 export WANDB_PROJECT=gr00t
 export WANDB_DIR="$EXP_DIR"
 
+# WANDB_RUN_ID is normally passed via sbatch --export by the web submit; fall
+# back to slurm_<job_id> for legacy bash ./submit invocations.
 if [ -n "${SLURM_JOB_ID:-}" ]; then
-    export WANDB_RUN_ID="slurm_${SLURM_JOB_ID}"
+    : "${WANDB_RUN_ID:=slurm_${SLURM_JOB_ID}}"
+    export WANDB_RUN_ID
     export WANDB_RESUME=allow
 fi
 

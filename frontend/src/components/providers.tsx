@@ -3,7 +3,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { Toaster } from "sonner";
-import { resumeActiveMoves } from "@/lib/move-watcher";
+import { resumeActiveCopies } from "@/lib/copy-watcher";
 
 export function Providers({ children }: { children: React.ReactNode }) {
   const [client] = useState(
@@ -14,11 +14,11 @@ export function Providers({ children }: { children: React.ReactNode }) {
         },
       }),
   );
-  // Reattach toast progress to any move-checkpoint transfers that were in
+  // Reattach toast progress to any copy-checkpoint transfers that were in
   // flight before the page refreshed. The transfer itself keeps running
   // server-side; this just brings the notification back.
   useEffect(() => {
-    resumeActiveMoves();
+    resumeActiveCopies();
   }, []);
   return (
     <QueryClientProvider client={client}>

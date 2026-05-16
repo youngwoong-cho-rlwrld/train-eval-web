@@ -97,31 +97,40 @@ function WandbCard() {
         <div className="space-y-2">
           <Label className="flex items-center justify-between">
             <span>API key</span>
-            <a
-              href="https://wandb.ai/authorize"
-              target="_blank"
-              rel="noreferrer"
-              className="inline-flex items-center gap-1 text-xs text-blue-600 hover:underline"
-            >
-              get one <ExternalLink className="h-3 w-3" />
-            </a>
+            {!status.data?.logged_in && (
+              <a
+                href="https://wandb.ai/authorize"
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1 text-xs text-blue-600 hover:underline"
+              >
+                get one <ExternalLink className="h-3 w-3" />
+              </a>
+            )}
           </Label>
-          <div className="flex gap-2">
-            <Input
-              type="password"
-              value={key}
-              onChange={(e) => setKey(e.target.value)}
-              placeholder="wandb api key"
-              className="flex-1 font-mono text-xs"
-              autoComplete="off"
-            />
-            <Button
-              onClick={() => login.mutate()}
-              disabled={!key.trim() || login.isPending}
-            >
-              {login.isPending ? "Saving…" : "Save"}
-            </Button>
-          </div>
+          {status.data?.logged_in ? (
+            <p className="text-sm text-slate-600 dark:text-slate-400">
+              Connected as{" "}
+              <span className="font-mono">{status.data.entity ?? "(unknown)"}</span>.
+            </p>
+          ) : (
+            <div className="flex gap-2">
+              <Input
+                type="password"
+                value={key}
+                onChange={(e) => setKey(e.target.value)}
+                placeholder="wandb api key"
+                className="flex-1 font-mono text-xs"
+                autoComplete="off"
+              />
+              <Button
+                onClick={() => login.mutate()}
+                disabled={!key.trim() || login.isPending}
+              >
+                {login.isPending ? "Saving…" : "Save"}
+              </Button>
+            </div>
+          )}
         </div>
 
         <div className="space-y-2">
