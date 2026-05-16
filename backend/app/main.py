@@ -326,3 +326,10 @@ async def get_move_status(move_id: str):
     if not status:
         raise HTTPException(404, f"move job {move_id} not found")
     return status
+
+
+@app.post("/api/move-jobs/{move_id}/cancel")
+async def post_cancel_move(move_id: str):
+    if not move_checkpoint.cancel_move(move_id):
+        raise HTTPException(404, f"move job {move_id} not running")
+    return {"status": "cancelled"}

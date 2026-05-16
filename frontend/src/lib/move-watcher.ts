@@ -89,8 +89,19 @@ async function watch({ moveId, verb, destCluster }: ActiveMove) {
 
   const past = verb === "Move" ? "Moved" : "Copied";
   const present = verb === "Move" ? "Moving" : "Copying";
+
+  let cancelled = false;
+  const cancelAction = {
+    label: "Cancel",
+    onClick: () => {
+      cancelled = true;
+      void api(`/api/move-jobs/${moveId}/cancel`, { method: "POST" }).catch(() => {});
+    },
+  };
+
   const toastId = toast.loading(`${present} checkpoint…`, {
     duration: Infinity,
+    action: cancelAction,
   });
   try {
     while (true) {
@@ -116,10 +127,14 @@ async function watch({ moveId, verb, destCluster }: ActiveMove) {
         return;
       }
       if (s.status === "error") {
-        toast.error(s.error ?? `${verb} failed`, {
-          id: toastId,
-          duration: 10_000,
-        });
+        if (cancelled || s.error === "cancelled") {
+          toast.info(`${verb} cancelled`, { id: toastId, duration: 4000 });
+        } else {
+          toast.error(s.error ?? `${verb} failed`, {
+            id: toastId,
+            duration: 10_000,
+          });
+        }
         removeActive(moveId);
         return;
       }
@@ -130,11 +145,17 @@ async function watch({ moveId, verb, destCluster }: ActiveMove) {
           ? Math.min(100, Math.round((dst / src) * 100))
           : null;
       const summary = `${s.moves_done + 1}/${s.moves_total}`;
+      const name = s.current_source
+        ? s.current_source.split("/").filter(Boolean).pop()
+        : null;
+      const prefix = name
+        ? `${present} ${name} (${summary})`
+        : `${present} ${summary}`;
       toast.loading(
         pct != null
-          ? `${present} ${summary} — ${pct}% (${formatBytes(dst)} / ${formatBytes(src)})`
-          : `${present} ${summary}…`,
-        { id: toastId, duration: Infinity },
+          ? `${prefix} — ${pct}% (${formatBytes(dst)} / ${formatBytes(src)})`
+          : `${prefix}…`,
+        { id: toastId, duration: Infinity, action: cancelAction },
       );
       await new Promise((r) => setTimeout(r, 2000));
     }
