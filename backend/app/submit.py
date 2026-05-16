@@ -76,6 +76,9 @@ class SubmitRequest(BaseModel):
     # None means "use whatever the variant config.sh says".
     dataset_override: str | list[str] | None = None
     extra_args: list[str] = []
+    # Eval-only: absolute path to the checkpoint dir on the cluster. The
+    # eval body uses this verbatim when set; otherwise it auto-picks.
+    checkpoint_path: str | None = None
 
 
 class SubmitResponse(BaseModel):
@@ -174,7 +177,11 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         f"--output={log_dir}/{job_name}_%j.out",
         f"--error={log_dir}/{job_name}_%j.err",
         f"--export=ALL,VARIANT={shlex.quote(req.variant)},CLUSTER={shlex.quote(req.cluster)},"
-        f"REPO_ROOT={repo_root_remote},RESUME_EXPECTED={resume_expected}",
+        f"REPO_ROOT={repo_root_remote},RESUME_EXPECTED={resume_expected}"
+        + (
+            f",EVAL_CHECKPOINT={shlex.quote(req.checkpoint_path)}"
+            if req.phase == "eval" and req.checkpoint_path else ""
+        ),
         *sbatch_flags,
         *[shlex.quote(a) for a in req.extra_args],
         body_path,

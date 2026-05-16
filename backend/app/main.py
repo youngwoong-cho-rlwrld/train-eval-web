@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
-from . import clusters, datasets, details, flags, jobs, mlxp, mlxp_submit, partitions, submit, variants, wandb_auth
+from . import clusters, datasets, details, flags, jobs, mlxp, mlxp_submit, move_checkpoint, partitions, submit, variants, wandb_auth
 from .ssh import ssh_tail_lines
 
 
@@ -76,6 +76,45 @@ async def get_variant(name: str):
         return await variants.load_variant(name)
     except FileNotFoundError:
         raise HTTPException(404, f"variant {name} not found")
+
+
+@app.get("/api/variants/{name}/flags")
+async def get_variant_flags(name: str, cluster: str, phase: str = "train"):
+    try:
+        v = await variants.load_variant(name)
+    except FileNotFoundError:
+        raise HTTPException(404, f"variant {name} not found")
+    out = flags.flags_for(v, cluster, phase)
+    return {"flags": [{"flag": f, "value": val} for f, val in out]}
+
+
+@app.get("/api/variants/{name}/selected-checkpoint")
+async def get_selected_checkpoint(name: str, cluster: str):
+    """The checkpoint path the eval body would pick at runtime, mirroring
+    lib/eval_body_n16.sh's nested-then-flat lookup. Slurm-only — MLXP eval
+    isn't wired."""
+    if cluster == "mlxp":
+        return {"path": None, "step": None}
+    try:
+        env = await clusters.load_cluster(cluster)
+    except FileNotFoundError:
+        raise HTTPException(404, f"cluster {cluster} not found")
+    cmd = (
+        f'D=$HOME/.train-eval-web/experiments/{name}/checkpoints; '
+        f'p=$(ls -d "$D"/*/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1); '
+        f'[ -z "$p" ] && p=$(ls -d "$D"/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1); '
+        f'printf "%s\\n" "$p"'
+    )
+    from .ssh import ssh_run
+    r = await ssh_run(env.ssh_alias, cmd, timeout=15.0)
+    path = r.stdout.strip()
+    if not path:
+        return {"path": None, "step": None}
+    try:
+        step = int(path.rsplit("-", 1)[-1])
+    except ValueError:
+        step = None
+    return {"path": path, "step": step}
 
 
 # ── submit ──
@@ -240,3 +279,50 @@ async def get_job_flags(cluster: str, job_id: str):
         raise HTTPException(404, f"variant {det.variant} not found")
     out = flags.flags_for(v, cluster, det.phase)
     return {"flags": [{"flag": f, "value": val} for f, val in out]}
+
+
+# ── move checkpoint ──
+
+@app.get(
+    "/api/jobs/{cluster}/{job_id}/checkpoints",
+    response_model=list[move_checkpoint.CheckpointEntry],
+)
+async def get_checkpoints(cluster: str, job_id: str):
+    try:
+        return await move_checkpoint.list_checkpoints(cluster, job_id)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post(
+    "/api/jobs/{cluster}/{job_id}/move-checkpoint",
+    response_model=move_checkpoint.MoveCheckpointStartResponse,
+)
+async def post_move_checkpoint(
+    cluster: str, job_id: str, req: move_checkpoint.MoveCheckpointRequest
+):
+    try:
+        move_id = await move_checkpoint.start_move(
+            src_cluster=cluster,
+            src_job=job_id,
+            dest_cluster=req.dest_cluster,
+            sources=req.sources,
+            dest_path_root=req.dest_path_root,
+            delete_source=req.delete_source,
+        )
+    except (ValueError, FileNotFoundError) as e:
+        raise HTTPException(400, str(e))
+    return move_checkpoint.MoveCheckpointStartResponse(move_id=move_id)
+
+
+@app.get(
+    "/api/move-jobs/{move_id}",
+    response_model=move_checkpoint.MoveJobStatus,
+)
+async def get_move_status(move_id: str):
+    status = move_checkpoint.get_move_status(move_id)
+    if not status:
+        raise HTTPException(404, f"move job {move_id} not found")
+    return status

@@ -131,7 +131,7 @@ function JobTable({ rows, kind }: { rows: Job[]; kind: "active" | "recent" }) {
             const phase = phaseOf(j.job_name);
             return (
               <tr key={`${j.cluster}-${j.job_id}`} className="border-b border-slate-100 last:border-0 hover:bg-slate-50 dark:border-slate-900 dark:hover:bg-slate-900/40">
-                <td className="py-2 pr-4 font-mono min-w-[260px]">
+                <td className="py-2 pr-4 font-mono">
                   <Link href={`/jobs/${j.cluster}/${j.job_id}`} className="text-blue-600 hover:underline">
                     {j.job_id}
                   </Link>

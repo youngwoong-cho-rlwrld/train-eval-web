@@ -34,7 +34,7 @@ import { useMyMlxpNode } from "@/hooks/use-my-mlxp-node";
 import { DatasetField } from "@/components/submit/dataset-field";
 import { MlxpCard } from "@/components/submit/mlxp-card";
 import { AvailabilityCard } from "@/components/submit/availability-card";
-import { VariantPreview } from "@/components/submit/variant-preview";
+import { ConfigCard } from "@/components/config-card";
 import { useDatasetDir } from "@/hooks/use-dataset-dir";
 
 type Phase = "train" | "resume" | "eval";
@@ -50,6 +50,8 @@ export default function SubmitPage() {
   // Persisted across sessions + synced across pages via useMyMlxpNode.
   const [mlxpNode, setMlxpNode] = useMyMlxpNode();
   const [extraArgs, setExtraArgs] = useState<string>("");
+  const [checkpointPath, setCheckpointPath] = useState<string>("");
+  const [checkpointTouched, setCheckpointTouched] = useState<boolean>(false);
 
   // Dataset override state. For single-task variants, `singleDataset` holds
   // the chosen name. For multi-task, `multiDatasets` holds the array of
@@ -101,6 +103,27 @@ export default function SubmitPage() {
     retry: false,
     enabled: !isSlurm,
   });
+  const wantsCheckpoint = phase === "eval" && isSlurm && !!variantName;
+  const selectedCkpt = useQuery({
+    queryKey: ["selected-checkpoint", variantName, cluster],
+    queryFn: () =>
+      api<{ path: string | null; step: number | null }>(
+        `/api/variants/${variantName}/selected-checkpoint?cluster=${cluster}`,
+      ),
+    enabled: wantsCheckpoint,
+  });
+
+  // Prefill checkpoint with the auto-detected one until the user types over it.
+  useEffect(() => {
+    if (!checkpointTouched && selectedCkpt.data?.path) {
+      setCheckpointPath(selectedCkpt.data.path);
+    }
+  }, [selectedCkpt.data?.path, checkpointTouched]);
+  // Reset prefill state when variant / cluster / phase changes.
+  useEffect(() => {
+    setCheckpointPath("");
+    setCheckpointTouched(false);
+  }, [variantName, cluster, phase]);
 
   // Whenever a new variant loads (or the user picks a different one), reset
   // dataset state to that variant's defaults. `datasetTouched` is reset so
@@ -150,6 +173,7 @@ export default function SubmitPage() {
           node: isSlurm ? null : mlxpNode,
           dataset_override,
           extra_args: extraArgs.split(/\s+/).filter(Boolean),
+          checkpoint_path: wantsCheckpoint ? checkpointPath.trim() : null,
         }),
       });
     },
@@ -164,6 +188,7 @@ export default function SubmitPage() {
   const canSubmit =
     !!variantName &&
     (isSlurm ? !!partition : !!mlxpNode) &&
+    (!wantsCheckpoint || !!checkpointPath.trim()) &&
     !submit.isPending;
   const selectedPartition = partitions.data?.find((p) => p.name === partition);
 
@@ -296,6 +321,36 @@ export default function SubmitPage() {
                     />
                   )}
 
+                  {wantsCheckpoint && (
+                    <Field label="Checkpoint">
+                      <Input
+                        value={checkpointPath}
+                        onChange={(e) => {
+                          setCheckpointPath(e.target.value);
+                          setCheckpointTouched(true);
+                        }}
+                        placeholder={
+                          selectedCkpt.isLoading
+                            ? "looking up auto-pick…"
+                            : "/absolute/path/to/checkpoint-N"
+                        }
+                        className="font-mono text-xs"
+                      />
+                      {!checkpointPath.trim() && !selectedCkpt.isLoading && (
+                        <p className="text-xs text-red-600 dark:text-red-400">
+                          Choose a checkpoint
+                        </p>
+                      )}
+                      {checkpointPath.trim() && selectedCkpt.data?.path &&
+                        checkpointPath.trim() !== selectedCkpt.data.path && (
+                          <p className="text-xs text-slate-500">
+                            Auto-pick was{" "}
+                            <code>{selectedCkpt.data.path}</code> — overriding.
+                          </p>
+                        )}
+                    </Field>
+                  )}
+
                   <Field label="Extra sbatch args (optional)">
                     <Input
                       placeholder="--exclusive --nice=100"
@@ -384,7 +439,17 @@ export default function SubmitPage() {
             </CardContent>
           </Card>
 
-          {variant.data && <VariantPreview variant={variant.data} />}
+          {variant.data && (
+            <ConfigCard
+              variantName={variant.data.name}
+              flagsUrl={`/api/variants/${variant.data.name}/flags?cluster=${cluster}&phase=${phase}`}
+              queryKey={["variant-flags", variant.data.name, cluster, phase]}
+              modalityConfigFile={variant.data.vars.TRAIN_MODALITY_CONFIG ?? null}
+              cluster={cluster}
+              phase={phase}
+              className="mt-6"
+            />
+          )}
 
           <div className="flex justify-end">
             <Button onClick={() => submit.mutate()} disabled={!canSubmit}>

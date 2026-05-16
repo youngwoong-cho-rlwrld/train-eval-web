@@ -310,7 +310,7 @@ def _render_job_yaml(job_name: str, body: str, num_gpus: int, cpu: str, mem: str
             "labels": {"owner": "youngwoong", "tool": "train-eval-web"},
         },
         "spec": {
-            "ttlSecondsAfterFinished": 1800,
+            "ttlSecondsAfterFinished": 604800,  # 7 days — Jobs page keeps showing them
             "backoffLimit": 0,
             "template": {
                 "metadata": {

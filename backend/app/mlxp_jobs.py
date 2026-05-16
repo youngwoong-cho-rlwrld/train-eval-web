@@ -80,7 +80,20 @@ def _elapsed(start: str | None, end: str | None) -> str:
 
 
 async def list_jobs() -> list[Job]:
-    """All MLXP jobs in p-rlwrld with owner=youngwoong label."""
+    """All MLXP jobs we know about: live k8s Jobs + archived runs derived
+    from DDN checkpoint directories.
+
+    k8s Jobs are GC'd 30 min after completion (`ttlSecondsAfterFinished`),
+    so a Jobs page opened later wouldn't show them. We fall back to listing
+    `<exp_dir>/checkpoints/<job-name>` on DDN — every completed training
+    run leaves one of those behind for the lifetime of the checkpoints.
+    """
+    live = await _list_live_jobs()
+    archived = await _list_archived_jobs(seen={j.job_name for j in live})
+    return live + archived
+
+
+async def _list_live_jobs() -> list[Job]:
     try:
         data = await _kubectl_json("get", "jobs", "-n", _NS, "-l", "owner=youngwoong")
     except RuntimeError:
@@ -118,12 +131,83 @@ async def list_jobs() -> list[Job]:
     return out
 
 
+async def _list_archived_jobs(seen: set[str]) -> list[Job]:
+    """Scan DDN for completed runs whose k8s Job has been GC'd."""
+    import asyncio
+    from .mlxp_data_pod import ensure_listing_pod, NAMESPACE
+
+    try:
+        pod = await ensure_listing_pod()
+    except Exception:
+        return []
+
+    # One liner per run: <variant>|<job_name>|<latest_step>|<start_epoch>|<end_epoch>
+    # NOTE: array glob with nullglob, not `ls $glob` — `ls` with zero-arg
+    # falls back to listing `.` which used to slip past the empty check and
+    # produced fake rows (`experiment_cfg`, `logs`, `runs`) in the table.
+    script = r"""
+shopt -s nullglob
+for d in /data/youngwoong/experiments/*/checkpoints/*/; do
+    matches=( "$d"checkpoint-* )
+    [ ${#matches[@]} -eq 0 ] && continue
+    job_name=$(basename "$d")
+    variant=$(basename "$(dirname "$(dirname "$d")")")
+    latest=$(for m in "${matches[@]}"; do basename "$m" | sed 's:^checkpoint-::'; done | sort -n | tail -1)
+    start_epoch=$(stat -c %Y "$d" 2>/dev/null || echo 0)
+    end_epoch=$(stat -c %Y "$d"checkpoint-$latest 2>/dev/null || echo "$start_epoch")
+    printf '%s|%s|%s|%s|%s\n' "$variant" "$job_name" "$latest" "$start_epoch" "$end_epoch"
+done
+"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "kubectl", "exec", "-n", NAMESPACE, pod, "--", "bash", "-c", script,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20.0)
+    except Exception:
+        return []
+
+    out: list[Job] = []
+    for line in stdout.decode(errors="replace").splitlines():
+        parts = line.split("|")
+        if len(parts) != 5:
+            continue
+        variant, job_name, latest, start_e, end_e = parts
+        # The shell script only emits rows where checkpoint-N exists, so
+        # `latest` is always a number for real runs. Anything else means the
+        # shell got confused; drop it.
+        if not latest.isdigit():
+            continue
+        if job_name in seen:
+            continue
+        try:
+            start_iso = datetime.fromtimestamp(int(start_e), tz=timezone.utc).isoformat()
+            end_iso = datetime.fromtimestamp(int(end_e), tz=timezone.utc).isoformat()
+        except ValueError:
+            continue
+        elapsed = _elapsed(start_iso, end_iso)
+        out.append(Job(
+            cluster="mlxp", job_id=job_name, job_name=job_name, partition="mlxp",
+            state="COMPLETED", elapsed=elapsed, nodelist="(archived)",
+            start=start_iso, end=end_iso,
+        ))
+    return out
+
+
 async def get_job(name: str) -> dict[str, Any]:
-    """Return a slurm-sacct-shaped dict for one MLXP job."""
+    """Return a slurm-sacct-shaped dict for one MLXP job.
+
+    Falls back to the archived-on-DDN view when the k8s Job is gone
+    (TTL'd), so the job-detail page works for completed runs too.
+    """
     try:
         job_data = await _kubectl_json("get", "job", name, "-n", _NS)
-    except RuntimeError as e:
-        raise FileNotFoundError(f"mlxp job not found: {name}: {e}")
+    except RuntimeError:
+        archived = await _archived_record(name)
+        if archived:
+            return archived
+        raise FileNotFoundError(f"mlxp job not found: {name}")
     status = job_data.get("status", {}) or {}
     start = status.get("startTime") or ""
     end = status.get("completionTime") or ""
@@ -182,13 +266,19 @@ async def cancel_job(name: str) -> None:
 
 
 async def tail_logs(job_name: str, follow: bool = True):
-    """Yield log lines for the job's pod via `kubectl logs`."""
+    """Stream log lines for an MLXP job.
+
+    Primary source is `kubectl logs` on the job's pod. Once a job's k8s
+    record has been GC'd we fall back to the on-DDN log file the body
+    script left at `<exp_dir>/checkpoints/logs/training_rank0.log`.
+    """
     if shutil.which("kubectl") is None:
         raise RuntimeError("kubectl not found on PATH")
-    # Resolve pod name first.
     pod_data = await _kubectl_json("get", "pods", "-n", _NS, "-l", f"job-name={job_name}")
     pods = pod_data.get("items", [])
     if not pods:
+        async for line in _tail_archived_log(job_name):
+            yield line
         return
     pod_name = pods[0]["metadata"]["name"]
 
@@ -201,6 +291,45 @@ async def tail_logs(job_name: str, follow: bool = True):
     # 64KB (asyncio's default) a long-running tqdm bar overflows readline.
     proc = await asyncio.create_subprocess_exec(
         *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        limit=1 << 20,
+    )
+    assert proc.stdout is not None
+    try:
+        async for line in _iter_logical_lines(proc.stdout):
+            yield line
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+
+
+async def _tail_archived_log(job_name: str):
+    """Serve <variant>/checkpoints/logs/training_rank0.log via the data pod,
+    holding the connection open with tail -F so EventSource doesn't loop."""
+    import shlex
+    from .details import parse_phase_and_variant
+    from .mlxp_data_pod import ensure_listing_pod
+
+    _, variant = parse_phase_and_variant(job_name, "mlxp")
+    if not variant:
+        return
+    log_path = f"/data/youngwoong/experiments/{variant}/checkpoints/logs/training_rank0.log"
+    try:
+        pod = await ensure_listing_pod()
+    except Exception:
+        return
+    cmd = (
+        f"if [ -f {shlex.quote(log_path)} ]; then "
+        f"  exec tail -n +1 -F {shlex.quote(log_path)}; "
+        "else "
+        f"  echo '(no log file at {log_path})'; "
+        "  sleep 86400; "  # hold the connection so EventSource doesn't reconnect-loop
+        "fi"
+    )
+    proc = await asyncio.create_subprocess_exec(
+        "kubectl", "exec", "-n", _NS, pod, "--", "bash", "-c", cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         limit=1 << 20,
@@ -242,3 +371,25 @@ async def _iter_logical_lines(reader):
             buf = buf[idx + 1:]
             if line:
                 yield line.decode(errors="replace")
+
+
+async def _archived_record(name: str) -> dict[str, Any] | None:
+    """Return a sacct-shaped dict for a single archived (k8s-gone) job by
+    walking DDN. Returns None if no checkpoint dir matches the name."""
+    archived = await _list_archived_jobs(seen=set())
+    for j in archived:
+        if j.job_name == name:
+            return {
+                "JobID": j.job_id,
+                "JobName": j.job_name,
+                "Partition": j.partition,
+                "State": j.state,
+                "ExitCode": "",
+                "Start": j.start or "",
+                "End": j.end or "",
+                "Elapsed": j.elapsed,
+                "NodeList": j.nodelist,
+                "Reason": "(archived; k8s record GC'd)",
+                "cluster": "mlxp",
+            }
+    return None

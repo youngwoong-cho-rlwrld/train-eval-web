@@ -30,9 +30,13 @@ log "$EXP_NAME"
 log "  cluster=$CLUSTER  partition=$PARTITION  gpu=$GPU_INSTANCE"
 log "========================================================"
 
-LAST_CKPT=$(ls -d ${CKPT_DIR}/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1)
-if [ -z "$LAST_CKPT" ]; then
-    log "ERROR: No checkpoint found in ${CKPT_DIR}"
+if [ -n "${EVAL_CHECKPOINT:-}" ]; then
+    LAST_CKPT="$EVAL_CHECKPOINT"
+else
+    LAST_CKPT=$(ls -d ${CKPT_DIR}/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1)
+fi
+if [ -z "$LAST_CKPT" ] || [ ! -d "$LAST_CKPT" ]; then
+    log "ERROR: no checkpoint at '$LAST_CKPT'"
     exit 1
 fi
 log "Checkpoint: $LAST_CKPT"
