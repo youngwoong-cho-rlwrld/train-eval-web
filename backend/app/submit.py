@@ -79,6 +79,30 @@ class SubmitRequest(BaseModel):
     # Eval-only: absolute path to the checkpoint dir on the cluster. The
     # eval body uses this verbatim when set; otherwise it auto-picks.
     checkpoint_path: str | None = None
+    # Optional override for the auto-generated job_name. Must match
+    # `{train|resume|eval}_<anything>_<YYYYMMDD>_<HHMMSS>` so the parser
+    # keeps working. None → server builds the default.
+    job_name: str | None = None
+
+
+def make_default_job_name(phase: str, variant: str) -> str:
+    return f"{phase}_{variant}_{datetime.now():%Y%m%d_%H%M%S}"
+
+
+def resolve_job_name(req_job_name: str | None, phase: str, variant: str) -> str:
+    """Return user-provided job_name if non-empty, else build the default.
+
+    No format validation — caller may pass any string. Note that names that
+    don't match `{phase}_<slug>_<YYYYMMDD>_<HHMMSS>` will resolve to
+    ("unknown", None) in parse_phase_and_variant, so phase/variant won't be
+    derivable from the name.
+    """
+    if req_job_name is None:
+        return make_default_job_name(phase, variant)
+    name = req_job_name.strip()
+    if not name:
+        return make_default_job_name(phase, variant)
+    return name
 
 
 class SubmitResponse(BaseModel):
@@ -163,12 +187,17 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     # Unified shape across slurm + MLXP. The cluster/partition were
     # cosmetic in the slurm filename — drop them; the table column shows
     # both, and `parse_phase_and_variant` now expects this exact format.
-    job_name = f"{req.phase}_{req.variant}_{datetime.now():%Y%m%d_%H%M%S}"
+    job_name = resolve_job_name(req.job_name, req.phase, req.variant)
     log_dir = cluster.vars["LOG_DIR"]
     resume_expected = "1" if req.phase == "resume" else "0"
 
     body_path = f"$HOME/{CLUSTER_STAGING_REL}/lib/{body_script}"
     repo_root_remote = f"$HOME/{CLUSTER_STAGING_REL}"
+
+    # Persist phase+variant in sacct's Comment field so the details page can
+    # recover them even when the user picked a custom job_name that doesn't
+    # match the unified regex.
+    comment = f"phase={req.phase};variant={req.variant}"
 
     sbatch_parts = [
         "/opt/slurm/bin/sbatch",
@@ -179,6 +208,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         f"--time={shlex.quote(walltime)}",
         f"--output={log_dir}/{job_name}_%j.out",
         f"--error={log_dir}/{job_name}_%j.err",
+        f"--comment={shlex.quote(comment)}",
         f"--export=ALL,VARIANT={shlex.quote(req.variant)},CLUSTER={shlex.quote(req.cluster)},"
         f"REPO_ROOT={repo_root_remote},RESUME_EXPECTED={resume_expected},"
         # Pin wandb run id to the slurm display name so the URL is stable
@@ -206,6 +236,22 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     if not m:
         raise RuntimeError(f"could not parse sbatch output: {sb.stdout!r}")
     job_id = m.group(1)
+
+    # Persistent sidecar so the details page can recover phase/variant for
+    # this job_id forever. Slurm's --comment is unreliable: it's on the
+    # live controller (scontrol) but most slurmdbd setups (kakao's
+    # included) don't archive it to sacct.
+    meta_dir = "$HOME/.train-eval-web/jobs"
+    meta = (
+        f"phase={req.phase}\n"
+        f"variant={req.variant}\n"
+        f"job_name={job_name}\n"
+    )
+    meta_cmd = (
+        f"mkdir -p {meta_dir} && "
+        f"cat > {meta_dir}/{job_id}.meta <<'EOF'\n{meta}EOF"
+    )
+    await ssh_run(host, meta_cmd, timeout=15.0)
 
     return SubmitResponse(
         job_id=job_id,

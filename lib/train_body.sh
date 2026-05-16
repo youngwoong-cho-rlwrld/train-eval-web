@@ -10,7 +10,10 @@ export NO_ALBUMENTATIONS_UPDATE=1
 : "${REPO_ROOT:?REPO_ROOT must be set by submit wrapper}"
 : "${CLUSTER:?CLUSTER must be set by submit wrapper}"
 : "${VARIANT:?VARIANT must be set by submit wrapper}"
+# Cluster envs still export legacy REPO_ROOT; keep the submitted staging root.
+SUBMIT_REPO_ROOT="$REPO_ROOT"
 source "$REPO_ROOT/clusters/${CLUSTER}.env"
+REPO_ROOT="$SUBMIT_REPO_ROOT"
 source "$REPO_ROOT/lib/_common.sh"
 
 EXP_DIR="$REPO_ROOT/experiments/$VARIANT"
@@ -92,13 +95,7 @@ source "$GROOT_DIR/.venv/bin/activate"
 export WANDB_PROJECT=gr00t
 export WANDB_DIR="$EXP_DIR"
 
-# WANDB_RUN_ID is normally passed via sbatch --export by the web submit; fall
-# back to slurm_<job_id> for legacy bash ./submit invocations.
-if [ -n "${SLURM_JOB_ID:-}" ]; then
-    : "${WANDB_RUN_ID:=slurm_${SLURM_JOB_ID}}"
-    export WANDB_RUN_ID
-    export WANDB_RESUME=allow
-fi
+export WANDB_RESUME=allow
 
 python scripts/gr00t_finetune.py \
     --num-gpus "$TRAIN_NUM_GPUS" \

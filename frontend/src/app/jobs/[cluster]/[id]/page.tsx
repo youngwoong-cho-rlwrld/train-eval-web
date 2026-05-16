@@ -236,9 +236,9 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
         </Card>
       </div>
 
-      {details.data?.variant && (
+      {details.data && (
         <ConfigCard
-          variantName={details.data.variant}
+          variantName={details.data.variant ?? null}
           flagsUrl={`/api/jobs/${cluster}/${id}/flags`}
           queryKey={["job-flags", cluster, id]}
           modalityConfigFile={variantQuery.data?.vars.TRAIN_MODALITY_CONFIG ?? null}
@@ -303,11 +303,15 @@ function ProgressCard({ d }: { d: JobDetails }) {
     }
   }
 
-  const label = isComplete
+  // Training jobs deserve a tidy "step N/N" at completion even if the live
+  // current_label decayed; eval/other phases already carry a meaningful
+  // current_label (e.g. "15/15 runs · episode 70/70") so respect it.
+  const isTrainPhase = d.phase === "train" || d.phase === "resume";
+  const label = isComplete && isTrainPhase
     ? p.max_steps
       ? `step ${p.max_steps.toLocaleString()}/${p.max_steps.toLocaleString()}`
       : "Complete"
-    : p.current_label;
+    : (p.current_label ?? (isComplete ? "Complete" : null));
 
   return (
     <Card>

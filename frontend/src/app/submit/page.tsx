@@ -39,6 +39,16 @@ import { useDatasetDir } from "@/hooks/use-dataset-dir";
 
 type Phase = "train" | "resume" | "eval";
 
+function buildDefaultJobName(phase: Phase, variant: string): string {
+  if (!variant) return "";
+  const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const ts =
+    `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}` +
+    `_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+  return `${phase}_${variant}_${ts}`;
+}
+
 export default function SubmitPage() {
   const router = useRouter();
   const qc = useQueryClient();
@@ -52,6 +62,8 @@ export default function SubmitPage() {
   const [extraArgs, setExtraArgs] = useState<string>("");
   const [checkpointPath, setCheckpointPath] = useState<string>("");
   const [checkpointTouched, setCheckpointTouched] = useState<boolean>(false);
+  const [jobName, setJobName] = useState<string>("");
+  const [jobNameTouched, setJobNameTouched] = useState<boolean>(false);
 
   // Dataset override state. For single-task variants, `singleDataset` holds
   // the chosen name. For multi-task, `multiDatasets` holds the array of
@@ -112,6 +124,20 @@ export default function SubmitPage() {
       ),
     enabled: wantsCheckpoint,
   });
+  const trimmedCkpt = checkpointPath.trim();
+  const checkpointExists = useQuery({
+    queryKey: ["path-exists", cluster, trimmedCkpt],
+    queryFn: () =>
+      api<{ exists: boolean; kind: "dir" | "file" | null }>(
+        `/api/clusters/${cluster}/path-exists?path=${encodeURIComponent(trimmedCkpt)}`,
+      ),
+    enabled: wantsCheckpoint && !!trimmedCkpt,
+  });
+  const checkpointExistsValue: boolean | null = !trimmedCkpt
+    ? null
+    : checkpointExists.isLoading || checkpointExists.data === undefined
+      ? null
+      : checkpointExists.data.exists;
 
   // Prefill checkpoint with the auto-detected one until the user types over it.
   useEffect(() => {
@@ -119,6 +145,14 @@ export default function SubmitPage() {
       setCheckpointPath(selectedCkpt.data.path);
     }
   }, [selectedCkpt.data?.path, checkpointTouched]);
+
+  // Auto-fill job_name with the default until the user types over it.
+  // For MLXP, phase is locked to "train" — defaults reflect that.
+  useEffect(() => {
+    if (jobNameTouched) return;
+    const effectivePhase = isSlurm ? phase : "train";
+    setJobName(buildDefaultJobName(effectivePhase, variantName));
+  }, [phase, variantName, isSlurm, jobNameTouched]);
   // Reset prefill state when variant / cluster / phase changes.
   useEffect(() => {
     setCheckpointPath("");
@@ -174,6 +208,7 @@ export default function SubmitPage() {
           dataset_override,
           extra_args: extraArgs.split(/\s+/).filter(Boolean),
           checkpoint_path: wantsCheckpoint ? checkpointPath.trim() : null,
+          job_name: jobNameTouched ? jobName.trim() : null,
         }),
       });
     },
@@ -188,7 +223,8 @@ export default function SubmitPage() {
   const canSubmit =
     !!variantName &&
     (isSlurm ? !!partition : !!mlxpNode) &&
-    (!wantsCheckpoint || !!checkpointPath.trim()) &&
+    (!wantsCheckpoint ||
+      (!!trimmedCkpt && checkpointExistsValue !== false)) &&
     !submit.isPending;
   const selectedPartition = partitions.data?.find((p) => p.name === partition);
 
@@ -321,6 +357,48 @@ export default function SubmitPage() {
                     />
                   )}
 
+                  <Field
+                    label={
+                      <span className="flex items-center gap-2">
+                        Job name
+                        <span className="font-mono text-xs font-normal text-slate-500">
+                          {jobName.length}
+                        </span>
+                      </span>
+                    }
+                  >
+                    <div className="flex gap-2">
+                      <Input
+                        value={jobName}
+                        onChange={(e) => {
+                          setJobName(e.target.value);
+                          setJobNameTouched(true);
+                        }}
+                        placeholder={
+                          variantName
+                            ? buildDefaultJobName(phase, variantName)
+                            : "pick a variant first"
+                        }
+                        className="flex-1 font-mono text-xs"
+                      />
+                      {jobNameTouched && (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => {
+                            setJobNameTouched(false);
+                            setJobName(buildDefaultJobName(phase, variantName));
+                          }}
+                        >
+                          Reset to default
+                        </Button>
+                      )}
+                    </div>
+                    <p className="text-xs text-slate-500">
+                      Used as <code>--job-name</code> and the wandb run id.
+                    </p>
+                  </Field>
+
                   {wantsCheckpoint && (
                     <Field label="Checkpoint">
                       <Input
@@ -334,15 +412,24 @@ export default function SubmitPage() {
                             ? "looking up auto-pick…"
                             : "/absolute/path/to/checkpoint-N"
                         }
-                        className="font-mono text-xs"
+                        className={
+                          trimmedCkpt && checkpointExistsValue === false
+                            ? "font-mono text-xs border-red-500 focus-visible:ring-red-500"
+                            : "font-mono text-xs"
+                        }
                       />
-                      {!checkpointPath.trim() && !selectedCkpt.isLoading && (
+                      {!trimmedCkpt && !selectedCkpt.isLoading && (
                         <p className="text-xs text-red-600 dark:text-red-400">
                           Choose a checkpoint
                         </p>
                       )}
-                      {checkpointPath.trim() && selectedCkpt.data?.path &&
-                        checkpointPath.trim() !== selectedCkpt.data.path && (
+                      {trimmedCkpt && checkpointExistsValue === false && (
+                        <p className="text-xs text-red-600 dark:text-red-400">
+                          Path not found on <code>{cluster}</code>.
+                        </p>
+                      )}
+                      {trimmedCkpt && selectedCkpt.data?.path &&
+                        trimmedCkpt !== selectedCkpt.data.path && (
                           <p className="text-xs text-slate-500">
                             Auto-pick was{" "}
                             <code>{selectedCkpt.data.path}</code> — overriding.
@@ -427,6 +514,49 @@ export default function SubmitPage() {
                     />
                   )}
 
+                  <Field
+                    label={
+                      <span className="flex items-center gap-2">
+                        Job name
+                        <span className="font-mono text-xs font-normal text-slate-500">
+                          {jobName.length}
+                        </span>
+                      </span>
+                    }
+                  >
+                    <div className="flex gap-2">
+                      <Input
+                        value={jobName}
+                        onChange={(e) => {
+                          setJobName(e.target.value);
+                          setJobNameTouched(true);
+                        }}
+                        placeholder={
+                          variantName
+                            ? buildDefaultJobName("train", variantName)
+                            : "pick a variant first"
+                        }
+                        className="flex-1 font-mono text-xs"
+                      />
+                      {jobNameTouched && (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => {
+                            setJobNameTouched(false);
+                            setJobName(buildDefaultJobName("train", variantName));
+                          }}
+                        >
+                          Reset to default
+                        </Button>
+                      )}
+                    </div>
+                    <p className="text-xs text-slate-500">
+                      Carried as the MLXP <code>display-name</code> annotation
+                      and the wandb run id.
+                    </p>
+                  </Field>
+
                   <Field label="Extra gr00t_finetune.py args (optional)">
                     <Input
                       placeholder="--tune-visual --random-diffusion"
@@ -447,6 +577,8 @@ export default function SubmitPage() {
               modalityConfigFile={variant.data.vars.TRAIN_MODALITY_CONFIG ?? null}
               cluster={cluster}
               phase={phase}
+              checkpointOverride={wantsCheckpoint ? checkpointPath : null}
+              checkpointOverrideExists={checkpointExistsValue}
               className="mt-6"
             />
           )}
@@ -479,7 +611,7 @@ function Field({
   label,
   children,
 }: {
-  label: string;
+  label: React.ReactNode;
   children: React.ReactNode;
 }) {
   return (

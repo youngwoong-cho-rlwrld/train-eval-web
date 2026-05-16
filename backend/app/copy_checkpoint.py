@@ -124,7 +124,7 @@ async def list_checkpoints(cluster: str, job_id: str) -> list[CheckpointEntry]:
     with no per-run nesting; we surface each `checkpoint-N` as its own folder.
     """
     sacct = await get_job(cluster, job_id)
-    _, variant = parse_phase_and_variant(sacct.get("JobName") or job_id, cluster)
+    _, variant = parse_phase_and_variant(sacct.get("JobName") or job_id)
     if not variant:
         return []
 
@@ -202,7 +202,7 @@ async def start_copy(
         raise ValueError("no checkpoints selected")
 
     sacct = await get_job(src_cluster, src_job)
-    _, variant = parse_phase_and_variant(sacct.get("JobName") or src_job, src_cluster)
+    _, variant = parse_phase_and_variant(sacct.get("JobName") or src_job)
     if not variant:
         raise ValueError("could not resolve variant from job name")
 

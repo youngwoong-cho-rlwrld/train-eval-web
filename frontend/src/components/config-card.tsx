@@ -19,33 +19,46 @@ export function ConfigCard({
   queryKey,
   cluster,
   phase,
+  checkpointOverride,
+  checkpointOverrideExists,
   className,
 }: {
-  variantName: string;
+  variantName: string | null;
   modalityConfigFile?: string | null;
   flagsUrl: string;
   queryKey: unknown[];
   cluster?: string;
   phase?: string;
+  checkpointOverride?: string | null;
+  // null = unknown / not yet checked; true/false = result from
+  // /api/clusters/<c>/path-exists. Owned by the parent so it can also
+  // gate the Submit button.
+  checkpointOverrideExists?: boolean | null;
   className?: string;
 }) {
   const flags = useQuery({
     queryKey,
     queryFn: () => api<{ flags: FlagEntry[] }>(flagsUrl),
+    enabled: !!variantName,
   });
-  const wantsCheckpoint = phase === "eval" && !!cluster && cluster !== "mlxp";
+  const wantsCheckpoint =
+    !!variantName && phase === "eval" && !!cluster && cluster !== "mlxp";
+  const overridePath = checkpointOverride?.trim() || null;
   const selectedCkpt = useQuery({
     queryKey: ["selected-checkpoint", variantName, cluster],
     queryFn: () =>
       api<{ path: string | null; step: number | null }>(
         `/api/variants/${variantName}/selected-checkpoint?cluster=${cluster}`,
       ),
-    enabled: wantsCheckpoint,
+    enabled: wantsCheckpoint && !overridePath,
   });
-  const configPath = `configs/experiments/${variantName}/config.sh`;
-  const modalityPath = modalityConfigFile
-    ? `configs/experiments/${variantName}/${modalityConfigFile}`
+  const configPath = variantName
+    ? `configs/experiments/${variantName}/config.sh`
     : null;
+  const modalityPath =
+    variantName && modalityConfigFile
+      ? `configs/experiments/${variantName}/${modalityConfigFile}`
+      : null;
 
   return (
     <Card className={className}>
@@ -53,22 +66,33 @@ export function ConfigCard({
         <CardTitle>
           Config{" "}
           <span className="text-xs font-normal text-slate-500">
-            {variantName}
+            {variantName ?? "(variant unknown — couldn't parse job_name)"}
           </span>
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="divide-y divide-slate-100 dark:divide-slate-900">
-          <ConfigPathRow label="config" value={configPath} />
+          {configPath && <ConfigPathRow label="config" value={configPath} />}
           {modalityPath && (
             <ConfigPathRow label="modality" value={modalityPath} />
           )}
           {wantsCheckpoint && (
             <ConfigPathRow
               label="checkpoint"
+              tone={
+                overridePath && checkpointOverrideExists === false
+                  ? "error"
+                  : "default"
+              }
               value={
-                selectedCkpt.data?.path ??
-                (selectedCkpt.isLoading ? "…" : "(none found — eval will fail)")
+                overridePath
+                  ? checkpointOverrideExists === null
+                    ? `${overridePath}  (checking…)`
+                    : checkpointOverrideExists
+                      ? overridePath
+                      : `${overridePath}  (not found on ${cluster})`
+                  : selectedCkpt.data?.path ??
+                    (selectedCkpt.isLoading ? "…" : "(none found — eval will fail)")
               }
             />
           )}
@@ -95,13 +119,25 @@ export function ConfigCard({
   );
 }
 
-function ConfigPathRow({ label, value }: { label: string; value: string }) {
+function ConfigPathRow({
+  label,
+  value,
+  tone = "default",
+}: {
+  label: string;
+  value: string;
+  tone?: "default" | "error";
+}) {
+  const valueClass =
+    tone === "error"
+      ? "flex-1 truncate font-mono text-xs text-red-600 dark:text-red-400"
+      : "flex-1 truncate font-mono text-xs";
   return (
     <div className="flex items-center justify-between gap-4 py-2">
       <div className="min-w-[110px] text-xs uppercase tracking-wide text-slate-500">
         {label}
       </div>
-      <div className="flex-1 truncate font-mono text-xs">{value}</div>
+      <div className={valueClass}>{value}</div>
       <CopyButton value={value} />
     </div>
   );

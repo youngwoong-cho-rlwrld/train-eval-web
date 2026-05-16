@@ -4,7 +4,9 @@ Keeps the same shape as slurm's `jobs.py` so the existing /jobs and
 /jobs/<cluster>/<id> UI consumes both without branching.
 
 Conventions:
-  - Job names produced by mlxp_submit are `youngwoong-train-<variant>-<ts>`.
+  - k8s Job name = 6-char alpha-leading id (e.g. `m41d60`). Display name
+    is carried as the annotation `train-eval-web/display-name` with shape
+    `{phase}_{variant}_{YYYYMMDD}_{HHMMSS}` — same as slurm's job_name.
   - Jobs are labelled `owner=youngwoong,tool=train-eval-web`. We list by label.
   - State synthesized from job.status counts (Pending/Running/Succeeded/Failed).
 """
@@ -113,11 +115,11 @@ async def _list_live_jobs() -> list[Job]:
 
     out: list[Job] = []
     for j in data.get("items", []):
-        name = j["metadata"]["name"]
+        job_id = j["metadata"]["name"]
         annotations = (j["metadata"].get("annotations") or {})
-        display_name = annotations.get("train-eval-web/display-name") or name
+        job_name = annotations.get("train-eval-web/display-name") or job_id
         status = j.get("status", {}) or {}
-        pod = pods_by_job.get(name)
+        pod = pods_by_job.get(job_id)
         state = _state_from_pod_and_job(status, pod)
         start = status.get("startTime")
         end = status.get("completionTime")
@@ -126,7 +128,7 @@ async def _list_live_jobs() -> list[Job]:
         nodelist = (pod or {}).get("spec", {}).get("nodeName") or "(unscheduled)"
 
         out.append(Job(
-            cluster="mlxp", job_id=name, job_name=display_name, partition="mlxp",
+            cluster="mlxp", job_id=job_id, job_name=job_name, partition="mlxp",
             state=state, elapsed=elapsed, nodelist=nodelist,
             start=start, end=end,
         ))
@@ -237,13 +239,13 @@ async def get_job(name: str) -> dict[str, Any]:
             reason = c["reason"]
             break
 
-    display_name = (
-        ((job_data.get("metadata") or {}).get("annotations") or {})
-        .get("train-eval-web/display-name") or name
-    )
+    annotations = ((job_data.get("metadata") or {}).get("annotations") or {})
+    job_name = annotations.get("train-eval-web/display-name") or name
+    job_comment = annotations.get("train-eval-web/comment") or ""
     return {
         "JobID": name,
-        "JobName": display_name,
+        "JobName": job_name,
+        "JobComment": job_comment,
         "Partition": "mlxp",
         "State": state,
         "ExitCode": exit_code,
@@ -318,7 +320,7 @@ async def _tail_archived_log(job_name: str):
     from .details import parse_phase_and_variant
     from .mlxp_data_pod import ensure_listing_pod
 
-    _, variant = parse_phase_and_variant(job_name, "mlxp")
+    _, variant = parse_phase_and_variant(job_name)
     if not variant:
         return
     log_path = f"/data/youngwoong/experiments/{variant}/checkpoints/logs/training_rank0.log"

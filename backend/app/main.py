@@ -51,6 +51,32 @@ async def get_mlxp_gpus():
         raise HTTPException(503, str(e))
 
 
+@app.get("/api/clusters/{name}/path-exists")
+async def get_path_exists(name: str, path: str):
+    """Check whether `path` exists (file or dir) on the cluster.
+
+    Used by the submit page to verify a user-typed eval checkpoint path
+    before launching. Slurm-only; mlxp eval isn't wired yet.
+    """
+    if name == "mlxp":
+        return {"exists": False, "kind": None}
+    if not path or not path.strip():
+        return {"exists": False, "kind": None}
+    try:
+        env = await clusters.load_cluster(name)
+    except FileNotFoundError:
+        raise HTTPException(404, f"cluster {name} not found")
+    from .ssh import ssh_run
+    import shlex
+    p = shlex.quote(path.strip())
+    cmd = f'if [ -d {p} ]; then echo dir; elif [ -f {p} ]; then echo file; else echo none; fi'
+    r = await ssh_run(env.ssh_alias, cmd, timeout=10.0)
+    kind = r.stdout.strip()
+    if kind not in ("dir", "file"):
+        return {"exists": False, "kind": None}
+    return {"exists": True, "kind": kind}
+
+
 @app.get("/api/clusters/{name}/datasets", response_model=list[datasets.DatasetInfo])
 async def get_cluster_datasets(name: str, path: str | None = None):
     if name not in clusters.list_clusters():
@@ -146,10 +172,11 @@ async def post_submit(req: submit.SubmitRequest):
                 node=req.node,
                 dataset_override=req.dataset_override,
                 extra_args=req.extra_args,
+                job_name=req.job_name,
             )
             r = await mlxp_submit.submit_mlxp(mlxp_req)
             return {
-                "job_id": r.job_name,
+                "job_id": r.job_id,
                 "job_name": r.job_name,
                 "partition": f"mlxp/{mlxp_req.num_gpus}gpu",
                 "sbatch_cmd": "kubectl apply (rendered Job YAML)",

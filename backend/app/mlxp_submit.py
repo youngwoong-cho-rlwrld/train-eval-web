@@ -55,12 +55,14 @@ class MlxpSubmitRequest(BaseModel):
     dataset_override: str | list[str] | None = None
     extra_args: list[str] = []
     wandb_secret: str = "youngwoong-wandb"
+    # Optional override for the auto-generated display job_name. Validated
+    # against the unified regex in submit.resolve_job_name.
+    job_name: str | None = None
 
 
 class MlxpSubmitResponse(BaseModel):
     job_id: str             # 6-char k8s Job name, used in /jobs/<cluster>/<id>
-    display_name: str       # human-readable {phase}_{variant}_{ts}
-    job_name: str           # alias for job_id (frontend compatibility)
+    job_name: str           # human-readable {phase}_{variant}_{ts}, same shape as slurm
     pod_name: str | None = None
     yaml: str
     apply_stdout: str
@@ -75,16 +77,16 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
     variant = await load_variant(req.variant)
     cpu, mem = _GPU_RESOURCES[req.num_gpus]
 
-    # Two names: the underlying k8s Job uses a 6-char id so URLs are short
-    # and DNS-safe; the display name (logged + used as wandb run name) is
-    # the human-readable `{phase}_{variant}_{YYYYMMDD}_{HHMMSS}`.
-    job_id = "m" + uuid.uuid4().hex[:5]  # 6 chars, always alpha-leading
-    display_name = f"train_{req.variant}_{datetime.now():%Y%m%d_%H%M%S}"
-    job_name = job_id  # what kubectl sees
+    # job_id is the k8s Job resource name — 6-char alpha-leading so it's
+    # DNS-safe and URL-short. job_name is the display name carried as an
+    # annotation; same shape as slurm's job_name.
+    from .submit import resolve_job_name
+    job_id = "m" + uuid.uuid4().hex[:5]
+    job_name = resolve_job_name(req.job_name, "train", req.variant)
 
     node = req.node or DEFAULT_NODE
-    body_script = _render_body_script(variant, req, display_name)
-    spec = _render_job_yaml(job_name, display_name, body_script, req.num_gpus, cpu, mem, req.wandb_secret, node)
+    body_script = _render_body_script(variant, req, job_name)
+    spec = _render_job_yaml(job_id, job_name, body_script, req.num_gpus, cpu, mem, req.wandb_secret, node, req.variant)
     yaml_text = yaml.safe_dump(spec, sort_keys=False)
 
     proc = await asyncio.create_subprocess_exec(
@@ -99,24 +101,22 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
 
     return MlxpSubmitResponse(
         job_id=job_id,
-        display_name=display_name,
-        job_name=job_id,
+        job_name=job_name,
         pod_name=None,
         yaml=yaml_text,
         apply_stdout=stdout.decode(errors="replace").strip(),
     )
 
 
-def _render_body_script(variant, req: MlxpSubmitRequest, display_name: str) -> str:
-    # `display_name` flows into WANDB_RUN_ID, --experiment-name, and the
-    # checkpoint sub-dir launch_finetune.py creates on DDN.
-    job_name = display_name
+def _render_body_script(variant, req: MlxpSubmitRequest, job_name: str) -> str:
     """Render the inline bash the container runs.
 
     Resolves the variant's dataset list, then dispatches to the right gr00t
     entrypoint based on MODEL_VERSION:
       - n1.5 → gr00t_finetune.py with /tmp/data_config.yaml
       - n1.6 → launch_finetune.py with --dataset-path + --modality-config-path
+
+    `job_name` flows into WANDB_RUN_ID and --experiment-name / --run_name.
     """
     model = (variant.vars.get("MODEL_VERSION") or "n1.5").strip()
 
@@ -304,18 +304,24 @@ torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/launch_finetune.py \\
 """
 
 
-def _render_job_yaml(job_name: str, display_name: str, body: str, num_gpus: int, cpu: str, mem: str,
-                     wandb_secret: str, node: str) -> dict:
+def _render_job_yaml(job_id: str, job_name: str, body: str, num_gpus: int, cpu: str, mem: str,
+                     wandb_secret: str, node: str, variant: str) -> dict:
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
         "metadata": {
-            "name": job_name,
+            "name": job_id,
             "namespace": "p-rlwrld",
             "labels": {"owner": "youngwoong", "tool": "train-eval-web"},
             # display-name carries the human-readable {phase}_{variant}_{ts}
             # with underscores — invalid in k8s resource names but fine here.
-            "annotations": {"train-eval-web/display-name": display_name},
+            # comment mirrors slurm's sacct Comment field so the details page
+            # can recover phase/variant even when the user picked a custom
+            # job_name that doesn't match the unified regex.
+            "annotations": {
+                "train-eval-web/display-name": job_name,
+                "train-eval-web/comment": f"phase=train;variant={variant}",
+            },
         },
         "spec": {
             "ttlSecondsAfterFinished": 604800,  # 7 days — Jobs page keeps showing them

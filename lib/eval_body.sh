@@ -10,7 +10,10 @@ export NO_ALBUMENTATIONS_UPDATE=1
 : "${REPO_ROOT:?REPO_ROOT must be set by submit wrapper}"
 : "${CLUSTER:?CLUSTER must be set by submit wrapper}"
 : "${VARIANT:?VARIANT must be set by submit wrapper}"
+# Cluster envs still export legacy REPO_ROOT; keep the submitted staging root.
+SUBMIT_REPO_ROOT="$REPO_ROOT"
 source "$REPO_ROOT/clusters/${CLUSTER}.env"
+REPO_ROOT="$SUBMIT_REPO_ROOT"
 source "$REPO_ROOT/lib/_common.sh"
 
 EXP_DIR="$REPO_ROOT/experiments/$VARIANT"

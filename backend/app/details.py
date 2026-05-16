@@ -1,8 +1,8 @@
 """Per-job extended details: phase, paths, wandb url, progress.
 
-Parses metadata out of the slurm job_name (which is shaped like
-`<phase>_<variant>_<cluster>_<partition>_<timestamp>`), reads variant
-config locally, and asks the cluster a few small questions over SSH to
+Parses metadata out of the job_name (shape `{train|resume|eval}_{variant}_{YYYYMMDD}_{HHMMSS}`,
+identical across slurm and mlxp), reads variant config locally, and asks
+the cluster a few small questions over SSH (slurm) or kubectl (mlxp) to
 compute progress.
 """
 
@@ -21,19 +21,16 @@ from .variants import load_variant
 
 from .wandb_config import get_project
 
-# Wandb config. We can infer two of three pieces from submission state:
-#   - run id: WANDB_RUN_ID pinned by the body script (k8s job_name for
-#     mlxp, slurm_<jobid> for slurm). Already in hand.
+# Wandb config:
+#   - run id: WANDB_RUN_ID pinned by submit.py (slurm) / body script
+#     (mlxp) to job_name. Already in hand here.
 #   - entity: wandb.Api().default_entity after `wandb login` on this
-#     laptop. Resolved lazily in _wandb_step.
+#     laptop. Resolved lazily in _wandb_entity.
 #   - project: configurable in Settings (persisted via wandb_config),
-#     since launch_finetune.py / gr00t_finetune.py override our
-#     exported WANDB_PROJECT internally — no submission-side signal
-#     reveals which project the run actually lands in.
-# Entity override still env-only.
+#     since launch_finetune.py / gr00t_finetune.py override our exported
+#     WANDB_PROJECT internally — no submission-side signal reveals which
+#     project the run actually lands in.
 WANDB_ENTITY_OVERRIDE = os.environ.get("TRAIN_EVAL_WEB_WANDB_ENTITY")
-
-KNOWN_CLUSTERS = ("kakao", "skt")
 
 
 class Paths(BaseModel):
@@ -70,52 +67,84 @@ class JobDetails(BaseModel):
     progress: Progress
 
 
-def parse_phase_and_variant(job_name: str, cluster: str) -> tuple[str, str | None]:
+def parse_phase_and_variant(job_name: str) -> tuple[str, str | None]:
     """Pull (phase, variant) out of a display name.
 
-    Today's shape (both clusters): `{train|eval|resume}_{variant}_{YYYYMMDD}_{HHMMSS}`.
+    Shape (both clusters): `{train|eval|resume}_{variant}_{YYYYMMDD}_{HHMMSS}`.
     The variant itself contains underscores (e.g. `n16_cube_stack_3cm_right_480`),
     so we anchor on the trailing timestamp `_\\d{8}_\\d{6}` to find the boundary.
     """
-    # New unified shape.
     m = re.match(r"^(train|resume|eval)_(.+)_(\d{8}_\d{6})$", job_name)
     if m:
         return m.group(1), m.group(2)
+    return "unknown", None
 
-    # ── legacy: pre-refactor MLXP names `youngwoong-<phase>-<slug>-<ts>` ──
-    if cluster == "mlxp":
-        m = re.match(r"^youngwoong-(train|resume|eval)-(.+)-(\d{8}-\d{6})$", job_name)
-        if not m:
-            return "unknown", None
-        phase = m.group(1)
-        slug = m.group(2).lower()
-        from .variants import list_variants
-        try:
-            available = list_variants()
-            hyphen_map = {v: v.lower().replace("_", "-") for v in available}
-            for v, vh in hyphen_map.items():
-                if vh == slug:
-                    return phase, v
-            prefix_matches = [v for v, vh in hyphen_map.items() if vh.startswith(slug)]
-            if len(prefix_matches) == 1:
-                return phase, prefix_matches[0]
-            if len(prefix_matches) > 1:
-                return phase, max(prefix_matches, key=len)
-        except Exception:
-            pass
-        return phase, slug.replace("-", "_")
 
-    # ── legacy slurm: `{phase}_{variant}_{cluster}_{partition}_{ts}` ──
-    phase_match = re.match(r"^(train|resume|eval)_", job_name)
-    if not phase_match:
-        return "unknown", None
-    phase = phase_match.group(1)
-    after_phase = job_name[len(phase) + 1:]
-    needle = f"_{cluster}_"
-    idx = after_phase.find(needle)
-    if idx < 0:
-        return phase, None
-    return phase, after_phase[:idx]
+def _parse_comment_metadata(comment: str) -> tuple[str | None, str | None]:
+    """Recover (phase, variant) from the sacct Comment / k8s annotation
+    we set at submit time. Shape: 'phase=<p>;variant=<v>'."""
+    if not comment:
+        return None, None
+    fields: dict[str, str] = {}
+    for chunk in comment.split(";"):
+        if "=" in chunk:
+            k, v = chunk.split("=", 1)
+            fields[k.strip()] = v.strip()
+    phase = fields.get("phase")
+    variant = fields.get("variant")
+    if phase not in ("train", "resume", "eval"):
+        phase = None
+    return phase, variant
+
+
+def resolve_phase_and_variant(job_name: str, sacct: dict | None = None) -> tuple[str, str | None]:
+    """Prefer the explicit phase/variant we stashed at submit time (sacct
+    Comment / scontrol Comment / sidecar .meta for slurm, k8s annotation
+    surfaced under JobComment for mlxp). Fall back to parsing the
+    job_name."""
+    if sacct:
+        comment = sacct.get("Comment") or sacct.get("JobComment") or ""
+        phase, variant = _parse_comment_metadata(comment)
+        if phase and variant:
+            return phase, variant
+    return parse_phase_and_variant(job_name)
+
+
+async def _read_slurm_meta(host: str, job_id: str) -> tuple[str | None, str | None]:
+    """Read the phase/variant sidecar written at submit time.
+    `~/.train-eval-web/jobs/<job_id>.meta` shape: lines `key=value`."""
+    r = await ssh_run(
+        host,
+        f"cat $HOME/.train-eval-web/jobs/{job_id}.meta 2>/dev/null",
+        timeout=10.0,
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        return None, None
+    fields: dict[str, str] = {}
+    for line in r.stdout.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            fields[k.strip()] = v.strip()
+    phase = fields.get("phase")
+    if phase not in ("train", "resume", "eval"):
+        phase = None
+    return phase, fields.get("variant")
+
+
+async def _read_slurm_scontrol_comment(host: str, job_id: str) -> str | None:
+    """Pull the Comment field out of `scontrol show job` (the live
+    controller's view — sacct doesn't archive Comment on this cluster)."""
+    r = await ssh_run(
+        host,
+        f"scontrol show job {job_id} 2>/dev/null | tr ' ' '\\n' | grep -m1 '^Comment='",
+        timeout=10.0,
+    )
+    if r.returncode != 0:
+        return None
+    line = r.stdout.strip()
+    if not line.startswith("Comment="):
+        return None
+    return line[len("Comment="):]
 
 
 async def get_details(cluster: str, job_id: str) -> JobDetails:
@@ -124,12 +153,26 @@ async def get_details(cluster: str, job_id: str) -> JobDetails:
     state = sacct.get("State", "")
     elapsed = sacct.get("Elapsed", "")
 
-    phase, variant = parse_phase_and_variant(job_name, cluster)
+    phase, variant = resolve_phase_and_variant(job_name, sacct)
 
     if cluster == "mlxp":
         return await _mlxp_details(job_id, job_name, state, elapsed, phase, variant)
 
     env = await load_cluster(cluster)
+
+    # Slurm: if sacct didn't return Comment (slurmdbd doesn't archive it on
+    # this cluster), check scontrol (works for jobs still in the
+    # controller) and then the on-disk .meta sidecar (permanent).
+    if not variant:
+        scontrol_comment = await _read_slurm_scontrol_comment(env.ssh_alias, job_id)
+        if scontrol_comment:
+            p, v = _parse_comment_metadata(scontrol_comment)
+            if p and v:
+                phase, variant = p, v
+    if not variant:
+        p, v = await _read_slurm_meta(env.ssh_alias, job_id)
+        if p and v:
+            phase, variant = p, v
     log_dir = env.vars["LOG_DIR"]
     stdout_path = f"{log_dir}/{job_name}_{job_id}.out"
     stderr_path = f"{log_dir}/{job_name}_{job_id}.err"
@@ -153,17 +196,10 @@ async def get_details(cluster: str, job_id: str) -> JobDetails:
 
     wandb_url: str | None = None
     if phase in ("train", "resume"):
-        # train_body.sh exports WANDB_RUN_ID=slurm_$SLURM_JOB_ID with WANDB_RESUME=allow.
+        # submit.py pins WANDB_RUN_ID = job_name via sbatch --export.
         entity = await _wandb_entity()
         if entity:
-            # Two run-id shapes:
-            #  - Legacy: name shaped `<phase>_<v>_<cluster>_<partition>_<ts>`;
-            #    body fell back to WANDB_RUN_ID=slurm_<jobid>.
-            #  - New: name `<phase>_<v>_<ts>`; submit.py pins WANDB_RUN_ID
-            #    to that. Discriminate on the embedded `_<cluster>_`.
-            legacy = bool(re.search(r"_(kakao|skt)_", job_name or ""))
-            run_id = f"slurm_{job_id}" if legacy else job_name
-            wandb_url = f"https://wandb.ai/{entity}/{get_project()}/runs/{run_id}"
+            wandb_url = f"https://wandb.ai/{entity}/{get_project()}/runs/{job_name}"
 
     progress = await _compute_progress(cluster, job_id, phase, variant, stdout_path, stderr_path, ckpt_dir, eval_dir)
 
@@ -187,15 +223,16 @@ async def _mlxp_details(job_id: str, job_name: str, state: str, elapsed: str,
         eval_dir=None,
         isaac_logs_glob=None,
     )
-    # mlxp_submit body pins WANDB_RUN_ID=<job_name>, so the wandb URL is
-    # the job_name itself.
+    # mlxp body pins WANDB_RUN_ID = job_name (resolved from the Job's
+    # display-name annotation by get_job). The k8s job_id has no wandb
+    # run behind it.
     entity = await _wandb_entity()
     wandb_url = (
-        f"https://wandb.ai/{entity}/{get_project()}/runs/{job_id}"
+        f"https://wandb.ai/{entity}/{get_project()}/runs/{job_name}"
         if entity else None
     )
 
-    progress = await _mlxp_progress(job_id, variant, phase)
+    progress = await _mlxp_progress(job_name, variant, phase)
 
     return JobDetails(
         cluster="mlxp", job_id=job_id, job_name=job_name,
@@ -204,12 +241,15 @@ async def _mlxp_details(job_id: str, job_name: str, state: str, elapsed: str,
     )
 
 
-async def _mlxp_progress(job_id: str, variant: str | None, phase: str) -> Progress:
+async def _mlxp_progress(run_id: str, variant: str | None, phase: str) -> Progress:
     """Progress for an MLXP training job.
 
     Primary source: the run's wandb summary (its `_step` field is updated
     every logging tick — i.e. every 10 training steps for gr00t-n16).
     Fallback: highest `checkpoint-N` dir on DDN (SAVE_STEPS granularity).
+
+    `run_id` is the wandb run id — the job_name (display name) for MLXP,
+    not the k8s job_id which has no wandb run behind it.
     """
     import asyncio
 
@@ -228,7 +268,7 @@ async def _mlxp_progress(job_id: str, variant: str | None, phase: str) -> Progre
         return progress
 
     # 1. wandb — fine-grained (per logging tick).
-    step = await _wandb_step(job_id)
+    step = await _wandb_step(run_id)
     if step is not None:
         progress.current_step = step
         if progress.max_steps:
@@ -337,13 +377,33 @@ _BODY_SUFFIX_RE = re.compile(r"/lib/(train|eval)_body(?:_n16)?\.sh$")
 async def _resolve_exp_dir(host: str, job_id: str, variant: str) -> str:
     """Find the variant's experiment dir on the cluster, per-job.
 
-    Different submission tools write to different roots: the legacy bash
-    `./submit` uses `$REPO_ROOT/experiments/<v>` where `$REPO_ROOT` is
-    `~/train-eval-scripts`; the web app uses `~/.train-eval-web`. Ask
-    slurm which one this specific job actually ran from by parsing the
-    Command field of `scontrol show job`.
+    Two parallel submission paths write to different roots:
+      - web app  → `~/.train-eval-web/experiments/<v>`
+      - bash CLI → `~/train-eval-scripts/experiments/<v>`
+
+    Whichever the live job is actually using is the one with a fresh
+    `logs/` subdir. We pick by mtime — that handles the case where the
+    scontrol Command path doesn't match the running job's REPO_ROOT
+    (the user can `bash ./submit` from train-eval-scripts but with a
+    body script copied into .train-eval-web, and vice versa).
     """
-    # Try scontrol first (works while the job is in slurm's recent memory).
+    candidates = [
+        f"$HOME/{CLUSTER_STAGING_REL}/experiments/{variant}",
+        f"$HOME/train-eval-scripts/experiments/{variant}",
+    ]
+    # Pick the candidate whose logs/ has the most recent mtime. Returns
+    # one line: the winning candidate path, or empty if neither has logs/.
+    script = " ; ".join(
+        f'[ -d {c}/logs ] && echo "$(stat -c %Y {c}/logs 2>/dev/null) {c}"'
+        for c in candidates
+    ) + " | sort -n | tail -1 | awk '{print $2}'"
+    r = await ssh_run(host, script, timeout=10.0)
+    chosen = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ""
+    if chosen:
+        return chosen
+
+    # No logs/ in either candidate → derive from scontrol's Command path
+    # (works while the job is in slurm's recent memory).
     r = await ssh_run(host, f"scontrol show job {job_id} 2>/dev/null | grep -m1 '^   Command='", timeout=10.0)
     if r.returncode == 0 and r.stdout.strip():
         line = r.stdout.strip()
@@ -353,12 +413,8 @@ async def _resolve_exp_dir(host: str, job_id: str, variant: str) -> str:
             repo_root = cmd_path[: m.start()]
             return f"{repo_root}/experiments/{variant}"
 
-    # Fallback for jobs that have aged out of scontrol — probe both known paths.
-    candidates = [
-        f"$HOME/train-eval-scripts/experiments/{variant}",
-        f"$HOME/{CLUSTER_STAGING_REL}/experiments/{variant}",
-    ]
-    probe = " || ".join(f"(test -d {c} && echo {c})" for c in candidates)
+    # Last resort: existence probe.
+    probe = " ; ".join(f"(test -d {c} && echo {c})" for c in candidates)
     r = await ssh_run(host, probe, timeout=10.0)
     lines = r.stdout.strip().splitlines()
     if lines:
@@ -427,22 +483,63 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
         v = await load_variant(variant)
         eval_sets = v.arrays.get("EVAL_SETS", [])
         n_runs = int(v.vars.get("N_RUNS", "0") or 0)
+        n_eps = int(v.vars.get("N_EPISODES", "0") or 0)
         tasks = v.arrays.get("TASKS") or ["__single__"]
         total = max(len(tasks) * len(eval_sets) * n_runs, 0)
         progress.total_runs = total or None
 
-        if eval_dir and total > 0:
-            host = (await load_cluster(cluster)).ssh_alias
-            r = await ssh_run(
-                host,
-                f"find {eval_dir} -type f -name results.json 2>/dev/null | wc -l",
-                timeout=10.0,
+        if not (eval_dir and total > 0):
+            return progress
+
+        host = (await load_cluster(cluster)).ssh_alias
+        # Completed runs = number of results.json files written by the body.
+        r = await ssh_run(
+            host,
+            f"find {eval_dir} -type f -name results.json 2>/dev/null | wc -l",
+            timeout=10.0,
+        )
+        try:
+            completed = int(r.stdout.strip())
+        except ValueError:
+            completed = 0
+        progress.completed_runs = completed
+
+        # Episode counter inside the *active* server log (most recently
+        # touched server_<set>_run<i>.log). Each "Resetting environment
+        # with seed:" marks an episode boundary; the body's stabilization
+        # pass adds one extra reset, so clamp to N_EPISODES.
+        current_ep = 0
+        logs_dir = eval_dir.rsplit("/", 1)[0] + "/logs"
+        if n_eps > 0:
+            ep_cmd = (
+                f"latest=$(ls -t {logs_dir}/server_*.log 2>/dev/null | head -1); "
+                f"if [ -n \"$latest\" ]; then "
+                f"grep -c 'Resetting environment with seed:' \"$latest\" 2>/dev/null || echo 0; "
+                f"else echo 0; fi"
             )
+            r = await ssh_run(host, ep_cmd, timeout=10.0)
             try:
-                completed = int(r.stdout.strip())
+                current_ep = min(int(r.stdout.strip()), n_eps)
             except ValueError:
-                completed = 0
-            progress.completed_runs = completed
+                current_ep = 0
+
+        # Promote eval into the unified step-based shape so the frontend
+        # ETA + progress bar work the same way as training:
+        #   current_step = completed_runs · N_EPISODES + episodes_in_active_run
+        #   max_steps    = total_runs    · N_EPISODES
+        if n_eps > 0:
+            progress.max_steps = total * n_eps
+            # Don't double-count: if a run finished, current_ep is from a
+            # log file that may still belong to it. Reset to 0 when no
+            # new run has started yet (server log mtime older than newest
+            # results.json), but for simplicity we just rely on the clamp
+            # — overcount of n_eps gets absorbed when results.json lands.
+            progress.current_step = min(completed * n_eps + current_ep, progress.max_steps)
+            progress.percent = round(100.0 * progress.current_step / progress.max_steps, 1)
+            progress.current_label = (
+                f"{completed}/{total} runs · episode {current_ep}/{n_eps}"
+            )
+        else:
             progress.percent = round(100.0 * completed / total, 1)
             progress.current_label = f"{completed}/{total} runs"
     return progress
