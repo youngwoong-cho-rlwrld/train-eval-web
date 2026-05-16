@@ -246,6 +246,11 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         f"phase={req.phase}\n"
         f"variant={req.variant}\n"
         f"job_name={job_name}\n"
+        + (
+            f"checkpoint_path={req.checkpoint_path.strip()}\n"
+            if req.phase == "eval" and req.checkpoint_path and req.checkpoint_path.strip()
+            else ""
+        )
     )
     meta_cmd = (
         f"mkdir -p {meta_dir} && "

@@ -8,6 +8,7 @@ compute progress.
 
 import os
 import re
+import shlex
 from typing import Any
 
 from pydantic import BaseModel
@@ -16,7 +17,7 @@ from .clusters import load_cluster
 from .jobs import get_job
 from .paths import CLUSTER_STAGING_REL
 from .ssh import ssh_run
-from .variants import load_variant
+from .variants import list_variants, load_variant
 
 
 from .wandb_config import get_project
@@ -38,6 +39,7 @@ class Paths(BaseModel):
     stderr: str
     exp_dir: str
     ckpt_dir: str | None = None
+    eval_checkpoint: str | None = None
     eval_dir: str | None = None
     isaac_logs_glob: str | None = None
 
@@ -67,16 +69,56 @@ class JobDetails(BaseModel):
     progress: Progress
 
 
+def _match_known_variant(candidate: str) -> str:
+    """Normalize variant slugs from all historical job-name conventions."""
+    try:
+        variants = list_variants()
+    except Exception:
+        variants = []
+    variants_by_len = sorted(variants, key=len, reverse=True)
+
+    candidates = [candidate]
+    parts = candidate.split("_")
+    # Legacy Slurm names appended `<cluster>_<partition>` after the variant:
+    # train_n15_cube_stack_3cm_right_kakao_background_20260514_...
+    if len(parts) > 2:
+        candidates.append("_".join(parts[:-2]))
+
+    for c in candidates:
+        if not c:
+            continue
+        for variant in variants_by_len:
+            if c == variant or c.startswith(f"{variant}_"):
+                return variant
+        # Older job names predate the explicit 480 suffix, but the current
+        # repo/cluster variant directories carry it.
+        if f"{c}_480" in variants:
+            return f"{c}_480"
+
+    return candidate
+
+
 def parse_phase_and_variant(job_name: str) -> tuple[str, str | None]:
     """Pull (phase, variant) out of a display name.
 
-    Shape (both clusters): `{train|eval|resume}_{variant}_{YYYYMMDD}_{HHMMSS}`.
-    The variant itself contains underscores (e.g. `n16_cube_stack_3cm_right_480`),
-    so we anchor on the trailing timestamp `_\\d{8}_\\d{6}` to find the boundary.
+    Supported shapes:
+      - `{phase}_{variant}_{YYYYMMDD}_{HHMMSS}`
+      - `{prefix}_{phase}_{variant}_{YYYYMMDD}_{HHMMSS}`
+      - legacy `{phase}_{variant}_{cluster}_{partition}_{YYYYMMDD}_{HHMMSS}`
+
+    The variant itself contains underscores, so we first strip the trailing
+    timestamp, then use the known local variant names to remove legacy suffixes.
     """
-    m = re.match(r"^(train|resume|eval)_(.+)_(\d{8}_\d{6})$", job_name)
-    if m:
-        return m.group(1), m.group(2)
+    m = re.match(r"^(.+)_(\d{8}_\d{6})$", job_name)
+    if not m:
+        return "unknown", None
+
+    body = m.group(1)
+    parts = body.split("_")
+    for idx, part in enumerate(parts):
+        if part in ("train", "resume", "eval") and idx + 1 < len(parts):
+            candidate = "_".join(parts[idx + 1:])
+            return part, _match_known_variant(candidate)
     return "unknown", None
 
 
@@ -110,8 +152,16 @@ def resolve_phase_and_variant(job_name: str, sacct: dict | None = None) -> tuple
     return parse_phase_and_variant(job_name)
 
 
-async def _read_slurm_meta(host: str, job_id: str) -> tuple[str | None, str | None]:
-    """Read the phase/variant sidecar written at submit time.
+def _phase_variant_from_meta(fields: dict[str, str]) -> tuple[str | None, str | None]:
+    phase = fields.get("phase")
+    if phase not in ("train", "resume", "eval"):
+        phase = None
+    return phase, fields.get("variant")
+
+
+async def _read_slurm_meta(host: str, job_id: str) -> dict[str, str]:
+    """Read the sidecar written at submit time.
+
     `~/.train-eval-web/jobs/<job_id>.meta` shape: lines `key=value`."""
     r = await ssh_run(
         host,
@@ -119,16 +169,13 @@ async def _read_slurm_meta(host: str, job_id: str) -> tuple[str | None, str | No
         timeout=10.0,
     )
     if r.returncode != 0 or not r.stdout.strip():
-        return None, None
+        return {}
     fields: dict[str, str] = {}
     for line in r.stdout.splitlines():
         if "=" in line:
             k, v = line.split("=", 1)
             fields[k.strip()] = v.strip()
-    phase = fields.get("phase")
-    if phase not in ("train", "resume", "eval"):
-        phase = None
-    return phase, fields.get("variant")
+    return fields
 
 
 async def _read_slurm_scontrol_comment(host: str, job_id: str) -> str | None:
@@ -147,6 +194,74 @@ async def _read_slurm_scontrol_comment(host: str, job_id: str) -> str | None:
     return line[len("Comment="):]
 
 
+async def _resolve_slurm_log_paths(
+    host: str,
+    log_dir: str,
+    job_name: str,
+    job_id: str,
+) -> tuple[str, str, str | None]:
+    """Return stdout/stderr paths and the job-name portion from real logs.
+
+    Historical jobs may not have sidecar metadata, and Slurm accounting can be
+    less reliable than the actual log filenames. The logs all end in
+    `_<job_id>.out|err`, regardless of the job-name convention.
+    """
+    default_stdout = f"{log_dir}/{job_name}_{job_id}.out"
+    default_stderr = f"{log_dir}/{job_name}_{job_id}.err"
+    r = await ssh_run(
+        host,
+        f"ls -1 {shlex.quote(log_dir)}/*_{shlex.quote(job_id)}.out 2>/dev/null | head -1",
+        timeout=10.0,
+    )
+    stdout = r.stdout.strip().splitlines()[0] if r.stdout.strip() else default_stdout
+    if not stdout.endswith(f"_{job_id}.out"):
+        return default_stdout, default_stderr, None
+
+    stderr = f"{stdout[:-4]}.err"
+    leaf = stdout.rsplit("/", 1)[-1]
+    log_job_name = leaf[: -len(f"_{job_id}.out")]
+    return stdout, stderr, log_job_name or None
+
+
+async def _resolve_runtime_exp_dir(
+    host: str,
+    stdout_path: str,
+    phase: str,
+) -> str | None:
+    """Recover the experiment directory the job actually used from stdout."""
+    if phase in ("train", "resume"):
+        patterns = r"Output:[[:space:]]+|output_dir:[[:space:]]+|--output-dir[[:space:]]+"
+    elif phase == "eval":
+        patterns = (
+            r"DONE[[:space:]]+|Saved to .*/results\.json|"
+            r"Running eval -> |SKIP .*results\.json already exists"
+        )
+    else:
+        return None
+
+    r = await ssh_run(
+        host,
+        f"grep -E {shlex.quote(patterns)} {shlex.quote(stdout_path)} 2>/dev/null | tail -20",
+        timeout=10.0,
+    )
+    for line in reversed(r.stdout.splitlines()):
+        if phase in ("train", "resume"):
+            m = re.search(r"Output:\s*(\S+)|output_dir:\s*(\S+)|--output-dir\s+(\S+)", line)
+            if not m:
+                continue
+            ckpt_dir = next((g for g in m.groups() if g), "").strip("'\"")
+            if "/checkpoints" in ckpt_dir:
+                return ckpt_dir.split("/checkpoints", 1)[0]
+        else:
+            m = re.search(r"(?:DONE\s+|Saved to )(\S+)/results\.json", line)
+            if m:
+                return m.group(1)
+            m = re.search(r"(/\S+?)/eval_results(?:/|\s|$)", line)
+            if m:
+                return m.group(1)
+    return None
+
+
 async def get_details(cluster: str, job_id: str) -> JobDetails:
     sacct = await get_job(cluster, job_id)
     job_name = sacct.get("JobName", "")
@@ -159,6 +274,7 @@ async def get_details(cluster: str, job_id: str) -> JobDetails:
         return await _mlxp_details(job_id, job_name, state, elapsed, phase, variant)
 
     env = await load_cluster(cluster)
+    slurm_meta: dict[str, str] = {}
 
     # Slurm: if sacct didn't return Comment (slurmdbd doesn't archive it on
     # this cluster), check scontrol (works for jobs still in the
@@ -170,26 +286,53 @@ async def get_details(cluster: str, job_id: str) -> JobDetails:
             if p and v:
                 phase, variant = p, v
     if not variant:
-        p, v = await _read_slurm_meta(env.ssh_alias, job_id)
+        slurm_meta = await _read_slurm_meta(env.ssh_alias, job_id)
+        p, v = _phase_variant_from_meta(slurm_meta)
         if p and v:
             phase, variant = p, v
+    elif phase == "eval":
+        # Eval details may need checkpoint_path even when phase/variant were
+        # already recovered from the job name or sacct comment.
+        slurm_meta = await _read_slurm_meta(env.ssh_alias, job_id)
     log_dir = env.vars["LOG_DIR"]
-    stdout_path = f"{log_dir}/{job_name}_{job_id}.out"
-    stderr_path = f"{log_dir}/{job_name}_{job_id}.err"
+    stdout_path, stderr_path, log_job_name = await _resolve_slurm_log_paths(
+        env.ssh_alias,
+        log_dir,
+        job_name,
+        job_id,
+    )
+    if not variant and log_job_name:
+        p, v = parse_phase_and_variant(log_job_name)
+        if p != "unknown" and v:
+            phase, variant = p, v
 
     # The per-variant experiment dir on the cluster depends on who submitted:
     # web-submitted jobs use ~/.train-eval-web/experiments/<variant>; jobs
     # launched via the bash `./submit` use ~/train-eval-scripts/experiments/<variant>.
     # Probe both, prefer one that actually exists.
     exp_dir_remote = await _resolve_exp_dir(env.ssh_alias, job_id, variant) if variant else f"$HOME/{CLUSTER_STAGING_REL}/experiments"
+    runtime_exp_dir = await _resolve_runtime_exp_dir(env.ssh_alias, stdout_path, phase)
+    if runtime_exp_dir:
+        exp_dir_remote = runtime_exp_dir
     ckpt_dir = f"{exp_dir_remote}/checkpoints" if phase in ("train", "resume") else None
     eval_dir = f"{exp_dir_remote}/eval_results" if phase == "eval" else None
+    eval_checkpoint = (
+        await _resolve_eval_checkpoint(
+            env.ssh_alias,
+            stdout_path,
+            exp_dir_remote,
+            slurm_meta.get("checkpoint_path"),
+        )
+        if phase == "eval" and variant
+        else None
+    )
     isaac_logs_glob = f"{exp_dir_remote}/logs/server_*.log" if phase == "eval" else None
     paths = Paths(
         stdout=stdout_path,
         stderr=stderr_path,
         exp_dir=exp_dir_remote,
         ckpt_dir=ckpt_dir,
+        eval_checkpoint=eval_checkpoint,
         eval_dir=eval_dir,
         isaac_logs_glob=isaac_logs_glob,
     )
@@ -374,6 +517,98 @@ async def _wandb_step(run_id: str) -> int | None:
 _BODY_SUFFIX_RE = re.compile(r"/lib/(train|eval)_body(?:_n16)?\.sh$")
 
 
+def _exp_dir_rel_candidates(variant: str) -> list[str]:
+    """Experiment roots relative to $HOME, in preferred fallback order."""
+    return [
+        f"{CLUSTER_STAGING_REL}/experiments/{variant}",
+        f"train-eval-scripts/experiments/{variant}",
+    ]
+
+
+def _latest_logs_dir_script(variant: str) -> str:
+    """Shell snippet that prints the candidate exp dir with newest logs/.
+
+    Keep this as a loop instead of a shell pipeline built with `;`: without
+    grouping, only the last command is piped, which can return
+    "<mtime> <path>" instead of just the path when the first candidate wins.
+    """
+    rels = " ".join(shlex.quote(rel) for rel in _exp_dir_rel_candidates(variant))
+    return (
+        "best_mtime=-1; best_path=''; "
+        f"for rel in {rels}; do "
+        'c="$HOME/$rel"; '
+        'if [ -d "$c/logs" ]; then '
+        'm=$(stat -c %Y "$c/logs" 2>/dev/null || echo 0); '
+        'case "$m" in ""|*[!0-9]*) m=0;; esac; '
+        'if [ "$m" -gt "$best_mtime" ]; then '
+        'best_mtime="$m"; best_path="$c"; '
+        "fi; "
+        "fi; "
+        "done; "
+        'printf "%s\\n" "$best_path"'
+    )
+
+
+def _existing_exp_dirs_script(variant: str) -> str:
+    """Shell snippet that prints existing candidate exp dirs, in order."""
+    rels = " ".join(shlex.quote(rel) for rel in _exp_dir_rel_candidates(variant))
+    return (
+        f"for rel in {rels}; do "
+        'c="$HOME/$rel"; '
+        'if [ -d "$c" ]; then printf "%s\\n" "$c"; fi; '
+        "done"
+    )
+
+
+def _remote_path_expr(path: str) -> str:
+    """Quote a remote path for shell use while preserving a leading $HOME."""
+    return path if path.startswith("$HOME/") else shlex.quote(path)
+
+
+async def _resolve_eval_checkpoint(
+    host: str,
+    stdout_path: str,
+    exp_dir: str,
+    submitted_checkpoint: str | None,
+) -> str | None:
+    """Return the checkpoint path for an eval job.
+
+    Completed/running eval logs are the most accurate source because the body
+    only logs `Checkpoint:` after verifying the directory exists. For pending
+    or pre-log jobs, fall back to the submit sidecar's explicit checkpoint,
+    then the same nested-then-flat auto-pick used by eval_body_n16.sh.
+    """
+    stdout_q = shlex.quote(stdout_path)
+    r = await ssh_run(
+        host,
+        f"grep -E 'Checkpoint: ' {stdout_q} 2>/dev/null | tail -1",
+        timeout=10.0,
+    )
+    line = r.stdout.strip()
+    marker = "Checkpoint: "
+    if marker in line:
+        checkpoint = line.split(marker, 1)[1].strip()
+        if checkpoint:
+            return checkpoint
+
+    if submitted_checkpoint:
+        checkpoint = submitted_checkpoint.strip()
+        if checkpoint:
+            return checkpoint
+
+    ckpt_dir = f"{exp_dir}/checkpoints"
+    ckpt_dir_expr = _remote_path_expr(ckpt_dir)
+    cmd = (
+        f"D={ckpt_dir_expr}; "
+        'p=$(ls -d "$D"/*/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1); '
+        '[ -z "$p" ] && p=$(ls -d "$D"/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1); '
+        'printf "%s\\n" "$p"'
+    )
+    r = await ssh_run(host, cmd, timeout=15.0)
+    checkpoint = r.stdout.strip()
+    return checkpoint or None
+
+
 async def _resolve_exp_dir(host: str, job_id: str, variant: str) -> str:
     """Find the variant's experiment dir on the cluster, per-job.
 
@@ -387,17 +622,9 @@ async def _resolve_exp_dir(host: str, job_id: str, variant: str) -> str:
     (the user can `bash ./submit` from train-eval-scripts but with a
     body script copied into .train-eval-web, and vice versa).
     """
-    candidates = [
-        f"$HOME/{CLUSTER_STAGING_REL}/experiments/{variant}",
-        f"$HOME/train-eval-scripts/experiments/{variant}",
-    ]
     # Pick the candidate whose logs/ has the most recent mtime. Returns
     # one line: the winning candidate path, or empty if neither has logs/.
-    script = " ; ".join(
-        f'[ -d {c}/logs ] && echo "$(stat -c %Y {c}/logs 2>/dev/null) {c}"'
-        for c in candidates
-    ) + " | sort -n | tail -1 | awk '{print $2}'"
-    r = await ssh_run(host, script, timeout=10.0)
+    r = await ssh_run(host, _latest_logs_dir_script(variant), timeout=10.0)
     chosen = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ""
     if chosen:
         return chosen
@@ -414,12 +641,11 @@ async def _resolve_exp_dir(host: str, job_id: str, variant: str) -> str:
             return f"{repo_root}/experiments/{variant}"
 
     # Last resort: existence probe.
-    probe = " ; ".join(f"(test -d {c} && echo {c})" for c in candidates)
-    r = await ssh_run(host, probe, timeout=10.0)
+    r = await ssh_run(host, _existing_exp_dirs_script(variant), timeout=10.0)
     lines = r.stdout.strip().splitlines()
     if lines:
         return lines[0]
-    return candidates[0]
+    return f"$HOME/{_exp_dir_rel_candidates(variant)[0]}"
 
 
 _TQDM_STEP_RE = re.compile(r"(\d+)/(\d+)\s*\[")

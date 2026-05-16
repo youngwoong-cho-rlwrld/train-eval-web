@@ -13,6 +13,7 @@ Conventions:
 
 import asyncio
 import json
+import shlex
 import shutil
 from datetime import datetime, timezone
 from typing import Any
@@ -186,8 +187,12 @@ done
         if job_name in seen:
             continue
         try:
-            start_iso = datetime.fromtimestamp(int(start_e), tz=timezone.utc).isoformat()
-            end_iso = datetime.fromtimestamp(int(end_e), tz=timezone.utc).isoformat()
+            start_i = int(start_e)
+            end_i = int(end_e)
+            if end_i < start_i:
+                start_i, end_i = end_i, start_i
+            start_iso = datetime.fromtimestamp(start_i, tz=timezone.utc).isoformat()
+            end_iso = datetime.fromtimestamp(end_i, tz=timezone.utc).isoformat()
         except ValueError:
             continue
         elapsed = _elapsed(start_iso, end_iso)
@@ -316,25 +321,32 @@ async def tail_logs(job_name: str, follow: bool = True):
 async def _tail_archived_log(job_name: str):
     """Serve <variant>/checkpoints/logs/training_rank0.log via the data pod,
     holding the connection open with tail -F so EventSource doesn't loop."""
-    import shlex
-    from .details import parse_phase_and_variant
+    from .details import _parse_comment_metadata, parse_phase_and_variant
     from .mlxp_data_pod import ensure_listing_pod
 
-    _, variant = parse_phase_and_variant(job_name)
+    record = await _archived_record(job_name)
+    variant = None
+    if record:
+        _, variant = _parse_comment_metadata(record.get("JobComment") or "")
+    if not variant:
+        _, variant = parse_phase_and_variant(job_name)
     if not variant:
         return
-    log_path = f"/data/youngwoong/experiments/{variant}/checkpoints/logs/training_rank0.log"
+    log_paths = [
+        f"/data/youngwoong/experiments/{variant}/checkpoints/{job_name}/logs/training.log",
+        f"/data/youngwoong/experiments/{variant}/checkpoints/logs/training_rank0.log",
+    ]
     try:
         pod = await ensure_listing_pod()
     except Exception:
         return
+    tests = " ".join(shlex.quote(p) for p in log_paths)
     cmd = (
-        f"if [ -f {shlex.quote(log_path)} ]; then "
-        f"  exec tail -n +1 -F {shlex.quote(log_path)}; "
-        "else "
-        f"  echo '(no log file at {log_path})'; "
-        "  sleep 86400; "  # hold the connection so EventSource doesn't reconnect-loop
-        "fi"
+        f"for p in {tests}; do "
+        '  if [ -f "$p" ]; then exec tail -n +1 -F "$p"; fi; '
+        "done; "
+        "echo '(archived MLXP pod logs are unavailable for this run; no persisted training log was found)'; "
+        "sleep 86400"
     )
     proc = await asyncio.create_subprocess_exec(
         "kubectl", "exec", "-n", _NS, pod, "--", "bash", "-c", cmd,
@@ -384,20 +396,68 @@ async def _iter_logical_lines(reader):
 async def _archived_record(name: str) -> dict[str, Any] | None:
     """Return a sacct-shaped dict for a single archived (k8s-gone) job by
     walking DDN. Returns None if no checkpoint dir matches the name."""
-    archived = await _list_archived_jobs(seen=set())
-    for j in archived:
-        if j.job_name == name:
-            return {
-                "JobID": j.job_id,
-                "JobName": j.job_name,
-                "Partition": j.partition,
-                "State": j.state,
-                "ExitCode": "",
-                "Start": j.start or "",
-                "End": j.end or "",
-                "Elapsed": j.elapsed,
-                "NodeList": j.nodelist,
-                "Reason": "(archived; k8s record GC'd)",
-                "cluster": "mlxp",
-            }
+    from .mlxp_data_pod import ensure_listing_pod, NAMESPACE
+
+    try:
+        pod = await ensure_listing_pod()
+    except Exception:
+        return None
+
+    script = r"""
+shopt -s nullglob
+for d in /data/youngwoong/experiments/*/checkpoints/""" + shlex.quote(name) + r"""/; do
+    matches=( "$d"checkpoint-* )
+    [ ${#matches[@]} -eq 0 ] && continue
+    variant=$(basename "$(dirname "$(dirname "$d")")")
+    job_name=$(basename "$d")
+    latest=$(for m in "${matches[@]}"; do basename "$m" | sed 's:^checkpoint-::'; done | sort -n | tail -1)
+    start_epoch=$(stat -c %Y "$d" 2>/dev/null || echo 0)
+    end_epoch=$(stat -c %Y "$d"checkpoint-$latest 2>/dev/null || echo "$start_epoch")
+    printf '%s|%s|%s|%s|%s\n' "$variant" "$job_name" "$latest" "$start_epoch" "$end_epoch"
+    break
+done
+"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "kubectl", "exec", "-n", NAMESPACE, pod, "--", "bash", "-c", script,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20.0)
+    except Exception:
+        return None
+
+    line = stdout.decode(errors="replace").strip().splitlines()
+    if not line:
+        return None
+    parts = line[0].split("|")
+    if len(parts) != 5:
+        return None
+    variant, job_name, latest, start_e, end_e = parts
+    if not latest.isdigit():
+        return None
+    try:
+        start_i = int(start_e)
+        end_i = int(end_e)
+        if end_i < start_i:
+            start_i, end_i = end_i, start_i
+        start_iso = datetime.fromtimestamp(start_i, tz=timezone.utc).isoformat()
+        end_iso = datetime.fromtimestamp(end_i, tz=timezone.utc).isoformat()
+    except ValueError:
+        return None
+    elapsed = _elapsed(start_iso, end_iso)
+    return {
+        "JobID": job_name,
+        "JobName": job_name,
+        "JobComment": f"phase=train;variant={variant}",
+        "Partition": "mlxp",
+        "State": "COMPLETED",
+        "ExitCode": "",
+        "Start": start_iso,
+        "End": end_iso,
+        "Elapsed": elapsed,
+        "NodeList": "(archived)",
+        "Reason": "(archived; k8s record GC'd)",
+        "cluster": "mlxp",
+    }
     return None

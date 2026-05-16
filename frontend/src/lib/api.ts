@@ -60,6 +60,7 @@ export type Paths = {
   stderr: string;
   exp_dir: string;
   ckpt_dir: string | null;
+  eval_checkpoint: string | null;
   eval_dir: string | null;
   isaac_logs_glob: string | null;
 };

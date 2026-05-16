@@ -24,7 +24,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from .clusters import load_cluster
-from .details import parse_phase_and_variant
+from .details import get_details, resolve_phase_and_variant
 from .jobs import get_job
 from .mlxp_data_pod import ensure_listing_pod, NAMESPACE as MLXP_NS
 from .ssh import ssh_run, _CM_OPTS
@@ -118,17 +118,15 @@ def cancel_copy(copy_id: str) -> bool:
 async def list_checkpoints(cluster: str, job_id: str) -> list[CheckpointEntry]:
     """One entry per run folder.
 
-    MLXP runs nest under `<variant>/checkpoints/<job_name>/checkpoint-N` —
-    each `<job_name>/` is one run folder, and we tag it with its latest
-    checkpoint step. Slurm flat layout has `<variant>/checkpoints/checkpoint-N`
-    with no per-run nesting; we surface each `checkpoint-N` as its own folder.
+    MLXP runs nest under `<variant>/checkpoints/<job_name>/checkpoint-N`.
+    Slurm jobs may use either `<variant>/checkpoints/checkpoint-N` or a
+    one-level nested launcher directory. We surface every `checkpoint-N`.
     """
-    sacct = await get_job(cluster, job_id)
-    _, variant = parse_phase_and_variant(sacct.get("JobName") or job_id)
-    if not variant:
-        return []
-
     if cluster == "mlxp":
+        sacct = await get_job(cluster, job_id)
+        _, variant = resolve_phase_and_variant(sacct.get("JobName") or job_id, sacct)
+        if not variant:
+            return []
         pod = await ensure_listing_pod()
         # Emit `<run_dir>|<latest_step>` for every per-job dir that has at
         # least one checkpoint-N inside.
@@ -159,13 +157,28 @@ done
             ))
         return result
 
-    # slurm — probe both known exp roots; merge as flat checkpoint-N entries.
+    # slurm — prefer the exact path resolved for this job, then probe both
+    # known roots for the normalized variant. Include one-level nested
+    # checkpoint layouts used by newer launchers.
     env = await load_cluster(cluster)
+    det = await get_details(cluster, job_id)
+    variant = det.variant
+    if not variant:
+        return []
     roots = [
+        det.paths.ckpt_dir,
         f"$HOME/train-eval-scripts/experiments/{variant}/checkpoints",
         f"$HOME/.train-eval-web/experiments/{variant}/checkpoints",
     ]
-    cmds = " ; ".join(f"ls -d {r}/checkpoint-* 2>/dev/null" for r in roots)
+    deduped_roots = list(dict.fromkeys(r for r in roots if r))
+
+    def path_expr(path: str) -> str:
+        return path if path.startswith("$HOME/") else shlex.quote(path)
+
+    cmds = " ; ".join(
+        f"ls -d {path_expr(r)}/checkpoint-* {path_expr(r)}/*/checkpoint-* 2>/dev/null"
+        for r in deduped_roots
+    )
     r = await ssh_run(env.ssh_alias, cmds, timeout=15.0)
     return _parse_paths(r.stdout, nested=False, fallback_job=job_id)
 
@@ -184,7 +197,8 @@ def _parse_paths(stdout: str, *, nested: bool, fallback_job: str = "") -> list[C
             step = int(leaf.split("-", 1)[1])
         except ValueError:
             continue
-        job_name = line.rsplit("/", 2)[1] if nested else fallback_job
+        parent = line.rsplit("/", 2)[1] if "/" in line else ""
+        job_name = parent if (nested or parent != "checkpoints") else fallback_job
         out.append(CheckpointEntry(path=line, job_name=job_name, step=step))
     return out
 
@@ -201,8 +215,11 @@ async def start_copy(
     if not sources:
         raise ValueError("no checkpoints selected")
 
-    sacct = await get_job(src_cluster, src_job)
-    _, variant = parse_phase_and_variant(sacct.get("JobName") or src_job)
+    if src_cluster == "mlxp":
+        sacct = await get_job(src_cluster, src_job)
+        _, variant = resolve_phase_and_variant(sacct.get("JobName") or src_job, sacct)
+    else:
+        variant = (await get_details(src_cluster, src_job)).variant
     if not variant:
         raise ValueError("could not resolve variant from job name")
 

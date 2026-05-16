@@ -44,6 +44,8 @@ export function ConfigCard({
   const wantsCheckpoint =
     !!variantName && phase === "eval" && !!cluster && cluster !== "mlxp";
   const overridePath = checkpointOverride?.trim() || null;
+  const overrideMissing = overridePath && checkpointOverrideExists === false;
+  const overrideChecking = overridePath && checkpointOverrideExists === null;
   const selectedCkpt = useQuery({
     queryKey: ["selected-checkpoint", variantName, cluster],
     queryFn: () =>
@@ -79,18 +81,14 @@ export function ConfigCard({
           {wantsCheckpoint && (
             <ConfigPathRow
               label="checkpoint"
-              tone={
-                overridePath && checkpointOverrideExists === false
-                  ? "error"
-                  : "default"
-              }
+              tone={overrideMissing ? "error" : "default"}
               value={
                 overridePath
-                  ? checkpointOverrideExists === null
+                  ? overrideChecking
                     ? `${overridePath}  (checking…)`
-                    : checkpointOverrideExists
-                      ? overridePath
-                      : `${overridePath}  (not found on ${cluster})`
+                    : overrideMissing
+                      ? `${overridePath}  (not found on ${cluster})`
+                      : overridePath
                   : selectedCkpt.data?.path ??
                     (selectedCkpt.isLoading ? "…" : "(none found — eval will fail)")
               }

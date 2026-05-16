@@ -16,6 +16,7 @@ Different from slurm:
 import asyncio
 import json
 import re
+import shlex
 import shutil
 import uuid
 from datetime import datetime
@@ -153,6 +154,7 @@ def _render_body_script(variant, req: MlxpSubmitRequest, job_name: str) -> str:
     user_extra = " ".join(req.extra_args)
 
     ckpt_dir = f"{USER_HOME_ON_DDN}/experiments/{variant.name}/checkpoints"
+    run_log_dir = f"{ckpt_dir}/{job_name}/logs"
 
     if model == "n1.6":
         return _render_body_n16(
@@ -203,6 +205,9 @@ cd {GR00T_DIR}
 source .venv/bin/activate
 
 mkdir -p {ckpt_dir}
+RUN_LOG_DIR={shlex.quote(run_log_dir)}
+mkdir -p "$RUN_LOG_DIR"
+exec > >(tee -a "$RUN_LOG_DIR/training.log") 2>&1
 
 # Render data_config.yaml from variant config.
 cat > /tmp/data_config.yaml <<'YAML_EOF'
@@ -257,6 +262,7 @@ def _render_body_n16(*, variant, req: MlxpSubmitRequest, job_name: str,
         f"{USER_HOME_ON_DDN}/datasets/{n}" for n in names
     )
     global_batch = int(batch_size) * req.num_gpus
+    run_log_dir = f"{ckpt_dir}/{job_name}/logs"
 
     return f"""\
 set -euo pipefail
@@ -272,6 +278,9 @@ cd {GR00T_N16_DIR}
 source .venv/bin/activate
 
 mkdir -p {ckpt_dir}
+RUN_LOG_DIR={shlex.quote(run_log_dir)}
+mkdir -p "$RUN_LOG_DIR"
+exec > >(tee -a "$RUN_LOG_DIR/training.log") 2>&1
 
 cat > /tmp/modality_config.py <<'PY_EOF'
 {modality_text}

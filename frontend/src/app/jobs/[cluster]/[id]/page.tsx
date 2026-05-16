@@ -244,6 +244,11 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
           modalityConfigFile={variantQuery.data?.vars.TRAIN_MODALITY_CONFIG ?? null}
           cluster={cluster}
           phase={details.data.phase}
+          checkpointOverride={
+            details.data.phase === "eval"
+              ? details.data.paths.eval_checkpoint
+              : null
+          }
           className="mt-6"
         />
       )}
@@ -264,7 +269,12 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
           </div>
         </CardHeader>
         <CardContent>
-          <LogStream cluster={cluster} jobId={id} stream={stream} />
+          <LogStream
+            key={`${cluster}:${id}:${stream}`}
+            cluster={cluster}
+            jobId={id}
+            stream={stream}
+          />
         </CardContent>
       </Card>
     </div>
@@ -371,6 +381,7 @@ function PathsCard({ d }: { d: JobDetails }) {
     { label: "exp dir", value: d.paths.exp_dir },
   ];
   if (d.paths.ckpt_dir) rows.push({ label: "checkpoints", value: d.paths.ckpt_dir });
+  if (d.paths.eval_checkpoint) rows.push({ label: "checkpoint", value: d.paths.eval_checkpoint });
   if (d.paths.eval_dir) rows.push({ label: "eval results", value: d.paths.eval_dir });
   if (d.paths.isaac_logs_glob) rows.push({ label: "isaac sim logs", value: d.paths.isaac_logs_glob });
 
@@ -412,7 +423,6 @@ function LogStream({
   const stickToBottomRef = useRef(true);
 
   useEffect(() => {
-    setLines([]);
     stickToBottomRef.current = true;
     if (!enabled) return;
     const es = new EventSource(logStreamUrl(cluster, jobId, stream));
@@ -620,4 +630,3 @@ function CopyCheckpointDialog({
     </Dialog>
   );
 }
-
