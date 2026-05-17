@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
-from . import clusters, copy_checkpoint, datasets, details, flags, jobs, mlxp, mlxp_submit, partitions, submit, variants, wandb_auth
+from . import clusters, copy_checkpoint, datasets, details, flags, job_resume, jobs, mlxp, mlxp_submit, partitions, submit, variants, wandb_auth
 from .ssh import ssh_tail_lines
 
 
@@ -155,7 +155,7 @@ async def post_submit(req: submit.SubmitRequest):
     try:
         if req.cluster == "mlxp":
             if req.phase != "train":
-                raise ValueError("MLXP currently supports phase=train only (no resume/eval yet)")
+                raise ValueError("MLXP currently supports phase=train only")
             # GPU count comes from the variant's TRAIN_NUM_GPUS, same source of
             # truth slurm uses. The MLXP submit then maps it to CPU/RAM per the
             # Notion guide's table.
@@ -210,11 +210,23 @@ async def get_job(cluster: str, job_id: str):
 
 
 @app.get("/api/jobs/{cluster}/{job_id}/details", response_model=details.JobDetails)
-async def get_job_details(cluster: str, job_id: str):
+async def get_job_details(cluster: str, job_id: str, include_gpu: bool = False):
     try:
-        return await details.get_details(cluster, job_id)
+        return await details.get_details(cluster, job_id, include_gpu=include_gpu)
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/jobs/{cluster}/{job_id}/resume", response_model=submit.SubmitResponse)
+async def post_resume_job(cluster: str, job_id: str):
+    try:
+        return await job_resume.resume_timed_out_job(cluster, job_id)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     except RuntimeError as e:
         raise HTTPException(500, str(e))
 
@@ -305,6 +317,22 @@ async def get_job_flags(cluster: str, job_id: str):
     except FileNotFoundError:
         raise HTTPException(404, f"variant {det.variant} not found")
     out = flags.flags_for(v, cluster, det.phase)
+    if cluster != "mlxp" and det.phase == "eval":
+        env = await clusters.load_cluster(cluster)
+        meta = await details._read_slurm_meta(env.ssh_alias, job_id)
+        override = (meta.get("eval_parallel_sims_per_gpu") or "").strip()
+        if override:
+            rewritten: list[tuple[str, str]] = []
+            replaced = False
+            for flag, val in out:
+                if flag == "EVAL_PARALLEL_SIMS_PER_GPU":
+                    rewritten.append((flag, override))
+                    replaced = True
+                else:
+                    rewritten.append((flag, val))
+            if not replaced:
+                rewritten.append(("EVAL_PARALLEL_SIMS_PER_GPU", override))
+            out = rewritten
     return {"flags": [{"flag": f, "value": val} for f, val in out]}
 
 

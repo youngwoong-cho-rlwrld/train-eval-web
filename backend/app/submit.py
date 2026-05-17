@@ -12,8 +12,9 @@ import shlex
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .clusters import ClusterEnv, load_cluster
 from .paths import CLUSTER_STAGING_REL, CLUSTERS_DIR, CONFIGS_DIR, EXPERIMENTS_DIR, LIB_DIR
@@ -63,7 +64,11 @@ def _apply_dataset_override(config_text: str, override: str | list[str]) -> str:
 class SubmitRequest(BaseModel):
     cluster: str
     variant: str
-    phase: str                  # "train" | "resume" | "eval"
+    phase: Literal["train", "eval"]
+    # Internal job action: retry a timed-out training job from its existing
+    # checkpoint. This is intentionally separate from the submit-page phase.
+    resume: bool = False
+    resume_of: str | None = None
     # Slurm-only: partition name (None → fall back to cluster.env default).
     partition: str | None = None
     # MLXP-only: which k8s node to pin via nodeAffinity (each rlwrld team
@@ -75,12 +80,18 @@ class SubmitRequest(BaseModel):
     #   - list of "name|cfg|weight" entries → replaces DATASETS array
     # None means "use whatever the variant config.sh says".
     dataset_override: str | list[str] | None = None
-    extra_args: list[str] = []
+    extra_args: list[str] = Field(default_factory=list)
+    # Eval-only: override EVAL_PARALLEL_SIMS_PER_GPU from config.sh for this
+    # submission. The eval body applies this after sourcing config.sh.
+    eval_parallel_sims_per_gpu: int | None = Field(default=None, ge=1)
     # Eval-only: absolute path to the checkpoint dir on the cluster. The
     # eval body uses this verbatim when set; otherwise it auto-picks.
     checkpoint_path: str | None = None
+    # Internal eval resume: remote eval_results dir from the timed-out job.
+    # Seed the staged eval_results before sbatch so completed runs are skipped.
+    seed_eval_results_from: str | list[str] | None = None
     # Optional override for the auto-generated job_name. Must match
-    # `{train|resume|eval}_<anything>_<YYYYMMDD>_<HHMMSS>` so the parser
+    # `{train|eval}_<anything>_<YYYYMMDD>_<HHMMSS>` so the parser
     # keeps working. None → server builds the default.
     job_name: str | None = None
 
@@ -123,15 +134,19 @@ _BODY_BY_PHASE_MODEL = {
 
 
 async def submit(req: SubmitRequest) -> SubmitResponse:
+    if req.resume and req.phase != "train":
+        raise ValueError("resume=true is only valid for phase=train")
+    if req.eval_parallel_sims_per_gpu is not None and req.phase != "eval":
+        raise ValueError("eval_parallel_sims_per_gpu is only valid for phase=eval")
+
     cluster = await load_cluster(req.cluster)
     variant = await load_variant(req.variant)
 
     # ── Resolve partition + body script + walltime ──
     model = variant.vars.get("MODEL_VERSION", "n1.5")
-    route_phase = "train" if req.phase == "resume" else req.phase
-    body_walltime = _BODY_BY_PHASE_MODEL.get((route_phase, model))
+    body_walltime = _BODY_BY_PHASE_MODEL.get((req.phase, model))
     if body_walltime is None:
-        raise ValueError(f"Unsupported (phase, model): ({route_phase}, {model})")
+        raise ValueError(f"Unsupported (phase, model): ({req.phase}, {model})")
     body_script, walltime = body_walltime
 
     partition = req.partition or cluster.vars["PARTITION"]
@@ -160,7 +175,12 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     ]
     for local, remote_name in sync_targets:
         remote = f"{CLUSTER_STAGING_REL}/{remote_name}"
-        r = await rsync_to(host, local, remote, delete=True)
+        excludes = (
+            ["checkpoints/", "eval_results/", "logs/", "results.json"]
+            if remote_name == "experiments"
+            else None
+        )
+        r = await rsync_to(host, local, remote, delete=True, exclude=excludes)
         if r.returncode != 0:
             raise RuntimeError(f"rsync failed for {local}: {r.stderr}")
         rsync_results.append(r)
@@ -183,13 +203,35 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             finally:
                 Path(tmp_path).unlink(missing_ok=True)
 
+    if req.phase == "eval" and req.seed_eval_results_from:
+        dst_rel = f"{CLUSTER_STAGING_REL}/experiments/{req.variant}/eval_results"
+        seed_sources = (
+            [req.seed_eval_results_from]
+            if isinstance(req.seed_eval_results_from, str)
+            else req.seed_eval_results_from
+        )
+        for source in seed_sources:
+            src = source.strip().rstrip("/")
+            if not src:
+                continue
+            seed_cmd = (
+                f"src={shlex.quote(src)}; dst=$HOME/{shlex.quote(dst_rel)}; "
+                "mkdir -p \"$dst\" && "
+                "if [ \"$src\" != \"$dst\" ] && [ -d \"$src\" ]; then "
+                "rsync -a --ignore-existing \"$src\"/ \"$dst\"/; "
+                "fi"
+            )
+            seeded = await ssh_run(host, seed_cmd, timeout=120.0)
+            if seeded.returncode != 0:
+                raise RuntimeError(f"seeding eval results failed: {seeded.stderr or seeded.stdout}")
+
     # ── Build sbatch command ──
     # Unified shape across slurm + MLXP. The cluster/partition were
     # cosmetic in the slurm filename — drop them; the table column shows
     # both, and `parse_phase_and_variant` now expects this exact format.
     job_name = resolve_job_name(req.job_name, req.phase, req.variant)
     log_dir = cluster.vars["LOG_DIR"]
-    resume_expected = "1" if req.phase == "resume" else "0"
+    resume_expected = "1" if req.resume else "0"
 
     body_path = f"$HOME/{CLUSTER_STAGING_REL}/lib/{body_script}"
     repo_root_remote = f"$HOME/{CLUSTER_STAGING_REL}"
@@ -211,9 +253,14 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         f"--comment={shlex.quote(comment)}",
         f"--export=ALL,VARIANT={shlex.quote(req.variant)},CLUSTER={shlex.quote(req.cluster)},"
         f"REPO_ROOT={repo_root_remote},RESUME_EXPECTED={resume_expected},"
+        f"SUBMIT_PARTITION={shlex.quote(partition)},"
         # Pin wandb run id to the slurm display name so the URL is stable
         # and matches MLXP's run-id format.
         f"WANDB_RUN_ID={shlex.quote(job_name)}"
+        + (
+            f",SUBMIT_EVAL_PARALLEL_SIMS_PER_GPU={req.eval_parallel_sims_per_gpu}"
+            if req.phase == "eval" and req.eval_parallel_sims_per_gpu is not None else ""
+        )
         + (
             f",EVAL_CHECKPOINT={shlex.quote(req.checkpoint_path)}"
             if req.phase == "eval" and req.checkpoint_path else ""
@@ -246,6 +293,17 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         f"phase={req.phase}\n"
         f"variant={req.variant}\n"
         f"job_name={job_name}\n"
+        + (
+            f"resume_of={req.resume_of.strip()}\n"
+            if req.resume_of and req.resume_of.strip()
+            else ""
+        )
+        + ("resume=true\n" if req.resume else "")
+        + (
+            f"eval_parallel_sims_per_gpu={req.eval_parallel_sims_per_gpu}\n"
+            if req.phase == "eval" and req.eval_parallel_sims_per_gpu is not None
+            else ""
+        )
         + (
             f"checkpoint_path={req.checkpoint_path.strip()}\n"
             if req.phase == "eval" and req.checkpoint_path and req.checkpoint_path.strip()

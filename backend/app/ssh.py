@@ -66,14 +66,23 @@ async def ssh_run(host: str, cmd: str, timeout: float = 60.0) -> SSHResult:
     )
 
 
-async def rsync_to(host: str, local_path: str, remote_path: str,
-                   *, delete: bool = False, timeout: float = 120.0) -> SSHResult:
+async def rsync_to(
+    host: str,
+    local_path: str,
+    remote_path: str,
+    *,
+    delete: bool = False,
+    exclude: list[str] | None = None,
+    timeout: float = 120.0,
+) -> SSHResult:
     """rsync local_path to host:remote_path. Creates parent dirs."""
     # Reuse the multiplexed ssh master rather than negotiating a new session.
     ssh_e = "ssh -o BatchMode=yes " + " ".join(_CM_OPTS)
     args = ["rsync", "-az", "-e", ssh_e]
     if delete:
         args.append("--delete")
+    for pattern in exclude or []:
+        args.append(f"--exclude={pattern}")
     args.extend([local_path, f"{host}:{remote_path}"])
     proc = await asyncio.create_subprocess_exec(
         *args,

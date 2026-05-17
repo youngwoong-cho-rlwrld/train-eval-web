@@ -98,6 +98,7 @@ def _eval_n15(v: Variant, cluster: str) -> list[tuple[str, str]]:
         ("--instruction", v.vars.get("INSTRUCTION", "")),
         ("--n-episodes", v.vars.get("N_EPISODES", "")),
         ("--n-runs", v.vars.get("N_RUNS", "")),
+        ("EVAL_PARALLEL_SIMS_PER_GPU", v.vars.get("EVAL_PARALLEL_SIMS_PER_GPU", v.vars.get("EVAL_PARALLEL_SIMS", "1"))),
         ("--execution-horizon", v.vars.get("EXECUTION_HORIZON", "")),
         ("--max-episode-steps", v.vars.get("MAX_EPISODE_STEPS", "")),
         ("(eval_sets)", " ".join(v.arrays.get("EVAL_SETS") or [])),

@@ -2,9 +2,12 @@
 
 import Link from "next/link";
 import { useMemo, useState } from "react";
-import { useIsFetching, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, type Job, type JobDetails } from "@/lib/api";
+import { useRouter } from "next/navigation";
+import { useIsFetching, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
+import { api, type Job, type JobDetails, type SubmitResponse } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { CopyButton } from "@/components/copy-button";
@@ -138,7 +141,14 @@ function JobTable({ rows, kind }: { rows: Job[]; kind: "active" | "recent" }) {
                 </td>
                 <Td><PhaseBadge phase={phase} /></Td>
                 <Td>{j.cluster}</Td>
-                <Td><StateBadge state={j.state} /></Td>
+                <Td>
+                  <div className="flex items-center gap-2">
+                    <StateBadge state={j.state} />
+                    {kind === "recent" && isTimeout(j.state) && (
+                      <ResumeButton job={j} />
+                    )}
+                  </div>
+                </Td>
                 <Td className="font-mono text-xs">{j.partition}</Td>
                 <Td className="font-mono text-xs">{j.elapsed}</Td>
                 {kind === "active" && (
@@ -173,6 +183,36 @@ function JobTable({ rows, kind }: { rows: Job[]; kind: "active" | "recent" }) {
         </tbody>
       </table>
     </div>
+  );
+}
+
+function ResumeButton({ job }: { job: Job }) {
+  const router = useRouter();
+  const qc = useQueryClient();
+  const resume = useMutation({
+    mutationFn: () =>
+      api<SubmitResponse>(`/api/jobs/${job.cluster}/${job.job_id}/resume`, {
+        method: "POST",
+      }),
+    onSuccess: (data) => {
+      toast.success(`Submitted resume job ${data.job_id} on ${job.cluster}`);
+      qc.invalidateQueries({ queryKey: ["jobs"] });
+      qc.invalidateQueries({ queryKey: ["job-details"] });
+      router.push(`/jobs/${job.cluster}/${data.job_id}`);
+    },
+    onError: (err: Error) => toast.error(`Resume failed: ${err.message}`),
+  });
+
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      className="h-7 px-2 text-xs"
+      onClick={() => resume.mutate()}
+      disabled={resume.isPending}
+    >
+      {resume.isPending ? "Resuming..." : "Resume"}
+    </Button>
   );
 }
 
@@ -267,6 +307,10 @@ function StateBadge({ state }: { state: string }) {
     : state === "COMPLETED" ? "secondary"
     : "outline";
   return <Badge variant={v}>{state}</Badge>;
+}
+
+function isTimeout(state: string): boolean {
+  return state.toUpperCase().startsWith("TIMEOUT");
 }
 
 function Th({ children }: { children: React.ReactNode }) {

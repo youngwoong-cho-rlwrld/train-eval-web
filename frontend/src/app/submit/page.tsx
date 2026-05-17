@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
@@ -37,7 +37,7 @@ import { AvailabilityCard } from "@/components/submit/availability-card";
 import { ConfigCard } from "@/components/config-card";
 import { useDatasetDir } from "@/hooks/use-dataset-dir";
 
-type Phase = "train" | "resume" | "eval";
+type Phase = "train" | "eval";
 
 function buildDefaultJobName(phase: Phase, variant: string): string {
   if (!variant) return "";
@@ -60,8 +60,12 @@ export default function SubmitPage() {
   // Persisted across sessions + synced across pages via useMyMlxpNode.
   const [mlxpNode, setMlxpNode] = useMyMlxpNode();
   const [extraArgs, setExtraArgs] = useState<string>("");
-  const [checkpointPath, setCheckpointPath] = useState<string>("");
-  const [checkpointTouched, setCheckpointTouched] = useState<boolean>(false);
+  const [evalParallelSimsPerGpu, setEvalParallelSimsPerGpu] =
+    useState<string>("");
+  const [checkpointEdit, setCheckpointEdit] = useState<{
+    scope: string;
+    value: string;
+  } | null>(null);
   const [jobName, setJobName] = useState<string>("");
   const [jobNameTouched, setJobNameTouched] = useState<boolean>(false);
 
@@ -70,9 +74,11 @@ export default function SubmitPage() {
   // "name|cfg|weight" strings (N1.5) or plain "name" strings (N1.6). Both
   // are initialized from the variant's own config when it loads; user can
   // edit before submit.
-  const [singleDataset, setSingleDataset] = useState<string>("");
-  const [multiDatasets, setMultiDatasets] = useState<string[]>([]);
-  const [datasetTouched, setDatasetTouched] = useState<boolean>(false);
+  const [datasetEdit, setDatasetEdit] = useState<{
+    variant: string;
+    single: string;
+    multi: string[];
+  } | null>(null);
 
   const clusters = useQuery({
     queryKey: ["clusters"],
@@ -97,6 +103,8 @@ export default function SubmitPage() {
     enabled: !!cluster && cluster !== "mlxp",
   });
   const isSlurm = cluster !== "mlxp";
+  const submitPhase: Phase = isSlurm ? phase : "train";
+  const checkpointScope = `${cluster}:${variantName}:${submitPhase}`;
 
   const [datasetDir, setDatasetDir] = useDatasetDir(cluster);
   const datasets = useQuery({
@@ -116,6 +124,29 @@ export default function SubmitPage() {
     enabled: !isSlurm,
   });
   const wantsCheckpoint = phase === "eval" && isSlurm && !!variantName;
+  const evalParallelSimsPerGpuTrimmed = evalParallelSimsPerGpu.trim();
+  const evalParallelSimsPerGpuParsed = Number.parseInt(
+    evalParallelSimsPerGpuTrimmed,
+    10,
+  );
+  const hasEvalParallelSimsPerGpuOverride =
+    evalParallelSimsPerGpuTrimmed.length > 0;
+  const evalParallelSimsPerGpuValid =
+    !wantsCheckpoint ||
+    !hasEvalParallelSimsPerGpuOverride ||
+    (/^[1-9]\d*$/.test(evalParallelSimsPerGpuTrimmed) &&
+      evalParallelSimsPerGpuParsed >= 1);
+  const evalGpuCount = Number.parseInt(
+    variant.data?.vars.TRAIN_NUM_GPUS ?? "",
+    10,
+  );
+  const evalParallelTotal =
+    wantsCheckpoint &&
+    hasEvalParallelSimsPerGpuOverride &&
+    evalParallelSimsPerGpuValid &&
+    evalGpuCount > 0
+      ? evalParallelSimsPerGpuParsed * evalGpuCount
+      : null;
   const selectedCkpt = useQuery({
     queryKey: ["selected-checkpoint", variantName, cluster],
     queryFn: () =>
@@ -124,6 +155,11 @@ export default function SubmitPage() {
       ),
     enabled: wantsCheckpoint,
   });
+  const activeCheckpointEdit =
+    checkpointEdit?.scope === checkpointScope ? checkpointEdit : null;
+  const checkpointPath = activeCheckpointEdit
+    ? activeCheckpointEdit.value
+    : selectedCkpt.data?.path ?? "";
   const trimmedCkpt = checkpointPath.trim();
   const checkpointExists = useQuery({
     queryKey: ["path-exists", cluster, trimmedCkpt],
@@ -139,54 +175,42 @@ export default function SubmitPage() {
       ? null
       : checkpointExists.data.exists;
 
-  // Prefill checkpoint with the auto-detected one until the user types over it.
-  useEffect(() => {
-    if (!checkpointTouched && selectedCkpt.data?.path) {
-      setCheckpointPath(selectedCkpt.data.path);
-    }
-  }, [selectedCkpt.data?.path, checkpointTouched]);
+  const defaultJobName = useMemo(
+    () => buildDefaultJobName(submitPhase, variantName),
+    [submitPhase, variantName],
+  );
+  const shownJobName = jobNameTouched ? jobName : defaultJobName;
 
-  // Auto-fill job_name with the default until the user types over it.
-  // For MLXP, phase is locked to "train" — defaults reflect that.
-  useEffect(() => {
-    if (jobNameTouched) return;
-    const effectivePhase = isSlurm ? phase : "train";
-    setJobName(buildDefaultJobName(effectivePhase, variantName));
-  }, [phase, variantName, isSlurm, jobNameTouched]);
-  // Reset prefill state when variant / cluster / phase changes.
-  useEffect(() => {
-    setCheckpointPath("");
-    setCheckpointTouched(false);
-  }, [variantName, cluster, phase]);
-
-  // Whenever a new variant loads (or the user picks a different one), reset
-  // dataset state to that variant's defaults. `datasetTouched` is reset so
-  // changing variant doesn't carry over a previous override.
-  useEffect(() => {
-    if (!variant.data) return;
+  const datasetDefaults = useMemo(() => {
+    if (!variant.data) return { single: "", multi: [] as string[] };
     // Priority: N1.6 multi (TRAIN_DATASET_NAMES, name-only) → N1.5 multi
     // (DATASETS, "name|cfg|weight") → single (DATASET_NAME).
     if (variant.data.arrays.TRAIN_DATASET_NAMES) {
-      setMultiDatasets(variant.data.arrays.TRAIN_DATASET_NAMES);
-      setSingleDataset("");
-    } else if (variant.data.arrays.DATASETS) {
-      setMultiDatasets(variant.data.arrays.DATASETS);
-      setSingleDataset("");
-    } else if (variant.data.vars.DATASET_NAME) {
-      setSingleDataset(variant.data.vars.DATASET_NAME);
-      setMultiDatasets([]);
+      return { single: "", multi: variant.data.arrays.TRAIN_DATASET_NAMES };
     }
-    setDatasetTouched(false);
+    if (variant.data.arrays.DATASETS) {
+      return { single: "", multi: variant.data.arrays.DATASETS };
+    }
+    if (variant.data.vars.DATASET_NAME) {
+      return { single: variant.data.vars.DATASET_NAME, multi: [] as string[] };
+    }
+    return { single: "", multi: [] as string[] };
   }, [variant.data]);
 
-  // Pick a sensible default partition when the cluster's partitions arrive
-  // (or when the cluster changes and the previously-selected partition no
-  // longer exists in the new cluster).
-  useEffect(() => {
-    if (!partitions.data) return;
-    if (partition && partitions.data.some((p) => p.name === partition)) return;
-    const def = partitions.data.find((p) => p.is_default) ?? partitions.data[0];
-    setPartition(def?.name ?? "");
+  const activeDatasetEdit =
+    datasetEdit?.variant === variantName ? datasetEdit : null;
+  const datasetTouched = activeDatasetEdit !== null;
+  const singleDataset = activeDatasetEdit
+    ? activeDatasetEdit.single
+    : datasetDefaults.single;
+  const multiDatasets = activeDatasetEdit
+    ? activeDatasetEdit.multi
+    : datasetDefaults.multi;
+
+  const selectedPartitionName = useMemo(() => {
+    if (!partitions.data) return "";
+    if (partition && partitions.data.some((p) => p.name === partition)) return partition;
+    return (partitions.data.find((p) => p.is_default) ?? partitions.data[0])?.name ?? "";
   }, [partitions.data, partition]);
 
   const submit = useMutation({
@@ -202,11 +226,14 @@ export default function SubmitPage() {
         body: JSON.stringify({
           cluster,
           variant: variantName,
-          phase,
-          partition: isSlurm ? partition : null,
+          phase: submitPhase,
+          partition: isSlurm ? selectedPartitionName : null,
           node: isSlurm ? null : mlxpNode,
           dataset_override,
           extra_args: extraArgs.split(/\s+/).filter(Boolean),
+          eval_parallel_sims_per_gpu: wantsCheckpoint && hasEvalParallelSimsPerGpuOverride
+            ? evalParallelSimsPerGpuParsed
+            : null,
           checkpoint_path: wantsCheckpoint ? checkpointPath.trim() : null,
           job_name: jobNameTouched ? jobName.trim() : null,
         }),
@@ -222,11 +249,13 @@ export default function SubmitPage() {
 
   const canSubmit =
     !!variantName &&
-    (isSlurm ? !!partition : !!mlxpNode) &&
+    (isSlurm ? !!selectedPartitionName : !!mlxpNode) &&
     (!wantsCheckpoint ||
-      (!!trimmedCkpt && checkpointExistsValue !== false)) &&
+      (!!trimmedCkpt &&
+        checkpointExistsValue !== false &&
+        evalParallelSimsPerGpuValid)) &&
     !submit.isPending;
-  const selectedPartition = partitions.data?.find((p) => p.name === partition);
+  const selectedPartition = partitions.data?.find((p) => p.name === selectedPartitionName);
 
   return (
     <div className="mx-auto max-w-7xl px-8 py-12">
@@ -284,16 +313,13 @@ export default function SubmitPage() {
                       </SelectTrigger>
                       <SelectContent>
                         <SelectItem value="train">train</SelectItem>
-                        <SelectItem value="resume">
-                          resume (requires existing checkpoint)
-                        </SelectItem>
                         <SelectItem value="eval">eval</SelectItem>
                       </SelectContent>
                     </Select>
                   </Field>
 
                   <Field label="Partition">
-                    <Select value={partition} onValueChange={setPartition}>
+                    <Select value={selectedPartitionName} onValueChange={setPartition}>
                       <SelectTrigger>
                         <SelectValue placeholder="loading partitions…" />
                       </SelectTrigger>
@@ -342,12 +368,10 @@ export default function SubmitPage() {
                       single={singleDataset}
                       multi={multiDatasets}
                       onSingleChange={(v) => {
-                        setSingleDataset(v);
-                        setDatasetTouched(true);
+                        setDatasetEdit({ variant: variantName, single: v, multi: multiDatasets });
                       }}
                       onMultiChange={(v) => {
-                        setMultiDatasets(v);
-                        setDatasetTouched(true);
+                        setDatasetEdit({ variant: variantName, single: singleDataset, multi: v });
                       }}
                       touched={datasetTouched}
                       cluster={cluster}
@@ -362,21 +386,21 @@ export default function SubmitPage() {
                       <span className="flex items-center gap-2">
                         Job name
                         <span className="font-mono text-xs font-normal text-slate-500">
-                          {jobName.length}
+                          {shownJobName.length}
                         </span>
                       </span>
                     }
                   >
                     <div className="flex gap-2">
                       <Input
-                        value={jobName}
+                        value={shownJobName}
                         onChange={(e) => {
                           setJobName(e.target.value);
                           setJobNameTouched(true);
                         }}
                         placeholder={
                           variantName
-                            ? buildDefaultJobName(phase, variantName)
+                            ? defaultJobName
                             : "pick a variant first"
                         }
                         className="flex-1 font-mono text-xs"
@@ -387,7 +411,6 @@ export default function SubmitPage() {
                           size="sm"
                           onClick={() => {
                             setJobNameTouched(false);
-                            setJobName(buildDefaultJobName(phase, variantName));
                           }}
                         >
                           Reset to default
@@ -404,8 +427,10 @@ export default function SubmitPage() {
                       <Input
                         value={checkpointPath}
                         onChange={(e) => {
-                          setCheckpointPath(e.target.value);
-                          setCheckpointTouched(true);
+                          setCheckpointEdit({
+                            scope: checkpointScope,
+                            value: e.target.value,
+                          });
                         }}
                         placeholder={
                           selectedCkpt.isLoading
@@ -435,6 +460,31 @@ export default function SubmitPage() {
                             <code>{selectedCkpt.data.path}</code> — overriding.
                           </p>
                         )}
+                    </Field>
+                  )}
+
+                  {wantsCheckpoint && (
+                    <Field label="Eval parallel sims per GPU (optional)">
+                      <Input
+                        type="number"
+                        min={1}
+                        step={1}
+                        placeholder="config default"
+                        value={evalParallelSimsPerGpu}
+                        onChange={(e) =>
+                          setEvalParallelSimsPerGpu(e.target.value)
+                        }
+                      />
+                      {!evalParallelSimsPerGpuValid && (
+                        <p className="text-xs text-red-600 dark:text-red-400">
+                          Enter a positive integer.
+                        </p>
+                      )}
+                      {evalParallelTotal !== null && (
+                        <p className="text-xs text-slate-500">
+                          Total sims: <code>{evalParallelTotal}</code>
+                        </p>
+                      )}
                     </Field>
                   )}
 
@@ -499,12 +549,10 @@ export default function SubmitPage() {
                       single={singleDataset}
                       multi={multiDatasets}
                       onSingleChange={(v) => {
-                        setSingleDataset(v);
-                        setDatasetTouched(true);
+                        setDatasetEdit({ variant: variantName, single: v, multi: multiDatasets });
                       }}
                       onMultiChange={(v) => {
-                        setMultiDatasets(v);
-                        setDatasetTouched(true);
+                        setDatasetEdit({ variant: variantName, single: singleDataset, multi: v });
                       }}
                       touched={datasetTouched}
                       cluster={cluster}
@@ -519,21 +567,21 @@ export default function SubmitPage() {
                       <span className="flex items-center gap-2">
                         Job name
                         <span className="font-mono text-xs font-normal text-slate-500">
-                          {jobName.length}
+                          {shownJobName.length}
                         </span>
                       </span>
                     }
                   >
                     <div className="flex gap-2">
                       <Input
-                        value={jobName}
+                        value={shownJobName}
                         onChange={(e) => {
                           setJobName(e.target.value);
                           setJobNameTouched(true);
                         }}
                         placeholder={
                           variantName
-                            ? buildDefaultJobName("train", variantName)
+                            ? defaultJobName
                             : "pick a variant first"
                         }
                         className="flex-1 font-mono text-xs"
@@ -544,7 +592,6 @@ export default function SubmitPage() {
                           size="sm"
                           onClick={() => {
                             setJobNameTouched(false);
-                            setJobName(buildDefaultJobName("train", variantName));
                           }}
                         >
                           Reset to default
@@ -557,9 +604,9 @@ export default function SubmitPage() {
                     </p>
                   </Field>
 
-                  <Field label="Extra gr00t_finetune.py args (optional)">
+                  <Field label="Extra sbatch args (optional)">
                     <Input
-                      placeholder="--tune-visual --random-diffusion"
+                      placeholder="--exclude=rlwrld-gpu-260504-260803-st-p5en-48xl-3"
                       value={extraArgs}
                       onChange={(e) => setExtraArgs(e.target.value)}
                     />
@@ -572,11 +619,11 @@ export default function SubmitPage() {
           {variant.data && (
             <ConfigCard
               variantName={variant.data.name}
-              flagsUrl={`/api/variants/${variant.data.name}/flags?cluster=${cluster}&phase=${phase}`}
-              queryKey={["variant-flags", variant.data.name, cluster, phase]}
+              flagsUrl={`/api/variants/${variant.data.name}/flags?cluster=${cluster}&phase=${submitPhase}`}
+              queryKey={["variant-flags", variant.data.name, cluster, submitPhase]}
               modalityConfigFile={variant.data.vars.TRAIN_MODALITY_CONFIG ?? null}
               cluster={cluster}
-              phase={phase}
+              phase={submitPhase}
               checkpointOverride={wantsCheckpoint ? checkpointPath : null}
               checkpointOverrideExists={checkpointExistsValue}
               className="mt-6"
@@ -588,7 +635,7 @@ export default function SubmitPage() {
               {submit.isPending
                 ? "Submitting…"
                 : isSlurm
-                  ? `Submit ${phase} → ${cluster}/${partition || "?"}`
+                  ? `Submit ${phase} → ${cluster}/${selectedPartitionName || "?"}`
                   : `Submit train → mlxp/${mlxpNode}/${variant.data?.vars.TRAIN_NUM_GPUS ?? "?"}×H200`}
             </Button>
           </div>

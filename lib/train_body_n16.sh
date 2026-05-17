@@ -24,13 +24,15 @@ GPU_INSTANCE="$(detect_gpu_instance)"
 EXP_NAME="${SLURM_JOB_NAME:-${VARIANT}_${GPU_INSTANCE}_$(date +%Y%m%d%H%M%S)}"
 
 CKPT_DIR="$EXP_DIR/checkpoints"
+RUN_CKPT_DIR="$CKPT_DIR/$EXP_NAME"
 mkdir -p "$EXP_DIR/logs" "$LOG_DIR" "$CKPT_DIR"
 LOG_FILE="$EXP_DIR/logs/train.log"
 
 log "============================================="
 log "$EXP_NAME"
-log "  cluster=$CLUSTER  partition=$PARTITION  gpu=$GPU_INSTANCE  model=n1.6"
+log "  cluster=$CLUSTER  partition=${SUBMIT_PARTITION:-$PARTITION}  gpu=$GPU_INSTANCE  model=n1.6"
 log "  variant note: $TRAIN_NOTE"
+log "  output=$RUN_CKPT_DIR"
 log "============================================="
 
 # ── Build dataset path list (multi-dataset support, backward compat) ──
@@ -54,8 +56,18 @@ log "Modality config: $MODALITY_CONFIG_FILE"
 GLOBAL_BATCH_SIZE=$((TRAIN_NUM_GPUS * TRAIN_BATCH_SIZE))
 log "Global batch: $TRAIN_NUM_GPUS GPUs × $TRAIN_BATCH_SIZE per-device = $GLOBAL_BATCH_SIZE"
 
-if [ -d "$CKPT_DIR/checkpoint-${MAX_STEPS}" ]; then
-    log "Final checkpoint already exists at $CKPT_DIR/checkpoint-${MAX_STEPS} — skipping training."
+if [[ "${RESUME_EXPECTED:-0}" == "1" ]]; then
+    if compgen -G "$RUN_CKPT_DIR/checkpoint-*" > /dev/null; then
+        LATEST_CKPT=$(ls -d "$RUN_CKPT_DIR"/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1)
+        log "Resume requested; existing checkpoint found: $LATEST_CKPT"
+    else
+        log "ERROR: resume requested but no checkpoint in $RUN_CKPT_DIR"
+        exit 1
+    fi
+fi
+
+if [ -d "$RUN_CKPT_DIR/checkpoint-${MAX_STEPS}" ]; then
+    log "Final checkpoint already exists at $RUN_CKPT_DIR/checkpoint-${MAX_STEPS} — skipping training."
     exit 0
 fi
 

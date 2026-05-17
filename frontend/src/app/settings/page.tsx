@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ExternalLink } from "lucide-react";
@@ -30,18 +30,12 @@ export default function SettingsPage() {
 function WandbCard() {
   const qc = useQueryClient();
   const [key, setKey] = useState("");
-  const [project, setProject] = useState("");
+  const [projectDraft, setProjectDraft] = useState<string | null>(null);
 
   const status = useQuery({
     queryKey: ["wandb-status"],
     queryFn: () => api<WandbStatus>("/api/wandb/status"),
   });
-
-  // Keep the project input in sync with the saved value, but don't clobber
-  // a user edit in progress.
-  useEffect(() => {
-    if (status.data && project === "") setProject(status.data.project);
-  }, [status.data, project]);
 
   const login = useMutation({
     mutationFn: () =>
@@ -61,6 +55,10 @@ function WandbCard() {
     onError: (e: Error) => toast.error(e.message),
   });
 
+  const savedProject = status.data?.project ?? "";
+  const project = projectDraft ?? savedProject;
+  const projectDirty = project.trim() !== "" && project.trim() !== savedProject;
+
   const saveProject = useMutation({
     mutationFn: () =>
       api<WandbStatus>("/api/wandb/project", {
@@ -69,13 +67,12 @@ function WandbCard() {
       }),
     onSuccess: (res) => {
       toast.success(`Project set to ${res.project}`);
+      setProjectDraft(null);
+      qc.setQueryData(["wandb-status"], res);
       qc.invalidateQueries({ queryKey: ["wandb-status"] });
     },
     onError: (e: Error) => toast.error(e.message),
   });
-
-  const savedProject = status.data?.project ?? "";
-  const projectDirty = project.trim() !== "" && project.trim() !== savedProject;
 
   return (
     <Card className="mt-8">
@@ -138,7 +135,7 @@ function WandbCard() {
           <div className="flex gap-2">
             <Input
               value={project}
-              onChange={(e) => setProject(e.target.value)}
+              onChange={(e) => setProjectDraft(e.target.value)}
               placeholder="finetune-gr00t-n1d6"
               className="flex-1 font-mono text-xs"
               autoComplete="off"

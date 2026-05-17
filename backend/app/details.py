@@ -11,7 +11,7 @@ import re
 import shlex
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .clusters import load_cluster
 from .jobs import get_job
@@ -56,6 +56,22 @@ class Progress(BaseModel):
     percent: float | None = None         # 0..100
 
 
+class GpuDeviceUsage(BaseModel):
+    index: int
+    used_gb: float
+    total_gb: float
+    used_mib: int
+    total_mib: int
+
+
+class GpuUsage(BaseModel):
+    node: str | None = None
+    used_gb: float | None = None
+    total_gb: float | None = None
+    devices: list[GpuDeviceUsage] = Field(default_factory=list)
+    error: str | None = None
+
+
 class JobDetails(BaseModel):
     cluster: str
     job_id: str
@@ -67,6 +83,7 @@ class JobDetails(BaseModel):
     wandb_url: str | None
     paths: Paths
     progress: Progress
+    gpu: GpuUsage | None = None
 
 
 def _match_known_variant(candidate: str) -> str:
@@ -262,7 +279,7 @@ async def _resolve_runtime_exp_dir(
     return None
 
 
-async def get_details(cluster: str, job_id: str) -> JobDetails:
+async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> JobDetails:
     sacct = await get_job(cluster, job_id)
     job_name = sacct.get("JobName", "")
     state = sacct.get("State", "")
@@ -326,7 +343,7 @@ async def get_details(cluster: str, job_id: str) -> JobDetails:
         if phase == "eval" and variant
         else None
     )
-    isaac_logs_glob = f"{exp_dir_remote}/logs/server_*.log" if phase == "eval" else None
+    isaac_logs_glob = f"{exp_dir_remote}/logs/{job_id}/server_*.log" if phase == "eval" else None
     paths = Paths(
         stdout=stdout_path,
         stderr=stderr_path,
@@ -345,11 +362,21 @@ async def get_details(cluster: str, job_id: str) -> JobDetails:
             wandb_url = f"https://wandb.ai/{entity}/{get_project()}/runs/{job_name}"
 
     progress = await _compute_progress(cluster, job_id, phase, variant, stdout_path, stderr_path, ckpt_dir, eval_dir)
+    gpu = (
+        await _slurm_gpu_usage(
+            env.ssh_alias,
+            job_id,
+            sacct.get("NodeList") or "",
+            state,
+        )
+        if include_gpu
+        else None
+    )
 
     return JobDetails(
         cluster=cluster, job_id=job_id, job_name=job_name,
         phase=phase, variant=variant, state=state, elapsed=elapsed,
-        wandb_url=wandb_url, paths=paths, progress=progress,
+        wandb_url=wandb_url, paths=paths, progress=progress, gpu=gpu,
     )
 
 
@@ -382,6 +409,99 @@ async def _mlxp_details(job_id: str, job_name: str, state: str, elapsed: str,
         phase=phase, variant=variant, state=state, elapsed=elapsed,
         wandb_url=wandb_url, paths=paths, progress=progress,
     )
+
+
+def _parse_gpu_usage(stdout: str, node: str | None) -> GpuUsage | None:
+    devices: list[GpuDeviceUsage] = []
+    for line in stdout.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 3:
+            continue
+        try:
+            index = int(parts[0])
+            used_mib = int(parts[1])
+            total_mib = int(parts[2])
+        except ValueError:
+            continue
+        devices.append(
+            GpuDeviceUsage(
+                index=index,
+                used_mib=used_mib,
+                total_mib=total_mib,
+                used_gb=round(used_mib / 1024, 1),
+                total_gb=round(total_mib / 1024, 1),
+            )
+        )
+    if not devices:
+        return None
+    used_mib_total = sum(d.used_mib for d in devices)
+    total_mib_total = sum(d.total_mib for d in devices)
+    return GpuUsage(
+        node=node,
+        used_gb=round(used_mib_total / 1024, 1),
+        total_gb=round(total_mib_total / 1024, 1),
+        devices=devices,
+    )
+
+
+async def _first_slurm_node(host: str, nodelist: str) -> str | None:
+    node_expr = nodelist.strip()
+    if not node_expr or node_expr in {"None assigned", "N/A", "(None)"}:
+        return None
+    r = await ssh_run(
+        host,
+        f"PATH=/opt/slurm/bin:$PATH scontrol show hostnames {shlex.quote(node_expr)} 2>/dev/null | head -1",
+        timeout=8.0,
+    )
+    node = r.stdout.strip().splitlines()[0] if r.stdout.strip() else ""
+    return node or node_expr
+
+
+async def _slurm_gpu_usage(
+    host: str,
+    job_id: str,
+    nodelist: str,
+    state: str,
+) -> GpuUsage:
+    node_expr = nodelist.strip()
+    fallback_node = None if node_expr in {"", "None assigned", "N/A", "(None)"} else node_expr
+    if not state.upper().startswith(("RUNNING", "COMPLETING")):
+        return GpuUsage(node=fallback_node, error="GPU memory is only available while the job is running")
+
+    node = await _first_slurm_node(host, nodelist)
+
+    query = (
+        "nvidia-smi --query-gpu=index,memory.used,memory.total "
+        "--format=csv,noheader,nounits"
+    )
+
+    # Preferred: execute inside the job allocation. This works even when
+    # compute-node SSH is not available directly from the login node.
+    srun_cmd = (
+        f"PATH=/opt/slurm/bin:$PATH timeout 8 "
+        f"srun --jobid={shlex.quote(job_id)} --overlap --ntasks=1 "
+        f"bash -lc {shlex.quote(query)} 2>&1"
+    )
+    r = await ssh_run(host, srun_cmd, timeout=10.0)
+    usage = _parse_gpu_usage(r.stdout, node)
+    if usage:
+        return usage
+
+    # Fallback for clusters where login -> compute SSH is permitted.
+    if node:
+        ssh_cmd = (
+            "timeout 8 ssh -o BatchMode=yes -o ConnectTimeout=5 "
+            "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+            f"{shlex.quote(node)} {shlex.quote(query)} 2>&1"
+        )
+        r = await ssh_run(host, ssh_cmd, timeout=10.0)
+        usage = _parse_gpu_usage(r.stdout, node)
+        if usage:
+            return usage
+
+    err = (r.stderr or r.stdout or "").strip().splitlines()
+    message = err[-1] if err else "GPU memory is unavailable"
+    return GpuUsage(node=node, error=message[:240])
 
 
 async def _mlxp_progress(run_id: str, variant: str | None, phase: str) -> Progress:
@@ -730,41 +850,48 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
             completed = 0
         progress.completed_runs = completed
 
-        # Episode counter inside the *active* server log (most recently
-        # touched server_<set>_run<i>.log). Each "Resetting environment
-        # with seed:" marks an episode boundary; the body's stabilization
-        # pass adds one extra reset, so clamp to N_EPISODES.
-        current_ep = 0
+        # Episode counter inside this job's server logs. Parallel evals can
+        # have multiple active workers, so sum each log's episode count.
+        active_eps = 0
+        active_logs = 0
         logs_dir = eval_dir.rsplit("/", 1)[0] + "/logs"
         if n_eps > 0:
+            logs_dir_q = shlex.quote(logs_dir)
+            job_id_q = shlex.quote(job_id)
             ep_cmd = (
-                f"latest=$(ls -t {logs_dir}/server_*.log 2>/dev/null | head -1); "
-                f"if [ -n \"$latest\" ]; then "
-                f"grep -c 'Resetting environment with seed:' \"$latest\" 2>/dev/null || echo 0; "
-                f"else echo 0; fi"
+                f"job_logs={logs_dir_q}/{job_id_q}; "
+                f"if [ -d \"$job_logs\" ]; then pattern=\"$job_logs/server_*.log\"; "
+                f"else pattern={logs_dir_q}/server_*.log; fi; "
+                "total=0; count=0; "
+                "for f in $pattern; do "
+                "[ -f \"$f\" ] || continue; "
+                "c=$(grep -c 'Resetting environment with seed:' \"$f\" 2>/dev/null || echo 0); "
+                f"if [ \"$c\" -gt {n_eps} ]; then c={n_eps}; fi; "
+                "total=$((total + c)); count=$((count + 1)); "
+                "done; "
+                "echo \"$total $count\""
             )
             r = await ssh_run(host, ep_cmd, timeout=10.0)
             try:
-                current_ep = min(int(r.stdout.strip()), n_eps)
-            except ValueError:
-                current_ep = 0
+                parts = r.stdout.strip().split()
+                active_eps = int(parts[0]) if parts else 0
+                active_logs = int(parts[1]) if len(parts) > 1 else 0
+            except (ValueError, IndexError):
+                active_eps = 0
+                active_logs = 0
 
         # Promote eval into the unified step-based shape so the frontend
         # ETA + progress bar work the same way as training:
-        #   current_step = completed_runs · N_EPISODES + episodes_in_active_run
+        #   current_step = max(completed_runs · N_EPISODES, episodes_seen_in_this_job)
         #   max_steps    = total_runs    · N_EPISODES
         if n_eps > 0:
             progress.max_steps = total * n_eps
-            # Don't double-count: if a run finished, current_ep is from a
-            # log file that may still belong to it. Reset to 0 when no
-            # new run has started yet (server log mtime older than newest
-            # results.json), but for simplicity we just rely on the clamp
-            # — overcount of n_eps gets absorbed when results.json lands.
-            progress.current_step = min(completed * n_eps + current_ep, progress.max_steps)
+            progress.current_step = min(max(completed * n_eps, active_eps), progress.max_steps)
             progress.percent = round(100.0 * progress.current_step / progress.max_steps, 1)
-            progress.current_label = (
-                f"{completed}/{total} runs · episode {current_ep}/{n_eps}"
-            )
+            if active_logs > 1:
+                progress.current_label = f"{completed}/{total} runs · {active_eps}/{active_logs * n_eps} active episodes"
+            else:
+                progress.current_label = f"{completed}/{total} runs · episode {active_eps}/{n_eps}"
         else:
             progress.percent = round(100.0 * completed / total, 1)
             progress.current_label = f"{completed}/{total} runs"

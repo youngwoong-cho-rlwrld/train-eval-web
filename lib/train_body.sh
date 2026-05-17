@@ -30,7 +30,7 @@ LOG_FILE="$EXP_DIR/logs/train.log"
 
 log "========================================="
 log "$EXP_NAME"
-log "  cluster=$CLUSTER  partition=$PARTITION  gpu=$GPU_INSTANCE"
+log "  cluster=$CLUSTER  partition=${SUBMIT_PARTITION:-$PARTITION}  gpu=$GPU_INSTANCE"
 log "  variant note: $TRAIN_NOTE"
 log "========================================="
 

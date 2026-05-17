@@ -75,6 +75,22 @@ export type Progress = {
   percent: number | null;
 };
 
+export type GpuDeviceUsage = {
+  index: number;
+  used_gb: number;
+  total_gb: number;
+  used_mib: number;
+  total_mib: number;
+};
+
+export type GpuUsage = {
+  node: string | null;
+  used_gb: number | null;
+  total_gb: number | null;
+  devices: GpuDeviceUsage[];
+  error: string | null;
+};
+
 export type Dataset = {
   name: string;
   path: string;
@@ -113,4 +129,5 @@ export type JobDetails = {
   wandb_url: string | null;
   paths: Paths;
   progress: Progress;
+  gpu: GpuUsage | null;
 };
