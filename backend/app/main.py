@@ -320,18 +320,22 @@ async def get_job_flags(cluster: str, job_id: str):
     if cluster != "mlxp" and det.phase == "eval":
         env = await clusters.load_cluster(cluster)
         meta = await details._read_slurm_meta(env.ssh_alias, job_id)
-        override = (meta.get("eval_parallel_sims_per_gpu") or "").strip()
+        override = (
+            meta.get("eval_num_envs_per_gpu")
+            or meta.get("eval_parallel_sims_per_gpu")
+            or ""
+        ).strip()
         if override:
             rewritten: list[tuple[str, str]] = []
             replaced = False
             for flag, val in out:
-                if flag == "EVAL_PARALLEL_SIMS_PER_GPU":
+                if flag == "EVAL_NUM_ENVS_PER_GPU":
                     rewritten.append((flag, override))
                     replaced = True
                 else:
                     rewritten.append((flag, val))
             if not replaced:
-                rewritten.append(("EVAL_PARALLEL_SIMS_PER_GPU", override))
+                rewritten.append(("EVAL_NUM_ENVS_PER_GPU", override))
             out = rewritten
     return {"flags": [{"flag": f, "value": val} for f, val in out]}
 

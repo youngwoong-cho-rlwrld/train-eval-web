@@ -77,6 +77,8 @@ export type Progress = {
 
 export type GpuDeviceUsage = {
   index: number;
+  name: string | null;
+  utilization_gpu_percent: number | null;
   used_gb: number;
   total_gb: number;
   used_mib: number;
@@ -85,6 +87,7 @@ export type GpuDeviceUsage = {
 
 export type GpuUsage = {
   node: string | null;
+  utilization_gpu_percent: number | null;
   used_gb: number | null;
   total_gb: number | null;
   devices: GpuDeviceUsage[];

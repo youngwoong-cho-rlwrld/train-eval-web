@@ -81,8 +81,9 @@ class SubmitRequest(BaseModel):
     # None means "use whatever the variant config.sh says".
     dataset_override: str | list[str] | None = None
     extra_args: list[str] = Field(default_factory=list)
-    # Eval-only: override EVAL_PARALLEL_SIMS_PER_GPU from config.sh for this
-    # submission. The eval body applies this after sourcing config.sh.
+    # Eval-only: override Isaac's native vectorized env count per GPU.
+    eval_num_envs_per_gpu: int | None = Field(default=None, ge=1)
+    # Legacy request field accepted from older frontends/resume metadata.
     eval_parallel_sims_per_gpu: int | None = Field(default=None, ge=1)
     # Eval-only: absolute path to the checkpoint dir on the cluster. The
     # eval body uses this verbatim when set; otherwise it auto-picks.
@@ -136,8 +137,9 @@ _BODY_BY_PHASE_MODEL = {
 async def submit(req: SubmitRequest) -> SubmitResponse:
     if req.resume and req.phase != "train":
         raise ValueError("resume=true is only valid for phase=train")
-    if req.eval_parallel_sims_per_gpu is not None and req.phase != "eval":
-        raise ValueError("eval_parallel_sims_per_gpu is only valid for phase=eval")
+    eval_num_envs_per_gpu = req.eval_num_envs_per_gpu or req.eval_parallel_sims_per_gpu
+    if eval_num_envs_per_gpu is not None and req.phase != "eval":
+        raise ValueError("eval_num_envs_per_gpu is only valid for phase=eval")
 
     cluster = await load_cluster(req.cluster)
     variant = await load_variant(req.variant)
@@ -258,8 +260,8 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         # and matches MLXP's run-id format.
         f"WANDB_RUN_ID={shlex.quote(job_name)}"
         + (
-            f",SUBMIT_EVAL_PARALLEL_SIMS_PER_GPU={req.eval_parallel_sims_per_gpu}"
-            if req.phase == "eval" and req.eval_parallel_sims_per_gpu is not None else ""
+            f",SUBMIT_EVAL_NUM_ENVS_PER_GPU={eval_num_envs_per_gpu}"
+            if req.phase == "eval" and eval_num_envs_per_gpu is not None else ""
         )
         + (
             f",EVAL_CHECKPOINT={shlex.quote(req.checkpoint_path)}"
@@ -300,8 +302,8 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         )
         + ("resume=true\n" if req.resume else "")
         + (
-            f"eval_parallel_sims_per_gpu={req.eval_parallel_sims_per_gpu}\n"
-            if req.phase == "eval" and req.eval_parallel_sims_per_gpu is not None
+            f"eval_num_envs_per_gpu={eval_num_envs_per_gpu}\n"
+            if req.phase == "eval" and eval_num_envs_per_gpu is not None
             else ""
         )
         + (

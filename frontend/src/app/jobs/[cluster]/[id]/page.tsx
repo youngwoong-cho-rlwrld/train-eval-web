@@ -283,53 +283,44 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
 
 function GpuUsageSection({ d }: { d: JobDetails }) {
   const gpu = d.gpu;
-  const usedGb = gpu?.used_gb ?? null;
-  const totalGb = gpu?.total_gb ?? null;
-  const hasUsage = usedGb != null && totalGb != null && totalGb > 0;
-  const percent =
-    hasUsage
-      ? Math.max(0, Math.min(100, (100 * usedGb) / totalGb))
-      : null;
+  const hasUsage = !!gpu?.devices.length;
 
   return (
     <div className="mt-5 border-t border-slate-100 pt-4 dark:border-slate-900">
-      <div className="mb-2 text-xs font-medium uppercase tracking-wide text-slate-500">
-        GPU Memory
-      </div>
       {!gpu && (
         <p className="text-sm text-slate-500">GPU sample not requested.</p>
       )}
       {gpu && !hasUsage && (
         <div className="space-y-1 text-sm text-slate-500">
-          <p>{gpu.error ?? "GPU memory is unavailable."}</p>
+          <p>{gpu.error ?? "GPU utilization is unavailable."}</p>
           {gpu.node && <p className="font-mono text-xs">node: {gpu.node}</p>}
         </div>
       )}
-      {gpu && hasUsage && percent !== null && (
-        <div className="space-y-3">
-          <div className="flex items-baseline justify-between text-sm">
-            <span className="font-mono">
-              {usedGb.toFixed(1)} / {totalGb.toFixed(1)} GB
-            </span>
-            <span className="text-slate-500">{percent.toFixed(1)}%</span>
-          </div>
-          <div className="h-2 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
-            <div
-              className="h-full rounded-full bg-slate-900 transition-all dark:bg-slate-50"
-              style={{ width: `${percent}%` }}
-            />
-          </div>
-          <div className="grid gap-1 text-xs text-slate-500">
-            {gpu.node && <div className="font-mono">node: {gpu.node}</div>}
-            {gpu.devices.map((dev) => (
-              <div key={dev.index} className="flex justify-between gap-4">
-                <span className="font-mono">gpu {dev.index}</span>
-                <span className="font-mono">
-                  {dev.used_gb.toFixed(1)} / {dev.total_gb.toFixed(1)} GB
-                </span>
+      {gpu && hasUsage && (
+        <div className="space-y-3 text-xs text-slate-500">
+          {gpu.node && <div className="font-mono">node: {gpu.node}</div>}
+          {gpu.devices.map((dev) => {
+            const util = dev.utilization_gpu_percent;
+            const percent = util == null ? 0 : Math.max(0, Math.min(100, util));
+            const label = dev.name ? `gpu ${dev.index} · ${dev.name}` : `gpu ${dev.index}`;
+            return (
+              <div key={dev.index} className="space-y-1.5">
+                <div className="flex items-baseline justify-between gap-4">
+                  <span className="min-w-0 truncate font-mono">{label}</span>
+                  <span className="shrink-0 font-mono">
+                    {util == null ? "unknown" : `${util}%`} · {dev.used_gb.toFixed(1)} /{" "}
+                    {dev.total_gb.toFixed(1)} GB
+                  </span>
+                </div>
+                <div className="h-2 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
+                  <div
+                    className="h-full rounded-full bg-slate-900 transition-all dark:bg-slate-50"
+                    style={{ width: `${percent}%` }}
+                  />
+                </div>
               </div>
-            ))}
-          </div>
+            );
+          })}
         </div>
       )}
     </div>
@@ -361,11 +352,14 @@ function ProgressCard({ d }: { d: JobDetails }) {
   // ETA from elapsed × steps-remaining / current-step. Same linear model the
   // /jobs table uses.
   let etaLabel: string | null = null;
+  let etaTitle = "";
   if (!isComplete && p.current_step && p.max_steps && p.current_step < p.max_steps) {
     const elapsedSec = parseSlurmDuration(d.elapsed);
     if (elapsedSec > 0) {
       const etaSec = (elapsedSec * (p.max_steps - p.current_step)) / p.current_step;
       etaLabel = formatDuration(etaSec);
+      const unit = d.phase === "eval" ? "episode" : "step";
+      etaTitle = `Estimated from aggregate ${unit} throughput`;
     }
   }
 
@@ -419,7 +413,7 @@ function ProgressCard({ d }: { d: JobDetails }) {
               />
             </div>
             {etaLabel && (
-              <div className="mt-2 text-xs text-slate-500">
+              <div className="mt-2 text-xs text-slate-500" title={etaTitle}>
                 ~{etaLabel} left
               </div>
             )}

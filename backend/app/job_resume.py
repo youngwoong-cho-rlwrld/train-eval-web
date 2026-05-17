@@ -55,6 +55,11 @@ async def resume_timed_out_job(cluster: str, job_id: str) -> submit.SubmitRespon
     seed_eval_dirs = [det.paths.eval_dir] if det.paths.eval_dir else []
     env = await load_cluster(cluster)
     meta = await details._read_slurm_meta(env.ssh_alias, job_id)
+    eval_num_envs = (meta.get("eval_num_envs_per_gpu") or meta.get("eval_parallel_sims_per_gpu") or "").strip()
+    try:
+        eval_num_envs_per_gpu = int(eval_num_envs) if eval_num_envs else None
+    except ValueError:
+        eval_num_envs_per_gpu = None
     resume_of = (meta.get("resume_of") or "").strip()
     if resume_of and resume_of != job_id:
         try:
@@ -70,6 +75,7 @@ async def resume_timed_out_job(cluster: str, job_id: str) -> submit.SubmitRespon
             variant=variant,
             phase="eval",
             partition=partition,
+            eval_num_envs_per_gpu=eval_num_envs_per_gpu,
             checkpoint_path=checkpoint,
             seed_eval_results_from=seed_eval_dirs,
             job_name=job_name,

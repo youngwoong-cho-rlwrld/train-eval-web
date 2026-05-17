@@ -93,12 +93,20 @@ def _train_n16(v: Variant, cluster: str) -> list[tuple[str, str]]:
 
 def _eval_n15(v: Variant, cluster: str) -> list[tuple[str, str]]:
     """Mirror lib/eval_body.sh — gr00t inference + isaac client run."""
+    num_envs = (
+        v.vars.get("EVAL_NUM_ENVS_PER_GPU")
+        or v.vars.get("EVAL_NATIVE_NUM_ENVS_PER_SERVER")
+        or v.vars.get("EVAL_NUM_ENVS_PER_SERVER")
+        or v.vars.get("EVAL_PARALLEL_SIMS_PER_GPU")
+        or v.vars.get("EVAL_PARALLEL_SIMS")
+        or "1"
+    )
     return [
         ("--task-name", v.vars.get("TASK_NAME", "")),
         ("--instruction", v.vars.get("INSTRUCTION", "")),
         ("--n-episodes", v.vars.get("N_EPISODES", "")),
         ("--n-runs", v.vars.get("N_RUNS", "")),
-        ("EVAL_PARALLEL_SIMS_PER_GPU", v.vars.get("EVAL_PARALLEL_SIMS_PER_GPU", v.vars.get("EVAL_PARALLEL_SIMS", "1"))),
+        ("EVAL_NUM_ENVS_PER_GPU", num_envs),
         ("--execution-horizon", v.vars.get("EXECUTION_HORIZON", "")),
         ("--max-episode-steps", v.vars.get("MAX_EPISODE_STEPS", "")),
         ("(eval_sets)", " ".join(v.arrays.get("EVAL_SETS") or [])),

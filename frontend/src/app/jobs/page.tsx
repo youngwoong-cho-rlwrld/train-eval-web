@@ -49,7 +49,7 @@ export default function JobsPage() {
       .sort((a, b) => Number(b.job_id) - Number(a.job_id));
     const finished = all
       .filter((j) => !ACTIVE_STATES.has(j.state))
-      .sort((a, b) => Number(b.job_id) - Number(a.job_id));
+      .sort((a, b) => compareStartedDesc(a, b));
     return { active, finished };
   }, [data]);
 
@@ -242,7 +242,8 @@ function EtaCell({
     return <span className="text-slate-400">—</span>;
   }
   const etaSec = (elapsedSec * (max_steps - current_step)) / current_step;
-  return <span title={`assuming ${(elapsedSec / current_step).toFixed(2)}s/step`}>{formatDuration(etaSec)}</span>;
+  const unit = q.data.phase === "eval" ? "episode" : "step";
+  return <span title={`estimated from aggregate ${unit} throughput`}>{formatDuration(etaSec)}</span>;
 }
 
 function ProgressCell({ cluster, jobId, state }: { cluster: string; jobId: string; state: string }) {
@@ -311,6 +312,13 @@ function StateBadge({ state }: { state: string }) {
 
 function isTimeout(state: string): boolean {
   return state.toUpperCase().startsWith("TIMEOUT");
+}
+
+function compareStartedDesc(a: Job, b: Job): number {
+  const aStart = a.start ? Date.parse(a.start) : 0;
+  const bStart = b.start ? Date.parse(b.start) : 0;
+  if (aStart !== bStart) return bStart - aStart;
+  return Number(b.job_id) - Number(a.job_id);
 }
 
 function Th({ children }: { children: React.ReactNode }) {

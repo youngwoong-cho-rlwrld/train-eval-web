@@ -58,6 +58,8 @@ class Progress(BaseModel):
 
 class GpuDeviceUsage(BaseModel):
     index: int
+    name: str | None = None
+    utilization_gpu_percent: int | None = None
     used_gb: float
     total_gb: float
     used_mib: int
@@ -66,6 +68,7 @@ class GpuDeviceUsage(BaseModel):
 
 class GpuUsage(BaseModel):
     node: str | None = None
+    utilization_gpu_percent: float | None = None
     used_gb: float | None = None
     total_gb: float | None = None
     devices: list[GpuDeviceUsage] = Field(default_factory=list)
@@ -419,13 +422,28 @@ def _parse_gpu_usage(stdout: str, node: str | None) -> GpuUsage | None:
             continue
         try:
             index = int(parts[0])
-            used_mib = int(parts[1])
-            total_mib = int(parts[2])
+            if len(parts) >= 5:
+                name = parts[1] or None
+                utilization = int(parts[2])
+                used_mib = int(parts[3])
+                total_mib = int(parts[4])
+            elif len(parts) >= 4:
+                name = None
+                utilization = int(parts[1])
+                used_mib = int(parts[2])
+                total_mib = int(parts[3])
+            else:
+                name = None
+                utilization = None
+                used_mib = int(parts[1])
+                total_mib = int(parts[2])
         except ValueError:
             continue
         devices.append(
             GpuDeviceUsage(
                 index=index,
+                name=name,
+                utilization_gpu_percent=utilization,
                 used_mib=used_mib,
                 total_mib=total_mib,
                 used_gb=round(used_mib / 1024, 1),
@@ -436,8 +454,17 @@ def _parse_gpu_usage(stdout: str, node: str | None) -> GpuUsage | None:
         return None
     used_mib_total = sum(d.used_mib for d in devices)
     total_mib_total = sum(d.total_mib for d in devices)
+    utilization_values = [
+        d.utilization_gpu_percent
+        for d in devices
+        if d.utilization_gpu_percent is not None
+    ]
     return GpuUsage(
         node=node,
+        utilization_gpu_percent=(
+            round(sum(utilization_values) / len(utilization_values), 1)
+            if utilization_values else None
+        ),
         used_gb=round(used_mib_total / 1024, 1),
         total_gb=round(total_mib_total / 1024, 1),
         devices=devices,
@@ -471,7 +498,7 @@ async def _slurm_gpu_usage(
     node = await _first_slurm_node(host, nodelist)
 
     query = (
-        "nvidia-smi --query-gpu=index,memory.used,memory.total "
+        "nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total "
         "--format=csv,noheader,nounits"
     )
 
@@ -850,48 +877,71 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
             completed = 0
         progress.completed_runs = completed
 
-        # Episode counter inside this job's server logs. Parallel evals can
-        # have multiple active workers, so sum each log's episode count.
+        # Episode counter inside this job. Prefer client stdout because native
+        # Isaac vectorization can complete multiple environments per server
+        # reset; server reset counts are only a fallback.
         active_eps = 0
-        active_logs = 0
+        active_envs = 0
+        job_completed_runs = 0
         logs_dir = eval_dir.rsplit("/", 1)[0] + "/logs"
         if n_eps > 0:
-            logs_dir_q = shlex.quote(logs_dir)
+            env = await load_cluster(cluster)
+            log_dir_q = shlex.quote(env.vars["LOG_DIR"])
             job_id_q = shlex.quote(job_id)
+            stdout_cmd = (
+                f"pattern={log_dir_q}/*_{job_id_q}.out; "
+                "episodes=$(grep -h '^Episode .* completed' $pattern 2>/dev/null | wc -l); "
+                "runs=$(grep -h '^Results saved to:' $pattern 2>/dev/null | wc -l); "
+                "echo \"$episodes $runs\""
+            )
+            r = await ssh_run(host, stdout_cmd, timeout=10.0)
+            try:
+                parts = r.stdout.strip().split()
+                active_eps = int(parts[0]) if parts else 0
+                job_completed_runs = int(parts[1]) if len(parts) > 1 else 0
+            except (ValueError, IndexError):
+                active_eps = 0
+                job_completed_runs = 0
+
+            logs_dir_q = shlex.quote(logs_dir)
             ep_cmd = (
                 f"job_logs={logs_dir_q}/{job_id_q}; "
-                f"if [ -d \"$job_logs\" ]; then pattern=\"$job_logs/server_*.log\"; "
-                f"else pattern={logs_dir_q}/server_*.log; fi; "
-                "total=0; count=0; "
+                "if [ -d \"$job_logs\" ]; then pattern=\"$job_logs/server_*.log\"; "
+                "else echo '0 0'; exit 0; fi; "
+                "total=0; envs_started=0; "
                 "for f in $pattern; do "
                 "[ -f \"$f\" ] || continue; "
+                "envs=$(grep -m1 'Num envs:' \"$f\" 2>/dev/null | sed -E 's/.*Num envs: ([0-9]+).*/\\1/'); "
+                "case \"$envs\" in ''|*[!0-9]*) envs=1 ;; esac; "
                 "c=$(grep -c 'Resetting environment with seed:' \"$f\" 2>/dev/null || echo 0); "
+                "if [ \"$c\" -gt 0 ]; then c=$((c - 1)); fi; "
                 f"if [ \"$c\" -gt {n_eps} ]; then c={n_eps}; fi; "
-                "total=$((total + c)); count=$((count + 1)); "
+                "total=$((total + c * envs)); envs_started=$((envs_started + envs)); "
                 "done; "
-                "echo \"$total $count\""
+                "echo \"$total $envs_started\""
             )
             r = await ssh_run(host, ep_cmd, timeout=10.0)
             try:
                 parts = r.stdout.strip().split()
-                active_eps = int(parts[0]) if parts else 0
-                active_logs = int(parts[1]) if len(parts) > 1 else 0
+                active_eps = max(active_eps, int(parts[0]) if parts else 0)
+                active_envs = int(parts[1]) if len(parts) > 1 else 0
             except (ValueError, IndexError):
-                active_eps = 0
-                active_logs = 0
+                active_envs = 0
 
         # Promote eval into the unified step-based shape so the frontend
         # ETA + progress bar work the same way as training:
-        #   current_step = max(completed_runs · N_EPISODES, episodes_seen_in_this_job)
+        #   current_step = completed_runs · N_EPISODES + incomplete episodes in this job
         #   max_steps    = total_runs    · N_EPISODES
         if n_eps > 0:
             progress.max_steps = total * n_eps
-            progress.current_step = min(max(completed * n_eps, active_eps), progress.max_steps)
+            active_incomplete_eps = max(0, active_eps - job_completed_runs * n_eps)
+            progress.current_step = min(completed * n_eps + active_incomplete_eps, progress.max_steps)
             progress.percent = round(100.0 * progress.current_step / progress.max_steps, 1)
-            if active_logs > 1:
-                progress.current_label = f"{completed}/{total} runs · {active_eps}/{active_logs * n_eps} active episodes"
+            episode_label = f"{progress.current_step}/{progress.max_steps} episodes"
+            if active_envs > 1:
+                progress.current_label = f"{completed}/{total} runs · {episode_label} · {active_envs} envs started"
             else:
-                progress.current_label = f"{completed}/{total} runs · episode {active_eps}/{n_eps}"
+                progress.current_label = f"{completed}/{total} runs · {episode_label}"
         else:
             progress.percent = round(100.0 * completed / total, 1)
             progress.current_label = f"{completed}/{total} runs"

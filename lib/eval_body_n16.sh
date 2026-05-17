@@ -77,31 +77,31 @@ fi
 # Phase 2: Evaluation (Isaac Sim server + N1.6 eval client)
 ###############################################################################
 
-if [ -n "${SUBMIT_EVAL_PARALLEL_SIMS_PER_GPU:-}" ]; then
-    EVAL_PARALLEL_SIMS_PER_GPU="$SUBMIT_EVAL_PARALLEL_SIMS_PER_GPU"
-    unset EVAL_PARALLEL_SIMS_TOTAL
-fi
-EVAL_PARALLEL_SIMS_PER_GPU="${EVAL_PARALLEL_SIMS_PER_GPU:-${EVAL_PARALLEL_SIMS:-1}}"
-if ! [[ "$EVAL_PARALLEL_SIMS_PER_GPU" =~ ^[0-9]+$ ]] || [ "$EVAL_PARALLEL_SIMS_PER_GPU" -lt 1 ]; then
-    log "ERROR: EVAL_PARALLEL_SIMS_PER_GPU must be a positive integer, got '$EVAL_PARALLEL_SIMS_PER_GPU'"
-    exit 1
-fi
 EVAL_GPU_COUNT="${TRAIN_NUM_GPUS:-1}"
 if ! [[ "$EVAL_GPU_COUNT" =~ ^[0-9]+$ ]] || [ "$EVAL_GPU_COUNT" -lt 1 ]; then
     EVAL_GPU_COUNT=1
 fi
-EVAL_PARALLEL_SIMS=$((EVAL_PARALLEL_SIMS_PER_GPU * EVAL_GPU_COUNT))
-if [ -n "${EVAL_PARALLEL_SIMS_TOTAL:-}" ]; then
-    if ! [[ "$EVAL_PARALLEL_SIMS_TOTAL" =~ ^[0-9]+$ ]] || [ "$EVAL_PARALLEL_SIMS_TOTAL" -lt 1 ]; then
-        log "ERROR: EVAL_PARALLEL_SIMS_TOTAL must be a positive integer, got '$EVAL_PARALLEL_SIMS_TOTAL'"
-        exit 1
-    fi
-    EVAL_PARALLEL_SIMS="$EVAL_PARALLEL_SIMS_TOTAL"
-    log "Parallel sims: $EVAL_PARALLEL_SIMS total (capped by EVAL_PARALLEL_SIMS_TOTAL; base ${EVAL_PARALLEL_SIMS_PER_GPU} per GPU x $EVAL_GPU_COUNT GPUs)"
-else
-    log "Parallel sims: $EVAL_PARALLEL_SIMS ($EVAL_PARALLEL_SIMS_PER_GPU per GPU x $EVAL_GPU_COUNT GPUs)"
+
+if [ -n "${SUBMIT_EVAL_NUM_ENVS_PER_GPU:-}" ]; then
+    EVAL_NUM_ENVS_PER_GPU="$SUBMIT_EVAL_NUM_ENVS_PER_GPU"
+elif [ -n "${SUBMIT_EVAL_PARALLEL_SIMS_PER_GPU:-}" ]; then
+    EVAL_NUM_ENVS_PER_GPU="$SUBMIT_EVAL_PARALLEL_SIMS_PER_GPU"
 fi
-EVAL_PIN_CUDA_DEVICES="${EVAL_PIN_CUDA_DEVICES:-0}"
+EVAL_NUM_ENVS_PER_GPU="${EVAL_NUM_ENVS_PER_GPU:-${EVAL_NATIVE_NUM_ENVS_PER_SERVER:-${EVAL_NUM_ENVS_PER_SERVER:-${EVAL_PARALLEL_SIMS_PER_GPU:-${EVAL_PARALLEL_SIMS:-1}}}}}"
+if ! [[ "$EVAL_NUM_ENVS_PER_GPU" =~ ^[0-9]+$ ]] || [ "$EVAL_NUM_ENVS_PER_GPU" -lt 1 ]; then
+    log "ERROR: EVAL_NUM_ENVS_PER_GPU must be a positive integer, got '$EVAL_NUM_ENVS_PER_GPU'"
+    exit 1
+fi
+EVAL_REQUESTED_NUM_ENVS_PER_GPU="$EVAL_NUM_ENVS_PER_GPU"
+if [[ "${N_EPISODES:-}" =~ ^[0-9]+$ ]] && [ "$N_EPISODES" -gt 0 ] && [ "$EVAL_NUM_ENVS_PER_GPU" -gt "$N_EPISODES" ]; then
+    log "Requested EVAL_NUM_ENVS_PER_GPU=$EVAL_NUM_ENVS_PER_GPU exceeds N_EPISODES=$N_EPISODES; using $N_EPISODES"
+    EVAL_NUM_ENVS_PER_GPU="$N_EPISODES"
+fi
+EVAL_PARALLEL_WORKERS="$EVAL_GPU_COUNT"
+EVAL_TOTAL_NUM_ENVS=$((EVAL_NUM_ENVS_PER_GPU * EVAL_PARALLEL_WORKERS))
+log "Isaac native envs: $EVAL_TOTAL_NUM_ENVS total (${EVAL_NUM_ENVS_PER_GPU} per GPU x $EVAL_GPU_COUNT GPUs)"
+log "Isaac server workers: $EVAL_PARALLEL_WORKERS x ${EVAL_NUM_ENVS_PER_GPU} native envs"
+EVAL_PIN_CUDA_DEVICES="${EVAL_PIN_CUDA_DEVICES:-1}"
 if [ "$EVAL_PIN_CUDA_DEVICES" != "0" ] && [ "$EVAL_PIN_CUDA_DEVICES" != "1" ]; then
     log "ERROR: EVAL_PIN_CUDA_DEVICES must be 0 or 1, got '$EVAL_PIN_CUDA_DEVICES'"
     exit 1
@@ -111,7 +111,7 @@ if [ "$EVAL_PIN_CLIENT_CUDA_DEVICES" != "0" ] && [ "$EVAL_PIN_CLIENT_CUDA_DEVICE
     log "ERROR: EVAL_PIN_CLIENT_CUDA_DEVICES must be 0 or 1, got '$EVAL_PIN_CLIENT_CUDA_DEVICES'"
     exit 1
 fi
-EVAL_UNSET_CUDA_VISIBLE_DEVICES_FOR_SERVER="${EVAL_UNSET_CUDA_VISIBLE_DEVICES_FOR_SERVER:-1}"
+EVAL_UNSET_CUDA_VISIBLE_DEVICES_FOR_SERVER="${EVAL_UNSET_CUDA_VISIBLE_DEVICES_FOR_SERVER:-0}"
 if [ "$EVAL_UNSET_CUDA_VISIBLE_DEVICES_FOR_SERVER" != "0" ] && [ "$EVAL_UNSET_CUDA_VISIBLE_DEVICES_FOR_SERVER" != "1" ]; then
     log "ERROR: EVAL_UNSET_CUDA_VISIBLE_DEVICES_FOR_SERVER must be 0 or 1, got '$EVAL_UNSET_CUDA_VISIBLE_DEVICES_FOR_SERVER'"
     exit 1
@@ -122,7 +122,9 @@ if ! [[ "$EVAL_SIM_START_STAGGER_SECONDS" =~ ^[0-9]+$ ]]; then
     log "ERROR: EVAL_SIM_START_STAGGER_SECONDS must be a non-negative integer, got '$EVAL_SIM_START_STAGGER_SECONDS'"
     exit 1
 fi
-EVAL_SERVER_READY_TIMEOUT_SECONDS="${EVAL_SERVER_READY_TIMEOUT_SECONDS:-180}"
+if [ -z "${EVAL_SERVER_READY_TIMEOUT_SECONDS:-}" ]; then
+    EVAL_SERVER_READY_TIMEOUT_SECONDS=$((240 + EVAL_PARALLEL_WORKERS * EVAL_SIM_START_STAGGER_SECONDS))
+fi
 if ! [[ "$EVAL_SERVER_READY_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || [ "$EVAL_SERVER_READY_TIMEOUT_SECONDS" -lt 1 ]; then
     log "ERROR: EVAL_SERVER_READY_TIMEOUT_SECONDS must be a positive integer, got '$EVAL_SERVER_READY_TIMEOUT_SECONDS'"
     exit 1
@@ -141,11 +143,36 @@ cleanup_all() {
 trap cleanup_all EXIT
 trap 'cleanup_all; exit 130' INT TERM
 
+refresh_running_pids() {
+    local status=0
+    local completed_count
+    local _
+    local running_pids=()
+
+    mapfile -t running_pids < <(jobs -pr)
+    completed_count=$((${#PIDS[@]} - ${#running_pids[@]}))
+    if [ "$completed_count" -gt 0 ]; then
+        for _ in $(seq 1 "$completed_count"); do
+            if ! wait -n; then
+                FAILED=1
+                status=1
+            fi
+        done
+        mapfile -t running_pids < <(jobs -pr)
+    fi
+    PIDS=("${running_pids[@]}")
+    return "$status"
+}
+
 wait_for_slot() {
-    while [ "${#PIDS[@]}" -ge "$EVAL_PARALLEL_SIMS" ]; do
-        local pid="${PIDS[0]}"
-        PIDS=("${PIDS[@]:1}")
-        if ! wait "$pid"; then
+    while true; do
+        if ! refresh_running_pids; then
+            return 1
+        fi
+        if [ "${#PIDS[@]}" -lt "$EVAL_PARALLEL_WORKERS" ]; then
+            return 0
+        fi
+        if ! wait -n; then
             FAILED=1
             return 1
         fi
@@ -153,9 +180,14 @@ wait_for_slot() {
 }
 
 wait_for_all() {
-    local pid
-    for pid in "${PIDS[@]:-}"; do
-        if ! wait "$pid"; then
+    while true; do
+        if ! refresh_running_pids; then
+            :
+        fi
+        if [ "${#PIDS[@]}" -eq 0 ]; then
+            break
+        fi
+        if ! wait -n; then
             FAILED=1
         fi
     done
@@ -305,7 +337,7 @@ run_eval_one() (
     if [ "$EVAL_UNSET_CUDA_VISIBLE_DEVICES_FOR_SERVER" = "1" ]; then
         server_cuda_devices="<unset>"
     fi
-    log "  Isaac Sim server starting on port $PORT with CUDA_VISIBLE_DEVICES=${server_cuda_devices}"
+    log "  Isaac Sim server starting on port $PORT with CUDA_VISIBLE_DEVICES=${server_cuda_devices}, num_envs=${EVAL_NUM_ENVS_PER_GPU}"
 
     # Server: run from rlwrld_isaac venv (Python 3.11 + isaac-sim).
     setsid bash -c "
@@ -314,7 +346,7 @@ run_eval_one() (
         fi
         source '${ISAAC_DIR}/.venv/bin/activate'
         cd '${ISAAC_DIR}'
-        exec python scripts/environments/server_v2.py \
+        exec python '${REPO_ROOT}/lib/isaac_server_runner.py' scripts/environments/server_v2.py \
             --task 'Isaac-UniPickPlace-ALLEX-JointAction-VisualStereo-Abs-v0' \
             --task_name '${TASK_NAME_LOOP}' \
             --max-episode-steps ${MAX_EPISODE_STEPS} \
@@ -322,6 +354,7 @@ run_eval_one() (
             --image_resize_height 480 \
             --image_resize_width 640 \
             --port $PORT \
+            --num_envs ${EVAL_NUM_ENVS_PER_GPU} \
             --device cpu \
             --eval_set $EVAL_SET \
             --app_launcher.headless
@@ -389,9 +422,16 @@ for task_entry in "${TASKS[@]}"; do
 
     for EVAL_SET in "${EVAL_SETS[@]}"; do
         for i in $(seq 1 ${N_RUNS}); do
+            RUN_DIR="${TASK_EVAL_DIR}/${EVAL_SET}/run_${i}"
+            if [ -f "${RUN_DIR}/results.json" ]; then
+                log ""
+                log "  eval_set: ${EVAL_SET} / Run ${i}/${N_RUNS}"
+                log "  SKIP (results.json already exists): ${RUN_DIR}"
+                continue
+            fi
             wait_for_slot
             GPU_SLOT="$LAUNCH_IDX"
-            START_SLOT="$((LAUNCH_IDX % EVAL_PARALLEL_SIMS))"
+            START_SLOT="$((LAUNCH_IDX % EVAL_PARALLEL_WORKERS))"
             PORT="$(find_eval_port)"
             LAUNCH_IDX=$((LAUNCH_IDX + 1))
             run_eval_one \
@@ -485,7 +525,10 @@ agg = {
     'execution_horizon': ${EXECUTION_HORIZON},
     'max_steps': ${MAX_STEPS},
     'n_runs': n_runs,
-    'parallel_sims': ${EVAL_PARALLEL_SIMS},
+    'server_workers': ${EVAL_PARALLEL_WORKERS},
+    'requested_num_envs_per_gpu': ${EVAL_REQUESTED_NUM_ENVS_PER_GPU},
+    'num_envs_per_gpu': ${EVAL_NUM_ENVS_PER_GPU},
+    'total_num_envs': ${EVAL_TOTAL_NUM_ENVS},
 }
 
 if multi_task:

@@ -60,8 +60,7 @@ export default function SubmitPage() {
   // Persisted across sessions + synced across pages via useMyMlxpNode.
   const [mlxpNode, setMlxpNode] = useMyMlxpNode();
   const [extraArgs, setExtraArgs] = useState<string>("");
-  const [evalParallelSimsPerGpu, setEvalParallelSimsPerGpu] =
-    useState<string>("");
+  const [evalNumEnvsPerGpu, setEvalNumEnvsPerGpu] = useState<string>("");
   const [checkpointEdit, setCheckpointEdit] = useState<{
     scope: string;
     value: string;
@@ -124,28 +123,27 @@ export default function SubmitPage() {
     enabled: !isSlurm,
   });
   const wantsCheckpoint = phase === "eval" && isSlurm && !!variantName;
-  const evalParallelSimsPerGpuTrimmed = evalParallelSimsPerGpu.trim();
-  const evalParallelSimsPerGpuParsed = Number.parseInt(
-    evalParallelSimsPerGpuTrimmed,
+  const evalNumEnvsPerGpuTrimmed = evalNumEnvsPerGpu.trim();
+  const evalNumEnvsPerGpuParsed = Number.parseInt(
+    evalNumEnvsPerGpuTrimmed,
     10,
   );
-  const hasEvalParallelSimsPerGpuOverride =
-    evalParallelSimsPerGpuTrimmed.length > 0;
-  const evalParallelSimsPerGpuValid =
+  const hasEvalNumEnvsPerGpuOverride = evalNumEnvsPerGpuTrimmed.length > 0;
+  const evalNumEnvsPerGpuValid =
     !wantsCheckpoint ||
-    !hasEvalParallelSimsPerGpuOverride ||
-    (/^[1-9]\d*$/.test(evalParallelSimsPerGpuTrimmed) &&
-      evalParallelSimsPerGpuParsed >= 1);
+    !hasEvalNumEnvsPerGpuOverride ||
+    (/^[1-9]\d*$/.test(evalNumEnvsPerGpuTrimmed) &&
+      evalNumEnvsPerGpuParsed >= 1);
   const evalGpuCount = Number.parseInt(
     variant.data?.vars.TRAIN_NUM_GPUS ?? "",
     10,
   );
-  const evalParallelTotal =
+  const evalTotalNumEnvs =
     wantsCheckpoint &&
-    hasEvalParallelSimsPerGpuOverride &&
-    evalParallelSimsPerGpuValid &&
+    hasEvalNumEnvsPerGpuOverride &&
+    evalNumEnvsPerGpuValid &&
     evalGpuCount > 0
-      ? evalParallelSimsPerGpuParsed * evalGpuCount
+      ? evalNumEnvsPerGpuParsed * evalGpuCount
       : null;
   const selectedCkpt = useQuery({
     queryKey: ["selected-checkpoint", variantName, cluster],
@@ -231,8 +229,8 @@ export default function SubmitPage() {
           node: isSlurm ? null : mlxpNode,
           dataset_override,
           extra_args: extraArgs.split(/\s+/).filter(Boolean),
-          eval_parallel_sims_per_gpu: wantsCheckpoint && hasEvalParallelSimsPerGpuOverride
-            ? evalParallelSimsPerGpuParsed
+          eval_num_envs_per_gpu: wantsCheckpoint && hasEvalNumEnvsPerGpuOverride
+            ? evalNumEnvsPerGpuParsed
             : null,
           checkpoint_path: wantsCheckpoint ? checkpointPath.trim() : null,
           job_name: jobNameTouched ? jobName.trim() : null,
@@ -253,7 +251,7 @@ export default function SubmitPage() {
     (!wantsCheckpoint ||
       (!!trimmedCkpt &&
         checkpointExistsValue !== false &&
-        evalParallelSimsPerGpuValid)) &&
+        evalNumEnvsPerGpuValid)) &&
     !submit.isPending;
   const selectedPartition = partitions.data?.find((p) => p.name === selectedPartitionName);
 
@@ -464,25 +462,25 @@ export default function SubmitPage() {
                   )}
 
                   {wantsCheckpoint && (
-                    <Field label="Eval parallel sims per GPU (optional)">
+                    <Field label="Eval num_envs per GPU (optional)">
                       <Input
                         type="number"
                         min={1}
                         step={1}
                         placeholder="config default"
-                        value={evalParallelSimsPerGpu}
+                        value={evalNumEnvsPerGpu}
                         onChange={(e) =>
-                          setEvalParallelSimsPerGpu(e.target.value)
+                          setEvalNumEnvsPerGpu(e.target.value)
                         }
                       />
-                      {!evalParallelSimsPerGpuValid && (
+                      {!evalNumEnvsPerGpuValid && (
                         <p className="text-xs text-red-600 dark:text-red-400">
                           Enter a positive integer.
                         </p>
                       )}
-                      {evalParallelTotal !== null && (
+                      {evalTotalNumEnvs !== null && (
                         <p className="text-xs text-slate-500">
-                          Total sims: <code>{evalParallelTotal}</code>
+                          Total envs: <code>{evalTotalNumEnvs}</code>
                         </p>
                       )}
                     </Field>
