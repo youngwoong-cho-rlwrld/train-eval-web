@@ -321,13 +321,13 @@ async def tail_logs(job_name: str, follow: bool = True):
 async def _tail_archived_log(job_name: str):
     """Serve <variant>/checkpoints/logs/training_rank0.log via the data pod,
     holding the connection open with tail -F so EventSource doesn't loop."""
-    from .details import _parse_comment_metadata, parse_phase_and_variant
+    from .job_identity import parse_comment_metadata, parse_phase_and_variant
     from .mlxp_data_pod import ensure_listing_pod
 
     record = await _archived_record(job_name)
     variant = None
     if record:
-        _, variant = _parse_comment_metadata(record.get("JobComment") or "")
+        _, variant = parse_comment_metadata(record.get("JobComment") or "")
     if not variant:
         _, variant = parse_phase_and_variant(job_name)
     if not variant:

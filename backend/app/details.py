@@ -14,10 +14,17 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from .clusters import load_cluster
+from .eval_completion import eval_job_completed
+from .job_identity import (
+    parse_comment_metadata,
+    parse_phase_and_variant,
+    phase_variant_from_meta,
+    resolve_phase_and_variant,
+)
 from .jobs import get_job
 from .paths import CLUSTER_STAGING_REL
 from .ssh import ssh_run
-from .variants import list_variants, load_variant
+from .variants import load_variant
 
 
 from .wandb_config import get_project
@@ -87,96 +94,6 @@ class JobDetails(BaseModel):
     paths: Paths
     progress: Progress
     gpu: GpuUsage | None = None
-
-
-def _match_known_variant(candidate: str) -> str:
-    """Normalize variant slugs from all historical job-name conventions."""
-    try:
-        variants = list_variants()
-    except Exception:
-        variants = []
-    variants_by_len = sorted(variants, key=len, reverse=True)
-
-    candidates = [candidate]
-    parts = candidate.split("_")
-    # Legacy Slurm names appended `<cluster>_<partition>` after the variant:
-    # train_n15_cube_stack_3cm_right_kakao_background_20260514_...
-    if len(parts) > 2:
-        candidates.append("_".join(parts[:-2]))
-
-    for c in candidates:
-        if not c:
-            continue
-        for variant in variants_by_len:
-            if c == variant or c.startswith(f"{variant}_"):
-                return variant
-        # Older job names predate the explicit 480 suffix, but the current
-        # repo/cluster variant directories carry it.
-        if f"{c}_480" in variants:
-            return f"{c}_480"
-
-    return candidate
-
-
-def parse_phase_and_variant(job_name: str) -> tuple[str, str | None]:
-    """Pull (phase, variant) out of a display name.
-
-    Supported shapes:
-      - `{phase}_{variant}_{YYYYMMDD}_{HHMMSS}`
-      - `{prefix}_{phase}_{variant}_{YYYYMMDD}_{HHMMSS}`
-      - legacy `{phase}_{variant}_{cluster}_{partition}_{YYYYMMDD}_{HHMMSS}`
-
-    The variant itself contains underscores, so we first strip the trailing
-    timestamp, then use the known local variant names to remove legacy suffixes.
-    """
-    m = re.match(r"^(.+)_(\d{8}_\d{6})$", job_name)
-    if not m:
-        return "unknown", None
-
-    body = m.group(1)
-    parts = body.split("_")
-    for idx, part in enumerate(parts):
-        if part in ("train", "resume", "eval") and idx + 1 < len(parts):
-            candidate = "_".join(parts[idx + 1:])
-            return part, _match_known_variant(candidate)
-    return "unknown", None
-
-
-def _parse_comment_metadata(comment: str) -> tuple[str | None, str | None]:
-    """Recover (phase, variant) from the sacct Comment / k8s annotation
-    we set at submit time. Shape: 'phase=<p>;variant=<v>'."""
-    if not comment:
-        return None, None
-    fields: dict[str, str] = {}
-    for chunk in comment.split(";"):
-        if "=" in chunk:
-            k, v = chunk.split("=", 1)
-            fields[k.strip()] = v.strip()
-    phase = fields.get("phase")
-    variant = fields.get("variant")
-    if phase not in ("train", "resume", "eval"):
-        phase = None
-    return phase, variant
-
-
-def resolve_phase_and_variant(job_name: str, sacct: dict | None = None) -> tuple[str, str | None]:
-    """Prefer the explicit phase/variant we stashed at submit time (sacct
-    Comment / scontrol Comment / sidecar .meta for slurm, k8s annotation
-    surfaced under JobComment for mlxp). Fall back to parsing the
-    job_name."""
-    if sacct:
-        comment = sacct.get("Comment") or sacct.get("JobComment") or ""
-        phase, variant = _parse_comment_metadata(comment)
-        if phase and variant:
-            return phase, variant
-    return parse_phase_and_variant(job_name)
-
-
-def _phase_variant_from_meta(fields: dict[str, str]) -> tuple[str | None, str | None]:
-    phase = fields.get("phase")
-    if phase not in ("train", "resume", "eval"):
-        phase = None
-    return phase, fields.get("variant")
 
 
 async def _read_slurm_meta(host: str, job_id: str) -> dict[str, str]:
@@ -302,12 +219,12 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
     if not variant:
         scontrol_comment = await _read_slurm_scontrol_comment(env.ssh_alias, job_id)
         if scontrol_comment:
-            p, v = _parse_comment_metadata(scontrol_comment)
+            p, v = parse_comment_metadata(scontrol_comment)
             if p and v:
                 phase, variant = p, v
     if not variant:
         slurm_meta = await _read_slurm_meta(env.ssh_alias, job_id)
-        p, v = _phase_variant_from_meta(slurm_meta)
+        p, v = phase_variant_from_meta(slurm_meta)
         if p and v:
             phase, variant = p, v
     elif phase == "eval":
@@ -365,6 +282,12 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
             wandb_url = f"https://wandb.ai/{entity}/{get_project()}/runs/{job_name}"
 
     progress = await _compute_progress(cluster, job_id, phase, variant, stdout_path, stderr_path, ckpt_dir, eval_dir)
+    if phase == "eval" and variant and eval_dir:
+        try:
+            if await eval_job_completed(env.ssh_alias, stdout_path, eval_dir, variant):
+                state = "COMPLETED"
+        except Exception:
+            pass
     gpu = (
         await _slurm_gpu_usage(
             env.ssh_alias,
@@ -938,10 +861,7 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
             progress.current_step = min(completed * n_eps + active_incomplete_eps, progress.max_steps)
             progress.percent = round(100.0 * progress.current_step / progress.max_steps, 1)
             episode_label = f"{progress.current_step}/{progress.max_steps} episodes"
-            if active_envs > 1:
-                progress.current_label = f"{completed}/{total} runs · {episode_label} · {active_envs} envs started"
-            else:
-                progress.current_label = f"{completed}/{total} runs · {episode_label}"
+            progress.current_label = f"{completed}/{total} runs · {episode_label}"
         else:
             progress.percent = round(100.0 * completed / total, 1)
             progress.current_label = f"{completed}/{total} runs"

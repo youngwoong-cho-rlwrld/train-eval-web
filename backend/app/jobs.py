@@ -5,6 +5,8 @@ import asyncio
 from pydantic import BaseModel
 
 from .clusters import ClusterEnv, load_cluster, list_clusters
+from .eval_completion import eval_job_completed_from_log_dir
+from .job_identity import resolve_phase_and_variant
 from .ssh import ssh_run
 
 
@@ -24,6 +26,7 @@ class Job(BaseModel):
 
 _SQUEUE_FMT = "%i|%j|%P|%T|%M|%R|%L|%S"
 _SACCT_LIST_FMT = "JobID,JobName,Partition,State,Elapsed,Start,End,NodeList"
+_ACTIVE_STATES = {"RUNNING", "PENDING", "COMPLETING", "CONFIGURING", "SUSPENDED"}
 
 
 async def list_jobs(clusters: list[str] | None = None, hours: int = 24) -> list[Job]:
@@ -101,6 +104,7 @@ async def list_jobs(clusters: list[str] | None = None, hours: int = 24) -> list[
                     state=state, elapsed=parts[4], nodelist=parts[7],
                     start=start, end=end,
                 ))
+        await _normalize_completed_eval_jobs(host, env.vars["LOG_DIR"], local)
         return local
 
     per_cluster = await asyncio.gather(*[_for_cluster(c) for c in target_clusters])
@@ -128,7 +132,9 @@ async def get_job(cluster: str, job_id: str) -> dict:
         if len(lines) >= 2:
             header = lines[0].split("|")
             row = lines[1].split("|")
-            return {**dict(zip(header, row)), "cluster": cluster}
+            d = {**dict(zip(header, row)), "cluster": cluster}
+            await _normalize_completed_eval_record(env.ssh_alias, env.vars["LOG_DIR"], d)
+            return d
 
     # Fall back to squeue for jobs that don't have an sacct record yet.
     sq = await ssh_run(env.ssh_alias,
@@ -143,6 +149,7 @@ async def get_job(cluster: str, job_id: str) -> dict:
         d.setdefault("ExitCode", "")
         d.setdefault("End", "")
         d.setdefault("NodeList", parts[7] if len(parts) > 7 else "")
+        await _normalize_completed_eval_record(env.ssh_alias, env.vars["LOG_DIR"], d)
         return d
 
     raise FileNotFoundError(f"no job record for {job_id} on {cluster}")
@@ -157,3 +164,58 @@ async def cancel_job(cluster: str, job_id: str) -> None:
     r = await ssh_run(env.ssh_alias, f"scancel {job_id}", timeout=15.0)
     if r.returncode != 0:
         raise RuntimeError(f"scancel failed: {r.stderr}")
+
+
+def _terminal_non_completed(state: str) -> bool:
+    upper = state.upper()
+    if upper in _ACTIVE_STATES or upper.startswith("COMPLET"):
+        return False
+    return upper.startswith((
+        "FAIL",
+        "TIMEOUT",
+        "OUT_OF_MEMORY",
+        "NODE_FAIL",
+        "PREEMPT",
+        "CANCEL",
+    ))
+
+
+async def _normalize_completed_eval_jobs(host: str, log_dir: str, rows: list[Job]) -> None:
+    async def _one(job: Job) -> None:
+        if not _terminal_non_completed(job.state):
+            return
+        phase, variant = resolve_phase_and_variant(job.job_name)
+        if phase != "eval" or not variant:
+            return
+        try:
+            if await eval_job_completed_from_log_dir(host, log_dir, job.job_id, variant):
+                job.state = "COMPLETED"
+                job.reason = job.reason or "Slurm exited nonzero after eval artifacts completed"
+        except Exception:
+            return
+
+    await asyncio.gather(*(_one(j) for j in rows))
+
+
+async def _normalize_completed_eval_record(host: str, log_dir: str, record: dict) -> None:
+    state = str(record.get("State") or "")
+    if not _terminal_non_completed(state):
+        return
+    phase, variant = resolve_phase_and_variant(str(record.get("JobName") or ""), record)
+    if phase != "eval" or not variant:
+        return
+    try:
+        completed = await eval_job_completed_from_log_dir(
+            host,
+            log_dir,
+            str(record.get("JobID") or ""),
+            variant,
+        )
+    except Exception:
+        return
+    if not completed:
+        return
+    record.setdefault("SlurmState", state)
+    record["State"] = "COMPLETED"
+    if not record.get("Reason") or record.get("Reason") == "None":
+        record["Reason"] = "Slurm exited nonzero after eval artifacts completed"

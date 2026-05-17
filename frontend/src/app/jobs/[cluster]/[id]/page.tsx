@@ -12,6 +12,7 @@ import { toast } from "sonner";
 import { ArrowLeft, ExternalLink } from "lucide-react";
 import { api, logStreamUrl, type JobDetails, type Variant } from "@/lib/api";
 import { formatDuration, parseSlurmDuration } from "@/lib/duration";
+import { formatJobTimestamp } from "@/lib/job-time";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -225,7 +226,7 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
                     <div key={k} className="flex flex-col">
                       <dt className="text-xs uppercase tracking-wide text-slate-500">{k}</dt>
                       <dd className="font-mono text-xs">
-                        {k === "State" ? <Badge>{sacct.data[k]}</Badge> : sacct.data[k]}
+                        {k === "State" ? <Badge>{sacct.data[k]}</Badge> : formatSacctValue(k, sacct.data[k], cluster)}
                       </dd>
                     </div>
                   ) : null,
@@ -279,6 +280,13 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
       </Card>
     </div>
   );
+}
+
+function formatSacctValue(key: string, value: string, cluster: string) {
+  if (key !== "Start" && key !== "End") return value;
+  const formatted = formatJobTimestamp(value, cluster);
+  if (!formatted) return <span className="text-slate-400">—</span>;
+  return <span title={formatted.full}>{formatted.short}</span>;
 }
 
 function GpuUsageSection({ d }: { d: JobDetails }) {

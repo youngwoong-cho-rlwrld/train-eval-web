@@ -13,6 +13,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { CopyButton } from "@/components/copy-button";
 import { RefreshButton } from "@/components/refresh-button";
 import { formatDuration, parseSlurmDuration } from "@/lib/duration";
+import { formatJobTimestamp, parseJobTimestampMs } from "@/lib/job-time";
 
 const REFRESH_MS = 60_000;
 
@@ -165,10 +166,10 @@ function JobTable({ rows, kind }: { rows: Job[]; kind: "active" | "recent" }) {
                   <Td><ProgressCell cluster={j.cluster} jobId={j.job_id} state={j.state} /></Td>
                 )}
                 {kind === "recent" && (
-                  <Td className="font-mono text-xs"><Timestamp iso={j.start} /></Td>
+                  <Td className="font-mono text-xs"><Timestamp iso={j.start} cluster={j.cluster} /></Td>
                 )}
                 {kind === "recent" && (
-                  <Td className="font-mono text-xs"><Timestamp iso={j.end} /></Td>
+                  <Td className="font-mono text-xs"><Timestamp iso={j.end} cluster={j.cluster} /></Td>
                 )}
                 <td className="py-2 pr-4 font-mono text-xs" title={j.job_name}>
                   <div className="flex items-center gap-1">
@@ -278,12 +279,10 @@ function ProgressCell({ cluster, jobId, state }: { cluster: string; jobId: strin
   );
 }
 
-function Timestamp({ iso }: { iso?: string | null }) {
-  if (!iso) return <span className="text-slate-400">—</span>;
-  // ISO like "2026-05-14T15:55:07" → "05-14 15:55"
-  const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
-  const short = m ? `${m[2]}-${m[3]} ${m[4]}:${m[5]}` : iso;
-  return <span title={iso}>{short}</span>;
+function Timestamp({ iso, cluster }: { iso?: string | null; cluster: string }) {
+  const formatted = formatJobTimestamp(iso, cluster);
+  if (!formatted) return <span className="text-slate-400">—</span>;
+  return <span title={formatted.full}>{formatted.short}</span>;
 }
 
 function phaseOf(jobName: string): "train" | "resume" | "eval" | "other" {
@@ -315,8 +314,8 @@ function isTimeout(state: string): boolean {
 }
 
 function compareStartedDesc(a: Job, b: Job): number {
-  const aStart = a.start ? Date.parse(a.start) : 0;
-  const bStart = b.start ? Date.parse(b.start) : 0;
+  const aStart = parseJobTimestampMs(a.start, a.cluster);
+  const bStart = parseJobTimestampMs(b.start, b.cluster);
   if (aStart !== bStart) return bStart - aStart;
   return Number(b.job_id) - Number(a.job_id);
 }

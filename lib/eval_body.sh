@@ -165,22 +165,29 @@ trap 'cleanup_all; exit 130' INT TERM
 
 refresh_running_pids() {
     local status=0
-    local completed_count
-    local _
+    local pid
+    local running_pid
+    local is_running
     local running_pids=()
+    local active_pids=()
 
     mapfile -t running_pids < <(jobs -pr)
-    completed_count=$((${#PIDS[@]} - ${#running_pids[@]}))
-    if [ "$completed_count" -gt 0 ]; then
-        for _ in $(seq 1 "$completed_count"); do
-            if ! wait -n; then
-                FAILED=1
-                status=1
+    for pid in "${PIDS[@]:-}"; do
+        is_running=0
+        for running_pid in "${running_pids[@]:-}"; do
+            if [ "$pid" = "$running_pid" ]; then
+                is_running=1
+                break
             fi
         done
-        mapfile -t running_pids < <(jobs -pr)
-    fi
-    PIDS=("${running_pids[@]}")
+        if [ "$is_running" -eq 1 ]; then
+            active_pids+=("$pid")
+        elif ! wait "$pid"; then
+            FAILED=1
+            status=1
+        fi
+    done
+    PIDS=("${active_pids[@]}")
     return "$status"
 }
 
@@ -192,26 +199,23 @@ wait_for_slot() {
         if [ "${#PIDS[@]}" -lt "$EVAL_PARALLEL_WORKERS" ]; then
             return 0
         fi
-        if ! wait -n; then
-            FAILED=1
-            return 1
-        fi
+        sleep 2
     done
 }
 
 wait_for_all() {
+    local status=0
     while true; do
         if ! refresh_running_pids; then
-            :
+            status=1
         fi
         if [ "${#PIDS[@]}" -eq 0 ]; then
             break
         fi
-        if ! wait -n; then
-            FAILED=1
-        fi
+        sleep 2
     done
     PIDS=()
+    return "$status"
 }
 
 find_eval_port() {
@@ -471,7 +475,9 @@ for task_entry in "${TASKS[@]}"; do
     done
 done
 
-wait_for_all
+if ! wait_for_all; then
+    FAILED=1
+fi
 if [ "$FAILED" -ne 0 ]; then
     log "ERROR: one or more eval runs failed"
     exit 1
