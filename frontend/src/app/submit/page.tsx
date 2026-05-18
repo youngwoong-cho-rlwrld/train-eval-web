@@ -30,6 +30,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
+import { Switch } from "@/components/ui/switch";
 import { useMyMlxpNode } from "@/hooks/use-my-mlxp-node";
 import { DatasetField } from "@/components/submit/dataset-field";
 import { MlxpCard } from "@/components/submit/mlxp-card";
@@ -38,6 +39,12 @@ import { ConfigCard } from "@/components/config-card";
 import { useDatasetDir } from "@/hooks/use-dataset-dir";
 
 type Phase = "train" | "eval";
+type EvalConfigEdit = {
+  scope: string;
+  nEpisodes: string;
+  nRuns: string;
+  evalSets: string;
+};
 
 function buildDefaultJobName(phase: Phase, variant: string): string {
   if (!variant) return "";
@@ -61,6 +68,7 @@ export default function SubmitPage() {
   const [mlxpNode, setMlxpNode] = useMyMlxpNode();
   const [extraArgs, setExtraArgs] = useState<string>("");
   const [evalNumEnvsPerGpu, setEvalNumEnvsPerGpu] = useState<string>("");
+  const [evalConfigEdit, setEvalConfigEdit] = useState<EvalConfigEdit | null>(null);
   const [checkpointEdit, setCheckpointEdit] = useState<{
     scope: string;
     value: string;
@@ -104,6 +112,7 @@ export default function SubmitPage() {
   const isSlurm = cluster !== "mlxp";
   const submitPhase: Phase = isSlurm ? phase : "train";
   const checkpointScope = `${cluster}:${variantName}:${submitPhase}`;
+  const evalConfigScope = `${checkpointScope}:eval-config`;
 
   const [datasetDir, setDatasetDir] = useDatasetDir(cluster);
   const datasets = useQuery({
@@ -178,6 +187,55 @@ export default function SubmitPage() {
     [submitPhase, variantName],
   );
   const shownJobName = jobNameTouched ? jobName : defaultJobName;
+  const evalConfigDefaults = useMemo(
+    () => ({
+      nEpisodes: variant.data?.vars.N_EPISODES ?? "",
+      nRuns: variant.data?.vars.N_RUNS ?? "",
+      evalSets: formatEvalSetsInput(variant.data?.arrays.EVAL_SETS ?? []),
+    }),
+    [variant.data],
+  );
+  const activeEvalConfigEdit =
+    evalConfigEdit?.scope === evalConfigScope ? evalConfigEdit : null;
+  const evalNEpisodes = activeEvalConfigEdit
+    ? activeEvalConfigEdit.nEpisodes
+    : evalConfigDefaults.nEpisodes;
+  const evalNRuns = activeEvalConfigEdit
+    ? activeEvalConfigEdit.nRuns
+    : evalConfigDefaults.nRuns;
+  const evalSetsText = activeEvalConfigEdit
+    ? activeEvalConfigEdit.evalSets
+    : evalConfigDefaults.evalSets;
+  const evalSetValues = parseEvalSetsInput(evalSetsText);
+  const evalSetOptions = variant.data?.arrays.EVAL_SETS ?? [];
+  const evalNEpisodesTrimmed = evalNEpisodes.trim();
+  const evalNRunsTrimmed = evalNRuns.trim();
+  const evalNEpisodesParsed = Number.parseInt(evalNEpisodesTrimmed, 10);
+  const evalNRunsParsed = Number.parseInt(evalNRunsTrimmed, 10);
+  const evalNEpisodesValid =
+    !wantsCheckpoint || /^[1-9]\d*$/.test(evalNEpisodesTrimmed);
+  const evalNRunsValid =
+    !wantsCheckpoint || /^[1-9]\d*$/.test(evalNRunsTrimmed);
+  const evalSetsCharactersValid = evalSetValues.every((v) =>
+    /^[A-Za-z0-9_.-]+$/.test(v),
+  );
+  const evalSetsValid =
+    !wantsCheckpoint || (evalSetValues.length > 0 && evalSetsCharactersValid);
+  const evalTotalRuns =
+    wantsCheckpoint && evalNEpisodesValid && evalNRunsValid && evalSetsValid
+      ? evalNRunsParsed * evalSetValues.length
+      : null;
+  const evalTotalEpisodes =
+    evalTotalRuns !== null ? evalTotalRuns * evalNEpisodesParsed : null;
+  const updateEvalConfig = (patch: Partial<Omit<EvalConfigEdit, "scope">>) => {
+    const base = activeEvalConfigEdit ?? {
+      scope: evalConfigScope,
+      nEpisodes: evalConfigDefaults.nEpisodes,
+      nRuns: evalConfigDefaults.nRuns,
+      evalSets: evalConfigDefaults.evalSets,
+    };
+    setEvalConfigEdit({ ...base, ...patch, scope: evalConfigScope });
+  };
 
   const datasetDefaults = useMemo(() => {
     if (!variant.data) return { single: "", multi: [] as string[] };
@@ -232,6 +290,9 @@ export default function SubmitPage() {
           eval_num_envs_per_gpu: wantsCheckpoint && hasEvalNumEnvsPerGpuOverride
             ? evalNumEnvsPerGpuParsed
             : null,
+          eval_n_episodes: wantsCheckpoint ? evalNEpisodesParsed : null,
+          eval_n_runs: wantsCheckpoint ? evalNRunsParsed : null,
+          eval_sets: wantsCheckpoint ? evalSetValues : null,
           checkpoint_path: wantsCheckpoint ? checkpointPath.trim() : null,
           job_name: jobNameTouched ? jobName.trim() : null,
         }),
@@ -251,7 +312,10 @@ export default function SubmitPage() {
     (!wantsCheckpoint ||
       (!!trimmedCkpt &&
         checkpointExistsValue !== false &&
-        evalNumEnvsPerGpuValid)) &&
+        evalNumEnvsPerGpuValid &&
+        evalNEpisodesValid &&
+        evalNRunsValid &&
+        evalSetsValid)) &&
     !submit.isPending;
   const selectedPartition = partitions.data?.find((p) => p.name === selectedPartitionName);
 
@@ -462,6 +526,104 @@ export default function SubmitPage() {
                   )}
 
                   {wantsCheckpoint && (
+                    <div className="grid gap-4 sm:grid-cols-2">
+                      <Field label="--n-episodes">
+                        <Input
+                          type="number"
+                          min={1}
+                          step={1}
+                          value={evalNEpisodes}
+                          onChange={(e) =>
+                            updateEvalConfig({ nEpisodes: e.target.value })
+                          }
+                        />
+                        {!evalNEpisodesValid && (
+                          <p className="text-xs text-red-600 dark:text-red-400">
+                            Enter a positive integer.
+                          </p>
+                        )}
+                      </Field>
+
+                      <Field label="--n-runs">
+                        <Input
+                          type="number"
+                          min={1}
+                          step={1}
+                          value={evalNRuns}
+                          onChange={(e) =>
+                            updateEvalConfig({ nRuns: e.target.value })
+                          }
+                        />
+                        {!evalNRunsValid && (
+                          <p className="text-xs text-red-600 dark:text-red-400">
+                            Enter a positive integer.
+                          </p>
+                        )}
+                      </Field>
+                    </div>
+                  )}
+
+                  {wantsCheckpoint && (
+                    <Field label="(eval_sets)">
+                      {evalSetOptions.length > 0 && (
+                        <div className="grid gap-2 sm:grid-cols-3">
+                          {evalSetOptions.map((evalSet) => {
+                            const checked = evalSetValues.includes(evalSet);
+                            return (
+                              <label
+                                key={evalSet}
+                                className="flex h-9 items-center justify-between gap-3 rounded border border-slate-200 px-2 text-xs dark:border-slate-800"
+                              >
+                                <span className="font-mono">{evalSet}</span>
+                                <Switch
+                                  checked={checked}
+                                  onCheckedChange={(nextChecked) => {
+                                    const next = nextChecked
+                                      ? [...evalSetValues, evalSet]
+                                      : evalSetValues.filter((v) => v !== evalSet);
+                                    updateEvalConfig({
+                                      evalSets: formatEvalSetsInput(next),
+                                    });
+                                  }}
+                                />
+                              </label>
+                            );
+                          })}
+                        </div>
+                      )}
+                      <Input
+                        value={evalSetsText}
+                        onChange={(e) =>
+                          updateEvalConfig({ evalSets: e.target.value })
+                        }
+                        placeholder="0cm 1cm 3cm 5cm 7cm"
+                        className="font-mono text-xs"
+                      />
+                      {!evalSetsValid && (
+                        <p className="text-xs text-red-600 dark:text-red-400">
+                          Choose at least one eval set. Use letters, numbers,
+                          dot, underscore, or hyphen.
+                        </p>
+                      )}
+                      {evalTotalRuns !== null && evalTotalEpisodes !== null && (
+                        <p className="text-xs text-slate-500">
+                          Total: <code>{evalTotalRuns}</code> runs ·{" "}
+                          <code>{evalTotalEpisodes}</code> episodes
+                        </p>
+                      )}
+                      {activeEvalConfigEdit && (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => setEvalConfigEdit(null)}
+                        >
+                          Reset eval defaults
+                        </Button>
+                      )}
+                    </Field>
+                  )}
+
+                  {wantsCheckpoint && (
                     <Field label="Eval num_envs per GPU (optional)">
                       <Input
                         type="number"
@@ -665,4 +827,20 @@ function Field({
       {children}
     </div>
   );
+}
+
+function parseEvalSetsInput(value: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const part of value.split(/[\s,]+/)) {
+    const item = part.trim();
+    if (!item || seen.has(item)) continue;
+    seen.add(item);
+    out.push(item);
+  }
+  return out;
+}
+
+function formatEvalSetsInput(values: string[]): string {
+  return parseEvalSetsInput(values.join(" ")).join(" ");
 }

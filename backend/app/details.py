@@ -14,7 +14,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from .clusters import load_cluster
-from .eval_completion import eval_job_completed
+from .eval_completion import eval_job_completed, eval_shape
 from .job_identity import (
     parse_comment_metadata,
     parse_phase_and_variant,
@@ -281,10 +281,20 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
         if entity:
             wandb_url = f"https://wandb.ai/{entity}/{get_project()}/runs/{job_name}"
 
-    progress = await _compute_progress(cluster, job_id, phase, variant, stdout_path, stderr_path, ckpt_dir, eval_dir)
+    progress = await _compute_progress(
+        cluster,
+        job_id,
+        phase,
+        variant,
+        stdout_path,
+        stderr_path,
+        ckpt_dir,
+        eval_dir,
+        slurm_meta,
+    )
     if phase == "eval" and variant and eval_dir:
         try:
-            if await eval_job_completed(env.ssh_alias, stdout_path, eval_dir, variant):
+            if await eval_job_completed(env.ssh_alias, stdout_path, eval_dir, variant, slurm_meta):
                 state = "COMPLETED"
         except Exception:
             pass
@@ -723,7 +733,8 @@ _TQDM_STEP_RE = re.compile(r"(\d+)/(\d+)\s*\[")
 
 async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str | None,
                              stdout: str, stderr: str,
-                             ckpt_dir: str | None, eval_dir: str | None) -> Progress:
+                             ckpt_dir: str | None, eval_dir: str | None,
+                             slurm_meta: dict[str, str] | None = None) -> Progress:
     progress = Progress(phase=phase)
     if not variant:
         return progress
@@ -777,10 +788,7 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
 
     elif phase == "eval":
         v = await load_variant(variant)
-        eval_sets = v.arrays.get("EVAL_SETS", [])
-        n_runs = int(v.vars.get("N_RUNS", "0") or 0)
-        n_eps = int(v.vars.get("N_EPISODES", "0") or 0)
-        tasks = v.arrays.get("TASKS") or ["__single__"]
+        eval_sets, n_runs, n_eps, tasks = eval_shape(v, slurm_meta)
         total = max(len(tasks) * len(eval_sets) * n_runs, 0)
         progress.total_runs = total or None
 

@@ -134,3 +134,43 @@ export type JobDetails = {
   progress: Progress;
   gpu: GpuUsage | null;
 };
+
+export type ResultCell = {
+  eval_set: string;
+  mean_success_rate: number;
+  std_success_rate: number;
+  per_run_success_rate: number[];
+  success_counts: Array<number | null>;
+  episode_counts: Array<number | null>;
+  completed_runs: number;
+  expected_runs?: number | null;
+  source?: string | null;
+};
+
+export type ResultTask = {
+  task: string;
+  task_name?: string | null;
+  instruction?: string | null;
+  eval_sets: ResultCell[];
+};
+
+export type ResultVariant = {
+  cluster: string;
+  variant: string;
+  experiment?: string | null;
+  model_version?: string | null;
+  note?: string | null;
+  checkpoint?: string | null;
+  n_episodes?: number | null;
+  n_runs?: number | null;
+  num_envs_per_gpu?: number | null;
+  total_num_envs?: number | null;
+  source?: string | null;
+  tasks: ResultTask[];
+};
+
+export type ResultsResponse = {
+  clusters: string[];
+  variants: ResultVariant[];
+  errors: Array<{ cluster: string; error: string }>;
+};

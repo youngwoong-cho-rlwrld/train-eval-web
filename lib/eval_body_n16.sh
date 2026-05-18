@@ -77,6 +77,29 @@ fi
 # Phase 2: Evaluation (Isaac Sim server + N1.6 eval client)
 ###############################################################################
 
+if [ -n "${SUBMIT_EVAL_N_EPISODES:-}" ]; then
+    N_EPISODES="$SUBMIT_EVAL_N_EPISODES"
+fi
+if [ -n "${SUBMIT_EVAL_N_RUNS:-}" ]; then
+    N_RUNS="$SUBMIT_EVAL_N_RUNS"
+fi
+if [ -n "${SUBMIT_EVAL_SETS:-}" ]; then
+    read -r -a EVAL_SETS <<< "$SUBMIT_EVAL_SETS"
+fi
+if ! [[ "${N_EPISODES:-}" =~ ^[0-9]+$ ]] || [ "$N_EPISODES" -lt 1 ]; then
+    log "ERROR: N_EPISODES must be a positive integer, got '${N_EPISODES:-}'"
+    exit 1
+fi
+if ! [[ "${N_RUNS:-}" =~ ^[0-9]+$ ]] || [ "$N_RUNS" -lt 1 ]; then
+    log "ERROR: N_RUNS must be a positive integer, got '${N_RUNS:-}'"
+    exit 1
+fi
+if [[ "${EVAL_SETS+set}" != set ]] || [ "${#EVAL_SETS[@]}" -eq 0 ]; then
+    log "ERROR: EVAL_SETS must contain at least one eval set"
+    exit 1
+fi
+log "Eval shape: ${N_RUNS} runs x ${N_EPISODES} episodes; eval_sets=${EVAL_SETS[*]}"
+
 EVAL_GPU_COUNT="${TRAIN_NUM_GPUS:-1}"
 if ! [[ "$EVAL_GPU_COUNT" =~ ^[0-9]+$ ]] || [ "$EVAL_GPU_COUNT" -lt 1 ]; then
     EVAL_GPU_COUNT=1
@@ -360,7 +383,7 @@ run_eval_one() (
             --port $PORT \
             --num_envs ${EVAL_NUM_ENVS_PER_GPU} \
             --device cpu \
-            --eval_set $EVAL_SET \
+            --eval_set "$EVAL_SET" \
             --app_launcher.headless
     " > "$SERVER_LOG" 2>&1 &
     SERVER_PID=$!

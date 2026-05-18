@@ -6,7 +6,7 @@ from pydantic import BaseModel
 
 from .clusters import ClusterEnv, load_cluster, list_clusters
 from .eval_completion import eval_job_completed_from_log_dir
-from .job_identity import resolve_phase_and_variant
+from .job_identity import phase_variant_from_meta, resolve_phase_and_variant
 from .ssh import ssh_run
 
 
@@ -184,11 +184,19 @@ async def _normalize_completed_eval_jobs(host: str, log_dir: str, rows: list[Job
     async def _one(job: Job) -> None:
         if not _terminal_non_completed(job.state):
             return
+        meta: dict[str, str] = {}
         phase, variant = resolve_phase_and_variant(job.job_name)
+        if phase != "eval" or not variant:
+            meta = await _read_slurm_meta(host, job.job_id)
+            p, v = phase_variant_from_meta(meta)
+            if p and v:
+                phase, variant = p, v
+        elif phase == "eval":
+            meta = await _read_slurm_meta(host, job.job_id)
         if phase != "eval" or not variant:
             return
         try:
-            if await eval_job_completed_from_log_dir(host, log_dir, job.job_id, variant):
+            if await eval_job_completed_from_log_dir(host, log_dir, job.job_id, variant, meta):
                 job.state = "COMPLETED"
                 job.reason = job.reason or "Slurm exited nonzero after eval artifacts completed"
         except Exception:
@@ -201,7 +209,12 @@ async def _normalize_completed_eval_record(host: str, log_dir: str, record: dict
     state = str(record.get("State") or "")
     if not _terminal_non_completed(state):
         return
+    meta = await _read_slurm_meta(host, str(record.get("JobID") or ""))
     phase, variant = resolve_phase_and_variant(str(record.get("JobName") or ""), record)
+    if phase != "eval" or not variant:
+        p, v = phase_variant_from_meta(meta)
+        if p and v:
+            phase, variant = p, v
     if phase != "eval" or not variant:
         return
     try:
@@ -210,6 +223,7 @@ async def _normalize_completed_eval_record(host: str, log_dir: str, record: dict
             log_dir,
             str(record.get("JobID") or ""),
             variant,
+            meta,
         )
     except Exception:
         return
@@ -219,3 +233,19 @@ async def _normalize_completed_eval_record(host: str, log_dir: str, record: dict
     record["State"] = "COMPLETED"
     if not record.get("Reason") or record.get("Reason") == "None":
         record["Reason"] = "Slurm exited nonzero after eval artifacts completed"
+
+
+async def _read_slurm_meta(host: str, job_id: str) -> dict[str, str]:
+    r = await ssh_run(
+        host,
+        f"cat $HOME/.train-eval-web/jobs/{job_id}.meta 2>/dev/null",
+        timeout=10.0,
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        return {}
+    fields: dict[str, str] = {}
+    for line in r.stdout.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            fields[k.strip()] = v.strip()
+    return fields

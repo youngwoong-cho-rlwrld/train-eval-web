@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
-from . import clusters, copy_checkpoint, datasets, details, flags, job_resume, jobs, mlxp, mlxp_submit, partitions, submit, variants, wandb_auth
+from . import clusters, copy_checkpoint, datasets, details, flags, job_resume, jobs, mlxp, mlxp_submit, partitions, results, submit, variants, wandb_auth
 from .ssh import ssh_tail_lines
 
 
@@ -240,6 +240,18 @@ async def delete_job(cluster: str, job_id: str):
     return {"status": "cancelled"}
 
 
+# ── results ──
+
+@app.get("/api/results", response_model=results.ResultsResponse)
+async def get_results(cluster: str | None = None):
+    try:
+        return await results.list_results(cluster)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+
 @app.get("/api/jobs/{cluster}/{job_id}/logs")
 async def stream_logs(cluster: str, job_id: str, stream: str = "out"):
     """Server-Sent Events stream of log lines.
@@ -320,22 +332,29 @@ async def get_job_flags(cluster: str, job_id: str):
     if cluster != "mlxp" and det.phase == "eval":
         env = await clusters.load_cluster(cluster)
         meta = await details._read_slurm_meta(env.ssh_alias, job_id)
-        override = (
-            meta.get("eval_num_envs_per_gpu")
-            or meta.get("eval_parallel_sims_per_gpu")
-            or ""
-        ).strip()
-        if override:
+        overrides = {
+            "EVAL_NUM_ENVS_PER_GPU": (
+                meta.get("eval_num_envs_per_gpu")
+                or meta.get("eval_parallel_sims_per_gpu")
+                or ""
+            ).strip(),
+            "--n-episodes": (meta.get("eval_n_episodes") or "").strip(),
+            "--n-runs": (meta.get("eval_n_runs") or "").strip(),
+            "(eval_sets)": (meta.get("eval_sets") or "").strip(),
+        }
+        overrides = {k: v for k, v in overrides.items() if v}
+        if overrides:
             rewritten: list[tuple[str, str]] = []
-            replaced = False
+            replaced: set[str] = set()
             for flag, val in out:
-                if flag == "EVAL_NUM_ENVS_PER_GPU":
-                    rewritten.append((flag, override))
-                    replaced = True
+                if flag in overrides:
+                    rewritten.append((flag, overrides[flag]))
+                    replaced.add(flag)
                 else:
                     rewritten.append((flag, val))
-            if not replaced:
-                rewritten.append(("EVAL_NUM_ENVS_PER_GPU", override))
+            for flag, value in overrides.items():
+                if flag not in replaced:
+                    rewritten.append((flag, value))
             out = rewritten
     return {"flags": [{"flag": f, "value": val} for f, val in out]}
 

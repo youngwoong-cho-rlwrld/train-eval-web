@@ -60,6 +60,15 @@ async def resume_timed_out_job(cluster: str, job_id: str) -> submit.SubmitRespon
         eval_num_envs_per_gpu = int(eval_num_envs) if eval_num_envs else None
     except ValueError:
         eval_num_envs_per_gpu = None
+    try:
+        eval_n_episodes = int(meta.get("eval_n_episodes", "").strip()) if meta.get("eval_n_episodes") else None
+    except ValueError:
+        eval_n_episodes = None
+    try:
+        eval_n_runs = int(meta.get("eval_n_runs", "").strip()) if meta.get("eval_n_runs") else None
+    except ValueError:
+        eval_n_runs = None
+    eval_sets = [s for s in (meta.get("eval_sets") or "").split() if s] or None
     resume_of = (meta.get("resume_of") or "").strip()
     if resume_of and resume_of != job_id:
         try:
@@ -76,6 +85,9 @@ async def resume_timed_out_job(cluster: str, job_id: str) -> submit.SubmitRespon
             phase="eval",
             partition=partition,
             eval_num_envs_per_gpu=eval_num_envs_per_gpu,
+            eval_n_episodes=eval_n_episodes,
+            eval_n_runs=eval_n_runs,
+            eval_sets=eval_sets,
             checkpoint_path=checkpoint,
             seed_eval_results_from=seed_eval_dirs,
             job_name=job_name,

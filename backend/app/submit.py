@@ -85,6 +85,10 @@ class SubmitRequest(BaseModel):
     eval_num_envs_per_gpu: int | None = Field(default=None, ge=1)
     # Legacy request field accepted from older frontends/resume metadata.
     eval_parallel_sims_per_gpu: int | None = Field(default=None, ge=1)
+    # Eval-only: per-submission overrides for eval_allex.py and eval matrix.
+    eval_n_episodes: int | None = Field(default=None, ge=1)
+    eval_n_runs: int | None = Field(default=None, ge=1)
+    eval_sets: list[str] | None = None
     # Eval-only: absolute path to the checkpoint dir on the cluster. The
     # eval body uses this verbatim when set; otherwise it auto-picks.
     checkpoint_path: str | None = None
@@ -117,6 +121,24 @@ def resolve_job_name(req_job_name: str | None, phase: str, variant: str) -> str:
     return name
 
 
+def _normalize_eval_sets(eval_sets: list[str] | None) -> list[str] | None:
+    if eval_sets is None:
+        return None
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in eval_sets:
+        item = raw.strip()
+        if not item or item in seen:
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", item):
+            raise ValueError(f"invalid eval set {item!r}; use letters, numbers, dot, underscore, or hyphen")
+        seen.add(item)
+        out.append(item)
+    if not out:
+        raise ValueError("eval_sets must contain at least one eval set")
+    return out
+
+
 class SubmitResponse(BaseModel):
     job_id: str
     job_name: str
@@ -138,8 +160,14 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     if req.resume and req.phase != "train":
         raise ValueError("resume=true is only valid for phase=train")
     eval_num_envs_per_gpu = req.eval_num_envs_per_gpu or req.eval_parallel_sims_per_gpu
-    if eval_num_envs_per_gpu is not None and req.phase != "eval":
-        raise ValueError("eval_num_envs_per_gpu is only valid for phase=eval")
+    eval_sets = _normalize_eval_sets(req.eval_sets)
+    if req.phase != "eval" and any((
+        eval_num_envs_per_gpu is not None,
+        req.eval_n_episodes is not None,
+        req.eval_n_runs is not None,
+        eval_sets is not None,
+    )):
+        raise ValueError("eval overrides are only valid for phase=eval")
 
     cluster = await load_cluster(req.cluster)
     variant = await load_variant(req.variant)
@@ -264,6 +292,18 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             if req.phase == "eval" and eval_num_envs_per_gpu is not None else ""
         )
         + (
+            f",SUBMIT_EVAL_N_EPISODES={req.eval_n_episodes}"
+            if req.phase == "eval" and req.eval_n_episodes is not None else ""
+        )
+        + (
+            f",SUBMIT_EVAL_N_RUNS={req.eval_n_runs}"
+            if req.phase == "eval" and req.eval_n_runs is not None else ""
+        )
+        + (
+            f",SUBMIT_EVAL_SETS={shlex.quote(' '.join(eval_sets))}"
+            if req.phase == "eval" and eval_sets is not None else ""
+        )
+        + (
             f",EVAL_CHECKPOINT={shlex.quote(req.checkpoint_path)}"
             if req.phase == "eval" and req.checkpoint_path else ""
         ),
@@ -304,6 +344,21 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         + (
             f"eval_num_envs_per_gpu={eval_num_envs_per_gpu}\n"
             if req.phase == "eval" and eval_num_envs_per_gpu is not None
+            else ""
+        )
+        + (
+            f"eval_n_episodes={req.eval_n_episodes}\n"
+            if req.phase == "eval" and req.eval_n_episodes is not None
+            else ""
+        )
+        + (
+            f"eval_n_runs={req.eval_n_runs}\n"
+            if req.phase == "eval" and req.eval_n_runs is not None
+            else ""
+        )
+        + (
+            f"eval_sets={' '.join(eval_sets)}\n"
+            if req.phase == "eval" and eval_sets is not None
             else ""
         )
         + (
