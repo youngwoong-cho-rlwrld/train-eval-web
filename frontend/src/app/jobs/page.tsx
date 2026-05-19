@@ -15,6 +15,7 @@ import { RefreshButton } from "@/components/refresh-button";
 import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state";
 import { JobStateBadge } from "@/components/job-state-badge";
 import { ImmediateTooltip } from "@/components/immediate-tooltip";
+import { formatDuration, parseSlurmDuration } from "@/lib/duration";
 import { formatJobTimestamp, parseJobTimestampMs } from "@/lib/job-time";
 
 const REFRESH_MS = 60_000;
@@ -137,6 +138,7 @@ function JobTable({
             <Th>Cluster</Th>
             <Th>Partition</Th>
             <Th>Node</Th>
+            {showProgress && <Th>Server remaining</Th>}
             <Th>Started</Th>
             <Th>Ended</Th>
             <Th>Elapsed</Th>
@@ -157,7 +159,7 @@ function JobTable({
                   <JobStateBadge state={j.state} />
                 </Td>
                 {showProgress && (
-                  <Td className="min-w-[220px]">
+                  <Td className="min-w-[300px]">
                     <ActiveProgressCell job={j} />
                   </Td>
                 )}
@@ -193,6 +195,11 @@ function JobTable({
                 <Td>{j.cluster}</Td>
                 <Td className="font-mono text-xs">{j.partition}</Td>
                 <Td className="font-mono text-xs text-slate-500 min-w-[180px]">{j.nodelist}</Td>
+                {showProgress && (
+                  <Td className="font-mono text-xs">
+                    {j.time_left || <span className="text-slate-400">—</span>}
+                  </Td>
+                )}
                 <Td className="font-mono text-xs"><Timestamp iso={j.start} cluster={j.cluster} /></Td>
                 <Td className="font-mono text-xs"><Timestamp iso={j.end} cluster={j.cluster} /></Td>
                 <Td className="font-mono text-xs">{j.elapsed}</Td>
@@ -257,15 +264,32 @@ function ActiveProgressCell({ job }: { job: Job }) {
 
   const effectivePercent = Math.max(0, Math.min(100, percent ?? 0));
   const label = p?.current_label ?? `${effectivePercent.toFixed(1)}%`;
+  let etaLabel: string | null = null;
+  let etaTitle = "";
+  const d = details.data;
+  if (p?.current_step && p.max_steps && p.current_step < p.max_steps && d) {
+    const elapsedSec = parseSlurmDuration(d.elapsed);
+    if (elapsedSec > 0) {
+      const etaSec = (elapsedSec * (p.max_steps - p.current_step)) / p.current_step;
+      etaLabel = formatDuration(etaSec);
+      const unit = d.phase === "eval" ? "episode" : "step";
+      etaTitle = `Estimated from aggregate ${unit} throughput`;
+    }
+  }
 
   return (
     <div className="space-y-1.5">
-      <div className="flex items-center justify-between gap-3 text-xs">
-        <span className="min-w-0 truncate font-mono" title={label}>
+      <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 text-xs">
+        <span className="min-w-[8rem] flex-1 break-words font-mono leading-snug" title={label}>
           {label}
         </span>
-        <span className="shrink-0 font-mono text-slate-500">
+        <span className="shrink-0 whitespace-nowrap font-mono text-slate-500">
           {effectivePercent.toFixed(1)}%
+          {etaLabel && (
+            <ImmediateTooltip content={etaTitle}>
+              <span> · ~{etaLabel}</span>
+            </ImmediateTooltip>
+          )}
         </span>
       </div>
       <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">

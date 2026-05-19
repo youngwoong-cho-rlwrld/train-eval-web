@@ -19,6 +19,7 @@ source "$REPO_ROOT/lib/_common.sh"
 EXP_DIR="$REPO_ROOT/experiments/$VARIANT"
 [ -d "$EXP_DIR" ] || { echo "ERROR: experiment dir not found: $EXP_DIR"; exit 1; }
 source "$EXP_DIR/config.sh"
+TRAIN_REPO_DIR="${SUBMIT_TRAIN_REPO_DIR:-${TRAIN_REPO_DIR:-$GROOT_DIR}}"
 TRAIN_NUM_GPUS="${SUBMIT_TRAIN_NUM_GPUS:-$TRAIN_NUM_GPUS}"
 MAX_STEPS="${SUBMIT_TRAIN_MAX_STEPS:-$MAX_STEPS}"
 SAVE_STEPS="${SUBMIT_TRAIN_SAVE_STEPS:-$SAVE_STEPS}"
@@ -103,8 +104,8 @@ if [ -d "$CKPT_DIR/checkpoint-${MAX_STEPS}" ]; then
     exit 0
 fi
 
-cd "$GROOT_DIR"
-source "$GROOT_DIR/.venv/bin/activate"
+cd "$TRAIN_REPO_DIR"
+source "$TRAIN_REPO_DIR/.venv/bin/activate"
 export WANDB_PROJECT=gr00t
 export WANDB_DIR="$EXP_DIR"
 

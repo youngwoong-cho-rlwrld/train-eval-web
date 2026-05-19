@@ -19,6 +19,11 @@ from typing import Any, Awaitable, Callable
 from pydantic import BaseModel, Field
 
 from .ssh import ssh_run
+from .training_models import (
+    TrainingModel,
+    load_training_model,
+    slurm_repo_path,
+)
 
 
 class GitStatus(BaseModel):
@@ -49,20 +54,26 @@ def _short(commit: str | None) -> str | None:
     return commit[:12] if commit else None
 
 
-def training_repo_var(model: str) -> str:
-    return "GROOT_N16_DIR" if model.strip() == "n1.6" else "GROOT_DIR"
+def _coerce_model(model: str | TrainingModel) -> TrainingModel:
+    return model if isinstance(model, TrainingModel) else load_training_model(model)
 
 
-def training_repo_label(model: str) -> str:
-    return f"GR00T {model.strip() or 'n1.5'}"
+def training_repo_var(model: str | TrainingModel) -> str:
+    resolved = _coerce_model(model)
+    if not resolved.slurm_repo_var:
+        raise ValueError(f"model {resolved.id} missing SLURM_REPO_VAR")
+    return resolved.slurm_repo_var
 
 
-def slurm_training_repo_path(cluster_vars: dict[str, str], model: str) -> str:
-    key = training_repo_var(model)
-    path = (cluster_vars.get(key) or "").strip()
-    if not path:
-        raise ValueError(f"cluster config missing {key}")
-    return path
+def training_repo_label(model: str | TrainingModel) -> str:
+    return _coerce_model(model).label
+
+
+def slurm_training_repo_path(
+    cluster_vars: dict[str, str],
+    model: str | TrainingModel,
+) -> str:
+    return slurm_repo_path(cluster_vars, _coerce_model(model))
 
 
 async def _git_status(

@@ -11,7 +11,7 @@ Your new variant directory is automatically picked up by the Submit page (via `/
 
 ## What `config.sh` actually does
 
-It's plain bash, sourced by `lib/train_body.sh` / `lib/eval_body.sh` on the cluster. Two key modes:
+It's plain bash, sourced by the model's configured body scripts on the cluster. Set `MODEL_ID` to one of `configs/models/<model>.env`. Two key dataset modes:
 
 - **Single-task** — set `DATASET_NAME` (one dataset under `$DATA_DIR`).
 - **Multi-task** — set `DATASETS=("name|data_config|weight" ...)` instead (no `DATASET_NAME`).
@@ -22,7 +22,7 @@ The Submit page reads these at job-submission time, renders a `data_config.yaml`
 
 1. Open `http://localhost:3000/submit`
 2. Pick **cluster** (kakao / skt / mlxp)
-3. Pick your **variant** from the dropdown
+3. Pick your **experiment** from the dropdown
 4. (slurm) pick a **partition**; (mlxp) pick a **node** + **GPU count**
 5. (optional) override the **dataset(s)** for this run only
 6. Hit **Submit**

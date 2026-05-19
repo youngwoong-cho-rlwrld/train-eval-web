@@ -44,6 +44,12 @@ from .submission_snapshot import (
     snapshot_suffix,
     training_repo_label,
 )
+from .training_models import (
+    TrainingModel,
+    load_training_model,
+    mlxp_repo_path,
+    resolve_training_model,
+)
 from .variant_values import variant_int
 from .wandb_config import get_project as _wandb_project
 from .variants import load_variant
@@ -58,12 +64,15 @@ _GPU_RESOURCES = {
     8: ("100", "1500Gi"),
 }
 
-GR00T_DIR = f"{DDN_USER_HOME}/workspace/gr00t"
-GR00T_N16_DIR = f"{DDN_USER_HOME}/workspace/gr00t-n16"
-
-
-def mlxp_training_repo_path(model: str) -> str:
-    return GR00T_N16_DIR if model.strip() == "n1.6" else GR00T_DIR
+def mlxp_training_repo_path(model: str | TrainingModel) -> str:
+    resolved = model if isinstance(model, TrainingModel) else load_training_model(model)
+    return mlxp_repo_path(
+        resolved,
+        {
+            "DDN_USER_HOME": DDN_USER_HOME,
+            "DDN_MOUNT": DDN_MOUNT,
+        },
+    )
 
 
 class MlxpSubmitRequest(BaseModel):
@@ -100,8 +109,8 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
 
     variant = await load_variant(req.variant)
     cpu, mem = _GPU_RESOURCES[req.num_gpus]
-    model = (variant.vars.get("MODEL_VERSION") or "n1.5").strip()
-    if req.global_batch_size is not None and model == "n1.5" and req.global_batch_size % req.num_gpus != 0:
+    model = resolve_training_model(variant)
+    if req.global_batch_size is not None and model.family == "n1.5" and req.global_batch_size % req.num_gpus != 0:
         raise ValueError("global_batch_size must be divisible by num_gpus for n1.5 training")
 
     # job_id is the k8s Job resource name — 6-char alpha-leading so it's
@@ -126,8 +135,9 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
         job_name=job_name,
         node=node,
         submit_git=submit_git,
+        model=model,
     )
-    body_script = _render_body_script(variant, req, job_name, snapshot)
+    body_script = _render_body_script(variant, req, job_name, snapshot, model, repo_path)
     spec = _render_job_yaml(
         job_id,
         job_name,
@@ -161,8 +171,7 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
 
 
 def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job_name: str,
-                            node: str, submit_git) -> dict:
-    model = (variant.vars.get("MODEL_VERSION") or "n1.5").strip()
+                            node: str, submit_git, model: TrainingModel) -> dict:
     train_num_gpus = req.num_gpus
     train_max_steps = req.max_steps or variant_int(variant, "MAX_STEPS", 30000)
     train_save_steps = req.save_steps or variant_int(variant, "SAVE_STEPS", 1000)
@@ -175,7 +184,7 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
     config_text = render_training_config_snapshot(
         base_config=variant.raw,
         variant=variant.name,
-        model=model,
+        model=model.family,
         job_name=job_name,
         cluster="mlxp",
         node=node,
@@ -230,7 +239,14 @@ cat > {shlex.quote(meta_path)} <<'TRAIN_EVAL_CONFIG_META'
 """
 
 
-def _render_body_script(variant, req: MlxpSubmitRequest, job_name: str, snapshot: dict) -> str:
+def _render_body_script(
+    variant,
+    req: MlxpSubmitRequest,
+    job_name: str,
+    snapshot: dict,
+    model: TrainingModel,
+    repo_path: str,
+) -> str:
     """Render the inline bash the container runs.
 
     Resolves the variant's dataset list, then dispatches to the right gr00t
@@ -240,7 +256,7 @@ def _render_body_script(variant, req: MlxpSubmitRequest, job_name: str, snapshot
 
     `job_name` flows into WANDB_RUN_ID and --experiment-name / --run_name.
     """
-    model = (variant.vars.get("MODEL_VERSION") or "n1.5").strip()
+    family = model.family
 
     # ── Resolve dataset name list (model-agnostic) ──
     names: list[str] = []
@@ -271,7 +287,7 @@ def _render_body_script(variant, req: MlxpSubmitRequest, job_name: str, snapshot
     max_steps = str(req.max_steps or variant_int(variant, "MAX_STEPS", 30000))
     save_steps = str(req.save_steps or variant_int(variant, "SAVE_STEPS", 1000))
     batch_size = variant.vars.get("TRAIN_BATCH_SIZE", "64")
-    if model == "n1.5" and req.global_batch_size is not None:
+    if family == "n1.5" and req.global_batch_size is not None:
         batch_size = str(req.global_batch_size // req.num_gpus)
     train_extra = " ".join(variant.arrays.get("TRAIN_EXTRA_ARGS") or [])
     user_extra = " ".join(req.extra_args)
@@ -279,13 +295,15 @@ def _render_body_script(variant, req: MlxpSubmitRequest, job_name: str, snapshot
     ckpt_dir = f"{MLXP_EXPERIMENTS_DIR}/{variant.name}/checkpoints/{job_name}"
     run_log_dir = f"{ckpt_dir}/logs"
 
-    if model == "n1.6":
+    if family == "n1.6":
         return _render_body_n16(
             variant=variant, req=req, job_name=job_name, names=names,
             max_steps=max_steps, save_steps=save_steps, batch_size=batch_size,
             train_extra=train_extra, user_extra=user_extra, ckpt_dir=ckpt_dir,
-            snapshot=snapshot,
+            snapshot=snapshot, repo_path=repo_path,
         )
+    if family != "n1.5":
+        raise ValueError(f"unsupported MLXP model family: {family}")
 
     # ── N1.5: build the data_config.yaml rows ──
     if override_full is not None and isinstance(override, list) and any("|" in e for e in override):
@@ -325,7 +343,7 @@ export WANDB_RESUME=allow
 export NO_ALBUMENTATIONS_UPDATE=1
 export TOKENIZERS_PARALLELISM=false
 
-cd {GR00T_DIR}
+cd {shlex.quote(repo_path)}
 source .venv/bin/activate
 
 {_snapshot_preamble(snapshot)}
@@ -368,7 +386,7 @@ torchrun --nproc_per_node={req.num_gpus} scripts/gr00t_finetune.py \\
 def _render_body_n16(*, variant, req: MlxpSubmitRequest, job_name: str,
                      names: list[str], max_steps: str, save_steps: str,
                      batch_size: str, train_extra: str, user_extra: str,
-                     ckpt_dir: str, snapshot: dict) -> str:
+                     ckpt_dir: str, snapshot: dict, repo_path: str) -> str:
     """Body script for GR00T N1.6 (launch_finetune.py).
 
     Unlike N1.5, N1.6 takes --dataset-path (multiple) + --modality-config-path
@@ -399,7 +417,7 @@ export NO_ALBUMENTATIONS_UPDATE=1
 export TOKENIZERS_PARALLELISM=false
 export OMNI_KIT_ACCEPT_EULA=Y
 
-cd {GR00T_N16_DIR}
+cd {shlex.quote(repo_path)}
 source .venv/bin/activate
 
 {_snapshot_preamble(snapshot)}

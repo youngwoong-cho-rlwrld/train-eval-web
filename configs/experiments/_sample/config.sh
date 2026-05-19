@@ -10,7 +10,8 @@
 
 
 # ───── model ─────
-MODEL_VERSION=n1.5                  # n1.5 (gr00t train_body.sh) | n1.6 (train_body_n16.sh)
+MODEL_ID=n1.5                       # configs/models/<model>.env
+MODEL_VERSION=n1.5                  # runtime family: n1.5 or n1.6
 TRAIN_NOTE="N1.5 single-task @ 480x640 — sample variant, edit me"
 
 

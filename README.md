@@ -10,6 +10,7 @@ Runs on your Mac, talks to clusters over SSH. Configs live in this repo (`config
 train-eval-web/
 ├── configs/              # source of truth for experiments
 │   ├── clusters/         # kakao.env, skt.env
+│   ├── models/           # <model>.env: repo/body-script/runtime definitions
 │   └── experiments/      # <experiment>/config.sh, editable in UI
 ├── lib/                  # body scripts run by sbatch (train_body.sh, eval_body.sh, ...)
 ├── backend/              # FastAPI + asyncssh
@@ -38,14 +39,14 @@ The cluster copy at `~/.train-eval-web/` is a transient mirror — it gets overw
 
 ## Model-code changes and training snapshots
 
-Experiment configs and the web UI live in this repo, but GR00T model-code changes live in the actual training repos:
+Experiment configs and the web UI live in this repo, but model-code changes live in the actual training repos. The mapping is data-driven:
 
-- N1.5 experiments use the configured `gr00t` repo.
-- N1.6 experiments use the configured `gr00t-n16` repo.
-- Slurm repo paths come from `configs/clusters/<cluster>.env` via `GROOT_DIR` and `GROOT_N16_DIR`.
-- MLXP repo paths are the DDN workspaces used by the MLXP submitter.
+- Experiments select a model with `MODEL_ID=<model>` in `configs/experiments/<experiment>/config.sh`.
+- Models are defined in `configs/models/<model>.env`.
+- Slurm repo paths come from the model's `SLURM_REPO_VAR`, resolved against `configs/clusters/<cluster>.env`.
+- MLXP repo paths come from the model's `MLXP_REPO_DIR`.
 
-When you submit a training job, the webapp checks the selected model repo for the chosen experiment and backend. For example, an N1.6 training submission checks `gr00t-n16`, not `train-eval-web`.
+When you submit a training job, the webapp checks the selected model repo for the chosen experiment and backend. For example, an experiment with `MODEL_ID=n1.6` checks `gr00t-n16`, not `train-eval-web`.
 
 If the selected model repo is clean, the job submits immediately and the job detail page records that model repo commit in the Submission Snapshot. If the selected model repo has uncommitted changes, the submit UI opens a confirmation modal showing the dirty files and repo path. Clicking **Commit and submit** commits those model-code changes in the training repo, then submits the job and records the new commit hash.
 
@@ -56,3 +57,5 @@ So the normal workflow for changing N1.6 training code is:
 3. Submit an N1.6 training job from the UI.
 4. If prompted, review the dirty `gr00t-n16` files and click **Commit and submit**.
 5. Check the job detail page's Submission Snapshot for the effective config, code repo, repo path, training commit, and dirty-state record.
+
+To add a new N1.6-compatible model repo, add `configs/models/<model>.env`, point `SLURM_REPO_VAR` at a cluster env variable, add that variable to the relevant `configs/clusters/<cluster>.env`, then set `MODEL_ID=<model>` in the experiment config.

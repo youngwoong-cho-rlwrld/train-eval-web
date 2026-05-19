@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from . import clusters, copy_checkpoint, datasets, details, flags, job_resume, jobs, mlxp, mlxp_submit, partitions, results, submission_snapshot, submit, variants, wandb_auth
+from . import clusters, copy_checkpoint, datasets, details, flags, job_resume, jobs, mlxp, mlxp_submit, partitions, results, submission_snapshot, submit, training_models, variants, wandb_auth
 from .paths import CLUSTER_STAGING_REL
 from .ssh import ssh_tail_lines
 from .variant_values import variant_int
@@ -164,7 +164,7 @@ class SubmitConfigPreview(BaseModel):
 async def get_submit_git_status(cluster: str, variant: str):
     try:
         v = await variants.load_variant(variant)
-        model = (v.vars.get("MODEL_VERSION") or "n1.5").strip()
+        model = training_models.resolve_training_model(v)
         repo_label = submission_snapshot.training_repo_label(model)
         if cluster == "mlxp":
             return await submission_snapshot.mlxp_git_status(
@@ -190,7 +190,7 @@ async def get_submit_git_status(cluster: str, variant: str):
 async def post_submit_config_preview(req: submit.SubmitRequest):
     try:
         variant = await variants.load_variant(req.variant)
-        model = (variant.vars.get("MODEL_VERSION") or "n1.5").strip()
+        model = training_models.resolve_training_model(variant)
         job_name = submit.resolve_job_name(req.job_name, req.phase, req.variant)
         partition = req.partition
         node = req.node
@@ -217,7 +217,7 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
                             pass
                 if train_global_batch_size is None:
                     train_global_batch_size = variant_int(variant, "TRAIN_BATCH_SIZE", 64) * train_num_gpus
-            if req.train_global_batch_size is not None and model == "n1.5":
+            if req.train_global_batch_size is not None and model.family == "n1.5":
                 if req.train_global_batch_size % train_num_gpus != 0:
                     raise ValueError("train_global_batch_size must be divisible by train_num_gpus for n1.5 training")
 
@@ -229,7 +229,7 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
             text = submission_snapshot.render_training_config_snapshot(
                 base_config=variant.raw,
                 variant=req.variant,
-                model=model,
+                model=model.family,
                 job_name=job_name,
                 cluster=req.cluster,
                 partition=partition,

@@ -94,7 +94,7 @@ async def _variant_payload() -> list[dict[str, Any]]:
         payload.append(
             {
                 "variant": v.name,
-                "model_version": v.vars.get("MODEL_VERSION"),
+                "model_version": v.vars.get("MODEL_ID") or v.vars.get("MODEL_VERSION"),
                 "note": v.vars.get("TRAIN_NOTE"),
                 "eval_sets": v.arrays.get("EVAL_SETS", []),
                 "n_runs": _int_or_none(v.vars.get("N_RUNS")),

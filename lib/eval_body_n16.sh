@@ -18,6 +18,7 @@ source "$REPO_ROOT/lib/_common.sh"
 EXP_DIR="$REPO_ROOT/experiments/$VARIANT"
 [ -d "$EXP_DIR" ] || { echo "ERROR: experiment dir not found: $EXP_DIR"; exit 1; }
 source "$EXP_DIR/config.sh"
+TRAIN_REPO_DIR="${SUBMIT_TRAIN_REPO_DIR:-${TRAIN_REPO_DIR:-$GROOT_N16_DIR}}"
 
 GPU_INSTANCE="$(detect_gpu_instance)"
 EXP_NAME="${SLURM_JOB_NAME:-${VARIANT}_eval_${GPU_INSTANCE}_$(date +%Y%m%d%H%M%S)}"
@@ -30,7 +31,8 @@ LOG_FILE="$JOB_LOG_DIR/eval.log"
 
 log "========================================================"
 log "$EXP_NAME"
-log "  cluster=$CLUSTER  partition=${SUBMIT_PARTITION:-$PARTITION}  gpu=$GPU_INSTANCE  model=n1.6"
+log "  cluster=$CLUSTER  partition=${SUBMIT_PARTITION:-$PARTITION}  gpu=$GPU_INSTANCE  model=${MODEL_ID:-n1.6}"
+log "  train repo=$TRAIN_REPO_DIR"
 log "========================================================"
 
 # Honor explicit `--export EVAL_CHECKPOINT=<path>` from the submit wrapper.
@@ -434,7 +436,7 @@ run_eval_one() (
 
     # Client: gr00t-n16 venv (uv run handles env activation; PATH carries uv).
     export PATH="$HOME/.local/bin:$PATH"
-    cd "$GROOT_N16_DIR"
+    cd "$TRAIN_REPO_DIR"
 
     log "  Running eval on CUDA_VISIBLE_DEVICES=${cuda_devices} -> ${RUN_DIR}"
     uv run --extra allex python scripts/eval_allex.py \
@@ -601,7 +603,7 @@ agg = {
     'experiment': '${EXP_NAME}',
     'cluster': '${CLUSTER}',
     'gpu': '${GPU_INSTANCE}',
-    'model_version': 'n1.6',
+    'model_version': '${MODEL_ID:-n1.6}',
     'note': '${TRAIN_NOTE}',
     'checkpoint': '${LAST_CKPT}',
     'modality_config': '${MODALITY_CONFIG_FILE}',

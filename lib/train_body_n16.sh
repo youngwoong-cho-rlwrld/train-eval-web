@@ -18,6 +18,7 @@ source "$REPO_ROOT/lib/_common.sh"
 EXP_DIR="$REPO_ROOT/experiments/$VARIANT"
 [ -d "$EXP_DIR" ] || { echo "ERROR: experiment dir not found: $EXP_DIR"; exit 1; }
 source "$EXP_DIR/config.sh"
+TRAIN_REPO_DIR="${SUBMIT_TRAIN_REPO_DIR:-${TRAIN_REPO_DIR:-$GROOT_N16_DIR}}"
 TRAIN_NUM_GPUS="${SUBMIT_TRAIN_NUM_GPUS:-$TRAIN_NUM_GPUS}"
 MAX_STEPS="${SUBMIT_TRAIN_MAX_STEPS:-$MAX_STEPS}"
 SAVE_STEPS="${SUBMIT_TRAIN_SAVE_STEPS:-$SAVE_STEPS}"
@@ -33,7 +34,8 @@ LOG_FILE="$EXP_DIR/logs/train.log"
 
 log "============================================="
 log "$EXP_NAME"
-log "  cluster=$CLUSTER  partition=${SUBMIT_PARTITION:-$PARTITION}  gpu=$GPU_INSTANCE  model=n1.6"
+log "  cluster=$CLUSTER  partition=${SUBMIT_PARTITION:-$PARTITION}  gpu=$GPU_INSTANCE  model=${MODEL_ID:-n1.6}"
+log "  train repo=$TRAIN_REPO_DIR"
 log "  variant note: $TRAIN_NOTE"
 log "  output=$RUN_CKPT_DIR"
 log "============================================="
@@ -82,7 +84,7 @@ export WANDB_PROJECT=gr00t
 export WANDB_DIR="$EXP_DIR"
 export WANDB_RESUME=allow
 
-cd "$GROOT_N16_DIR"
+cd "$TRAIN_REPO_DIR"
 
 uv run torchrun --nproc_per_node="$TRAIN_NUM_GPUS" gr00t/experiment/launch_finetune.py \
     --base-model-path nvidia/GR00T-N1.6-3B \

@@ -21,6 +21,8 @@ configs/experiments/*/data_config.yaml
 configs/experiments/*
 !configs/experiments/_sample/
 !configs/experiments/_sample/**
+!configs/experiments/physixel_cube_stack_3cm_right_480/
+!configs/experiments/physixel_cube_stack_3cm_right_480/**
 
 # Local scratch
 .DS_Store

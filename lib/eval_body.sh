@@ -19,6 +19,7 @@ source "$REPO_ROOT/lib/_common.sh"
 EXP_DIR="$REPO_ROOT/experiments/$VARIANT"
 [ -d "$EXP_DIR" ] || { echo "ERROR: experiment dir not found: $EXP_DIR"; exit 1; }
 source "$EXP_DIR/config.sh"
+TRAIN_REPO_DIR="${SUBMIT_TRAIN_REPO_DIR:-${TRAIN_REPO_DIR:-$GROOT_DIR}}"
 
 GPU_INSTANCE="$(detect_gpu_instance)"
 EXP_NAME="${VARIANT}_eval_${GPU_INSTANCE}_$(date +%Y%m%d%H%M%S)"
@@ -452,8 +453,8 @@ run_eval_one() (
     log "  Waiting for server readiness..."
     wait_for_server_ready
 
-    source "${GROOT_DIR}/.venv/bin/activate"
-    cd "${GROOT_DIR}"
+    source "${TRAIN_REPO_DIR}/.venv/bin/activate"
+    cd "${TRAIN_REPO_DIR}"
 
     log "  Running eval on CUDA_VISIBLE_DEVICES=${cuda_devices} -> ${RUN_DIR}"
 
@@ -502,8 +503,8 @@ run_eval_one() (
     return 0
 )
 
-source "${GROOT_DIR}/.venv/bin/activate"
-cd "${GROOT_DIR}"
+source "${TRAIN_REPO_DIR}/.venv/bin/activate"
+cd "${TRAIN_REPO_DIR}"
 
 TASK_IDX=0
 for task_entry in "${TASKS[@]}"; do

@@ -6,6 +6,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIGS_DIR = REPO_ROOT / "configs"
 CLUSTERS_DIR = CONFIGS_DIR / "clusters"
 EXPERIMENTS_DIR = CONFIGS_DIR / "experiments"
+MODELS_DIR = CONFIGS_DIR / "models"
 LIB_DIR = REPO_ROOT / "lib"
 
 # Cluster-side staging dir, relative to the user's $HOME on each cluster.

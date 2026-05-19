@@ -8,6 +8,7 @@ update the corresponding builder here.
 
 from typing import Any
 
+from .training_models import resolve_training_model
 from .variants import Variant
 from .wandb_config import get_project
 
@@ -18,15 +19,17 @@ def flags_for(variant: Variant, cluster: str, phase: str) -> list[tuple[str, str
     Pseudo-values like `<job-name>` mark fields the submitter fills in at
     submit time rather than reading from the variant.
     """
-    model = (variant.vars.get("MODEL_VERSION") or "n1.5").strip()
+    model = resolve_training_model(variant).flags_profile
     if phase in ("train", "resume"):
         if model == "n1.6":
             return _train_n16(variant, cluster)
-        return _train_n15(variant, cluster)
+        if model == "n1.5":
+            return _train_n15(variant, cluster)
     if phase == "eval":
         if model == "n1.6":
             return _eval_n16(variant, cluster)
-        return _eval_n15(variant, cluster)
+        if model == "n1.5":
+            return _eval_n15(variant, cluster)
     return []
 
 

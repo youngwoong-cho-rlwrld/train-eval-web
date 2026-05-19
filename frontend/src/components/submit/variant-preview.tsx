@@ -11,6 +11,7 @@ import {
 } from "@/components/ui/card";
 
 const KEY_ORDER = [
+  "MODEL_ID",
   "MODEL_VERSION",
   "MAX_STEPS",
   "SAVE_STEPS",

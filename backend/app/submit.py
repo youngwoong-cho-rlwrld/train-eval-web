@@ -29,6 +29,7 @@ from .submission_snapshot import (
     slurm_training_repo_path,
     training_repo_label,
 )
+from .training_models import resolve_training_model
 from .variants import load_variant
 from .variant_values import variant_int
 
@@ -133,13 +134,6 @@ class SubmitResponse(BaseModel):
     sbatch_stdout: str
 
 
-_BODY_BY_PHASE_MODEL = {
-    ("train", "n1.5"): ("train_body.sh", "48:00:00"),
-    ("train", "n1.6"): ("train_body_n16.sh", "48:00:00"),
-    ("eval", "n1.5"):  ("eval_body.sh", "08:00:00"),
-    ("eval", "n1.6"):  ("eval_body_n16.sh", "08:00:00"),
-}
-
 MAX_EVAL_NUM_ENVS_PER_GPU = 1
 
 
@@ -188,12 +182,10 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     cluster = await load_cluster(req.cluster)
     variant = await load_variant(req.variant)
 
-    # ── Resolve partition + body script + walltime ──
-    model = variant.vars.get("MODEL_VERSION", "n1.5")
-    body_walltime = _BODY_BY_PHASE_MODEL.get((req.phase, model))
-    if body_walltime is None:
-        raise ValueError(f"Unsupported (phase, model): ({req.phase}, {model})")
-    body_script, walltime = body_walltime
+    # ── Resolve partition + model + body script + walltime ──
+    model = resolve_training_model(variant)
+    body_script, walltime = model.body_for_phase(req.phase)
+    training_repo = slurm_training_repo_path(cluster.vars, model)
 
     partition = req.partition or cluster.vars["PARTITION"]
     sbatch_flags: list[str] = []
@@ -218,7 +210,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
                     pass
         if effective_train_global_batch_size is None:
             effective_train_global_batch_size = variant_int(variant, "TRAIN_BATCH_SIZE", 64) * train_num_gpus
-    if req.phase == "train" and req.train_global_batch_size is not None and model == "n1.5":
+    if req.phase == "train" and req.train_global_batch_size is not None and model.family == "n1.5":
         if req.train_global_batch_size % train_num_gpus != 0:
             raise ValueError("train_global_batch_size must be divisible by train_num_gpus for n1.5 training")
     gpus = str(train_num_gpus)
@@ -236,7 +228,6 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     snapshot_text: str | None = None
     snapshot_meta_text: str | None = None
     if req.phase == "train":
-        training_repo = slurm_training_repo_path(cluster.vars, model)
         submit_git = await prepare_slurm_training_git(
             host=host,
             repo_path=training_repo,
@@ -253,7 +244,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         snapshot_text = render_training_config_snapshot(
             base_config=variant.raw,
             variant=req.variant,
-            model=model,
+            model=model.family,
             job_name=job_name,
             cluster=req.cluster,
             partition=partition,
@@ -286,7 +277,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     # root, so flatten configs/ on the way out: configs/clusters → clusters/,
     # configs/experiments → experiments/.
     staging = f"$HOME/{CLUSTER_STAGING_REL}"
-    mkdir_result = await ssh_run(host, f"mkdir -p {staging}/clusters {staging}/experiments {staging}/lib")
+    mkdir_result = await ssh_run(host, f"mkdir -p {staging}/clusters {staging}/experiments {staging}/models {staging}/lib")
     if mkdir_result.returncode != 0:
         raise RuntimeError(f"mkdir on cluster failed: {mkdir_result.stderr}")
 
@@ -295,6 +286,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     sync_targets = [
         (str(CONFIGS_DIR / "clusters") + "/",    "clusters"),
         (str(CONFIGS_DIR / "experiments") + "/", "experiments"),
+        (str(CONFIGS_DIR / "models") + "/",      "models"),
         (str(LIB_DIR) + "/",                      "lib"),
     ]
     for local, remote_name in sync_targets:
@@ -363,7 +355,10 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     # Persist phase+variant in sacct's Comment field so the details page can
     # recover them even when the user picked a custom job_name that doesn't
     # match the unified regex.
-    comment = f"phase={req.phase};variant={req.variant}"
+    comment = (
+        f"phase={req.phase};variant={req.variant};"
+        f"model_id={model.id};submit_train_repo_dir={training_repo}"
+    )
     if req.phase == "train":
         comment += (
             f";train_num_gpus={train_num_gpus}"
@@ -395,6 +390,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         f"--export=ALL,VARIANT={shlex.quote(req.variant)},CLUSTER={shlex.quote(req.cluster)},"
         f"REPO_ROOT={repo_root_remote},RESUME_EXPECTED={resume_expected},"
         f"SUBMIT_PARTITION={shlex.quote(partition)},"
+        f"SUBMIT_TRAIN_REPO_DIR={shlex.quote(training_repo)},"
         # Pin wandb run id to the slurm display name so the URL is stable
         # and matches MLXP's run-id format.
         f"WANDB_RUN_ID={shlex.quote(job_name)}"
@@ -459,6 +455,9 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     meta = (
         f"phase={req.phase}\n"
         f"variant={req.variant}\n"
+        f"model_id={model.id}\n"
+        f"model_label={model.label}\n"
+        f"submit_train_repo_dir={training_repo}\n"
         f"job_name={job_name}\n"
         + (
             f"resume_of={req.resume_of.strip()}\n"
