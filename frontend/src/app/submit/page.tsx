@@ -8,6 +8,7 @@ import {
   api,
   type Variant,
   type SubmitResponse,
+  type SubmitConfigPreview,
   type Partition,
   type Dataset,
   type MlxpNode,
@@ -340,6 +341,8 @@ export default function SubmitPage() {
     if (partition && partitions.data.some((p) => p.name === partition)) return partition;
     return (partitions.data.find((p) => p.is_default) ?? partitions.data[0])?.name ?? "";
   }, [partitions.data, partition]);
+  const selectedPartition = partitions.data?.find((p) => p.name === selectedPartitionName);
+  const variantError = variant.error as Error | null;
 
   const buildSubmitBody = (commitDirtyChanges: boolean) => {
       let dataset_override: string | string[] | null = null;
@@ -367,10 +370,48 @@ export default function SubmitPage() {
         eval_sets: wantsCheckpoint ? evalSetValues : null,
         eval_overwrite_results: wantsCheckpoint ? evalOverwriteResults : false,
         checkpoint_path: wantsCheckpoint ? checkpointPath.trim() : null,
-        job_name: jobNameTouched ? jobName.trim() : null,
+        job_name: shownJobName.trim() || null,
         commit_dirty_changes: commitDirtyChanges,
       };
   };
+
+  const configPreviewEnabled =
+    !!variantName &&
+    !variant.isLoading &&
+    !variantError &&
+    (submitPhase !== "train" || trainConfigValid) &&
+    (!wantsCheckpoint || (evalNEpisodesValid && evalNRunsValid && evalSetsValid));
+  const configPreview = useQuery({
+    queryKey: [
+      "submit-config-preview",
+      cluster,
+      variantName,
+      submitPhase,
+      selectedPartitionName,
+      mlxpNode,
+      datasetTouched,
+      singleDataset,
+      multiDatasets,
+      extraArgs,
+      trainNumGpus,
+      trainGlobalBatchSize,
+      trainMaxSteps,
+      trainSaveSteps,
+      evalNEpisodes,
+      evalNRuns,
+      evalSetValues,
+      evalOverwriteResults,
+      checkpointPath,
+      shownJobName,
+    ],
+    queryFn: () =>
+      api<SubmitConfigPreview>("/api/submit/config-preview", {
+        method: "POST",
+        body: JSON.stringify(buildSubmitBody(false)),
+      }),
+    enabled: configPreviewEnabled,
+    retry: false,
+  });
 
   const submit = useMutation({
     mutationFn: ({ commitDirtyChanges = false }: { commitDirtyChanges?: boolean } = {}) => {
@@ -425,8 +466,6 @@ export default function SubmitPage() {
     trainConfigValid &&
     !preflightPending &&
     !submit.isPending;
-  const selectedPartition = partitions.data?.find((p) => p.name === selectedPartitionName);
-  const variantError = variant.error as Error | null;
   const trainConfigFields =
     wantsTrainConfig && variant.isLoading ? (
       <Field label="Training overrides">
@@ -975,6 +1014,11 @@ export default function SubmitPage() {
               phase={submitPhase}
               checkpointOverride={wantsCheckpoint ? checkpointPath : null}
               checkpointOverrideExists={checkpointExistsValue}
+              effectiveConfigText={configPreview.data?.text ?? null}
+              effectiveConfigPath={configPreview.data?.path ?? null}
+              effectiveConfigLoading={configPreview.isLoading}
+              effectiveConfigError={configPreview.error as Error | null}
+              flagsOverride={configPreview.data?.flags ?? null}
               loading={variant.isLoading}
               error={variantError}
               className="mt-6"

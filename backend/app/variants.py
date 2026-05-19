@@ -45,6 +45,10 @@ async def load_variant(name: str) -> Variant:
     if not cfg_path.is_file():
         raise FileNotFoundError(f"Variant config not found: {cfg_path}")
     raw = cfg_path.read_text()
+    return await parse_variant_text(name, raw)
+
+
+async def parse_variant_text(name: str, raw: str) -> Variant:
     vars, arrays = await _parse_bash(raw)
     return Variant(name=name, raw=raw, vars=vars, arrays=arrays)
 

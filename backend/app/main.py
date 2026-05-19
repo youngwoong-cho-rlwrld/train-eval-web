@@ -4,10 +4,13 @@ import asyncio
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from . import clusters, copy_checkpoint, datasets, details, flags, job_resume, jobs, mlxp, mlxp_submit, partitions, results, submission_snapshot, submit, variants, wandb_auth
+from .paths import CLUSTER_STAGING_REL
 from .ssh import ssh_tail_lines
+from .variant_values import variant_int
 
 
 app = FastAPI(title="train-eval-web")
@@ -147,6 +150,16 @@ async def get_selected_checkpoint(name: str, cluster: str):
 
 # ── submit ──
 
+class ConfigPreviewFlag(BaseModel):
+    flag: str
+    value: str
+
+
+class SubmitConfigPreview(BaseModel):
+    path: str | None = None
+    text: str
+    flags: list[ConfigPreviewFlag]
+
 @app.get("/api/submit/git-status", response_model=submission_snapshot.GitStatus)
 async def get_submit_git_status(cluster: str, variant: str):
     try:
@@ -165,6 +178,96 @@ async def get_submit_git_status(cluster: str, variant: str):
             repo_path=submission_snapshot.slurm_training_repo_path(env.vars, model),
             repo_label=repo_label,
         )
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/submit/config-preview", response_model=SubmitConfigPreview)
+async def post_submit_config_preview(req: submit.SubmitRequest):
+    try:
+        variant = await variants.load_variant(req.variant)
+        model = (variant.vars.get("MODEL_VERSION") or "n1.5").strip()
+        job_name = submit.resolve_job_name(req.job_name, req.phase, req.variant)
+        partition = req.partition
+        node = req.node
+        if req.cluster != "mlxp":
+            env = await clusters.load_cluster(req.cluster)
+            partition = partition or env.vars["PARTITION"]
+        elif not node:
+            node = mlxp_submit.DEFAULT_NODE
+
+        path: str | None = None
+        if req.phase == "train":
+            train_num_gpus = req.train_num_gpus or variant_int(variant, "TRAIN_NUM_GPUS", 2)
+            train_max_steps = req.train_max_steps or variant_int(variant, "MAX_STEPS", 30000)
+            train_save_steps = req.train_save_steps or variant_int(variant, "SAVE_STEPS", 1000)
+            train_global_batch_size = req.train_global_batch_size
+            if train_global_batch_size is None:
+                for key in ("TRAIN_GLOBAL_BATCH_SIZE", "GLOBAL_BATCH_SIZE"):
+                    raw = variant.vars.get(key)
+                    if raw:
+                        try:
+                            train_global_batch_size = int(raw)
+                            break
+                        except ValueError:
+                            pass
+                if train_global_batch_size is None:
+                    train_global_batch_size = variant_int(variant, "TRAIN_BATCH_SIZE", 64) * train_num_gpus
+            if req.train_global_batch_size is not None and model == "n1.5":
+                if req.train_global_batch_size % train_num_gpus != 0:
+                    raise ValueError("train_global_batch_size must be divisible by train_num_gpus for n1.5 training")
+
+            suffix = submission_snapshot.snapshot_suffix(job_name)
+            if req.cluster == "mlxp":
+                path = f"{mlxp_submit.MLXP_EXPERIMENTS_DIR}/{req.variant}/config_{suffix}.sh"
+            else:
+                path = f"$HOME/{CLUSTER_STAGING_REL}/experiments/{req.variant}/config_{suffix}.sh"
+            text = submission_snapshot.render_training_config_snapshot(
+                base_config=variant.raw,
+                variant=req.variant,
+                model=model,
+                job_name=job_name,
+                cluster=req.cluster,
+                partition=partition,
+                node=node,
+                dataset_override=req.dataset_override,
+                extra_args=req.extra_args,
+                train_num_gpus=train_num_gpus,
+                train_global_batch_size=train_global_batch_size,
+                train_max_steps=train_max_steps,
+                train_save_steps=train_save_steps,
+                git=None,
+            )
+        elif req.phase == "eval":
+            eval_sets = submit._normalize_eval_sets(req.eval_sets)
+            text = submission_snapshot.render_eval_config_preview(
+                base_config=variant.raw,
+                variant=req.variant,
+                job_name=job_name,
+                cluster=req.cluster,
+                partition=partition,
+                node=node,
+                eval_n_episodes=req.eval_n_episodes,
+                eval_n_runs=req.eval_n_runs,
+                eval_sets=eval_sets,
+                eval_overwrite_results=req.eval_overwrite_results,
+                checkpoint_path=req.checkpoint_path,
+                extra_args=req.extra_args,
+            )
+        else:
+            raise ValueError(f"unsupported phase: {req.phase}")
+
+        effective_variant = await variants.parse_variant_text(req.variant, text)
+        out = flags.flags_for(effective_variant, req.cluster, req.phase)
+        return {
+            "path": path,
+            "text": text,
+            "flags": [{"flag": f, "value": val} for f, val in out],
+        }
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
     except ValueError as e:
@@ -382,7 +485,10 @@ async def get_job_flags(cluster: str, job_id: str):
     if not det.variant:
         return {"flags": []}
     try:
-        v = await variants.load_variant(det.variant)
+        if det.config_snapshot and det.config_snapshot.text:
+            v = await variants.parse_variant_text(det.variant, det.config_snapshot.text)
+        else:
+            v = await variants.load_variant(det.variant)
     except FileNotFoundError:
         raise HTTPException(404, f"variant {det.variant} not found")
     out = flags.flags_for(v, cluster, det.phase)

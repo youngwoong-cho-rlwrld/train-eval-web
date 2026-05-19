@@ -56,11 +56,13 @@ def _train_n15(v: Variant, cluster: str) -> list[tuple[str, str]]:
 
 def _train_n16(v: Variant, cluster: str) -> list[tuple[str, str]]:
     """gr00t/experiment/launch_finetune.py — N1.6 training."""
-    try:
-        nb = int(v.vars.get("TRAIN_NUM_GPUS", "0")) * int(v.vars.get("TRAIN_BATCH_SIZE", "0"))
-        global_batch = str(nb) if nb > 0 else ""
-    except ValueError:
-        global_batch = ""
+    global_batch = v.vars.get("TRAIN_GLOBAL_BATCH_SIZE") or v.vars.get("GLOBAL_BATCH_SIZE") or ""
+    if not global_batch:
+        try:
+            nb = int(v.vars.get("TRAIN_NUM_GPUS", "0")) * int(v.vars.get("TRAIN_BATCH_SIZE", "0"))
+            global_batch = str(nb) if nb > 0 else ""
+        except ValueError:
+            global_batch = ""
     names = v.arrays.get("TRAIN_DATASET_NAMES") or (
         [v.vars["DATASET_NAME"]] if "DATASET_NAME" in v.vars else []
     )

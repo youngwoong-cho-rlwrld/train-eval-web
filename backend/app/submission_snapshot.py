@@ -314,6 +314,20 @@ def _array_assignment(name: str, values: list[str]) -> str:
     return "\n".join(lines)
 
 
+def _set_array(config_text: str, name: str, values: list[str]) -> str:
+    rendered = _array_assignment(name, values)
+    pattern = rf"^{re.escape(name)}=\(.*?^\)\s*$"
+    if re.search(pattern, config_text, flags=re.MULTILINE | re.DOTALL):
+        return re.sub(
+            pattern,
+            rendered,
+            count=1,
+            flags=re.MULTILINE | re.DOTALL,
+        )
+    suffix = "" if config_text.endswith("\n") else "\n"
+    return f"{config_text}{suffix}{rendered}\n"
+
+
 def render_training_config_snapshot(
     *,
     base_config: str,
@@ -369,6 +383,52 @@ def render_training_config_snapshot(
     if extra_args:
         footer.append(_array_assignment("SUBMIT_EXTRA_ARGS", extra_args))
     footer.append("# -------------------------------------------")
+
+    suffix = "" if text.endswith("\n") else "\n"
+    return f"{text}{suffix}" + "\n".join(footer) + "\n"
+
+
+def render_eval_config_preview(
+    *,
+    base_config: str,
+    variant: str,
+    job_name: str,
+    cluster: str,
+    partition: str | None = None,
+    node: str | None = None,
+    eval_n_episodes: int | None = None,
+    eval_n_runs: int | None = None,
+    eval_sets: list[str] | None = None,
+    eval_overwrite_results: bool = False,
+    checkpoint_path: str | None = None,
+    extra_args: list[str] | None = None,
+) -> str:
+    text = base_config
+    if eval_n_episodes is not None:
+        text = _set_scalar(text, "N_EPISODES", eval_n_episodes)
+    if eval_n_runs is not None:
+        text = _set_scalar(text, "N_RUNS", eval_n_runs)
+    if eval_sets is not None:
+        text = _set_array(text, "EVAL_SETS", eval_sets)
+
+    footer = [
+        "",
+        "# ---- train-eval-web eval submission preview ----",
+        f"SUBMIT_JOB_NAME={shlex.quote(job_name)}",
+        f"SUBMIT_VARIANT={shlex.quote(variant)}",
+        f"SUBMIT_CLUSTER={shlex.quote(cluster)}",
+    ]
+    if partition:
+        footer.append(f"SUBMIT_PARTITION={shlex.quote(partition)}")
+    if node:
+        footer.append(f"SUBMIT_NODE={shlex.quote(node)}")
+    if checkpoint_path:
+        footer.append(f"SUBMIT_EVAL_CHECKPOINT={shlex.quote(checkpoint_path)}")
+    if eval_overwrite_results:
+        footer.append("SUBMIT_EVAL_OVERWRITE_RESULTS=1")
+    if extra_args:
+        footer.append(_array_assignment("SUBMIT_EXTRA_ARGS", extra_args))
+    footer.append("# -------------------------------------------------")
 
     suffix = "" if text.endswith("\n") else "\n"
     return f"{text}{suffix}" + "\n".join(footer) + "\n"

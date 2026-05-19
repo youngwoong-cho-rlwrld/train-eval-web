@@ -272,6 +272,8 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
             ? details.data.paths.eval_checkpoint
             : null
         }
+        effectiveConfigText={details.data?.config_snapshot?.text ?? null}
+        effectiveConfigPath={details.data?.config_snapshot?.path ?? null}
         loading={details.isLoading}
         error={detailsError}
         className="mt-6"

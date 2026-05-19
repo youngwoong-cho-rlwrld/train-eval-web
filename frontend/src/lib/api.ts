@@ -55,6 +55,17 @@ export type SubmitResponse = {
   sbatch_stdout: string;
 };
 
+export type ConfigPreviewFlag = {
+  flag: string;
+  value: string;
+};
+
+export type SubmitConfigPreview = {
+  path: string | null;
+  text: string;
+  flags: ConfigPreviewFlag[];
+};
+
 export type Paths = {
   stdout: string;
   stderr: string;
