@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state";
 
 export default function ExperimentsPage() {
   const variants = useQuery({
@@ -20,7 +21,11 @@ export default function ExperimentsPage() {
           <CardTitle>All variants</CardTitle>
         </CardHeader>
         <CardContent>
-          {variants.isLoading && <p className="text-sm text-slate-500">Loading…</p>}
+          {variants.isLoading && <LoadingState label="Loading variants..." rows={5} />}
+          {variants.error && <ErrorState message={(variants.error as Error).message} />}
+          {!variants.isLoading && !variants.error && variants.data?.length === 0 && (
+            <EmptyState message="No variants found." />
+          )}
           {variants.data && (
             <ul className="divide-y divide-slate-100 dark:divide-slate-900">
               {variants.data.map((v) => (

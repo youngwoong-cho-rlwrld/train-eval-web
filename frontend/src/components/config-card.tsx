@@ -9,6 +9,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { CopyButton } from "@/components/copy-button";
+import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state";
 
 type FlagEntry = { flag: string; value: string };
 
@@ -21,6 +22,8 @@ export function ConfigCard({
   phase,
   checkpointOverride,
   checkpointOverrideExists,
+  loading = false,
+  error,
   className,
 }: {
   variantName: string | null;
@@ -34,12 +37,14 @@ export function ConfigCard({
   // /api/clusters/<c>/path-exists. Owned by the parent so it can also
   // gate the Submit button.
   checkpointOverrideExists?: boolean | null;
+  loading?: boolean;
+  error?: Error | null;
   className?: string;
 }) {
   const flags = useQuery({
     queryKey,
     queryFn: () => api<{ flags: FlagEntry[] }>(flagsUrl),
-    enabled: !!variantName,
+    enabled: !!variantName && !loading && !error,
   });
   const wantsCheckpoint =
     !!variantName && phase === "eval" && !!cluster && cluster !== "mlxp";
@@ -52,7 +57,7 @@ export function ConfigCard({
       api<{ path: string | null; step: number | null }>(
         `/api/variants/${variantName}/selected-checkpoint?cluster=${cluster}`,
       ),
-    enabled: wantsCheckpoint && !overridePath,
+    enabled: wantsCheckpoint && !overridePath && !loading && !error,
   });
   const configPath = variantName
     ? `configs/experiments/${variantName}/config.sh`
@@ -68,34 +73,52 @@ export function ConfigCard({
         <CardTitle>
           Config{" "}
           <span className="text-xs font-normal text-slate-500">
-            {variantName ?? "(variant unknown — couldn't parse job_name)"}
+            {loading
+              ? "(loading variant...)"
+              : variantName ?? "(variant unknown — couldn't parse job_name)"}
           </span>
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-4">
-        <div className="divide-y divide-slate-100 dark:divide-slate-900">
-          {configPath && <ConfigPathRow label="config" value={configPath} />}
-          {modalityPath && (
-            <ConfigPathRow label="modality" value={modalityPath} />
-          )}
-          {wantsCheckpoint && (
-            <ConfigPathRow
-              label="checkpoint"
-              tone={overrideMissing ? "error" : "default"}
-              value={
-                overridePath
-                  ? overrideChecking
-                    ? `${overridePath}  (checking…)`
-                    : overrideMissing
-                      ? `${overridePath}  (not found on ${cluster})`
-                      : overridePath
-                  : selectedCkpt.data?.path ??
-                    (selectedCkpt.isLoading ? "…" : "(none found — eval will fail)")
-              }
-            />
-          )}
-        </div>
-        {flags.data && (
+        {loading && <LoadingState label="Loading config..." />}
+        {!loading && error && <ErrorState message={error.message} />}
+        {!loading && !error && !variantName && (
+          <EmptyState message="Config unavailable because the variant could not be resolved." />
+        )}
+        {!loading && !error && variantName && (
+          <div className="divide-y divide-slate-100 dark:divide-slate-900">
+            {configPath && <ConfigPathRow label="config" value={configPath} />}
+            {modalityPath && (
+              <ConfigPathRow label="modality" value={modalityPath} />
+            )}
+            {wantsCheckpoint && (
+              <ConfigPathRow
+                label="checkpoint"
+                tone={overrideMissing ? "error" : "default"}
+                value={
+                  overridePath
+                    ? overrideChecking
+                      ? `${overridePath}  (checking...)`
+                      : overrideMissing
+                        ? `${overridePath}  (not found on ${cluster})`
+                        : overridePath
+                    : selectedCkpt.data?.path ??
+                      (selectedCkpt.isLoading ? "..." : "(none found - eval will fail)")
+                }
+              />
+            )}
+          </div>
+        )}
+        {!loading && !error && variantName && flags.isLoading && (
+          <LoadingState label="Loading flags..." rows={2} />
+        )}
+        {!loading && !error && variantName && flags.error && (
+          <ErrorState message={(flags.error as Error).message} />
+        )}
+        {!loading && !error && variantName && flags.data && flags.data.flags.length === 0 && (
+          <EmptyState message="No flags resolved for this job." />
+        )}
+        {!loading && !error && variantName && flags.data && flags.data.flags.length > 0 && (
           <div className="divide-y divide-slate-100 dark:divide-slate-900">
             {flags.data.flags.map((f, i) => (
               <div

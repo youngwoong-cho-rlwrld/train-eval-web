@@ -7,6 +7,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { RefreshButton } from "@/components/refresh-button";
 import { useMyMlxpNode } from "@/hooks/use-my-mlxp-node";
+import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state";
 
 const REFRESH_MS = 60_000;
 
@@ -46,6 +47,36 @@ export default function MonitorPage() {
       </div>
 
       <div className="mt-8 space-y-6">
+        {clusters.isLoading && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">Slurm clusters</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <LoadingState label="Loading clusters..." rows={3} />
+            </CardContent>
+          </Card>
+        )}
+        {clusters.error && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">Slurm clusters</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <ErrorState message={(clusters.error as Error).message} />
+            </CardContent>
+          </Card>
+        )}
+        {!clusters.isLoading && !clusters.error && slurm.length === 0 && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">Slurm clusters</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <EmptyState message="No Slurm clusters configured." />
+            </CardContent>
+          </Card>
+        )}
         {slurm.map((c) => (
           <SlurmClusterPanel key={c} cluster={c} />
         ))}
@@ -78,8 +109,11 @@ function SlurmClusterPanel({ cluster }: { cluster: string }) {
         <CardDescription>{ps.length} partitions</CardDescription>
       </CardHeader>
       <CardContent>
-        {q.isLoading && <p className="text-sm text-slate-500">Loading…</p>}
-        {q.error && <p className="text-sm text-red-600">{(q.error as Error).message}</p>}
+        {q.isLoading && <LoadingState label="Loading partitions..." rows={3} />}
+        {q.error && <ErrorState message={(q.error as Error).message} />}
+        {!q.isLoading && !q.error && ps.length === 0 && (
+          <EmptyState message="No partitions reported." />
+        )}
         {ps.length > 0 && (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
@@ -169,8 +203,11 @@ function MlxpPanel() {
         </CardDescription>
       </CardHeader>
       <CardContent>
-        {q.isLoading && <p className="text-sm text-slate-500">Loading…</p>}
-        {q.error && <p className="text-sm text-red-600">{(q.error as Error).message}</p>}
+        {q.isLoading && <LoadingState label="Loading MLXP GPUs..." rows={3} />}
+        {q.error && <ErrorState message={(q.error as Error).message} />}
+        {!q.isLoading && !q.error && nodes.length === 0 && (
+          <EmptyState message="No MLXP GPU nodes reported." />
+        )}
         {nodes.length > 0 && (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">

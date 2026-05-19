@@ -37,6 +37,7 @@ import { MlxpCard } from "@/components/submit/mlxp-card";
 import { AvailabilityCard } from "@/components/submit/availability-card";
 import { ConfigCard } from "@/components/config-card";
 import { useDatasetDir } from "@/hooks/use-dataset-dir";
+import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state";
 
 type Phase = "train" | "eval";
 type EvalConfigEdit = {
@@ -381,8 +382,17 @@ export default function SubmitPage() {
     trainConfigValid &&
     !submit.isPending;
   const selectedPartition = partitions.data?.find((p) => p.name === selectedPartitionName);
+  const variantError = variant.error as Error | null;
   const trainConfigFields =
-    wantsTrainConfig && variant.data ? (
+    wantsTrainConfig && variant.isLoading ? (
+      <Field label="Training overrides">
+        <LoadingState label="Loading training defaults..." rows={4} />
+      </Field>
+    ) : wantsTrainConfig && variantError ? (
+      <Field label="Training overrides">
+        <ErrorState message={variantError.message} />
+      </Field>
+    ) : wantsTrainConfig && variant.data ? (
       <Field label="Training overrides">
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="space-y-1.5">
@@ -464,6 +474,34 @@ export default function SubmitPage() {
         )}
       </Field>
     ) : null;
+  const datasetField =
+    variantName && variant.isLoading ? (
+      <Field label="Dataset override">
+        <LoadingState label="Loading dataset defaults..." rows={3} />
+      </Field>
+    ) : variantName && variantError ? (
+      <Field label="Dataset override">
+        <ErrorState message={variantError.message} />
+      </Field>
+    ) : variant.data ? (
+      <DatasetField
+        variant={variant.data}
+        datasets={datasets.data ?? []}
+        single={singleDataset}
+        multi={multiDatasets}
+        onSingleChange={(v) => {
+          setDatasetEdit({ variant: variantName, single: v, multi: multiDatasets });
+        }}
+        onMultiChange={(v) => {
+          setDatasetEdit({ variant: variantName, single: singleDataset, multi: v });
+        }}
+        touched={datasetTouched}
+        cluster={cluster}
+        datasetDir={datasetDir}
+        onDatasetDirChange={setDatasetDir}
+        datasetsError={datasets.error as Error | null}
+      />
+    ) : null;
 
   return (
     <div className="mx-auto max-w-7xl px-8 py-12">
@@ -492,6 +530,8 @@ export default function SubmitPage() {
                     ))}
                   </SelectContent>
                 </Select>
+                {clusters.isLoading && <LoadingState label="Loading clusters..." rows={1} />}
+                {clusters.error && <ErrorState message={(clusters.error as Error).message} />}
               </Field>
 
               <Field label="Variant">
@@ -507,6 +547,8 @@ export default function SubmitPage() {
                     ))}
                   </SelectContent>
                 </Select>
+                {variantNames.isLoading && <LoadingState label="Loading variants..." rows={1} />}
+                {variantNames.error && <ErrorState message={(variantNames.error as Error).message} />}
               </Field>
 
               {isSlurm && (
@@ -567,27 +609,11 @@ export default function SubmitPage() {
                         checkpoint after preemption.
                       </p>
                     )}
+                    {partitions.isLoading && <LoadingState label="Loading partitions..." rows={2} />}
+                    {partitions.error && <ErrorState message={(partitions.error as Error).message} />}
                   </Field>
 
-                  {variant.data && (
-                    <DatasetField
-                      variant={variant.data}
-                      datasets={datasets.data ?? []}
-                      single={singleDataset}
-                      multi={multiDatasets}
-                      onSingleChange={(v) => {
-                        setDatasetEdit({ variant: variantName, single: v, multi: multiDatasets });
-                      }}
-                      onMultiChange={(v) => {
-                        setDatasetEdit({ variant: variantName, single: singleDataset, multi: v });
-                      }}
-                      touched={datasetTouched}
-                      cluster={cluster}
-                      datasetDir={datasetDir}
-                      onDatasetDirChange={setDatasetDir}
-                      datasetsError={datasets.error as Error | null}
-                    />
-                  )}
+                  {datasetField}
 
                   {trainConfigFields}
 
@@ -812,7 +838,7 @@ export default function SubmitPage() {
                   <Field label="Node">
                     <Select value={mlxpNode} onValueChange={setMlxpNode}>
                       <SelectTrigger>
-                        <SelectValue placeholder="select your sanctioned node…" />
+                        <SelectValue placeholder="select a default node..." />
                       </SelectTrigger>
                       <SelectContent>
                         {mlxp.data?.map((n) => (
@@ -829,33 +855,15 @@ export default function SubmitPage() {
                         ))}
                       </SelectContent>
                     </Select>
+                    {mlxp.isLoading && <LoadingState label="Loading MLXP nodes..." rows={2} />}
+                    {mlxp.error && <ErrorState message={(mlxp.error as Error).message} />}
                     <p className="text-xs text-slate-500">
-                      Each rlwrld member is sanctioned for a specific node —
-                      check the GPU Resource Schedule sheet. Wrong-node
-                      submission has triggered admin job deletions. Your
-                      selection is saved locally for next time.
+                      Pick the MLXP node this app should target by default.
+                      Your selection is saved locally for next time.
                     </p>
                   </Field>
 
-                  {variant.data && (
-                    <DatasetField
-                      variant={variant.data}
-                      datasets={datasets.data ?? []}
-                      single={singleDataset}
-                      multi={multiDatasets}
-                      onSingleChange={(v) => {
-                        setDatasetEdit({ variant: variantName, single: v, multi: multiDatasets });
-                      }}
-                      onMultiChange={(v) => {
-                        setDatasetEdit({ variant: variantName, single: singleDataset, multi: v });
-                      }}
-                      touched={datasetTouched}
-                      cluster={cluster}
-                      datasetDir={datasetDir}
-                      onDatasetDirChange={setDatasetDir}
-                      datasetsError={datasets.error as Error | null}
-                    />
-                  )}
+                  {datasetField}
 
                   {trainConfigFields}
 
@@ -913,16 +921,18 @@ export default function SubmitPage() {
             </CardContent>
           </Card>
 
-          {variant.data && (
+          {variantName && (
             <ConfigCard
-              variantName={variant.data.name}
-              flagsUrl={`/api/variants/${variant.data.name}/flags?cluster=${cluster}&phase=${submitPhase}`}
-              queryKey={["variant-flags", variant.data.name, cluster, submitPhase]}
-              modalityConfigFile={variant.data.vars.TRAIN_MODALITY_CONFIG ?? null}
+              variantName={variant.data?.name ?? variantName}
+              flagsUrl={`/api/variants/${variantName}/flags?cluster=${cluster}&phase=${submitPhase}`}
+              queryKey={["variant-flags", variantName, cluster, submitPhase]}
+              modalityConfigFile={variant.data?.vars.TRAIN_MODALITY_CONFIG ?? null}
               cluster={cluster}
               phase={submitPhase}
               checkpointOverride={wantsCheckpoint ? checkpointPath : null}
               checkpointOverrideExists={checkpointExistsValue}
+              loading={variant.isLoading}
+              error={variantError}
               className="mt-6"
             />
           )}
@@ -939,15 +949,59 @@ export default function SubmitPage() {
         </div>
 
         <aside className="space-y-4 lg:sticky lg:top-6 lg:self-start">
-          {isSlurm && partitions.data && (
-            <AvailabilityCard cluster={cluster} partitions={partitions.data} />
+          {isSlurm && (
+            partitions.data ? (
+              <AvailabilityCard cluster={cluster} partitions={partitions.data} />
+            ) : (
+              <AsideStatusCard
+                title="GPU availability"
+                description={`${cluster} · refreshes every 30s`}
+                loading={partitions.isLoading}
+                error={partitions.error as Error | null}
+              />
+            )
           )}
-          {!isSlurm && mlxp.data && (
-            <MlxpCard nodes={mlxp.data} yoursNode={mlxpNode} />
+          {!isSlurm && (
+            mlxp.data ? (
+              <MlxpCard nodes={mlxp.data} yoursNode={mlxpNode} />
+            ) : (
+              <AsideStatusCard
+                title="MLXP (Naver, k8s)"
+                description={`your node: ${mlxpNode || "-"}`}
+                loading={mlxp.isLoading}
+                error={mlxp.error as Error | null}
+              />
+            )
           )}
         </aside>
       </div>
     </div>
+  );
+}
+
+function AsideStatusCard({
+  title,
+  description,
+  loading,
+  error,
+}: {
+  title: string;
+  description: string;
+  loading: boolean;
+  error: Error | null;
+}) {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">{title}</CardTitle>
+        <CardDescription>{description}</CardDescription>
+      </CardHeader>
+      <CardContent>
+        {loading && <LoadingState label="Loading..." rows={3} />}
+        {error && <ErrorState message={error.message} />}
+        {!loading && !error && <EmptyState message="No data available." />}
+      </CardContent>
+    </Card>
   );
 }
 

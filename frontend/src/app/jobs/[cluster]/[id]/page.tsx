@@ -36,6 +36,7 @@ import {
 import { ConfigCard } from "@/components/config-card";
 import { CopyButton } from "@/components/copy-button";
 import { RefreshButton } from "@/components/refresh-button";
+import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state";
 import { startCopyWatcher } from "@/lib/copy-watcher";
 
 const REFRESH_MS = 60_000;
@@ -111,6 +112,7 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
   const isTrainPhase = phase === "train" || phase === "resume";
   const isComplete = (sacct.data?.State ?? "").toUpperCase().startsWith("COMPLET");
   const canCopy = isTrainPhase && isComplete;
+  const detailsError = details.error as Error | null;
   const [stream, setStream] = useState<"out" | "err" | "isaac">("out");
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [copyOpen, setCopyOpen] = useState(false);
@@ -133,6 +135,17 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
             <span className="text-slate-400">·</span>{" "}
             <span className="text-slate-500">{cluster}</span>
           </h1>
+          {details.isLoading && (
+            <div className="mt-1 flex items-center gap-2 text-sm text-slate-600 dark:text-slate-400">
+              <Badge variant="secondary">loading</Badge>
+              <span className="font-mono text-xs">resolving job details...</span>
+            </div>
+          )}
+          {details.error && (
+            <div className="mt-1 text-sm text-red-600 dark:text-red-400">
+              {detailsError?.message}
+            </div>
+          )}
           {details.data && (
             <div className="mt-1 flex items-center gap-2 text-sm text-slate-600 dark:text-slate-400">
               <Badge variant={phase === "eval" ? "outline" : "default"}>{phase ?? "unknown"}</Badge>
@@ -211,14 +224,18 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
       </Dialog>
 
       <div className="mt-6 grid gap-6 lg:grid-cols-2">
-        {details.data && <ProgressCard d={details.data} />}
+        <ProgressCard
+          d={details.data}
+          isLoading={details.isLoading}
+          error={detailsError}
+        />
         <Card>
           <CardHeader>
             <CardTitle>sacct</CardTitle>
           </CardHeader>
           <CardContent>
-            {sacct.isLoading && <p className="text-sm text-slate-500">Loading…</p>}
-            {sacct.error && <p className="text-sm text-red-600">{(sacct.error as Error).message}</p>}
+            {sacct.isLoading && <LoadingState label="Loading sacct..." rows={4} />}
+            {sacct.error && <ErrorState message={(sacct.error as Error).message} />}
             {sacct.data && (
               <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
                 {["State", "ExitCode", "Elapsed", "Start", "End", "Partition", "NodeList", "Reason"].map((k) =>
@@ -237,24 +254,29 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
         </Card>
       </div>
 
-      {details.data && (
-        <ConfigCard
-          variantName={details.data.variant ?? null}
-          flagsUrl={`/api/jobs/${cluster}/${id}/flags`}
-          queryKey={["job-flags", cluster, id]}
-          modalityConfigFile={variantQuery.data?.vars.TRAIN_MODALITY_CONFIG ?? null}
-          cluster={cluster}
-          phase={details.data.phase}
-          checkpointOverride={
-            details.data.phase === "eval"
-              ? details.data.paths.eval_checkpoint
-              : null
-          }
-          className="mt-6"
-        />
-      )}
+      <ConfigCard
+        variantName={details.data?.variant ?? null}
+        flagsUrl={`/api/jobs/${cluster}/${id}/flags`}
+        queryKey={["job-flags", cluster, id]}
+        modalityConfigFile={variantQuery.data?.vars.TRAIN_MODALITY_CONFIG ?? null}
+        cluster={cluster}
+        phase={details.data?.phase}
+        checkpointOverride={
+          details.data?.phase === "eval"
+            ? details.data.paths.eval_checkpoint
+            : null
+        }
+        loading={details.isLoading}
+        error={detailsError}
+        className="mt-6"
+      />
 
-      {details.data && <PathsCard d={details.data} />}
+      <PathsCard
+        d={details.data}
+        cluster={cluster}
+        isLoading={details.isLoading}
+        error={detailsError}
+      />
 
       <Card className="mt-6">
         <CardHeader className="flex flex-row items-center justify-between">
@@ -338,33 +360,43 @@ function GpuUsageSection({ d }: { d: JobDetails }) {
   );
 }
 
-function ProgressCard({ d }: { d: JobDetails }) {
-  const p = d.progress;
-  const isComplete = (d.state ?? "").toUpperCase().startsWith("COMPLET");
+function ProgressCard({
+  d,
+  isLoading = false,
+  error,
+}: {
+  d?: JobDetails;
+  isLoading?: boolean;
+  error?: Error | null;
+}) {
+  const p = d?.progress;
+  const isComplete = (d?.state ?? "").toUpperCase().startsWith("COMPLET");
   // Treat a completed job as 100% even when the backend signal didn't make
   // it (e.g. wandb run already archived, checkpoint path moved off DDN).
-  const effectivePercent = isComplete ? 100 : (p.percent ?? 0);
-  const showBar =
+  const effectivePercent = isComplete ? 100 : (p?.percent ?? 0);
+  const showBar = Boolean(
     isComplete ||
-    (p.current_step !== null && p.max_steps) ||
-    (p.completed_runs !== null && p.total_runs);
+    (p?.current_step !== null && p?.max_steps) ||
+    (p?.completed_runs !== null && p?.total_runs),
+  );
   // Surface wandb-not-configured as the actionable cause of empty progress,
   // rather than the generic "No progress yet" which looks like a backend bug.
   const wandbStatus = useQuery({
     queryKey: ["wandb-status"],
     queryFn: () => api<{ logged_in: boolean; entity: string | null; project: string; error: string | null }>("/api/wandb/status"),
+    enabled: !!d && (d.phase === "train" || d.phase === "resume") && !isComplete,
     staleTime: 60_000,
   });
-  const isTrain = d.phase === "train" || d.phase === "resume";
+  const isTrain = d?.phase === "train" || d?.phase === "resume";
   const wandbMissing =
     !isComplete && isTrain && wandbStatus.data && !wandbStatus.data.logged_in;
-  const showGpu = /^(RUNNING|COMPLETING)/i.test(d.state ?? "");
+  const showGpu = /^(RUNNING|COMPLETING)/i.test(d?.state ?? "");
 
   // ETA from elapsed × steps-remaining / current-step. Same linear model the
   // /jobs table uses.
   let etaLabel: string | null = null;
   let etaTitle = "";
-  if (!isComplete && p.current_step && p.max_steps && p.current_step < p.max_steps) {
+  if (!isComplete && p?.current_step && p.max_steps && p.current_step < p.max_steps && d) {
     const elapsedSec = parseSlurmDuration(d.elapsed);
     if (elapsedSec > 0) {
       const etaSec = (elapsedSec * (p.max_steps - p.current_step)) / p.current_step;
@@ -377,18 +409,18 @@ function ProgressCard({ d }: { d: JobDetails }) {
   // Training jobs deserve a tidy "step N/N" at completion even if the live
   // current_label decayed; eval/other phases already carry a meaningful
   // current_label (e.g. "15/15 runs · episode 70/70") so respect it.
-  const isTrainPhase = d.phase === "train" || d.phase === "resume";
+  const isTrainPhase = d?.phase === "train" || d?.phase === "resume";
   const label = isComplete && isTrainPhase
-    ? p.max_steps
+    ? p?.max_steps
       ? `step ${p.max_steps.toLocaleString()}/${p.max_steps.toLocaleString()}`
       : "Complete"
-    : (p.current_label ?? (isComplete ? "Complete" : null));
+    : (p?.current_label ?? (isComplete ? "Complete" : null));
 
   return (
     <Card>
       <CardHeader className="flex flex-row items-center justify-between">
         <CardTitle>Progress</CardTitle>
-        {d.wandb_url && (
+        {d?.wandb_url && (
           <a
             href={d.wandb_url}
             target="_blank"
@@ -400,68 +432,96 @@ function ProgressCard({ d }: { d: JobDetails }) {
         )}
       </CardHeader>
       <CardContent>
-        {!showBar && wandbMissing && (
-          <p className="text-sm text-slate-600 dark:text-slate-400">
-            <Link href="/settings" className="text-blue-600 hover:underline">
-              Sign in
-            </Link>{" "}
-            to see live progress
-          </p>
+        {isLoading && <LoadingState label="Loading progress..." />}
+        {!isLoading && error && <ErrorState message={error.message} />}
+        {!isLoading && !error && !d && (
+          <EmptyState message="Progress unavailable." />
         )}
-        {!showBar && !wandbMissing && (
-          <p className="text-sm text-slate-500">{p.current_label ?? "No progress yet."}</p>
-        )}
-        {showBar && (
+        {!isLoading && !error && d && (
           <>
-            <div className="flex items-baseline justify-between text-sm">
-              <span className="font-mono">{label}</span>
-              <span className="text-slate-500">{effectivePercent.toFixed(1)}%</span>
-            </div>
-            <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
-              <div
-                className="h-full rounded-full bg-slate-900 transition-all dark:bg-slate-50"
-                style={{ width: `${Math.max(0, Math.min(100, effectivePercent))}%` }}
-              />
-            </div>
-            {etaLabel && (
-              <div className="mt-2 text-xs text-slate-500" title={etaTitle}>
-                ~{etaLabel} left
-              </div>
+            {!showBar && wandbMissing && (
+              <p className="text-sm text-slate-600 dark:text-slate-400">
+                <Link href="/settings" className="text-blue-600 hover:underline">
+                  Sign in
+                </Link>{" "}
+                to see live progress
+              </p>
             )}
+            {!showBar && !wandbMissing && (
+              <p className="text-sm text-slate-500">{p?.current_label ?? "No progress yet."}</p>
+            )}
+            {showBar && (
+              <>
+                <div className="flex items-baseline justify-between text-sm">
+                  <span className="font-mono">{label}</span>
+                  <span className="text-slate-500">{effectivePercent.toFixed(1)}%</span>
+                </div>
+                <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
+                  <div
+                    className="h-full rounded-full bg-slate-900 transition-all dark:bg-slate-50"
+                    style={{ width: `${Math.max(0, Math.min(100, effectivePercent))}%` }}
+                  />
+                </div>
+                {etaLabel && (
+                  <div className="mt-2 text-xs text-slate-500" title={etaTitle}>
+                    ~{etaLabel} left
+                  </div>
+                )}
+              </>
+            )}
+            {showGpu && <GpuUsageSection d={d} />}
           </>
         )}
-        {showGpu && <GpuUsageSection d={d} />}
       </CardContent>
     </Card>
   );
 }
 
-function PathsCard({ d }: { d: JobDetails }) {
+function PathsCard({
+  d,
+  cluster,
+  isLoading = false,
+  error,
+}: {
+  d?: JobDetails;
+  cluster: string;
+  isLoading?: boolean;
+  error?: Error | null;
+}) {
   const rows: { label: string; value: string }[] = [
-    { label: "stdout", value: d.paths.stdout },
-    { label: "stderr", value: d.paths.stderr },
-    { label: "exp dir", value: d.paths.exp_dir },
+    ...(d
+      ? [
+          { label: "stdout", value: d.paths.stdout },
+          { label: "stderr", value: d.paths.stderr },
+          { label: "exp dir", value: d.paths.exp_dir },
+        ]
+      : []),
   ];
-  if (d.paths.ckpt_dir) rows.push({ label: "checkpoints", value: d.paths.ckpt_dir });
-  if (d.paths.eval_checkpoint) rows.push({ label: "checkpoint", value: d.paths.eval_checkpoint });
-  if (d.paths.eval_dir) rows.push({ label: "eval results", value: d.paths.eval_dir });
-  if (d.paths.isaac_logs_glob) rows.push({ label: "isaac sim logs", value: d.paths.isaac_logs_glob });
+  if (d?.paths.ckpt_dir) rows.push({ label: "checkpoints", value: d.paths.ckpt_dir });
+  if (d?.paths.eval_checkpoint) rows.push({ label: "checkpoint", value: d.paths.eval_checkpoint });
+  if (d?.paths.eval_dir) rows.push({ label: "eval results", value: d.paths.eval_dir });
+  if (d?.paths.isaac_logs_glob) rows.push({ label: "isaac sim logs", value: d.paths.isaac_logs_glob });
 
   return (
     <Card className="mt-6">
       <CardHeader>
-        <CardTitle>Paths <span className="text-xs font-normal text-slate-500">on {d.cluster}</span></CardTitle>
+        <CardTitle>Paths <span className="text-xs font-normal text-slate-500">on {d?.cluster ?? cluster}</span></CardTitle>
       </CardHeader>
       <CardContent>
-        <div className="divide-y divide-slate-100 dark:divide-slate-900">
-          {rows.map((r) => (
-            <div key={r.label} className="flex items-center justify-between gap-4 py-2">
-              <div className="min-w-[110px] text-xs uppercase tracking-wide text-slate-500">{r.label}</div>
-              <div className="flex-1 truncate font-mono text-xs">{r.value}</div>
-              <CopyButton value={r.value} />
-            </div>
-          ))}
-        </div>
+        {isLoading && <LoadingState label="Loading paths..." />}
+        {!isLoading && error && <ErrorState message={error.message} />}
+        {!isLoading && !error && !d && <EmptyState message="Paths unavailable." />}
+        {!isLoading && !error && d && (
+          <div className="divide-y divide-slate-100 dark:divide-slate-900">
+            {rows.map((r) => (
+              <div key={r.label} className="flex items-center justify-between gap-4 py-2">
+                <div className="min-w-[110px] text-xs uppercase tracking-wide text-slate-500">{r.label}</div>
+                <div className="flex-1 truncate font-mono text-xs">{r.value}</div>
+                <CopyButton value={r.value} />
+              </div>
+            ))}
+          </div>
+        )}
       </CardContent>
     </Card>
   );
@@ -609,12 +669,13 @@ function CopyCheckpointDialog({
             <div className="space-y-1.5">
               <Label>Checkpoints</Label>
               {checkpoints.isLoading && (
-                <p className="text-sm text-slate-500">Loading…</p>
+                <LoadingState label="Loading checkpoints..." rows={3} />
+              )}
+              {checkpoints.error && (
+                <ErrorState message={(checkpoints.error as Error).message} />
               )}
               {checkpoints.data && checkpoints.data.length === 0 && (
-                <p className="text-sm text-slate-500">
-                  No checkpoints found for this variant.
-                </p>
+                <EmptyState message="No checkpoints found for this variant." />
               )}
               {checkpoints.data && checkpoints.data.length > 0 && (
                 <div className="max-h-56 overflow-y-auto rounded-md border border-slate-200 dark:border-slate-800">
@@ -652,6 +713,12 @@ function CopyCheckpointDialog({
                   ))}
                 </SelectContent>
               </Select>
+              {clusters.isLoading && (
+                <LoadingState label="Loading destination clusters..." rows={1} />
+              )}
+              {clusters.error && (
+                <ErrorState message={(clusters.error as Error).message} />
+              )}
             </div>
             <div className="space-y-1.5">
               <Label>Destination directory (optional)</Label>

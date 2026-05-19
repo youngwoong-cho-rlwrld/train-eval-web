@@ -12,6 +12,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { CopyButton } from "@/components/copy-button";
 import { RefreshButton } from "@/components/refresh-button";
+import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state";
 import { formatDuration, parseSlurmDuration } from "@/lib/duration";
 import { formatJobTimestamp, parseJobTimestampMs } from "@/lib/job-time";
 
@@ -71,9 +72,11 @@ export default function JobsPage() {
           <CardDescription>{active.length} {active.length === 1 ? "job" : "jobs"} in queue or running.</CardDescription>
         </CardHeader>
         <CardContent>
-          {isLoading && <p className="text-sm text-slate-500">Loading…</p>}
-          {error && <p className="text-sm text-red-600">{(error as Error).message}</p>}
-          {!isLoading && active.length === 0 && <p className="text-sm text-slate-500">No active jobs.</p>}
+          {isLoading && <LoadingState label="Loading active jobs..." rows={4} />}
+          {error && <ErrorState message={(error as Error).message} />}
+          {!isLoading && !error && active.length === 0 && (
+            <EmptyState message="No active jobs." />
+          )}
           {active.length > 0 && <JobTable rows={active} kind="active" />}
         </CardContent>
       </Card>
@@ -98,11 +101,12 @@ export default function JobsPage() {
           </div>
         </CardHeader>
         <CardContent>
-          {finished.length === 0 ? (
-            <p className="text-sm text-slate-500">Nothing in this window.</p>
-          ) : (
-            <JobTable rows={finished} kind="recent" />
+          {isLoading && <LoadingState label="Loading recent jobs..." rows={4} />}
+          {error && <ErrorState message={(error as Error).message} />}
+          {!isLoading && !error && finished.length === 0 && (
+            <EmptyState message="Nothing in this window." />
           )}
+          {finished.length > 0 && <JobTable rows={finished} kind="recent" />}
         </CardContent>
       </Card>
     </div>

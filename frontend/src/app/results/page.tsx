@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { RefreshButton } from "@/components/refresh-button";
+import { LoadingState } from "@/components/loading-state";
 
 const REFRESH_MS = 120_000;
 
@@ -98,7 +99,9 @@ export default function ResultsPage() {
 
       {resultsQuery.isLoading && (
         <Card className="mt-8">
-          <CardContent className="py-8 text-sm text-slate-500">Loading results...</CardContent>
+          <CardContent className="py-8">
+            <LoadingState label="Loading results..." rows={5} />
+          </CardContent>
         </Card>
       )}
 
