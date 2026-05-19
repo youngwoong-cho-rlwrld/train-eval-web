@@ -17,7 +17,7 @@ const items = [
 export function Nav() {
   const pathname = usePathname();
   return (
-    <aside className="flex h-screen w-56 flex-col border-r border-slate-200 bg-slate-50/40 px-3 py-6 dark:border-slate-800 dark:bg-slate-950/40">
+    <aside className="flex h-screen w-56 shrink-0 flex-col border-r border-slate-200 bg-slate-50/40 px-3 py-6 dark:border-slate-800 dark:bg-slate-950/40">
       <Link href="/" className="mb-6 px-3 text-sm font-semibold tracking-tight text-slate-900 dark:text-slate-50">
         train-eval-web
       </Link>

@@ -17,11 +17,11 @@ export default function RootLayout({
 }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en" className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}>
-      <body className="min-h-full">
+      <body className="h-full overflow-hidden">
         <Providers>
-          <div className="flex min-h-screen">
+          <div className="flex h-screen overflow-hidden">
             <Nav />
-            <main className="flex-1 overflow-auto">{children}</main>
+            <main className="min-w-0 flex-1 overflow-y-auto">{children}</main>
           </div>
         </Providers>
       </body>
