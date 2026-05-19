@@ -18,6 +18,9 @@ source "$REPO_ROOT/lib/_common.sh"
 EXP_DIR="$REPO_ROOT/experiments/$VARIANT"
 [ -d "$EXP_DIR" ] || { echo "ERROR: experiment dir not found: $EXP_DIR"; exit 1; }
 source "$EXP_DIR/config.sh"
+TRAIN_NUM_GPUS="${SUBMIT_TRAIN_NUM_GPUS:-$TRAIN_NUM_GPUS}"
+MAX_STEPS="${SUBMIT_TRAIN_MAX_STEPS:-$MAX_STEPS}"
+SAVE_STEPS="${SUBMIT_TRAIN_SAVE_STEPS:-$SAVE_STEPS}"
 
 GPU_INSTANCE="$(detect_gpu_instance)"
 # EXP_NAME mirrors the slurm job name when launched via submit; fallback for ad-hoc runs.
@@ -52,9 +55,11 @@ MODALITY_CONFIG_FILE="$EXP_DIR/$TRAIN_MODALITY_CONFIG"
 [ -f "$MODALITY_CONFIG_FILE" ] || { echo "ERROR: modality config not found: $MODALITY_CONFIG_FILE"; exit 1; }
 log "Modality config: $MODALITY_CONFIG_FILE"
 
-# ── Per-device → global batch size (decision: keep TRAIN_BATCH_SIZE per-device) ──
-GLOBAL_BATCH_SIZE=$((TRAIN_NUM_GPUS * TRAIN_BATCH_SIZE))
-log "Global batch: $TRAIN_NUM_GPUS GPUs × $TRAIN_BATCH_SIZE per-device = $GLOBAL_BATCH_SIZE"
+# ── Per-device → global batch size (default: keep TRAIN_BATCH_SIZE per-device) ──
+GLOBAL_BATCH_SIZE="${SUBMIT_TRAIN_GLOBAL_BATCH_SIZE:-$((TRAIN_NUM_GPUS * TRAIN_BATCH_SIZE))}"
+log "Global batch: $GLOBAL_BATCH_SIZE"
+log "Train GPUs: $TRAIN_NUM_GPUS"
+log "Save steps: $SAVE_STEPS"
 
 if [[ "${RESUME_EXPECTED:-0}" == "1" ]]; then
     if compgen -G "$RUN_CKPT_DIR/checkpoint-*" > /dev/null; then

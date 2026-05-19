@@ -50,7 +50,7 @@ export default function JobsPage() {
       .sort((a, b) => Number(b.job_id) - Number(a.job_id));
     const finished = all
       .filter((j) => !ACTIVE_STATES.has(j.state))
-      .sort((a, b) => compareStartedDesc(a, b));
+      .sort((a, b) => compareEndedDesc(a, b));
     return { active, finished };
   }, [data]);
 
@@ -313,7 +313,11 @@ function isTimeout(state: string): boolean {
   return state.toUpperCase().startsWith("TIMEOUT");
 }
 
-function compareStartedDesc(a: Job, b: Job): number {
+function compareEndedDesc(a: Job, b: Job): number {
+  const aEnd = parseJobTimestampMs(a.end, a.cluster);
+  const bEnd = parseJobTimestampMs(b.end, b.cluster);
+  if (aEnd !== bEnd) return bEnd - aEnd;
+
   const aStart = parseJobTimestampMs(a.start, a.cluster);
   const bStart = parseJobTimestampMs(b.start, b.cluster);
   if (aStart !== bStart) return bStart - aStart;

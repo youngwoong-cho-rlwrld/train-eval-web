@@ -45,6 +45,13 @@ type EvalConfigEdit = {
   nRuns: string;
   evalSets: string;
 };
+type TrainConfigEdit = {
+  scope: string;
+  numGpus: string;
+  globalBatchSize: string;
+  maxSteps: string;
+  saveSteps: string;
+};
 
 function buildDefaultJobName(phase: Phase, variant: string): string {
   if (!variant) return "";
@@ -68,7 +75,9 @@ export default function SubmitPage() {
   const [mlxpNode, setMlxpNode] = useMyMlxpNode();
   const [extraArgs, setExtraArgs] = useState<string>("");
   const [evalNumEnvsPerGpu, setEvalNumEnvsPerGpu] = useState<string>("");
+  const [evalOverwriteResults, setEvalOverwriteResults] = useState<boolean>(false);
   const [evalConfigEdit, setEvalConfigEdit] = useState<EvalConfigEdit | null>(null);
+  const [trainConfigEdit, setTrainConfigEdit] = useState<TrainConfigEdit | null>(null);
   const [checkpointEdit, setCheckpointEdit] = useState<{
     scope: string;
     value: string;
@@ -113,6 +122,7 @@ export default function SubmitPage() {
   const submitPhase: Phase = isSlurm ? phase : "train";
   const checkpointScope = `${cluster}:${variantName}:${submitPhase}`;
   const evalConfigScope = `${checkpointScope}:eval-config`;
+  const trainConfigScope = `${checkpointScope}:train-config`;
 
   const [datasetDir, setDatasetDir] = useDatasetDir(cluster);
   const datasets = useQuery({
@@ -236,6 +246,78 @@ export default function SubmitPage() {
     };
     setEvalConfigEdit({ ...base, ...patch, scope: evalConfigScope });
   };
+  const trainConfigDefaults = useMemo(() => {
+    const vars = variant.data?.vars;
+    const numGpus = vars?.TRAIN_NUM_GPUS ?? "2";
+    const perGpuBatch = vars?.TRAIN_BATCH_SIZE ?? "";
+    let globalBatchSize =
+      vars?.TRAIN_GLOBAL_BATCH_SIZE ?? vars?.GLOBAL_BATCH_SIZE ?? "";
+    const parsedNumGpus = Number.parseInt(numGpus, 10);
+    const parsedPerGpuBatch = Number.parseInt(perGpuBatch, 10);
+    if (!globalBatchSize && parsedNumGpus > 0 && parsedPerGpuBatch > 0) {
+      globalBatchSize = String(parsedNumGpus * parsedPerGpuBatch);
+    }
+    return {
+      numGpus,
+      globalBatchSize,
+      maxSteps: vars?.MAX_STEPS ?? "",
+      saveSteps: vars?.SAVE_STEPS ?? "",
+    };
+  }, [variant.data]);
+  const activeTrainConfigEdit =
+    trainConfigEdit?.scope === trainConfigScope ? trainConfigEdit : null;
+  const trainNumGpus = activeTrainConfigEdit
+    ? activeTrainConfigEdit.numGpus
+    : trainConfigDefaults.numGpus;
+  const trainGlobalBatchSize = activeTrainConfigEdit
+    ? activeTrainConfigEdit.globalBatchSize
+    : trainConfigDefaults.globalBatchSize;
+  const trainMaxSteps = activeTrainConfigEdit
+    ? activeTrainConfigEdit.maxSteps
+    : trainConfigDefaults.maxSteps;
+  const trainSaveSteps = activeTrainConfigEdit
+    ? activeTrainConfigEdit.saveSteps
+    : trainConfigDefaults.saveSteps;
+  const trainNumGpusParsed = Number.parseInt(trainNumGpus.trim(), 10);
+  const trainGlobalBatchSizeParsed = Number.parseInt(
+    trainGlobalBatchSize.trim(),
+    10,
+  );
+  const trainMaxStepsParsed = Number.parseInt(trainMaxSteps.trim(), 10);
+  const trainSaveStepsParsed = Number.parseInt(trainSaveSteps.trim(), 10);
+  const isPositiveInteger = (value: string) => /^[1-9]\d*$/.test(value.trim());
+  const trainModel = variant.data?.vars.MODEL_VERSION ?? "n1.5";
+  const wantsTrainConfig = submitPhase === "train" && !!variantName;
+  const trainNumGpusValid =
+    !wantsTrainConfig ||
+    (isPositiveInteger(trainNumGpus) &&
+      (isSlurm || [1, 2, 4, 8].includes(trainNumGpusParsed)));
+  const trainGlobalBatchSizeValid =
+    !wantsTrainConfig ||
+    (isPositiveInteger(trainGlobalBatchSize) &&
+      (trainModel !== "n1.5" ||
+        trainGlobalBatchSizeParsed % trainNumGpusParsed === 0));
+  const trainMaxStepsValid =
+    !wantsTrainConfig || isPositiveInteger(trainMaxSteps);
+  const trainSaveStepsValid =
+    !wantsTrainConfig || isPositiveInteger(trainSaveSteps);
+  const trainConfigValid =
+    trainNumGpusValid &&
+    trainGlobalBatchSizeValid &&
+    trainMaxStepsValid &&
+    trainSaveStepsValid;
+  const updateTrainConfig = (
+    patch: Partial<Omit<TrainConfigEdit, "scope">>,
+  ) => {
+    const base = activeTrainConfigEdit ?? {
+      scope: trainConfigScope,
+      numGpus: trainConfigDefaults.numGpus,
+      globalBatchSize: trainConfigDefaults.globalBatchSize,
+      maxSteps: trainConfigDefaults.maxSteps,
+      saveSteps: trainConfigDefaults.saveSteps,
+    };
+    setTrainConfigEdit({ ...base, ...patch, scope: trainConfigScope });
+  };
 
   const datasetDefaults = useMemo(() => {
     if (!variant.data) return { single: "", multi: [] as string[] };
@@ -287,12 +369,18 @@ export default function SubmitPage() {
           node: isSlurm ? null : mlxpNode,
           dataset_override,
           extra_args: extraArgs.split(/\s+/).filter(Boolean),
+          train_num_gpus: submitPhase === "train" ? trainNumGpusParsed : null,
+          train_global_batch_size:
+            submitPhase === "train" ? trainGlobalBatchSizeParsed : null,
+          train_max_steps: submitPhase === "train" ? trainMaxStepsParsed : null,
+          train_save_steps: submitPhase === "train" ? trainSaveStepsParsed : null,
           eval_num_envs_per_gpu: wantsCheckpoint && hasEvalNumEnvsPerGpuOverride
             ? evalNumEnvsPerGpuParsed
             : null,
           eval_n_episodes: wantsCheckpoint ? evalNEpisodesParsed : null,
           eval_n_runs: wantsCheckpoint ? evalNRunsParsed : null,
           eval_sets: wantsCheckpoint ? evalSetValues : null,
+          eval_overwrite_results: wantsCheckpoint ? evalOverwriteResults : false,
           checkpoint_path: wantsCheckpoint ? checkpointPath.trim() : null,
           job_name: jobNameTouched ? jobName.trim() : null,
         }),
@@ -316,8 +404,92 @@ export default function SubmitPage() {
         evalNEpisodesValid &&
         evalNRunsValid &&
         evalSetsValid)) &&
+    trainConfigValid &&
     !submit.isPending;
   const selectedPartition = partitions.data?.find((p) => p.name === selectedPartitionName);
+  const trainConfigFields =
+    wantsTrainConfig && variant.data ? (
+      <Field label="Training overrides">
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="space-y-1.5">
+            <Label className="text-xs text-slate-500">--num-gpus</Label>
+            <Input
+              type="number"
+              min={1}
+              step={1}
+              value={trainNumGpus}
+              onChange={(e) => updateTrainConfig({ numGpus: e.target.value })}
+            />
+            {!trainNumGpusValid && (
+              <p className="text-xs text-red-600 dark:text-red-400">
+                {isSlurm ? "Enter a positive integer." : "Use 1, 2, 4, or 8."}
+              </p>
+            )}
+          </div>
+
+          <div className="space-y-1.5">
+            <Label className="text-xs text-slate-500">--global-batch-size</Label>
+            <Input
+              type="number"
+              min={1}
+              step={1}
+              value={trainGlobalBatchSize}
+              onChange={(e) =>
+                updateTrainConfig({ globalBatchSize: e.target.value })
+              }
+            />
+            {!trainGlobalBatchSizeValid && (
+              <p className="text-xs text-red-600 dark:text-red-400">
+                {trainModel === "n1.5"
+                  ? "Must divide evenly by --num-gpus."
+                  : "Enter a positive integer."}
+              </p>
+            )}
+          </div>
+
+          <div className="space-y-1.5">
+            <Label className="text-xs text-slate-500">--max-steps</Label>
+            <Input
+              type="number"
+              min={1}
+              step={1}
+              value={trainMaxSteps}
+              onChange={(e) => updateTrainConfig({ maxSteps: e.target.value })}
+            />
+            {!trainMaxStepsValid && (
+              <p className="text-xs text-red-600 dark:text-red-400">
+                Enter a positive integer.
+              </p>
+            )}
+          </div>
+
+          <div className="space-y-1.5">
+            <Label className="text-xs text-slate-500">--save-steps</Label>
+            <Input
+              type="number"
+              min={1}
+              step={1}
+              value={trainSaveSteps}
+              onChange={(e) => updateTrainConfig({ saveSteps: e.target.value })}
+            />
+            {!trainSaveStepsValid && (
+              <p className="text-xs text-red-600 dark:text-red-400">
+                Enter a positive integer.
+              </p>
+            )}
+          </div>
+        </div>
+        {activeTrainConfigEdit && (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setTrainConfigEdit(null)}
+          >
+            Reset train defaults
+          </Button>
+        )}
+      </Field>
+    ) : null;
 
   return (
     <div className="mx-auto max-w-7xl px-8 py-12">
@@ -442,6 +614,8 @@ export default function SubmitPage() {
                       datasetsError={datasets.error as Error | null}
                     />
                   )}
+
+                  {trainConfigFields}
 
                   <Field
                     label={
@@ -648,6 +822,18 @@ export default function SubmitPage() {
                     </Field>
                   )}
 
+                  {wantsCheckpoint && (
+                    <div className="flex h-10 items-center justify-between gap-4 rounded border border-slate-200 px-3 dark:border-slate-800">
+                      <Label className="text-sm font-medium">
+                        Overwrite existing evaluation results if present
+                      </Label>
+                      <Switch
+                        checked={evalOverwriteResults}
+                        onCheckedChange={setEvalOverwriteResults}
+                      />
+                    </div>
+                  )}
+
                   <Field label="Extra sbatch args (optional)">
                     <Input
                       placeholder="--exclusive --nice=100"
@@ -721,6 +907,8 @@ export default function SubmitPage() {
                       datasetsError={datasets.error as Error | null}
                     />
                   )}
+
+                  {trainConfigFields}
 
                   <Field
                     label={
@@ -796,7 +984,7 @@ export default function SubmitPage() {
                 ? "Submitting…"
                 : isSlurm
                   ? `Submit ${phase} → ${cluster}/${selectedPartitionName || "?"}`
-                  : `Submit train → mlxp/${mlxpNode}/${variant.data?.vars.TRAIN_NUM_GPUS ?? "?"}×H200`}
+                  : `Submit train → mlxp/${mlxpNode}/${trainNumGpus || "?"}×H200`}
             </Button>
           </div>
         </div>

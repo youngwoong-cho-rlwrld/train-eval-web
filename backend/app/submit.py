@@ -81,6 +81,11 @@ class SubmitRequest(BaseModel):
     # None means "use whatever the variant config.sh says".
     dataset_override: str | list[str] | None = None
     extra_args: list[str] = Field(default_factory=list)
+    # Train-only: per-submission overrides. None means "use config.sh".
+    train_num_gpus: int | None = Field(default=None, ge=1)
+    train_global_batch_size: int | None = Field(default=None, ge=1)
+    train_max_steps: int | None = Field(default=None, ge=1)
+    train_save_steps: int | None = Field(default=None, ge=1)
     # Eval-only: override Isaac's native vectorized env count per GPU.
     eval_num_envs_per_gpu: int | None = Field(default=None, ge=1)
     # Legacy request field accepted from older frontends/resume metadata.
@@ -89,6 +94,7 @@ class SubmitRequest(BaseModel):
     eval_n_episodes: int | None = Field(default=None, ge=1)
     eval_n_runs: int | None = Field(default=None, ge=1)
     eval_sets: list[str] | None = None
+    eval_overwrite_results: bool = False
     # Eval-only: absolute path to the checkpoint dir on the cluster. The
     # eval body uses this verbatim when set; otherwise it auto-picks.
     checkpoint_path: str | None = None
@@ -139,6 +145,16 @@ def _normalize_eval_sets(eval_sets: list[str] | None) -> list[str] | None:
     return out
 
 
+def _variant_int(variant: Variant, key: str, default: int) -> int:
+    raw = variant.vars.get(key)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"variant {variant.name}: {key} must be an integer")
+
+
 class SubmitResponse(BaseModel):
     job_id: str
     job_name: str
@@ -166,8 +182,16 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         req.eval_n_episodes is not None,
         req.eval_n_runs is not None,
         eval_sets is not None,
+        req.eval_overwrite_results,
     )):
         raise ValueError("eval overrides are only valid for phase=eval")
+    if req.phase != "train" and any((
+        req.train_num_gpus is not None,
+        req.train_global_batch_size is not None,
+        req.train_max_steps is not None,
+        req.train_save_steps is not None,
+    )):
+        raise ValueError("train overrides are only valid for phase=train")
 
     cluster = await load_cluster(req.cluster)
     variant = await load_variant(req.variant)
@@ -183,8 +207,17 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     sbatch_flags: list[str] = []
     if _is_background_partition(partition):
         sbatch_flags.append("--requeue")
+    exclude_nodes = (cluster.vars.get("SBATCH_EXCLUDE") or cluster.vars.get("SLURM_EXCLUDE_NODES") or "").strip()
+    if exclude_nodes:
+        sbatch_flags.append(f"--exclude={shlex.quote(exclude_nodes)}")
 
-    gpus = variant.vars.get("TRAIN_NUM_GPUS", "2")
+    train_num_gpus = req.train_num_gpus or _variant_int(variant, "TRAIN_NUM_GPUS", 2)
+    train_max_steps = req.train_max_steps or _variant_int(variant, "MAX_STEPS", 30000)
+    train_save_steps = req.train_save_steps or _variant_int(variant, "SAVE_STEPS", 1000)
+    if req.phase == "train" and req.train_global_batch_size is not None and model == "n1.5":
+        if req.train_global_batch_size % train_num_gpus != 0:
+            raise ValueError("train_global_batch_size must be divisible by train_num_gpus for n1.5 training")
+    gpus = str(train_num_gpus)
 
     # ── Sync code to cluster staging ──
     # Body scripts expect $REPO_ROOT/{clusters,experiments,lib}/ at the staging
@@ -270,6 +303,14 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     # recover them even when the user picked a custom job_name that doesn't
     # match the unified regex.
     comment = f"phase={req.phase};variant={req.variant}"
+    if req.phase == "train":
+        comment += (
+            f";train_num_gpus={train_num_gpus}"
+            f";train_max_steps={train_max_steps}"
+            f";train_save_steps={train_save_steps}"
+        )
+        if req.train_global_batch_size is not None:
+            comment += f";train_global_batch_size={req.train_global_batch_size}"
 
     sbatch_parts = [
         "/opt/slurm/bin/sbatch",
@@ -288,6 +329,16 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         # and matches MLXP's run-id format.
         f"WANDB_RUN_ID={shlex.quote(job_name)}"
         + (
+            f",SUBMIT_TRAIN_NUM_GPUS={train_num_gpus},"
+            f"SUBMIT_TRAIN_MAX_STEPS={train_max_steps},"
+            f"SUBMIT_TRAIN_SAVE_STEPS={train_save_steps}"
+            if req.phase == "train" else ""
+        )
+        + (
+            f",SUBMIT_TRAIN_GLOBAL_BATCH_SIZE={req.train_global_batch_size}"
+            if req.phase == "train" and req.train_global_batch_size is not None else ""
+        )
+        + (
             f",SUBMIT_EVAL_NUM_ENVS_PER_GPU={eval_num_envs_per_gpu}"
             if req.phase == "eval" and eval_num_envs_per_gpu is not None else ""
         )
@@ -302,6 +353,10 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         + (
             f",SUBMIT_EVAL_SETS={shlex.quote(' '.join(eval_sets))}"
             if req.phase == "eval" and eval_sets is not None else ""
+        )
+        + (
+            ",SUBMIT_EVAL_OVERWRITE_RESULTS=1"
+            if req.phase == "eval" and req.eval_overwrite_results else ""
         )
         + (
             f",EVAL_CHECKPOINT={shlex.quote(req.checkpoint_path)}"
@@ -347,6 +402,23 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             else ""
         )
         + (
+            f"train_num_gpus={train_num_gpus}\n"
+            f"train_max_steps={train_max_steps}\n"
+            f"train_save_steps={train_save_steps}\n"
+            if req.phase == "train"
+            else ""
+        )
+        + (
+            f"train_global_batch_size={req.train_global_batch_size}\n"
+            if req.phase == "train" and req.train_global_batch_size is not None
+            else ""
+        )
+        + (
+            f"exclude_nodes={exclude_nodes}\n"
+            if exclude_nodes
+            else ""
+        )
+        + (
             f"eval_n_episodes={req.eval_n_episodes}\n"
             if req.phase == "eval" and req.eval_n_episodes is not None
             else ""
@@ -359,6 +431,11 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         + (
             f"eval_sets={' '.join(eval_sets)}\n"
             if req.phase == "eval" and eval_sets is not None
+            else ""
+        )
+        + (
+            "eval_overwrite_results=true\n"
+            if req.phase == "eval" and req.eval_overwrite_results
             else ""
         )
         + (

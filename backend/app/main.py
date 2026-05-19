@@ -156,12 +156,11 @@ async def post_submit(req: submit.SubmitRequest):
         if req.cluster == "mlxp":
             if req.phase != "train":
                 raise ValueError("MLXP currently supports phase=train only")
-            # GPU count comes from the variant's TRAIN_NUM_GPUS, same source of
-            # truth slurm uses. The MLXP submit then maps it to CPU/RAM per the
-            # Notion guide's table.
+            # GPU count defaults to TRAIN_NUM_GPUS; submit-time overrides use
+            # the same request fields as Slurm and then map to MLXP CPU/RAM.
             v = await variants.load_variant(req.variant)
             try:
-                num_gpus = int(v.vars.get("TRAIN_NUM_GPUS", "2"))
+                num_gpus = req.train_num_gpus or int(v.vars.get("TRAIN_NUM_GPUS", "2"))
             except ValueError:
                 raise ValueError(
                     f"variant {req.variant}: TRAIN_NUM_GPUS must be an integer"
@@ -169,6 +168,9 @@ async def post_submit(req: submit.SubmitRequest):
             mlxp_req = mlxp_submit.MlxpSubmitRequest(
                 variant=req.variant,
                 num_gpus=num_gpus,
+                global_batch_size=req.train_global_batch_size,
+                max_steps=req.train_max_steps,
+                save_steps=req.train_save_steps,
                 node=req.node,
                 dataset_override=req.dataset_override,
                 extra_args=req.extra_args,

@@ -100,6 +100,33 @@ if [[ "${EVAL_SETS+set}" != set ]] || [ "${#EVAL_SETS[@]}" -eq 0 ]; then
 fi
 log "Eval shape: ${N_RUNS} runs x ${N_EPISODES} episodes; eval_sets=${EVAL_SETS[*]}"
 
+EVAL_OVERWRITE_RESULTS="${SUBMIT_EVAL_OVERWRITE_RESULTS:-${EVAL_OVERWRITE_RESULTS:-0}}"
+if [ "$EVAL_OVERWRITE_RESULTS" != "0" ] && [ "$EVAL_OVERWRITE_RESULTS" != "1" ]; then
+    log "ERROR: EVAL_OVERWRITE_RESULTS must be 0 or 1, got '$EVAL_OVERWRITE_RESULTS'"
+    exit 1
+fi
+if [ "$EVAL_OVERWRITE_RESULTS" = "1" ]; then
+    log "Overwrite existing evaluation results: enabled"
+    rm -f "$EXP_DIR/results.json"
+fi
+
+EVAL_BASE_SEED="${EVAL_BASE_SEED:-42}"
+if ! [[ "$EVAL_BASE_SEED" =~ ^[0-9]+$ ]]; then
+    log "ERROR: EVAL_BASE_SEED must be a non-negative integer, got '$EVAL_BASE_SEED'"
+    exit 1
+fi
+EVAL_SEED_RUN_STRIDE="${EVAL_SEED_RUN_STRIDE:-$((N_EPISODES + 1))}"
+EVAL_SEED_SET_STRIDE="${EVAL_SEED_SET_STRIDE:-$((N_RUNS * EVAL_SEED_RUN_STRIDE + 1))}"
+EVAL_SEED_TASK_STRIDE="${EVAL_SEED_TASK_STRIDE:-$((${#EVAL_SETS[@]} * EVAL_SEED_SET_STRIDE + 1))}"
+for seed_var in EVAL_SEED_RUN_STRIDE EVAL_SEED_SET_STRIDE EVAL_SEED_TASK_STRIDE; do
+    seed_val="${!seed_var}"
+    if ! [[ "$seed_val" =~ ^[0-9]+$ ]] || [ "$seed_val" -lt 1 ]; then
+        log "ERROR: $seed_var must be a positive integer, got '$seed_val'"
+        exit 1
+    fi
+done
+log "Eval seed ranges: base=$EVAL_BASE_SEED run_stride=$EVAL_SEED_RUN_STRIDE eval_set_stride=$EVAL_SEED_SET_STRIDE task_stride=$EVAL_SEED_TASK_STRIDE"
+
 EVAL_GPU_COUNT="${TRAIN_NUM_GPUS:-1}"
 if ! [[ "$EVAL_GPU_COUNT" =~ ^[0-9]+$ ]] || [ "$EVAL_GPU_COUNT" -lt 1 ]; then
     EVAL_GPU_COUNT=1
@@ -159,7 +186,7 @@ FAILED=0
 LAUNCH_IDX=0
 
 cleanup_all() {
-    for pid in "${PIDS[@]:-}"; do
+    for pid in "${PIDS[@]}"; do
         kill "$pid" 2>/dev/null || true
     done
 }
@@ -175,9 +202,9 @@ refresh_running_pids() {
     local active_pids=()
 
     mapfile -t running_pids < <(jobs -pr)
-    for pid in "${PIDS[@]:-}"; do
+    for pid in "${PIDS[@]}"; do
         is_running=0
-        for running_pid in "${running_pids[@]:-}"; do
+        for running_pid in "${running_pids[@]}"; do
             if [ "$pid" = "$running_pid" ]; then
                 is_running=1
                 break
@@ -185,7 +212,11 @@ refresh_running_pids() {
         done
         if [ "$is_running" -eq 1 ]; then
             active_pids+=("$pid")
-        elif ! wait "$pid"; then
+        elif wait "$pid"; then
+            :
+        else
+            local worker_status=$?
+            log "ERROR: eval worker pid $pid exited with status $worker_status"
             FAILED=1
             status=1
         fi
@@ -228,7 +259,7 @@ find_eval_port() {
     while true; do
         port="$(find_available_port)"
         used=0
-        for existing in "${PORTS[@]:-}"; do
+        for existing in "${PORTS[@]}"; do
             if [ "$existing" = "$port" ]; then
                 used=1
                 break
@@ -270,9 +301,10 @@ run_eval_one() (
     local SERVER_LOG_TAG="$5"
     local EVAL_SET="$6"
     local RUN_IDX="$7"
-    local GPU_SLOT="$8"
-    local PORT="$9"
-    local START_SLOT="${10}"
+    local RUN_SEED="$8"
+    local GPU_SLOT="$9"
+    local PORT="${10}"
+    local START_SLOT="${11}"
     local RUN_DIR="${TASK_EVAL_DIR}/${EVAL_SET}/run_${RUN_IDX}"
     local SERVER_PID=""
     local SERVER_LOG="${JOB_LOG_DIR}/server_${SERVER_LOG_TAG}${EVAL_SET}_run${RUN_IDX}.log"
@@ -339,7 +371,12 @@ run_eval_one() (
     }
 
     log ""
-    log "  eval_set: ${EVAL_SET} / Run ${RUN_IDX}/${N_RUNS}"
+    log "  eval_set: ${EVAL_SET} / Run ${RUN_IDX}/${N_RUNS} / seed ${RUN_SEED}"
+
+    if [ "$EVAL_OVERWRITE_RESULTS" = "1" ] && [ -e "$RUN_DIR" ]; then
+        log "  OVERWRITE: removing existing results at ${RUN_DIR}"
+        rm -rf -- "$RUN_DIR"
+    fi
 
     # Idempotent: skip if this (set, run) already produced a results.json.
     if [ -f "${RUN_DIR}/results.json" ]; then
@@ -406,7 +443,7 @@ run_eval_one() (
         --instruction "${INSTRUCTION_LOOP}" \
         --n-episodes ${N_EPISODES} \
         --execution-horizon ${EXECUTION_HORIZON} \
-        --seed 42 &
+        --seed ${RUN_SEED} &
     local CLIENT_PID=$!
     while kill -0 "$CLIENT_PID" 2>/dev/null; do
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -429,11 +466,20 @@ run_eval_one() (
         log "ERROR: eval client failed"
         return 1
     fi
+    if [ ! -f "${RUN_DIR}/results.json" ]; then
+        log "ERROR: eval client exited successfully but did not write ${RUN_DIR}/results.json"
+        kill_server || true
+        return 1
+    fi
 
-    kill_server
+    kill_server || cleanup || true
+    trap - EXIT
+    log "  Completed eval_set: ${EVAL_SET} / Run ${RUN_IDX}/${N_RUNS}"
     sleep 5
+    return 0
 )
 
+TASK_IDX=0
 for task_entry in "${TASKS[@]}"; do
     IFS='|' read -r TASK_SHORT_LOOP TASK_NAME_LOOP INSTRUCTION_LOOP <<<"$task_entry"
     if [ "$MULTI_TASK" -eq 1 ]; then
@@ -447,15 +493,17 @@ for task_entry in "${TASKS[@]}"; do
     fi
     mkdir -p "$TASK_EVAL_DIR"
 
+    EVAL_SET_IDX=0
     for EVAL_SET in "${EVAL_SETS[@]}"; do
         for i in $(seq 1 ${N_RUNS}); do
             RUN_DIR="${TASK_EVAL_DIR}/${EVAL_SET}/run_${i}"
-            if [ -f "${RUN_DIR}/results.json" ]; then
+            if [ "$EVAL_OVERWRITE_RESULTS" != "1" ] && [ -f "${RUN_DIR}/results.json" ]; then
                 log ""
                 log "  eval_set: ${EVAL_SET} / Run ${i}/${N_RUNS}"
                 log "  SKIP (results.json already exists): ${RUN_DIR}"
                 continue
             fi
+            RUN_SEED=$((EVAL_BASE_SEED + TASK_IDX * EVAL_SEED_TASK_STRIDE + EVAL_SET_IDX * EVAL_SEED_SET_STRIDE + (i - 1) * EVAL_SEED_RUN_STRIDE))
             wait_for_slot
             GPU_SLOT="$LAUNCH_IDX"
             START_SLOT="$((LAUNCH_IDX % EVAL_PARALLEL_WORKERS))"
@@ -469,12 +517,15 @@ for task_entry in "${TASKS[@]}"; do
                 "$SERVER_LOG_TAG" \
                 "$EVAL_SET" \
                 "$i" \
+                "$RUN_SEED" \
                 "$GPU_SLOT" \
                 "$PORT" \
                 "$START_SLOT" &
             PIDS+=("$!")
         done
+        EVAL_SET_IDX=$((EVAL_SET_IDX + 1))
     done
+    TASK_IDX=$((TASK_IDX + 1))
 done
 
 if ! wait_for_all; then
@@ -558,6 +609,10 @@ agg = {
     'requested_num_envs_per_gpu': ${EVAL_REQUESTED_NUM_ENVS_PER_GPU},
     'num_envs_per_gpu': ${EVAL_NUM_ENVS_PER_GPU},
     'total_num_envs': ${EVAL_TOTAL_NUM_ENVS},
+    'eval_base_seed': ${EVAL_BASE_SEED},
+    'eval_seed_run_stride': ${EVAL_SEED_RUN_STRIDE},
+    'eval_seed_set_stride': ${EVAL_SEED_SET_STRIDE},
+    'eval_seed_task_stride': ${EVAL_SEED_TASK_STRIDE},
 }
 
 if multi_task:

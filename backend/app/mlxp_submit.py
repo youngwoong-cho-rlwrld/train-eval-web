@@ -48,6 +48,9 @@ GR00T_N16_DIR = f"{USER_HOME_ON_DDN}/workspace/gr00t-n16"
 class MlxpSubmitRequest(BaseModel):
     variant: str
     num_gpus: int = 2
+    global_batch_size: int | None = None
+    max_steps: int | None = None
+    save_steps: int | None = None
     # The k8s node to pin via nodeAffinity. Each rlwrld team member is
     # sanctioned for a specific node (see the GPU Resource Schedule sheet);
     # using anyone else's node has triggered admin deletions in the past.
@@ -77,6 +80,9 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
 
     variant = await load_variant(req.variant)
     cpu, mem = _GPU_RESOURCES[req.num_gpus]
+    model = (variant.vars.get("MODEL_VERSION") or "n1.5").strip()
+    if req.global_batch_size is not None and model == "n1.5" and req.global_batch_size % req.num_gpus != 0:
+        raise ValueError("global_batch_size must be divisible by num_gpus for n1.5 training")
 
     # job_id is the k8s Job resource name — 6-char alpha-leading so it's
     # DNS-safe and URL-short. job_name is the display name carried as an
@@ -87,7 +93,17 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
 
     node = req.node or DEFAULT_NODE
     body_script = _render_body_script(variant, req, job_name)
-    spec = _render_job_yaml(job_id, job_name, body_script, req.num_gpus, cpu, mem, req.wandb_secret, node, req.variant)
+    spec = _render_job_yaml(
+        job_id,
+        job_name,
+        body_script,
+        req.num_gpus,
+        cpu,
+        mem,
+        req.wandb_secret,
+        node,
+        _job_comment(req, variant),
+    )
     yaml_text = yaml.safe_dump(spec, sort_keys=False)
 
     proc = await asyncio.create_subprocess_exec(
@@ -147,9 +163,11 @@ def _render_body_script(variant, req: MlxpSubmitRequest, job_name: str) -> str:
                 f"variant {variant.name} has no DATASET_NAME / DATASETS / TRAIN_DATASET_NAMES"
             )
 
-    max_steps = variant.vars.get("MAX_STEPS", "30000")
-    save_steps = variant.vars.get("SAVE_STEPS", "1000")
+    max_steps = str(req.max_steps or _variant_int(variant, "MAX_STEPS", 30000))
+    save_steps = str(req.save_steps or _variant_int(variant, "SAVE_STEPS", 1000))
     batch_size = variant.vars.get("TRAIN_BATCH_SIZE", "64")
+    if model == "n1.5" and req.global_batch_size is not None:
+        batch_size = str(req.global_batch_size // req.num_gpus)
     train_extra = " ".join(variant.arrays.get("TRAIN_EXTRA_ARGS") or [])
     user_extra = " ".join(req.extra_args)
 
@@ -261,7 +279,7 @@ def _render_body_n16(*, variant, req: MlxpSubmitRequest, job_name: str,
     dataset_paths_arg = " \\\n        ".join(
         f"{USER_HOME_ON_DDN}/datasets/{n}" for n in names
     )
-    global_batch = int(batch_size) * req.num_gpus
+    global_batch = req.global_batch_size or int(batch_size) * req.num_gpus
     run_log_dir = f"{ckpt_dir}/{job_name}/logs"
 
     return f"""\
@@ -313,8 +331,30 @@ torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/launch_finetune.py \\
 """
 
 
+def _variant_int(variant, key: str, default: int) -> int:
+    raw = variant.vars.get(key)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"variant {variant.name}: {key} must be an integer")
+
+
+def _job_comment(req: MlxpSubmitRequest, variant) -> str:
+    max_steps = req.max_steps or _variant_int(variant, "MAX_STEPS", 30000)
+    save_steps = req.save_steps or _variant_int(variant, "SAVE_STEPS", 1000)
+    comment = (
+        f"phase=train;variant={req.variant};train_num_gpus={req.num_gpus};"
+        f"train_max_steps={max_steps};train_save_steps={save_steps}"
+    )
+    if req.global_batch_size is not None:
+        comment += f";train_global_batch_size={req.global_batch_size}"
+    return comment
+
+
 def _render_job_yaml(job_id: str, job_name: str, body: str, num_gpus: int, cpu: str, mem: str,
-                     wandb_secret: str, node: str, variant: str) -> dict:
+                     wandb_secret: str, node: str, comment: str) -> dict:
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -329,7 +369,7 @@ def _render_job_yaml(job_id: str, job_name: str, body: str, num_gpus: int, cpu: 
             # job_name that doesn't match the unified regex.
             "annotations": {
                 "train-eval-web/display-name": job_name,
-                "train-eval-web/comment": f"phase=train;variant={variant}",
+                "train-eval-web/comment": comment,
             },
         },
         "spec": {

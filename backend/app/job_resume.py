@@ -36,12 +36,26 @@ async def resume_timed_out_job(cluster: str, job_id: str) -> submit.SubmitRespon
     job_name = det.job_name or str(record.get("JobName") or "").strip() or None
 
     if phase == "train":
+        env = await load_cluster(cluster)
+        meta = await details._read_slurm_meta(env.ssh_alias, job_id)
+
+        def int_meta(key: str) -> int | None:
+            try:
+                raw = (meta.get(key) or "").strip()
+                return int(raw) if raw else None
+            except ValueError:
+                return None
+
         return await submit.submit(
             submit.SubmitRequest(
                 cluster=cluster,
                 variant=variant,
                 phase="train",
                 partition=partition,
+                train_num_gpus=int_meta("train_num_gpus"),
+                train_global_batch_size=int_meta("train_global_batch_size"),
+                train_max_steps=int_meta("train_max_steps"),
+                train_save_steps=int_meta("train_save_steps"),
                 job_name=job_name,
                 resume=True,
                 resume_of=job_id,

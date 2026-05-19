@@ -296,7 +296,7 @@ function GpuUsageSection({ d }: { d: JobDetails }) {
   return (
     <div className="mt-5 border-t border-slate-100 pt-4 dark:border-slate-900">
       {!gpu && (
-        <p className="text-sm text-slate-500">GPU sample not requested.</p>
+        <p className="text-sm text-slate-500">GPU sample unavailable.</p>
       )}
       {gpu && !hasUsage && (
         <div className="space-y-1 text-sm text-slate-500">
@@ -309,21 +309,24 @@ function GpuUsageSection({ d }: { d: JobDetails }) {
           {gpu.node && <div className="font-mono">node: {gpu.node}</div>}
           {gpu.devices.map((dev) => {
             const util = dev.utilization_gpu_percent;
-            const percent = util == null ? 0 : Math.max(0, Math.min(100, util));
+            const memoryPercent =
+              dev.total_mib > 0
+                ? Math.max(0, Math.min(100, (dev.used_mib / dev.total_mib) * 100))
+                : 0;
             const label = dev.name ? `gpu ${dev.index} · ${dev.name}` : `gpu ${dev.index}`;
             return (
               <div key={dev.index} className="space-y-1.5">
                 <div className="flex items-baseline justify-between gap-4">
                   <span className="min-w-0 truncate font-mono">{label}</span>
                   <span className="shrink-0 font-mono">
-                    {util == null ? "unknown" : `${util}%`} · {dev.used_gb.toFixed(1)} /{" "}
-                    {dev.total_gb.toFixed(1)} GB
+                    {dev.used_gb.toFixed(1)} / {dev.total_gb.toFixed(1)} GB
+                    {util != null && ` · compute ${util}%`}
                   </span>
                 </div>
                 <div className="h-2 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
                   <div
                     className="h-full rounded-full bg-slate-900 transition-all dark:bg-slate-50"
-                    style={{ width: `${percent}%` }}
+                    style={{ width: `${memoryPercent}%` }}
                   />
                 </div>
               </div>

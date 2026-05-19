@@ -19,6 +19,16 @@ source "$REPO_ROOT/lib/_common.sh"
 EXP_DIR="$REPO_ROOT/experiments/$VARIANT"
 [ -d "$EXP_DIR" ] || { echo "ERROR: experiment dir not found: $EXP_DIR"; exit 1; }
 source "$EXP_DIR/config.sh"
+TRAIN_NUM_GPUS="${SUBMIT_TRAIN_NUM_GPUS:-$TRAIN_NUM_GPUS}"
+MAX_STEPS="${SUBMIT_TRAIN_MAX_STEPS:-$MAX_STEPS}"
+SAVE_STEPS="${SUBMIT_TRAIN_SAVE_STEPS:-$SAVE_STEPS}"
+if [ -n "${SUBMIT_TRAIN_GLOBAL_BATCH_SIZE:-}" ]; then
+    if (( SUBMIT_TRAIN_GLOBAL_BATCH_SIZE % TRAIN_NUM_GPUS != 0 )); then
+        echo "ERROR: SUBMIT_TRAIN_GLOBAL_BATCH_SIZE must be divisible by TRAIN_NUM_GPUS for n1.5 training"
+        exit 1
+    fi
+    TRAIN_BATCH_SIZE=$((SUBMIT_TRAIN_GLOBAL_BATCH_SIZE / TRAIN_NUM_GPUS))
+fi
 
 GPU_INSTANCE="$(detect_gpu_instance)"
 # EXP_NAME mirrors the slurm job name when launched via submit; fallback for ad-hoc runs.
@@ -71,6 +81,9 @@ else
 fi
 log "Output:         $CKPT_DIR"
 log "Max steps:      $MAX_STEPS"
+log "Save steps:     $SAVE_STEPS"
+log "Train GPUs:     $TRAIN_NUM_GPUS"
+log "Global batch:   $((TRAIN_NUM_GPUS * TRAIN_BATCH_SIZE)) ($TRAIN_BATCH_SIZE per GPU)"
 
 
 # Detect existing intermediate checkpoint → auto-resume

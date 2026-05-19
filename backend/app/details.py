@@ -96,6 +96,17 @@ class JobDetails(BaseModel):
     gpu: GpuUsage | None = None
 
 
+def _metadata_fields(text: str | None) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    if not text:
+        return fields
+    for chunk in text.split(";"):
+        if "=" in chunk:
+            k, v = chunk.split("=", 1)
+            fields[k.strip()] = v.strip()
+    return fields
+
+
 async def _read_slurm_meta(host: str, job_id: str) -> dict[str, str]:
     """Read the sidecar written at submit time.
 
@@ -208,7 +219,18 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
     phase, variant = resolve_phase_and_variant(job_name, sacct)
 
     if cluster == "mlxp":
-        return await _mlxp_details(job_id, job_name, state, elapsed, phase, variant)
+        return await _mlxp_details(
+            job_id,
+            job_name,
+            state,
+            elapsed,
+            phase,
+            variant,
+            include_gpu=include_gpu,
+            pod_name=sacct.get("_pod_name") or None,
+            node=sacct.get("NodeList") or None,
+            job_comment=sacct.get("JobComment") or None,
+        )
 
     env = await load_cluster(cluster)
     slurm_meta: dict[str, str] = {}
@@ -230,6 +252,8 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
     elif phase == "eval":
         # Eval details may need checkpoint_path even when phase/variant were
         # already recovered from the job name or sacct comment.
+        slurm_meta = await _read_slurm_meta(env.ssh_alias, job_id)
+    elif phase in ("train", "resume"):
         slurm_meta = await _read_slurm_meta(env.ssh_alias, job_id)
     log_dir = env.vars["LOG_DIR"]
     stdout_path, stderr_path, log_job_name = await _resolve_slurm_log_paths(
@@ -277,9 +301,7 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
     wandb_url: str | None = None
     if phase in ("train", "resume"):
         # submit.py pins WANDB_RUN_ID = job_name via sbatch --export.
-        entity = await _wandb_entity()
-        if entity:
-            wandb_url = f"https://wandb.ai/{entity}/{get_project()}/runs/{job_name}"
+        wandb_url = await _wandb_url(job_name)
 
     progress = await _compute_progress(
         cluster,
@@ -316,8 +338,18 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
     )
 
 
-async def _mlxp_details(job_id: str, job_name: str, state: str, elapsed: str,
-                        phase: str, variant: str | None) -> JobDetails:
+async def _mlxp_details(
+    job_id: str,
+    job_name: str,
+    state: str,
+    elapsed: str,
+    phase: str,
+    variant: str | None,
+    include_gpu: bool = False,
+    pod_name: str | None = None,
+    node: str | None = None,
+    job_comment: str | None = None,
+) -> JobDetails:
     """MLXP runs train via `kubectl apply` on a pod. All paths live on DDN."""
     exp_dir = f"/data/youngwoong/experiments/{variant}" if variant else "/data/youngwoong/experiments"
     ckpt_dir = f"{exp_dir}/checkpoints" if phase in ("train", "resume") else None
@@ -332,23 +364,20 @@ async def _mlxp_details(job_id: str, job_name: str, state: str, elapsed: str,
     # mlxp body pins WANDB_RUN_ID = job_name (resolved from the Job's
     # display-name annotation by get_job). The k8s job_id has no wandb
     # run behind it.
-    entity = await _wandb_entity()
-    wandb_url = (
-        f"https://wandb.ai/{entity}/{get_project()}/runs/{job_name}"
-        if entity else None
-    )
+    wandb_url = await _wandb_url(job_name)
 
-    progress = await _mlxp_progress(job_name, variant, phase)
+    progress = await _mlxp_progress(job_name, variant, phase, _metadata_fields(job_comment))
+    gpu = await _mlxp_gpu_usage(pod_name, node, state) if include_gpu else None
 
     return JobDetails(
         cluster="mlxp", job_id=job_id, job_name=job_name,
         phase=phase, variant=variant, state=state, elapsed=elapsed,
-        wandb_url=wandb_url, paths=paths, progress=progress,
+        wandb_url=wandb_url, paths=paths, progress=progress, gpu=gpu,
     )
 
 
 def _parse_gpu_usage(stdout: str, node: str | None) -> GpuUsage | None:
-    devices: list[GpuDeviceUsage] = []
+    samples: dict[int, dict[str, Any]] = {}
     for line in stdout.splitlines():
         parts = [p.strip() for p in line.split(",")]
         if len(parts) < 3:
@@ -372,10 +401,32 @@ def _parse_gpu_usage(stdout: str, node: str | None) -> GpuUsage | None:
                 total_mib = int(parts[2])
         except ValueError:
             continue
+        sample = samples.setdefault(
+            index,
+            {
+                "name": name,
+                "utilization_values": [],
+                "used_mib": used_mib,
+                "total_mib": total_mib,
+            },
+        )
+        if name:
+            sample["name"] = name
+        if utilization is not None:
+            sample["utilization_values"].append(utilization)
+        sample["used_mib"] = max(int(sample["used_mib"]), used_mib)
+        sample["total_mib"] = total_mib
+    devices: list[GpuDeviceUsage] = []
+    for index in sorted(samples):
+        sample = samples[index]
+        values = sample["utilization_values"]
+        utilization = round(sum(values) / len(values)) if values else None
+        used_mib = int(sample["used_mib"])
+        total_mib = int(sample["total_mib"])
         devices.append(
             GpuDeviceUsage(
                 index=index,
-                name=name,
+                name=sample["name"],
                 utilization_gpu_percent=utilization,
                 used_mib=used_mib,
                 total_mib=total_mib,
@@ -430,10 +481,11 @@ async def _slurm_gpu_usage(
 
     node = await _first_slurm_node(host, nodelist)
 
-    query = (
+    smi_query = (
         "nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total "
         "--format=csv,noheader,nounits"
     )
+    query = f"for i in 1 2 3; do {smi_query}; [ \"$i\" = 3 ] || sleep 1; done"
 
     # Preferred: execute inside the job allocation. This works even when
     # compute-node SSH is not available directly from the login node.
@@ -464,7 +516,70 @@ async def _slurm_gpu_usage(
     return GpuUsage(node=node, error=message[:240])
 
 
-async def _mlxp_progress(run_id: str, variant: str | None, phase: str) -> Progress:
+async def _mlxp_gpu_usage(
+    pod_name: str | None,
+    node: str | None,
+    state: str,
+) -> GpuUsage:
+    import asyncio
+    import shutil
+
+    fallback_node = node or pod_name or None
+    if not state.upper().startswith(("RUNNING", "COMPLETING")):
+        return GpuUsage(node=fallback_node, error="GPU memory is only available while the job is running")
+    if not pod_name:
+        return GpuUsage(node=fallback_node, error="MLXP pod is not available yet")
+    if shutil.which("kubectl") is None:
+        return GpuUsage(node=fallback_node, error="kubectl not found on PATH")
+
+    from .mlxp_data_pod import NAMESPACE
+
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "kubectl",
+            "exec",
+            "-n",
+            NAMESPACE,
+            pod_name,
+            "--",
+            "bash",
+            "-lc",
+            (
+                "for i in 1 2 3; do "
+                "nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total "
+                "--format=csv,noheader,nounits; "
+                '[ "$i" = 3 ] || sleep 1; '
+                "done"
+            ),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=12.0)
+    except Exception as exc:
+        if proc is not None and proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        return GpuUsage(node=fallback_node, error=f"MLXP GPU sample failed: {exc}")
+
+    if proc.returncode != 0:
+        msg = stderr.decode(errors="replace").strip() or stdout.decode(errors="replace").strip()
+        lines = msg.splitlines()
+        return GpuUsage(
+            node=fallback_node,
+            error=(lines[-1] if lines else "MLXP GPU sample failed")[:240],
+        )
+
+    usage = _parse_gpu_usage(stdout.decode(errors="replace"), fallback_node)
+    return usage or GpuUsage(node=fallback_node, error="MLXP GPU sample returned no devices")
+
+
+async def _mlxp_progress(
+    run_id: str,
+    variant: str | None,
+    phase: str,
+    metadata: dict[str, str] | None = None,
+) -> Progress:
     """Progress for an MLXP training job.
 
     Primary source: the run's wandb summary (its `_step` field is updated
@@ -480,10 +595,14 @@ async def _mlxp_progress(run_id: str, variant: str | None, phase: str) -> Progre
     if not variant:
         return progress
 
+    metadata = metadata or {}
     try:
-        v = await load_variant(variant)
-        if "MAX_STEPS" in v.vars:
-            progress.max_steps = int(v.vars["MAX_STEPS"])
+        if metadata.get("train_max_steps"):
+            progress.max_steps = int(metadata["train_max_steps"])
+        else:
+            v = await load_variant(variant)
+            if "MAX_STEPS" in v.vars:
+                progress.max_steps = int(v.vars["MAX_STEPS"])
     except Exception:
         pass
 
@@ -541,6 +660,26 @@ async def _mlxp_progress(run_id: str, variant: str | None, phase: str) -> Progre
     else:
         progress.current_label = f"step {cur:,}"
     return progress
+
+
+async def _wandb_url(run_id: str) -> str | None:
+    import asyncio
+
+    entity = await _wandb_entity()
+    if not entity:
+        return None
+    fallback = f"https://wandb.ai/{entity}/{get_project()}/runs/{run_id}"
+
+    def _query() -> str | None:
+        try:
+            import wandb
+            api = wandb.Api(timeout=10)
+            run = api.run(f"{entity}/{get_project()}/{run_id}")
+            return run.url or fallback
+        except Exception:
+            return fallback
+
+    return await asyncio.to_thread(_query)
 
 
 _wandb_entity_cache: str | None = None
@@ -762,9 +901,13 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
         #    are queued for requeue — we still want to show how far they got.
         max_steps: int | None = None
         try:
-            v = await load_variant(variant)
-            if "MAX_STEPS" in v.vars:
-                max_steps = int(v.vars["MAX_STEPS"])
+            meta_max_steps = (slurm_meta or {}).get("train_max_steps")
+            if meta_max_steps:
+                max_steps = int(meta_max_steps)
+            else:
+                v = await load_variant(variant)
+                if "MAX_STEPS" in v.vars:
+                    max_steps = int(v.vars["MAX_STEPS"])
         except Exception:
             pass
         progress.max_steps = max_steps
