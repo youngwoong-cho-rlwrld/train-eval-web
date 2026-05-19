@@ -2,20 +2,18 @@
 
 import Link from "next/link";
 import { useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
-import { useIsFetching, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { toast } from "sonner";
-import { api, type Job, type JobDetails, type SubmitResponse } from "@/lib/api";
+import { useIsFetching, useQuery, useQueryClient } from "@tanstack/react-query";
+import { api, type Job } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { CopyButton } from "@/components/copy-button";
 import { CopyCheckpointDialog } from "@/components/copy-checkpoint-dialog";
+import { ResumeJobButton } from "@/components/resume-job-button";
 import { RefreshButton } from "@/components/refresh-button";
 import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state";
 import { JobStateBadge } from "@/components/job-state-badge";
-import { formatDuration, parseSlurmDuration } from "@/lib/duration";
 import { formatJobTimestamp, parseJobTimestampMs } from "@/lib/job-time";
 
 const REFRESH_MS = 60_000;
@@ -79,7 +77,7 @@ export default function JobsPage() {
           {!isLoading && !error && active.length === 0 && (
             <EmptyState message="No active jobs." />
           )}
-          {active.length > 0 && <JobTable rows={active} kind="active" />}
+          {active.length > 0 && <JobTable rows={active} />}
         </CardContent>
       </Card>
 
@@ -108,14 +106,14 @@ export default function JobsPage() {
           {!isLoading && !error && finished.length === 0 && (
             <EmptyState message="Nothing in this window." />
           )}
-          {finished.length > 0 && <JobTable rows={finished} kind="recent" />}
+          {finished.length > 0 && <JobTable rows={finished} />}
         </CardContent>
       </Card>
     </div>
   );
 }
 
-function JobTable({ rows, kind }: { rows: Job[]; kind: "active" | "recent" }) {
+function JobTable({ rows }: { rows: Job[] }) {
   return (
     <div className="overflow-x-auto">
       <table className="w-full text-sm">
@@ -123,18 +121,15 @@ function JobTable({ rows, kind }: { rows: Job[]; kind: "active" | "recent" }) {
           <tr>
             <Th>Job ID</Th>
             <Th>Phase</Th>
-            <Th>Cluster</Th>
             <Th>State</Th>
-            {kind === "recent" && <Th>Actions</Th>}
-            <Th>Partition</Th>
-            <Th>Elapsed</Th>
-            {kind === "active" && <Th>Time Left</Th>}
-            {kind === "active" && <Th>Server Time Left</Th>}
-            {kind === "active" && <Th>Progress</Th>}
-            {kind === "recent" && <Th>Started</Th>}
-            {kind === "recent" && <Th>Ended</Th>}
             <Th>Name</Th>
+            <Th>Actions</Th>
+            <Th>Cluster</Th>
+            <Th>Partition</Th>
             <Th>Node</Th>
+            <Th>Started</Th>
+            <Th>Ended</Th>
+            <Th>Elapsed</Th>
           </tr>
         </thead>
         <tbody>
@@ -148,53 +143,40 @@ function JobTable({ rows, kind }: { rows: Job[]; kind: "active" | "recent" }) {
                   </Link>
                 </td>
                 <Td><PhaseBadge phase={phase} /></Td>
-                <Td>{j.cluster}</Td>
                 <Td>
                   <JobStateBadge state={j.state} />
                 </Td>
-                {kind === "recent" && (
-                  <Td>
-                    <div className="flex items-center gap-2">
-                      {kind === "recent" && isTimeout(j.state) && (
-                        <ResumeButton job={j} />
-                      )}
-                      {canCopyCheckpoint(j, phase) && (
-                        <CopyCheckpointShortcut job={j} />
-                      )}
-                      {!isTimeout(j.state) && !canCopyCheckpoint(j, phase) && (
-                        <span className="text-slate-400">—</span>
-                      )}
-                    </div>
-                  </Td>
-                )}
-                <Td className="font-mono text-xs">{j.partition}</Td>
-                <Td className="font-mono text-xs">{j.elapsed}</Td>
-                {kind === "active" && (
-                  <Td className="font-mono text-xs">
-                    <EtaCell cluster={j.cluster} jobId={j.job_id} state={j.state} elapsed={j.elapsed} />
-                  </Td>
-                )}
-                {kind === "active" && (
-                  <Td className="font-mono text-xs">
-                    {j.time_left ?? <span className="text-slate-400">—</span>}
-                  </Td>
-                )}
-                {kind === "active" && (
-                  <Td><ProgressCell cluster={j.cluster} jobId={j.job_id} state={j.state} /></Td>
-                )}
-                {kind === "recent" && (
-                  <Td className="font-mono text-xs"><Timestamp iso={j.start} cluster={j.cluster} /></Td>
-                )}
-                {kind === "recent" && (
-                  <Td className="font-mono text-xs"><Timestamp iso={j.end} cluster={j.cluster} /></Td>
-                )}
                 <td className="py-2 pr-4 font-mono text-xs" title={j.job_name}>
                   <div className="flex items-center gap-1">
                     <span className="max-w-[240px] truncate">{j.job_name}</span>
                     <CopyButton value={j.job_name} title="Copy job name" />
                   </div>
                 </td>
+                <Td>
+                  <div className="flex items-center gap-2">
+                    {canResumeJob(j) && (
+                      <ResumeJobButton
+                        cluster={j.cluster}
+                        jobId={j.job_id}
+                        phase={phase}
+                        jobName={j.job_name}
+                        className="h-7 px-2 text-xs"
+                      />
+                    )}
+                    {canCopyCheckpoint(j, phase) && (
+                      <CopyCheckpointShortcut job={j} />
+                    )}
+                    {!canResumeJob(j) && !canCopyCheckpoint(j, phase) && (
+                      <span className="text-slate-400">—</span>
+                    )}
+                  </div>
+                </Td>
+                <Td>{j.cluster}</Td>
+                <Td className="font-mono text-xs">{j.partition}</Td>
                 <Td className="font-mono text-xs text-slate-500 min-w-[180px]">{j.nodelist}</Td>
+                <Td className="font-mono text-xs"><Timestamp iso={j.start} cluster={j.cluster} /></Td>
+                <Td className="font-mono text-xs"><Timestamp iso={j.end} cluster={j.cluster} /></Td>
+                <Td className="font-mono text-xs">{j.elapsed}</Td>
               </tr>
             );
           })}
@@ -227,98 +209,6 @@ function CopyCheckpointShortcut({ job }: { job: Job }) {
   );
 }
 
-function ResumeButton({ job }: { job: Job }) {
-  const router = useRouter();
-  const qc = useQueryClient();
-  const resume = useMutation({
-    mutationFn: () =>
-      api<SubmitResponse>(`/api/jobs/${job.cluster}/${job.job_id}/resume`, {
-        method: "POST",
-      }),
-    onSuccess: (data) => {
-      toast.success(`Submitted resume job ${data.job_id} on ${job.cluster}`);
-      qc.invalidateQueries({ queryKey: ["jobs"] });
-      qc.invalidateQueries({ queryKey: ["job-details"] });
-      router.push(`/jobs/${job.cluster}/${data.job_id}`);
-    },
-    onError: (err: Error) => toast.error(`Resume failed: ${err.message}`),
-  });
-
-  return (
-    <Button
-      variant="outline"
-      size="sm"
-      className="h-7 px-2 text-xs"
-      onClick={() => resume.mutate()}
-      disabled={resume.isPending}
-    >
-      {resume.isPending ? "Resuming..." : "Resume"}
-    </Button>
-  );
-}
-
-function EtaCell({
-  cluster,
-  jobId,
-  state,
-  elapsed,
-}: {
-  cluster: string;
-  jobId: string;
-  state: string;
-  elapsed: string;
-}) {
-  // Reuses the same query key as ProgressCell so we don't double-fetch.
-  const isRunning = state === "RUNNING" || state === "COMPLETING";
-  const q = useQuery({
-    queryKey: ["job-details", cluster, jobId],
-    queryFn: () => api<JobDetails>(`/api/jobs/${cluster}/${jobId}/details`),
-    refetchInterval: isRunning ? REFRESH_MS : REFRESH_MS * 5,
-  });
-  if (!isRunning) return <span className="text-slate-400">—</span>;
-  if (!q.data) return <span className="text-slate-400">…</span>;
-  const { current_step, max_steps } = q.data.progress;
-  const elapsedSec = parseSlurmDuration(elapsed);
-  if (!current_step || !max_steps || current_step >= max_steps || elapsedSec <= 0) {
-    return <span className="text-slate-400">—</span>;
-  }
-  const etaSec = (elapsedSec * (max_steps - current_step)) / current_step;
-  const unit = q.data.phase === "eval" ? "episode" : "step";
-  return <span title={`estimated from aggregate ${unit} throughput`}>{formatDuration(etaSec)}</span>;
-}
-
-function ProgressCell({ cluster, jobId, state }: { cluster: string; jobId: string; state: string }) {
-  // Fetch for all active states. PENDING jobs that were preempted may have
-  // prior checkpoints / results.json files — the backend surfaces those so
-  // the user can see how far the previous run got while it waits in queue.
-  // Matches the page-level REFRESH_MS so the user only sees one cadence.
-  const isRunning = state === "RUNNING" || state === "COMPLETING";
-  const q = useQuery({
-    queryKey: ["job-details", cluster, jobId],
-    queryFn: () => api<JobDetails>(`/api/jobs/${cluster}/${jobId}/details`),
-    refetchInterval: isRunning ? REFRESH_MS : REFRESH_MS * 5,
-  });
-  if (q.isLoading || !q.data) return <span className="text-xs text-slate-400">…</span>;
-  const p = q.data.progress;
-  if (p.percent == null || p.current_label == null) {
-    return <span className="text-xs text-slate-400">—</span>;
-  }
-  return (
-    <div className="min-w-[160px] space-y-1">
-      <div className="flex items-baseline justify-between text-[11px]">
-        <span className="font-mono text-slate-600 dark:text-slate-300">{p.current_label}</span>
-        <span className="text-slate-500">{p.percent.toFixed(0)}%</span>
-      </div>
-      <div className="h-1 w-full overflow-hidden rounded bg-slate-100 dark:bg-slate-800">
-        <div
-          className={`h-full rounded transition-all ${isRunning ? "bg-slate-900 dark:bg-slate-50" : "bg-slate-400 dark:bg-slate-500"}`}
-          style={{ width: `${Math.max(0, Math.min(100, p.percent))}%` }}
-        />
-      </div>
-    </div>
-  );
-}
-
 function Timestamp({ iso, cluster }: { iso?: string | null; cluster: string }) {
   const formatted = formatJobTimestamp(iso, cluster);
   if (!formatted) return <span className="text-slate-400">—</span>;
@@ -341,6 +231,10 @@ function PhaseBadge({ phase }: { phase: ReturnType<typeof phaseOf> }) {
 
 function isTimeout(state: string): boolean {
   return state.toUpperCase().startsWith("TIMEOUT");
+}
+
+function canResumeJob(job: Job): boolean {
+  return job.cluster !== "mlxp" && isTimeout(job.state);
 }
 
 function canCopyCheckpoint(job: Job, phase: ReturnType<typeof phaseOf>): boolean {

@@ -27,6 +27,7 @@ import {
 import { ConfigCard } from "@/components/config-card";
 import { CopyButton } from "@/components/copy-button";
 import { CopyCheckpointDialog } from "@/components/copy-checkpoint-dialog";
+import { ResumeJobButton } from "@/components/resume-job-button";
 import { RefreshButton } from "@/components/refresh-button";
 import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state";
 import { JobStateBadge } from "@/components/job-state-badge";
@@ -104,6 +105,8 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
   const isEval = phase === "eval";
   const isTrainPhase = phase === "train" || phase === "resume";
   const isComplete = (sacct.data?.State ?? "").toUpperCase().startsWith("COMPLET");
+  const stateForActions = sacct.data?.State ?? details.data?.state ?? "";
+  const canResume = cluster !== "mlxp" && stateForActions.toUpperCase().startsWith("TIMEOUT");
   const canCopy = isTrainPhase && isComplete;
   const detailsError = details.error as Error | null;
   const [stream, setStream] = useState<"out" | "err" | "isaac">("out");
@@ -164,6 +167,15 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
             >
               Copy checkpoint
             </Button>
+          )}
+          {canResume && (
+            <ResumeJobButton
+              cluster={cluster}
+              jobId={id}
+              phase={phase}
+              variant={details.data?.variant}
+              jobName={details.data?.job_name}
+            />
           )}
           <Button
             variant="destructive"
