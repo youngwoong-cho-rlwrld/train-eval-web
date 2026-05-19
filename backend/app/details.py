@@ -22,6 +22,7 @@ from .job_identity import (
     resolve_phase_and_variant,
 )
 from .jobs import get_job
+from .mlxp_config import EXPERIMENTS_DIR as MLXP_EXPERIMENTS_DIR, NAMESPACE as MLXP_NAMESPACE
 from .paths import CLUSTER_STAGING_REL
 from .ssh import ssh_run
 from .variants import load_variant
@@ -351,11 +352,11 @@ async def _mlxp_details(
     job_comment: str | None = None,
 ) -> JobDetails:
     """MLXP runs train via `kubectl apply` on a pod. All paths live on DDN."""
-    exp_dir = f"/data/youngwoong/experiments/{variant}" if variant else "/data/youngwoong/experiments"
-    ckpt_dir = f"{exp_dir}/checkpoints" if phase in ("train", "resume") else None
+    exp_dir = f"{MLXP_EXPERIMENTS_DIR}/{variant}" if variant else MLXP_EXPERIMENTS_DIR
+    ckpt_dir = f"{exp_dir}/checkpoints/{job_name}" if phase in ("train", "resume") else None
     paths = Paths(
-        stdout=f"kubectl logs -n p-rlwrld -l job-name={job_id}",
-        stderr=f"kubectl logs -n p-rlwrld -l job-name={job_id}  (k8s merges stdout+stderr)",
+        stdout=f"kubectl logs -n {MLXP_NAMESPACE} -l job-name={job_id}",
+        stderr=f"kubectl logs -n {MLXP_NAMESPACE} -l job-name={job_id}  (k8s merges stdout+stderr)",
         exp_dir=exp_dir,
         ckpt_dir=ckpt_dir,
         eval_dir=None,
@@ -532,15 +533,13 @@ async def _mlxp_gpu_usage(
     if shutil.which("kubectl") is None:
         return GpuUsage(node=fallback_node, error="kubectl not found on PATH")
 
-    from .mlxp_data_pod import NAMESPACE
-
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             "kubectl",
             "exec",
             "-n",
-            NAMESPACE,
+            MLXP_NAMESPACE,
             pod_name,
             "--",
             "bash",
@@ -624,21 +623,24 @@ async def _mlxp_progress(
     import shutil
     if shutil.which("kubectl") is None:
         return progress
-    ckpt_dir = f"/data/youngwoong/experiments/{variant}/checkpoints"
-    from .mlxp_data_pod import ensure_listing_pod, NAMESPACE
+    ckpt_root = f"{MLXP_EXPERIMENTS_DIR}/{variant}/checkpoints"
+    ckpt_dirs = [f"{ckpt_root}/{run_id}", ckpt_root]
+    from .mlxp_data_pod import ensure_listing_pod
     try:
         pod = await ensure_listing_pod()
     except Exception:
         return progress
 
+    dirs = " ".join(shlex.quote(d) for d in ckpt_dirs)
     cmd = (
-        f"ls -d {ckpt_dir}/checkpoint-* 2>/dev/null "
-        "| sed 's:.*checkpoint-::' | sort -n | tail -1"
+        f"for d in {dirs}; do "
+        'ls -d "$d"/checkpoint-* 2>/dev/null; '
+        "done | sed 's:.*checkpoint-::' | sort -n | tail -1"
     )
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
-            "kubectl", "exec", "-n", NAMESPACE, pod, "--", "bash", "-c", cmd,
+            "kubectl", "exec", "-n", MLXP_NAMESPACE, pod, "--", "bash", "-c", cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

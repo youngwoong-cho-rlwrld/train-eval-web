@@ -7,7 +7,7 @@ Conventions:
   - k8s Job name = 6-char alpha-leading id (e.g. `m41d60`). Display name
     is carried as the annotation `train-eval-web/display-name` with shape
     `{phase}_{variant}_{YYYYMMDD}_{HHMMSS}` — same as slurm's job_name.
-  - Jobs are labelled `owner=youngwoong,tool=train-eval-web`. We list by label.
+  - Jobs are labelled with the configured owner/tool labels. We list by owner.
   - State synthesized from job.status counts (Pending/Running/Succeeded/Failed).
 """
 
@@ -19,9 +19,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .jobs import Job
+from .mlxp_config import EXPERIMENTS_DIR as MLXP_EXPERIMENTS_DIR, NAMESPACE, owner_selector
 
 
-_NS = "p-rlwrld"
+_NS = NAMESPACE
 
 
 async def _kubectl_json(*args: str, timeout: float = 20.0) -> dict[str, Any]:
@@ -32,10 +33,18 @@ async def _kubectl_json(*args: str, timeout: float = 20.0) -> dict[str, Any]:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise RuntimeError(f"kubectl {' '.join(args)} timed out after {timeout:g}s")
     if proc.returncode != 0:
         raise RuntimeError(f"kubectl {' '.join(args)} failed: {stderr.decode(errors='replace').strip()}")
-    return json.loads(stdout.decode())
+    try:
+        return json.loads(stdout.decode())
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"kubectl {' '.join(args)} returned invalid JSON: {exc}") from exc
 
 
 def _state_from_pod_and_job(job_status: dict, pod: dict | None) -> str:
@@ -98,14 +107,14 @@ async def list_jobs() -> list[Job]:
 
 async def _list_live_jobs() -> list[Job]:
     try:
-        data = await _kubectl_json("get", "jobs", "-n", _NS, "-l", "owner=youngwoong")
+        data = await _kubectl_json("get", "jobs", "-n", _NS, "-l", owner_selector())
     except RuntimeError:
         return []
 
     # We need pod-level info too (nodeName + start time of the actual pod, not the Job).
     pods_by_job: dict[str, dict] = {}
     try:
-        pod_data = await _kubectl_json("get", "pods", "-n", _NS, "-l", "owner=youngwoong")
+        pod_data = await _kubectl_json("get", "pods", "-n", _NS, "-l", owner_selector())
         for p in pod_data.get("items", []):
             labels = p.get("metadata", {}).get("labels", {})
             jn = labels.get("job-name") or labels.get("batch.kubernetes.io/job-name")
@@ -139,7 +148,7 @@ async def _list_live_jobs() -> list[Job]:
 async def _list_archived_jobs(seen: set[str]) -> list[Job]:
     """Scan DDN for completed runs whose k8s Job has been GC'd."""
     import asyncio
-    from .mlxp_data_pod import ensure_listing_pod, NAMESPACE
+    from .mlxp_data_pod import ensure_listing_pod
 
     try:
         pod = await ensure_listing_pod()
@@ -150,9 +159,10 @@ async def _list_archived_jobs(seen: set[str]) -> list[Job]:
     # NOTE: array glob with nullglob, not `ls $glob` — `ls` with zero-arg
     # falls back to listing `.` which used to slip past the empty check and
     # produced fake rows (`experiment_cfg`, `logs`, `runs`) in the table.
+    experiments_root = shlex.quote(MLXP_EXPERIMENTS_DIR)
     script = r"""
 shopt -s nullglob
-for d in /data/youngwoong/experiments/*/checkpoints/*/; do
+for d in __EXPERIMENTS_ROOT__/*/checkpoints/*/; do
     matches=( "$d"checkpoint-* )
     [ ${#matches[@]} -eq 0 ] && continue
     job_name=$(basename "$d")
@@ -162,10 +172,10 @@ for d in /data/youngwoong/experiments/*/checkpoints/*/; do
     end_epoch=$(stat -c %Y "$d"checkpoint-$latest 2>/dev/null || echo "$start_epoch")
     printf '%s|%s|%s|%s|%s\n' "$variant" "$job_name" "$latest" "$start_epoch" "$end_epoch"
 done
-"""
+""".replace("__EXPERIMENTS_ROOT__", experiments_root)
     try:
         proc = await asyncio.create_subprocess_exec(
-            "kubectl", "exec", "-n", NAMESPACE, pod, "--", "bash", "-c", script,
+            "kubectl", "exec", "-n", _NS, pod, "--", "bash", "-c", script,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -333,8 +343,8 @@ async def _tail_archived_log(job_name: str):
     if not variant:
         return
     log_paths = [
-        f"/data/youngwoong/experiments/{variant}/checkpoints/{job_name}/logs/training.log",
-        f"/data/youngwoong/experiments/{variant}/checkpoints/logs/training_rank0.log",
+        f"{MLXP_EXPERIMENTS_DIR}/{variant}/checkpoints/{job_name}/logs/training.log",
+        f"{MLXP_EXPERIMENTS_DIR}/{variant}/checkpoints/logs/training_rank0.log",
     ]
     try:
         pod = await ensure_listing_pod()
@@ -396,16 +406,18 @@ async def _iter_logical_lines(reader):
 async def _archived_record(name: str) -> dict[str, Any] | None:
     """Return a sacct-shaped dict for a single archived (k8s-gone) job by
     walking DDN. Returns None if no checkpoint dir matches the name."""
-    from .mlxp_data_pod import ensure_listing_pod, NAMESPACE
+    from .mlxp_data_pod import ensure_listing_pod
 
     try:
         pod = await ensure_listing_pod()
     except Exception:
         return None
 
+    experiments_root = shlex.quote(MLXP_EXPERIMENTS_DIR)
+    quoted_name = shlex.quote(name)
     script = r"""
 shopt -s nullglob
-for d in /data/youngwoong/experiments/*/checkpoints/""" + shlex.quote(name) + r"""/; do
+for d in __EXPERIMENTS_ROOT__/*/checkpoints/__JOB_NAME__/; do
     matches=( "$d"checkpoint-* )
     [ ${#matches[@]} -eq 0 ] && continue
     variant=$(basename "$(dirname "$(dirname "$d")")")
@@ -416,10 +428,10 @@ for d in /data/youngwoong/experiments/*/checkpoints/""" + shlex.quote(name) + r"
     printf '%s|%s|%s|%s|%s\n' "$variant" "$job_name" "$latest" "$start_epoch" "$end_epoch"
     break
 done
-"""
+""".replace("__EXPERIMENTS_ROOT__", experiments_root).replace("__JOB_NAME__", quoted_name)
     try:
         proc = await asyncio.create_subprocess_exec(
-            "kubectl", "exec", "-n", NAMESPACE, pod, "--", "bash", "-c", script,
+            "kubectl", "exec", "-n", _NS, pod, "--", "bash", "-c", script,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

@@ -1,12 +1,13 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { MLXP_DATASETS_DIR } from "@/lib/mlxp-config";
 
 const PREFIX = "datasetDir";
 const EVENT = "dataset-dir-change";
 
 const DEFAULTS: Record<string, string> = {
-  mlxp: "/data/youngwoong/datasets",
+  mlxp: MLXP_DATASETS_DIR,
 };
 const SLURM_DEFAULT = "~/datasets";
 

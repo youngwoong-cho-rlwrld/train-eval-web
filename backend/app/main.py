@@ -334,12 +334,18 @@ async def get_job_flags(cluster: str, job_id: str):
     if cluster != "mlxp" and det.phase == "eval":
         env = await clusters.load_cluster(cluster)
         meta = await details._read_slurm_meta(env.ssh_alias, job_id)
+        envs_override = (
+            meta.get("eval_num_envs_per_gpu")
+            or meta.get("eval_parallel_sims_per_gpu")
+            or ""
+        ).strip()
+        try:
+            if int(envs_override) > submit.MAX_EVAL_NUM_ENVS_PER_GPU:
+                envs_override = str(submit.MAX_EVAL_NUM_ENVS_PER_GPU)
+        except ValueError:
+            pass
         overrides = {
-            "EVAL_NUM_ENVS_PER_GPU": (
-                meta.get("eval_num_envs_per_gpu")
-                or meta.get("eval_parallel_sims_per_gpu")
-                or ""
-            ).strip(),
+            "EVAL_NUM_ENVS_PER_GPU": envs_override,
             "--n-episodes": (meta.get("eval_n_episodes") or "").strip(),
             "--n-runs": (meta.get("eval_n_runs") or "").strip(),
             "(eval_sets)": (meta.get("eval_sets") or "").strip(),

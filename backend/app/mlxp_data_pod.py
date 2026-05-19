@@ -1,45 +1,42 @@
-"""Auto-provision a data pod on MLXP for DDN listing operations.
-
-Listing datasets on /data/youngwoong/ requires `kubectl exec` into a pod
-that mounts the DDN PVC. A long-running data pod is the cheapest way to
-have that available on demand.
-
-`ensure_listing_pod()` returns the name of any running pod that satisfies
-this — any existing `owner=youngwoong` Running pod will do, including
-training pods. If nothing is running, it kubectl-applies our standard
-data-pod spec and waits for it to schedule.
-"""
+"""Auto-provision a data pod on MLXP for DDN listing operations."""
 
 import asyncio
 import json
 import shutil
 
-DATA_POD_NAME = "youngwoong-data-pod"
-NAMESPACE = "p-rlwrld"
-SANCTIONED_NODE = "h200-03-w-3a18"
+from .mlxp_config import (
+    DATA_POD_NAME,
+    DDN_MOUNT,
+    DDN_PVC,
+    DEFAULT_NODE,
+    IMAGE,
+    IMAGE_PULL_SECRET,
+    NAMESPACE,
+    OWNER_LABEL,
+    TOOL_LABEL,
+    ZONE,
+    owner_selector,
+)
 
-# Inline so the backend doesn't depend on a YAML file shipped alongside it.
-# Matches /Users/youngwoong/workspace/mlxp/youngwoong-data-pod.yaml; updates
-# there should be mirrored here.
 DATA_POD_YAML = f"""apiVersion: v1
 kind: Pod
 metadata:
   name: {DATA_POD_NAME}
   namespace: {NAMESPACE}
   annotations:
-    mlx.navercorp.com/zone: private-h200-rlwrld-0
+    mlx.navercorp.com/zone: {ZONE}
     sidecar.istio.io/inject: "false"
   labels:
-    owner: youngwoong
-    tool: train-eval-web
+    owner: {OWNER_LABEL}
+    tool: {TOOL_LABEL}
 spec:
   restartPolicy: Never
   imagePullSecrets:
-  - name: mlxp-registry
+  - name: {IMAGE_PULL_SECRET}
   volumes:
   - name: ddn
     persistentVolumeClaim:
-      claimName: ddn-rlwrld-shared
+      claimName: {DDN_PVC}
   affinity:
     nodeAffinity:
       requiredDuringSchedulingIgnoredDuringExecution:
@@ -48,10 +45,10 @@ spec:
           - key: kubernetes.io/hostname
             operator: In
             values:
-            - {SANCTIONED_NODE}
+            - {DEFAULT_NODE}
   containers:
   - name: main
-    image: mlxp.kr.ncr.ntruss.com/rlwrld-gpu-base:latest
+    image: {IMAGE}
     command: ["sleep", "14400"]
     env:
     - name: NVIDIA_VISIBLE_DEVICES
@@ -65,7 +62,7 @@ spec:
         memory: "16Gi"
     volumeMounts:
     - name: ddn
-      mountPath: /data
+      mountPath: {DDN_MOUNT}
 """
 
 
@@ -122,14 +119,14 @@ async def _kubectl_get_pods_json(label: str | None = None) -> dict:
 
 
 async def _find_running_with_ddn() -> str | None:
-    """First Running owner=youngwoong pod that has the ddn PVC mounted."""
-    data = await _kubectl_get_pods_json("owner=youngwoong")
+    """First Running owned pod that has the configured DDN PVC mounted."""
+    data = await _kubectl_get_pods_json(owner_selector())
     for item in data.get("items", []):
         if (item.get("status") or {}).get("phase") != "Running":
             continue
         vols = ((item.get("spec") or {}).get("volumes") or [])
         if any(
-            ((v.get("persistentVolumeClaim") or {}).get("claimName") == "ddn-rlwrld-shared")
+            ((v.get("persistentVolumeClaim") or {}).get("claimName") == DDN_PVC)
             for v in vols
         ):
             return item["metadata"]["name"]

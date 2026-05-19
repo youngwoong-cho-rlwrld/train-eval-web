@@ -143,6 +143,10 @@ if ! [[ "$EVAL_NUM_ENVS_PER_GPU" =~ ^[0-9]+$ ]] || [ "$EVAL_NUM_ENVS_PER_GPU" -l
     exit 1
 fi
 EVAL_REQUESTED_NUM_ENVS_PER_GPU="$EVAL_NUM_ENVS_PER_GPU"
+if [ "$EVAL_NUM_ENVS_PER_GPU" -gt 1 ]; then
+    log "EVAL_NUM_ENVS_PER_GPU=$EVAL_NUM_ENVS_PER_GPU requested; using 1 because ALLEX target reset is not vector-env safe"
+    EVAL_NUM_ENVS_PER_GPU=1
+fi
 if [[ "${N_EPISODES:-}" =~ ^[0-9]+$ ]] && [ "$N_EPISODES" -gt 0 ] && [ "$EVAL_NUM_ENVS_PER_GPU" -gt "$N_EPISODES" ]; then
     log "Requested EVAL_NUM_ENVS_PER_GPU=$EVAL_NUM_ENVS_PER_GPU exceeds N_EPISODES=$N_EPISODES; using $N_EPISODES"
     EVAL_NUM_ENVS_PER_GPU="$N_EPISODES"

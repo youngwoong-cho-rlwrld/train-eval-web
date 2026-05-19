@@ -6,13 +6,13 @@ count from it.
 
 - For slurm clusters, we hop through SSH and run the listing on the
   cluster host directly.
-- For MLXP we `kubectl exec` into any running `owner=youngwoong` pod
+- For MLXP we `kubectl exec` into any running owned pod
   with the DDN PVC mounted. The data-pod or a training pod both work
   as long as something is alive on the cluster.
 
 The directory to scan is supplied per request by the caller (the
 frontend persists it in localStorage). When omitted we fall back to
-`~/datasets/` for slurm and `/data/youngwoong/datasets/` for MLXP.
+`~/datasets/` for slurm and the configured MLXP datasets dir for MLXP.
 """
 
 import asyncio
@@ -22,7 +22,8 @@ from typing import Any
 from pydantic import BaseModel
 
 from .clusters import load_cluster
-from .mlxp_data_pod import NAMESPACE as MLXP_NS, ensure_listing_pod
+from .mlxp_config import DATASETS_DIR as MLXP_DEFAULT_DIR, NAMESPACE as MLXP_NS
+from .mlxp_data_pod import ensure_listing_pod
 from .ssh import ssh_run
 
 
@@ -36,7 +37,6 @@ class DatasetInfo(BaseModel):
 
 
 SLURM_DEFAULT_DIR = "~/datasets"
-MLXP_DEFAULT_DIR = "/data/youngwoong/datasets"
 
 
 # A single python -c is more robust than a bash loop for parsing JSON

@@ -1,7 +1,7 @@
 """Copy a job's final checkpoint to another server.
 
 Source layouts:
-- mlxp:   /data/youngwoong/experiments/<variant>/checkpoints/<job_name>/checkpoint-N
+- mlxp:   <MLXP experiments dir>/<variant>/checkpoints/<job_name>/checkpoint-N
 - slurm:  $EXP_DIR/checkpoints/checkpoint-N
 
 Destination layouts: same shape as the source per cluster (no nested
@@ -26,7 +26,8 @@ from pydantic import BaseModel
 from .clusters import load_cluster
 from .details import get_details, resolve_phase_and_variant
 from .jobs import get_job
-from .mlxp_data_pod import ensure_listing_pod, NAMESPACE as MLXP_NS
+from .mlxp_config import EXPERIMENTS_DIR as MLXP_EXPERIMENTS_DIR, NAMESPACE as MLXP_NS
+from .mlxp_data_pod import ensure_listing_pod
 from .ssh import ssh_run, _CM_OPTS
 
 
@@ -128,18 +129,21 @@ async def list_checkpoints(cluster: str, job_id: str) -> list[CheckpointEntry]:
         if not variant:
             return []
         pod = await ensure_listing_pod()
-        # Emit `<run_dir>|<latest_step>` for every per-job dir that has at
-        # least one checkpoint-N inside.
+        # Emit one row for each per-job checkpoint dir. Also include the
+        # historical direct-root layout used by older MLXP jobs.
+        experiments_root = shlex.quote(MLXP_EXPERIMENTS_DIR)
+        quoted_variant = shlex.quote(variant)
         script = (
             r"""
 shopt -s nullglob
-for d in /data/youngwoong/experiments/""" + shlex.quote(variant) + r"""/checkpoints/*/; do
+root=__EXPERIMENTS_ROOT__/__VARIANT__/checkpoints
+for d in "$root" "$root"/*/; do
     matches=( "$d"checkpoint-* )
     [ ${#matches[@]} -eq 0 ] && continue
     latest=$(for m in "${matches[@]}"; do basename "$m" | sed 's:^checkpoint-::'; done | sort -n | tail -1)
     printf '%s|%s\n' "${d%/}" "$latest"
 done
-""")
+""".replace("__EXPERIMENTS_ROOT__", experiments_root).replace("__VARIANT__", quoted_variant))
         proc = await asyncio.create_subprocess_exec(
             "kubectl", "exec", "-n", MLXP_NS, pod, "--", "bash", "-c", script,
             stdout=asyncio.subprocess.PIPE,
@@ -152,8 +156,11 @@ done
             if len(parts) != 2 or not parts[1].isdigit():
                 continue
             path, step = parts
+            job_name = path.rsplit("/", 1)[-1]
+            if job_name == "checkpoints":
+                job_name = sacct.get("JobName") or job_id
             result.append(CheckpointEntry(
-                path=path, job_name=path.rsplit("/", 1)[-1], step=int(step),
+                path=path, job_name=job_name, step=int(step),
             ))
         return result
 
@@ -225,7 +232,7 @@ async def start_copy(
 
     if not dest_path_root:
         if dest_cluster == "mlxp":
-            dest_path_root = f"/data/youngwoong/experiments/{variant}/checkpoints"
+            dest_path_root = f"{MLXP_EXPERIMENTS_DIR}/{variant}/checkpoints"
         else:
             dest_path_root = f"$HOME/.train-eval-web/experiments/{variant}/checkpoints"
 

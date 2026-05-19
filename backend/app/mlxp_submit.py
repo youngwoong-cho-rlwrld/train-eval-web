@@ -14,17 +14,29 @@ Different from slurm:
 """
 
 import asyncio
-import json
-import re
 import shlex
 import shutil
 import uuid
-from datetime import datetime
 
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from .mlxp_config import (
+    DATASETS_DIR,
+    DDN_MOUNT,
+    DDN_PVC,
+    DDN_USER_HOME,
+    DEFAULT_NODE,
+    EXPERIMENTS_DIR as MLXP_EXPERIMENTS_DIR,
+    IMAGE,
+    IMAGE_PULL_SECRET,
+    NAMESPACE,
+    WANDB_SECRET,
+    ZONE,
+    labels,
+)
 from .paths import EXPERIMENTS_DIR
+from .variant_values import variant_int
 from .wandb_config import get_project as _wandb_project
 from .variants import load_variant
 
@@ -38,11 +50,8 @@ _GPU_RESOURCES = {
     8: ("100", "1500Gi"),
 }
 
-DEFAULT_NODE = "h200-03-w-3a18"
-DDN_MOUNT = "/data"
-USER_HOME_ON_DDN = "/data/youngwoong"
-GR00T_DIR = f"{USER_HOME_ON_DDN}/workspace/gr00t"
-GR00T_N16_DIR = f"{USER_HOME_ON_DDN}/workspace/gr00t-n16"
+GR00T_DIR = f"{DDN_USER_HOME}/workspace/gr00t"
+GR00T_N16_DIR = f"{DDN_USER_HOME}/workspace/gr00t-n16"
 
 
 class MlxpSubmitRequest(BaseModel):
@@ -51,14 +60,12 @@ class MlxpSubmitRequest(BaseModel):
     global_batch_size: int | None = None
     max_steps: int | None = None
     save_steps: int | None = None
-    # The k8s node to pin via nodeAffinity. Each rlwrld team member is
-    # sanctioned for a specific node (see the GPU Resource Schedule sheet);
-    # using anyone else's node has triggered admin deletions in the past.
-    # Leave None to fall back to DEFAULT_NODE.
+    # The k8s node to pin via nodeAffinity. Leave None to fall back to the
+    # configured default node.
     node: str | None = None
     dataset_override: str | list[str] | None = None
-    extra_args: list[str] = []
-    wandb_secret: str = "youngwoong-wandb"
+    extra_args: list[str] = Field(default_factory=list)
+    wandb_secret: str = WANDB_SECRET
     # Optional override for the auto-generated display job_name. Validated
     # against the unified regex in submit.resolve_job_name.
     job_name: str | None = None
@@ -107,7 +114,7 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
     yaml_text = yaml.safe_dump(spec, sort_keys=False)
 
     proc = await asyncio.create_subprocess_exec(
-        "kubectl", "apply", "-f", "-", "--validate=false", "-n", "p-rlwrld",
+        "kubectl", "apply", "-f", "-", "--validate=false", "-n", NAMESPACE,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -163,16 +170,16 @@ def _render_body_script(variant, req: MlxpSubmitRequest, job_name: str) -> str:
                 f"variant {variant.name} has no DATASET_NAME / DATASETS / TRAIN_DATASET_NAMES"
             )
 
-    max_steps = str(req.max_steps or _variant_int(variant, "MAX_STEPS", 30000))
-    save_steps = str(req.save_steps or _variant_int(variant, "SAVE_STEPS", 1000))
+    max_steps = str(req.max_steps or variant_int(variant, "MAX_STEPS", 30000))
+    save_steps = str(req.save_steps or variant_int(variant, "SAVE_STEPS", 1000))
     batch_size = variant.vars.get("TRAIN_BATCH_SIZE", "64")
     if model == "n1.5" and req.global_batch_size is not None:
         batch_size = str(req.global_batch_size // req.num_gpus)
     train_extra = " ".join(variant.arrays.get("TRAIN_EXTRA_ARGS") or [])
     user_extra = " ".join(req.extra_args)
 
-    ckpt_dir = f"{USER_HOME_ON_DDN}/experiments/{variant.name}/checkpoints"
-    run_log_dir = f"{ckpt_dir}/{job_name}/logs"
+    ckpt_dir = f"{MLXP_EXPERIMENTS_DIR}/{variant.name}/checkpoints/{job_name}"
+    run_log_dir = f"{ckpt_dir}/logs"
 
     if model == "n1.6":
         return _render_body_n16(
@@ -200,7 +207,7 @@ def _render_body_script(variant, req: MlxpSubmitRequest, job_name: str) -> str:
             raise ValueError(f"bad DATASETS entry (need name|cfg|weight): {entry!r}")
         name, cfg, weight = parts
         yaml_rows.append(
-            f"    - path: {USER_HOME_ON_DDN}/datasets/{name}\n"
+            f"    - path: {DATASETS_DIR}/{name}\n"
             f"      embodiment_tag: new_embodiment\n"
             f"      data_config: {cfg}\n"
             f"      weight: {weight}"
@@ -277,10 +284,10 @@ def _render_body_n16(*, variant, req: MlxpSubmitRequest, job_name: str,
     modality_text = modality_path.read_text()
 
     dataset_paths_arg = " \\\n        ".join(
-        f"{USER_HOME_ON_DDN}/datasets/{n}" for n in names
+        f"{DATASETS_DIR}/{n}" for n in names
     )
     global_batch = req.global_batch_size or int(batch_size) * req.num_gpus
-    run_log_dir = f"{ckpt_dir}/{job_name}/logs"
+    run_log_dir = f"{ckpt_dir}/logs"
 
     return f"""\
 set -euo pipefail
@@ -331,19 +338,9 @@ torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/launch_finetune.py \\
 """
 
 
-def _variant_int(variant, key: str, default: int) -> int:
-    raw = variant.vars.get(key)
-    if raw is None or not raw.strip():
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        raise ValueError(f"variant {variant.name}: {key} must be an integer")
-
-
 def _job_comment(req: MlxpSubmitRequest, variant) -> str:
-    max_steps = req.max_steps or _variant_int(variant, "MAX_STEPS", 30000)
-    save_steps = req.save_steps or _variant_int(variant, "SAVE_STEPS", 1000)
+    max_steps = req.max_steps or variant_int(variant, "MAX_STEPS", 30000)
+    save_steps = req.save_steps or variant_int(variant, "SAVE_STEPS", 1000)
     comment = (
         f"phase=train;variant={req.variant};train_num_gpus={req.num_gpus};"
         f"train_max_steps={max_steps};train_save_steps={save_steps}"
@@ -360,8 +357,8 @@ def _render_job_yaml(job_id: str, job_name: str, body: str, num_gpus: int, cpu: 
         "kind": "Job",
         "metadata": {
             "name": job_id,
-            "namespace": "p-rlwrld",
-            "labels": {"owner": "youngwoong", "tool": "train-eval-web"},
+            "namespace": NAMESPACE,
+            "labels": labels(),
             # display-name carries the human-readable {phase}_{variant}_{ts}
             # with underscores — invalid in k8s resource names but fine here.
             # comment mirrors slurm's sacct Comment field so the details page
@@ -377,17 +374,17 @@ def _render_job_yaml(job_id: str, job_name: str, body: str, num_gpus: int, cpu: 
             "backoffLimit": 0,
             "template": {
                 "metadata": {
-                    "labels": {"owner": "youngwoong", "tool": "train-eval-web"},
+                    "labels": labels(),
                     "annotations": {
-                        "mlx.navercorp.com/zone": "private-h200-rlwrld-0",
+                        "mlx.navercorp.com/zone": ZONE,
                         "sidecar.istio.io/inject": "false",
                     },
                 },
                 "spec": {
                     "restartPolicy": "Never",
-                    "imagePullSecrets": [{"name": "mlxp-registry"}],
+                    "imagePullSecrets": [{"name": IMAGE_PULL_SECRET}],
                     "volumes": [
-                        {"name": "ddn", "persistentVolumeClaim": {"claimName": "ddn-rlwrld-shared"}},
+                        {"name": "ddn", "persistentVolumeClaim": {"claimName": DDN_PVC}},
                         {"name": "dshm", "emptyDir": {"medium": "Memory", "sizeLimit": "256Gi"}},
                     ],
                     "affinity": {
@@ -405,7 +402,7 @@ def _render_job_yaml(job_id: str, job_name: str, body: str, num_gpus: int, cpu: 
                     },
                     "containers": [{
                         "name": "main",
-                        "image": "mlxp.kr.ncr.ntruss.com/rlwrld-gpu-base:latest",
+                        "image": IMAGE,
                         "imagePullPolicy": "Always",
                         "command": ["/bin/bash", "-c"],
                         "args": [body],

@@ -74,7 +74,6 @@ export default function SubmitPage() {
   // Persisted across sessions + synced across pages via useMyMlxpNode.
   const [mlxpNode, setMlxpNode] = useMyMlxpNode();
   const [extraArgs, setExtraArgs] = useState<string>("");
-  const [evalNumEnvsPerGpu, setEvalNumEnvsPerGpu] = useState<string>("");
   const [evalOverwriteResults, setEvalOverwriteResults] = useState<boolean>(false);
   const [evalConfigEdit, setEvalConfigEdit] = useState<EvalConfigEdit | null>(null);
   const [trainConfigEdit, setTrainConfigEdit] = useState<TrainConfigEdit | null>(null);
@@ -142,28 +141,6 @@ export default function SubmitPage() {
     enabled: !isSlurm,
   });
   const wantsCheckpoint = phase === "eval" && isSlurm && !!variantName;
-  const evalNumEnvsPerGpuTrimmed = evalNumEnvsPerGpu.trim();
-  const evalNumEnvsPerGpuParsed = Number.parseInt(
-    evalNumEnvsPerGpuTrimmed,
-    10,
-  );
-  const hasEvalNumEnvsPerGpuOverride = evalNumEnvsPerGpuTrimmed.length > 0;
-  const evalNumEnvsPerGpuValid =
-    !wantsCheckpoint ||
-    !hasEvalNumEnvsPerGpuOverride ||
-    (/^[1-9]\d*$/.test(evalNumEnvsPerGpuTrimmed) &&
-      evalNumEnvsPerGpuParsed >= 1);
-  const evalGpuCount = Number.parseInt(
-    variant.data?.vars.TRAIN_NUM_GPUS ?? "",
-    10,
-  );
-  const evalTotalNumEnvs =
-    wantsCheckpoint &&
-    hasEvalNumEnvsPerGpuOverride &&
-    evalNumEnvsPerGpuValid &&
-    evalGpuCount > 0
-      ? evalNumEnvsPerGpuParsed * evalGpuCount
-      : null;
   const selectedCkpt = useQuery({
     queryKey: ["selected-checkpoint", variantName, cluster],
     queryFn: () =>
@@ -374,9 +351,7 @@ export default function SubmitPage() {
             submitPhase === "train" ? trainGlobalBatchSizeParsed : null,
           train_max_steps: submitPhase === "train" ? trainMaxStepsParsed : null,
           train_save_steps: submitPhase === "train" ? trainSaveStepsParsed : null,
-          eval_num_envs_per_gpu: wantsCheckpoint && hasEvalNumEnvsPerGpuOverride
-            ? evalNumEnvsPerGpuParsed
-            : null,
+          eval_num_envs_per_gpu: null,
           eval_n_episodes: wantsCheckpoint ? evalNEpisodesParsed : null,
           eval_n_runs: wantsCheckpoint ? evalNRunsParsed : null,
           eval_sets: wantsCheckpoint ? evalSetValues : null,
@@ -400,7 +375,6 @@ export default function SubmitPage() {
     (!wantsCheckpoint ||
       (!!trimmedCkpt &&
         checkpointExistsValue !== false &&
-        evalNumEnvsPerGpuValid &&
         evalNEpisodesValid &&
         evalNRunsValid &&
         evalSetsValid)) &&
@@ -793,31 +767,6 @@ export default function SubmitPage() {
                         >
                           Reset eval defaults
                         </Button>
-                      )}
-                    </Field>
-                  )}
-
-                  {wantsCheckpoint && (
-                    <Field label="Eval num_envs per GPU (optional)">
-                      <Input
-                        type="number"
-                        min={1}
-                        step={1}
-                        placeholder="config default"
-                        value={evalNumEnvsPerGpu}
-                        onChange={(e) =>
-                          setEvalNumEnvsPerGpu(e.target.value)
-                        }
-                      />
-                      {!evalNumEnvsPerGpuValid && (
-                        <p className="text-xs text-red-600 dark:text-red-400">
-                          Enter a positive integer.
-                        </p>
-                      )}
-                      {evalTotalNumEnvs !== null && (
-                        <p className="text-xs text-slate-500">
-                          Total envs: <code>{evalTotalNumEnvs}</code>
-                        </p>
                       )}
                     </Field>
                   )}

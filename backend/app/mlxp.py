@@ -4,12 +4,12 @@ The user runs the web app on their Mac, where `kubectl` is already
 configured against the MLXP control plane. We shell out to kubectl with
 the user's existing kubeconfig — no separate auth.
 
-Our service-account token is namespaced to `p-rlwrld`, so cluster-scope
+Our service-account token is namespaced to MLXP's project namespace, so cluster-scope
 `kubectl describe node` is forbidden. We derive per-node GPU usage by
 listing pods in our namespace and summing their `nvidia.com/gpu`
 requests. Nodes that only host other tenants' pods won't show up;
-the sanctioned-for-us node is always emitted explicitly even if it has
-no rlwrld pods.
+the configured default node is always emitted explicitly even if it has
+no owned pods.
 """
 
 import asyncio
@@ -19,8 +19,7 @@ from collections import defaultdict
 
 from pydantic import BaseModel
 
-
-GPUS_PER_H200_NODE = 8
+from .mlxp_config import DEFAULT_NODE, GPUS_PER_NODE, GPU_NODE_PREFIX, NAMESPACE
 
 
 class MlxpNode(BaseModel):
@@ -35,7 +34,7 @@ async def list_nodes() -> list[MlxpNode]:
         raise RuntimeError("kubectl not found on PATH")
 
     proc = await asyncio.create_subprocess_exec(
-        "kubectl", "get", "pod", "-n", "p-rlwrld",
+        "kubectl", "get", "pod", "-n", NAMESPACE,
         "--field-selector", "status.phase=Running",
         "-o", "json",
         stdout=asyncio.subprocess.PIPE,
@@ -60,15 +59,23 @@ async def list_nodes() -> list[MlxpNode]:
 
     out: list[MlxpNode] = []
     for name in sorted(used):
-        # H200 GPU nodes only. CPU/control-plane nodes show up if we have a
-        # data pod or pipeline pod there; those aren't GPU-relevant.
-        if not name.startswith("h200-"):
+        # GPU nodes only. CPU/control-plane nodes show up if we have a data
+        # pod or pipeline pod there; those aren't GPU-relevant.
+        if not name.startswith(GPU_NODE_PREFIX):
             continue
         u = used[name]
         out.append(MlxpNode(
             name=name,
             gpu_used=u,
-            gpu_total=GPUS_PER_H200_NODE,
-            gpu_free=max(0, GPUS_PER_H200_NODE - u),
+            gpu_total=GPUS_PER_NODE,
+            gpu_free=max(0, GPUS_PER_NODE - u),
         ))
+    if DEFAULT_NODE and all(n.name != DEFAULT_NODE for n in out):
+        out.append(MlxpNode(
+            name=DEFAULT_NODE,
+            gpu_used=0,
+            gpu_total=GPUS_PER_NODE,
+            gpu_free=GPUS_PER_NODE,
+        ))
+        out.sort(key=lambda n: n.name)
     return out

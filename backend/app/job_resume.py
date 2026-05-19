@@ -74,6 +74,8 @@ async def resume_timed_out_job(cluster: str, job_id: str) -> submit.SubmitRespon
         eval_num_envs_per_gpu = int(eval_num_envs) if eval_num_envs else None
     except ValueError:
         eval_num_envs_per_gpu = None
+    if eval_num_envs_per_gpu and eval_num_envs_per_gpu > submit.MAX_EVAL_NUM_ENVS_PER_GPU:
+        eval_num_envs_per_gpu = submit.MAX_EVAL_NUM_ENVS_PER_GPU
     try:
         eval_n_episodes = int(meta.get("eval_n_episodes", "").strip()) if meta.get("eval_n_episodes") else None
     except ValueError:

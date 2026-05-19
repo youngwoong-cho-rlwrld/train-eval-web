@@ -16,10 +16,11 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from .clusters import ClusterEnv, load_cluster
-from .paths import CLUSTER_STAGING_REL, CLUSTERS_DIR, CONFIGS_DIR, EXPERIMENTS_DIR, LIB_DIR
-from .ssh import SSHResult, rsync_to, ssh_run
-from .variants import Variant, load_variant
+from .clusters import load_cluster
+from .paths import CLUSTER_STAGING_REL, CONFIGS_DIR, LIB_DIR
+from .ssh import rsync_to, ssh_run
+from .variants import load_variant
+from .variant_values import variant_int
 
 
 def _is_background_partition(name: str) -> bool:
@@ -145,16 +146,6 @@ def _normalize_eval_sets(eval_sets: list[str] | None) -> list[str] | None:
     return out
 
 
-def _variant_int(variant: Variant, key: str, default: int) -> int:
-    raw = variant.vars.get(key)
-    if raw is None or not raw.strip():
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        raise ValueError(f"variant {variant.name}: {key} must be an integer")
-
-
 class SubmitResponse(BaseModel):
     job_id: str
     job_name: str
@@ -170,6 +161,8 @@ _BODY_BY_PHASE_MODEL = {
     ("eval", "n1.5"):  ("eval_body.sh", "08:00:00"),
     ("eval", "n1.6"):  ("eval_body_n16.sh", "08:00:00"),
 }
+
+MAX_EVAL_NUM_ENVS_PER_GPU = 1
 
 
 async def submit(req: SubmitRequest) -> SubmitResponse:
@@ -192,6 +185,15 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         req.train_save_steps is not None,
     )):
         raise ValueError("train overrides are only valid for phase=train")
+    if (
+        req.phase == "eval"
+        and eval_num_envs_per_gpu is not None
+        and eval_num_envs_per_gpu > MAX_EVAL_NUM_ENVS_PER_GPU
+    ):
+        raise ValueError(
+            "eval_num_envs_per_gpu > 1 is disabled: the ALLEX target reset "
+            "path is not vector-env safe"
+        )
 
     cluster = await load_cluster(req.cluster)
     variant = await load_variant(req.variant)
@@ -211,9 +213,9 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     if exclude_nodes:
         sbatch_flags.append(f"--exclude={shlex.quote(exclude_nodes)}")
 
-    train_num_gpus = req.train_num_gpus or _variant_int(variant, "TRAIN_NUM_GPUS", 2)
-    train_max_steps = req.train_max_steps or _variant_int(variant, "MAX_STEPS", 30000)
-    train_save_steps = req.train_save_steps or _variant_int(variant, "SAVE_STEPS", 1000)
+    train_num_gpus = req.train_num_gpus or variant_int(variant, "TRAIN_NUM_GPUS", 2)
+    train_max_steps = req.train_max_steps or variant_int(variant, "MAX_STEPS", 30000)
+    train_save_steps = req.train_save_steps or variant_int(variant, "SAVE_STEPS", 1000)
     if req.phase == "train" and req.train_global_batch_size is not None and model == "n1.5":
         if req.train_global_batch_size % train_num_gpus != 0:
             raise ValueError("train_global_batch_size must be divisible by train_num_gpus for n1.5 training")

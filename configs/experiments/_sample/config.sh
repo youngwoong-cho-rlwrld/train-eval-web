@@ -19,10 +19,8 @@ TRAIN_NOTE="N1.5 single-task @ 480x640 — sample variant, edit me"
 #   (a) Single-task → uncomment DATASET_NAME + DATA_CONFIG below.
 #   (b) Multi-task  → uncomment the DATASETS array instead.
 #
-# DATA_DIR resolves to ~/datasets which has symlinks to the V4 sim data on
-# each cluster. It's portable: kakao ($HOME=/rlwrld2/home/youngwoong_cho/)
-# and skt ($HOME=/fsx/rlwrld/youngwoong_cho/) both have the symlink tree at
-# $HOME/datasets/.
+# DATA_DIR resolves to ~/datasets; keep each cluster's dataset symlink tree
+# or DATA_DIR override pointed at the same logical dataset names.
 export DATA_DIR="$HOME/datasets"
 
 # (a) Single-task:
@@ -54,7 +52,7 @@ N_EPISODES=70
 EXECUTION_HORIZON=8
 MAX_EPISODE_STEPS=300
 N_RUNS=3                            # eval runs per (task, eval_set) combination
-EVAL_NUM_ENVS_PER_GPU=1             # Isaac native vectorized envs per GPU
+EVAL_NUM_ENVS_PER_GPU=1             # ALLEX eval currently runs one Isaac env per GPU
 EVAL_PIN_CUDA_DEVICES=1
 EVAL_UNSET_CUDA_VISIBLE_DEVICES_FOR_SERVER=0
 EVAL_PIN_CLIENT_CUDA_DEVICES=1

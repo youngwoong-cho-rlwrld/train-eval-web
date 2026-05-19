@@ -287,7 +287,7 @@ function Timestamp({ iso, cluster }: { iso?: string | null; cluster: string }) {
 
 function phaseOf(jobName: string): "train" | "resume" | "eval" | "other" {
   // Slurm names:  train_<variant>_<cluster>_<partition>_<ts>
-  // MLXP names:   youngwoong-train-<variant>-<ts>
+  // MLXP names:   train_<variant>_<ts> or <user>-train-<variant>-<ts>
   // Anchor on (start | hyphen | underscore) + phase + (hyphen | underscore).
   const m = jobName.match(/(?:^|[-_])(train|resume|eval)[-_]/);
   return (m?.[1] as "train" | "resume" | "eval") ?? "other";
