@@ -76,6 +76,10 @@ def slurm_training_repo_path(
     return slurm_repo_path(cluster_vars, _coerce_model(model))
 
 
+def _safe_git(repo_path: str) -> str:
+    return f"git -c {shlex.quote(f'safe.directory={repo_path}')}"
+
+
 async def _git_status(
     run: GitRunner,
     *,
@@ -83,7 +87,8 @@ async def _git_status(
     repo_label: str,
 ) -> GitStatus:
     repo = shlex.quote(repo_path)
-    rc, head, err = await run(f"cd {repo} && git rev-parse HEAD", 20.0)
+    git = _safe_git(repo_path)
+    rc, head, err = await run(f"cd {repo} && {git} rev-parse HEAD", 20.0)
     if rc != 0:
         return GitStatus(
             repo_path=repo_path,
@@ -94,7 +99,7 @@ async def _git_status(
             files=[],
             error=(err or head).strip() or "git rev-parse failed",
         )
-    rc, status, err = await run(f"cd {repo} && git status --short", 20.0)
+    rc, status, err = await run(f"cd {repo} && {git} status --short", 20.0)
     if rc != 0:
         commit = head.strip()
         return GitStatus(
@@ -156,10 +161,11 @@ async def _prepare_training_git(
 
     message = f"chore(training): snapshot state for {job_name}"
     repo = shlex.quote(repo_path)
-    rc, _, err = await run(f"cd {repo} && git add -A", 30.0)
+    git = _safe_git(repo_path)
+    rc, _, err = await run(f"cd {repo} && {git} add -A", 30.0)
     if rc != 0:
         raise RuntimeError(err.strip() or "git add failed")
-    rc, out, err = await run(f"cd {repo} && git commit -m {shlex.quote(message)}", 60.0)
+    rc, out, err = await run(f"cd {repo} && {git} commit -m {shlex.quote(message)}", 60.0)
     if rc != 0:
         raise RuntimeError((err or out).strip() or "git commit failed")
     clean = await _git_status(run, repo_path=repo_path, repo_label=repo_label)
@@ -354,6 +360,7 @@ def render_training_config_snapshot(
     train_global_batch_size: int | None,
     train_max_steps: int,
     train_save_steps: int,
+    train_action_horizon: int | None = None,
     wandb_project: str | None = None,
     git: SubmitGitInfo | None = None,
 ) -> str:
@@ -364,6 +371,8 @@ def render_training_config_snapshot(
     text = _set_scalar(text, "TRAIN_NUM_GPUS", train_num_gpus)
     text = _set_scalar(text, "MAX_STEPS", train_max_steps)
     text = _set_scalar(text, "SAVE_STEPS", train_save_steps)
+    if train_action_horizon is not None:
+        text = _set_scalar(text, "ACTION_HORIZON", train_action_horizon)
     if train_global_batch_size is not None:
         text = _set_scalar(text, "TRAIN_GLOBAL_BATCH_SIZE", train_global_batch_size)
         if model == "n1.5" and train_num_gpus > 0:
@@ -382,6 +391,8 @@ def render_training_config_snapshot(
         footer.append(f"SUBMIT_PARTITION={shlex.quote(partition)}")
     if node:
         footer.append(f"SUBMIT_NODE={shlex.quote(node)}")
+    if train_action_horizon is not None:
+        footer.append(f"SUBMIT_TRAIN_ACTION_HORIZON={train_action_horizon}")
     if git:
         footer.append(f"SUBMIT_GIT_REPO_LABEL={shlex.quote(git.repo_label)}")
         footer.append(f"SUBMIT_GIT_REPO_PATH={shlex.quote(git.repo_path)}")
@@ -468,6 +479,7 @@ def snapshot_metadata(
     train_global_batch_size: int | None = None,
     train_max_steps: int | None = None,
     train_save_steps: int | None = None,
+    train_action_horizon: int | None = None,
     wandb_project: str | None = None,
     git: SubmitGitInfo | None = None,
 ) -> dict[str, Any]:
@@ -487,6 +499,7 @@ def snapshot_metadata(
             "global_batch_size": train_global_batch_size,
             "max_steps": train_max_steps,
             "save_steps": train_save_steps,
+            "action_horizon": train_action_horizon,
             "wandb_project": wandb_project,
         },
         "dataset_override": dataset_override,

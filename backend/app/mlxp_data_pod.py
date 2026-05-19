@@ -135,7 +135,7 @@ async def _find_running_with_ddn() -> str | None:
 
 async def _apply_yaml(yaml_text: str) -> None:
     proc = await asyncio.create_subprocess_exec(
-        "kubectl", "apply", "-f", "-", "-n", NAMESPACE,
+        "kubectl", "create", "-f", "-", "--validate=false", "-n", NAMESPACE,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

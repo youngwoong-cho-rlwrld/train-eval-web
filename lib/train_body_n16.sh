@@ -22,6 +22,7 @@ TRAIN_REPO_DIR="${SUBMIT_TRAIN_REPO_DIR:-${TRAIN_REPO_DIR:-$GROOT_N16_DIR}}"
 TRAIN_NUM_GPUS="${SUBMIT_TRAIN_NUM_GPUS:-$TRAIN_NUM_GPUS}"
 MAX_STEPS="${SUBMIT_TRAIN_MAX_STEPS:-$MAX_STEPS}"
 SAVE_STEPS="${SUBMIT_TRAIN_SAVE_STEPS:-$SAVE_STEPS}"
+ACTION_HORIZON="${SUBMIT_TRAIN_ACTION_HORIZON:-${ACTION_HORIZON:-}}"
 
 GPU_INSTANCE="$(detect_gpu_instance)"
 # EXP_NAME mirrors the slurm job name when launched via submit; fallback for ad-hoc runs.
@@ -62,6 +63,9 @@ GLOBAL_BATCH_SIZE="${SUBMIT_TRAIN_GLOBAL_BATCH_SIZE:-$((TRAIN_NUM_GPUS * TRAIN_B
 log "Global batch: $GLOBAL_BATCH_SIZE"
 log "Train GPUs: $TRAIN_NUM_GPUS"
 log "Save steps: $SAVE_STEPS"
+if [[ -n "${ACTION_HORIZON:-}" ]]; then
+    log "Action horizon: $ACTION_HORIZON"
+fi
 
 if [[ "${RESUME_EXPECTED:-0}" == "1" ]]; then
     if compgen -G "$RUN_CKPT_DIR/checkpoint-*" > /dev/null; then
@@ -93,6 +97,11 @@ else
 fi
 log "Torchrun master port: $MASTER_PORT"
 
+ACTION_HORIZON_ARGS=()
+if [[ -n "${ACTION_HORIZON:-}" ]]; then
+    ACTION_HORIZON_ARGS=(--action-horizon "$ACTION_HORIZON")
+fi
+
 uv run torchrun --nproc_per_node="$TRAIN_NUM_GPUS" --master-port "$MASTER_PORT" gr00t/experiment/launch_finetune.py \
     --base-model-path nvidia/GR00T-N1.6-3B \
     --dataset-path "${DATASET_PATHS[@]}" \
@@ -104,6 +113,7 @@ uv run torchrun --nproc_per_node="$TRAIN_NUM_GPUS" --master-port "$MASTER_PORT" 
     --learning-rate 1e-4 \
     --max-steps "$MAX_STEPS" \
     --save-steps "$SAVE_STEPS" \
+    "${ACTION_HORIZON_ARGS[@]}" \
     --save-total-limit 5 \
     --dataloader-num-workers 8 \
     --experiment-name "$EXP_NAME" \

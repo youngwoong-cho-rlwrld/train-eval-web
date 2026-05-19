@@ -14,8 +14,11 @@ Different from slurm:
 """
 
 import asyncio
+import io
 import shlex
 import shutil
+import tarfile
+import time
 import uuid
 
 import yaml
@@ -50,7 +53,7 @@ from .training_models import (
     mlxp_repo_path,
     resolve_training_model,
 )
-from .variant_values import variant_int
+from .variant_values import variant_int, variant_optional_int
 from .wandb_config import get_project as _wandb_project
 from .variants import load_variant
 
@@ -81,6 +84,7 @@ class MlxpSubmitRequest(BaseModel):
     global_batch_size: int | None = None
     max_steps: int | None = None
     save_steps: int | None = None
+    action_horizon: int | None = Field(default=None, ge=1)
     # The k8s node to pin via nodeAffinity. Leave None to fall back to the
     # configured default node.
     node: str | None = None
@@ -112,6 +116,8 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
     model = resolve_training_model(variant)
     if req.global_batch_size is not None and model.family == "n1.5" and req.global_batch_size % req.num_gpus != 0:
         raise ValueError("global_batch_size must be divisible by num_gpus for n1.5 training")
+    if req.action_horizon is not None and model.family != "n1.6":
+        raise ValueError("action_horizon is only supported for n1.6 training")
 
     # job_id is the k8s Job resource name — 6-char alpha-leading so it's
     # DNS-safe and URL-short. job_name is the display name carried as an
@@ -137,6 +143,7 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
         submit_git=submit_git,
         model=model,
     )
+    await _write_snapshot_to_ddn(snapshot)
     body_script = _render_body_script(variant, req, job_name, snapshot, model, repo_path)
     spec = _render_job_yaml(
         job_id,
@@ -175,6 +182,9 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
     train_num_gpus = req.num_gpus
     train_max_steps = req.max_steps or variant_int(variant, "MAX_STEPS", 30000)
     train_save_steps = req.save_steps or variant_int(variant, "SAVE_STEPS", 1000)
+    train_action_horizon = req.action_horizon or variant_optional_int(variant, "ACTION_HORIZON")
+    if train_action_horizon is not None and model.family != "n1.6":
+        raise ValueError("action_horizon is only supported for n1.6 training")
     per_gpu_batch = int(variant.vars.get("TRAIN_BATCH_SIZE", "64"))
     train_global_batch_size = req.global_batch_size or per_gpu_batch * train_num_gpus
     suffix = snapshot_suffix(job_name)
@@ -194,6 +204,7 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
         train_global_batch_size=train_global_batch_size,
         train_max_steps=train_max_steps,
         train_save_steps=train_save_steps,
+        train_action_horizon=train_action_horizon,
         wandb_project=_wandb_project(),
         git=submit_git,
     )
@@ -211,6 +222,7 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
         train_global_batch_size=train_global_batch_size,
         train_max_steps=train_max_steps,
         train_save_steps=train_save_steps,
+        train_action_horizon=train_action_horizon,
         wandb_project=_wandb_project(),
         git=submit_git,
     )
@@ -239,6 +251,57 @@ cat > {shlex.quote(path)} <<'TRAIN_EVAL_CONFIG_SNAPSHOT'
 cat > {shlex.quote(meta_path)} <<'TRAIN_EVAL_CONFIG_META'
 {meta_text}TRAIN_EVAL_CONFIG_META
 """
+
+
+def _snapshot_tar(snapshot: dict) -> bytes:
+    payload = io.BytesIO()
+    with tarfile.open(fileobj=payload, mode="w") as tf:
+        for path_key, text_key in (
+            ("path", "config_text"),
+            ("meta_path", "meta_text"),
+        ):
+            data = snapshot[text_key].encode()
+            info = tarfile.TarInfo(snapshot[path_key].lstrip("/"))
+            info.size = len(data)
+            info.mode = 0o644
+            info.mtime = int(time.time())
+            tf.addfile(info, io.BytesIO(data))
+    return payload.getvalue()
+
+
+async def _write_snapshot_to_ddn(snapshot: dict) -> None:
+    from .mlxp_data_pod import ensure_listing_pod
+
+    pod = await ensure_listing_pod()
+    snapshot_dir = snapshot["path"].rsplit("/", 1)[0]
+    proc = await asyncio.create_subprocess_exec(
+        "kubectl",
+        "exec",
+        "-i",
+        "-n",
+        NAMESPACE,
+        pod,
+        "--",
+        "bash",
+        "-lc",
+        f"mkdir -p {shlex.quote(snapshot_dir)} && tar -xf - -C /",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input=_snapshot_tar(snapshot)),
+            timeout=60.0,
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise RuntimeError("writing MLXP config snapshot timed out")
+    if proc.returncode != 0:
+        err = stderr.decode(errors="replace").strip()
+        out = stdout.decode(errors="replace").strip()
+        raise RuntimeError(f"writing MLXP config snapshot failed: {err or out}")
 
 
 def _render_body_script(
@@ -408,12 +471,20 @@ def _render_body_n16(*, variant, req: MlxpSubmitRequest, job_name: str,
         f"{DATASETS_DIR}/{n}" for n in names
     )
     global_batch = req.global_batch_size or int(batch_size) * req.num_gpus
+    action_horizon = req.action_horizon or variant_optional_int(variant, "ACTION_HORIZON")
+    action_horizon_arg = (
+        f"    --action-horizon {action_horizon} \\\n"
+        if action_horizon is not None
+        else ""
+    )
     run_log_dir = f"{ckpt_dir}/logs"
     wandb_project = shlex.quote(_wandb_project())
+    uv_userbase = shlex.quote(f"{DDN_USER_HOME}/.local")
+    uv_bin_dir = shlex.quote(f"{DDN_USER_HOME}/.local/bin")
 
     return f"""\
 set -euo pipefail
-export PATH="$HOME/.local/bin:$PATH"
+export PATH="{uv_bin_dir}:$HOME/.local/bin:$PATH"
 export WANDB_PROJECT={wandb_project}
 export WANDB_RUN_ID="{job_name}"
 export WANDB_RESUME=allow
@@ -421,8 +492,11 @@ export NO_ALBUMENTATIONS_UPDATE=1
 export TOKENIZERS_PARALLELISM=false
 export OMNI_KIT_ACCEPT_EULA=Y
 
+if ! command -v uv >/dev/null 2>&1; then
+    PYTHONUSERBASE={uv_userbase} python3 -m pip install --user uv
+fi
+
 cd {shlex.quote(repo_path)}
-source .venv/bin/activate
 
 {_snapshot_preamble(snapshot)}
 mkdir -p {ckpt_dir}
@@ -440,7 +514,7 @@ if compgen -G "{ckpt_dir}/checkpoint-*" > /dev/null; then
     RESUME_FLAG="--resume"
 fi
 
-torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/launch_finetune.py \\
+uv run torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/launch_finetune.py \\
     --base-model-path nvidia/GR00T-N1.6-3B \\
     --dataset-path \\
         {dataset_paths_arg} \\
@@ -452,6 +526,7 @@ torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/launch_finetune.py \\
     --learning-rate 1e-4 \\
     --max-steps {max_steps} \\
     --save-steps {save_steps} \\
+{action_horizon_arg}\
     --save-total-limit 5 \\
     --dataloader-num-workers 8 \\
     --experiment-name "{job_name}" \\
@@ -464,11 +539,14 @@ torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/launch_finetune.py \\
 def _job_comment(req: MlxpSubmitRequest, variant, snapshot: dict) -> str:
     max_steps = req.max_steps or variant_int(variant, "MAX_STEPS", 30000)
     save_steps = req.save_steps or variant_int(variant, "SAVE_STEPS", 1000)
+    action_horizon = req.action_horizon or variant_optional_int(variant, "ACTION_HORIZON")
     comment = (
         f"phase=train;variant={req.variant};train_num_gpus={req.num_gpus};"
         f"train_max_steps={max_steps};train_save_steps={save_steps};"
         f"wandb_project={_wandb_project()}"
     )
+    if action_horizon is not None:
+        comment += f";train_action_horizon={action_horizon}"
     if req.global_batch_size is not None:
         comment += f";train_global_batch_size={req.global_batch_size}"
     comment += (
