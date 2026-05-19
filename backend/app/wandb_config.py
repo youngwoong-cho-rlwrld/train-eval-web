@@ -10,7 +10,7 @@ import json
 import os
 from pathlib import Path
 
-DEFAULT_PROJECT = "finetune-gr00t-n1d6"
+DEFAULT_PROJECT = "my project"
 _SETTINGS_DIR = Path.home() / ".train-eval-web"
 _SETTINGS_FILE = _SETTINGS_DIR / "wandb.json"
 

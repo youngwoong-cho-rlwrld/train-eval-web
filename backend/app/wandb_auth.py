@@ -2,8 +2,8 @@
 
 The API key is persisted to `~/.netrc` via `wandb.login(key=...)`. The
 project name is persisted to `~/.train-eval-web/wandb.json` (see
-wandb_config) and is used both for the backend's run lookup and for
-the `--wandb-project` flag we pass to launch_finetune.py.
+wandb_config) and is used both for the backend's run lookup and as the
+default project passed to training jobs.
 """
 
 import asyncio

@@ -136,7 +136,7 @@ function WandbCard() {
             <Input
               value={project}
               onChange={(e) => setProjectDraft(e.target.value)}
-              placeholder="finetune-gr00t-n1d6"
+              placeholder="my project"
               className="flex-1 font-mono text-xs"
               autoComplete="off"
             />
@@ -148,8 +148,8 @@ function WandbCard() {
             </Button>
           </div>
           <p className="text-xs text-slate-500">
-            Used for both the wandb API lookup and the{" "}
-            <code>--wandb-project</code> flag passed to MLXP jobs.
+            Used for wandb API lookup and as the default project for training
+            jobs.
           </p>
         </div>
       </CardContent>

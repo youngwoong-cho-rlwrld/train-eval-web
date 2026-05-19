@@ -194,6 +194,7 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
         train_global_batch_size=train_global_batch_size,
         train_max_steps=train_max_steps,
         train_save_steps=train_save_steps,
+        wandb_project=_wandb_project(),
         git=submit_git,
     )
     meta = snapshot_metadata(
@@ -210,6 +211,7 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
         train_global_batch_size=train_global_batch_size,
         train_max_steps=train_max_steps,
         train_save_steps=train_save_steps,
+        wandb_project=_wandb_project(),
         git=submit_git,
     )
     return {
@@ -294,6 +296,7 @@ def _render_body_script(
 
     ckpt_dir = f"{MLXP_EXPERIMENTS_DIR}/{variant.name}/checkpoints/{job_name}"
     run_log_dir = f"{ckpt_dir}/logs"
+    wandb_project = shlex.quote(_wandb_project())
 
     if family == "n1.6":
         return _render_body_n16(
@@ -335,7 +338,7 @@ def _render_body_script(
     return f"""\
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
-export WANDB_PROJECT=gr00t
+export WANDB_PROJECT={wandb_project}
 # Pin the wandb run-id to the k8s Job name so requeues continue the same
 # run (HF Trainer otherwise spawns a fresh run on each container start).
 export WANDB_RUN_ID="{job_name}"
@@ -406,11 +409,12 @@ def _render_body_n16(*, variant, req: MlxpSubmitRequest, job_name: str,
     )
     global_batch = req.global_batch_size or int(batch_size) * req.num_gpus
     run_log_dir = f"{ckpt_dir}/logs"
+    wandb_project = shlex.quote(_wandb_project())
 
     return f"""\
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
-export WANDB_PROJECT=gr00t
+export WANDB_PROJECT={wandb_project}
 export WANDB_RUN_ID="{job_name}"
 export WANDB_RESUME=allow
 export NO_ALBUMENTATIONS_UPDATE=1
@@ -452,7 +456,7 @@ torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/launch_finetune.py \\
     --dataloader-num-workers 8 \\
     --experiment-name "{job_name}" \\
     --use-wandb \\
-    --wandb-project {_wandb_project()} \\
+    --wandb-project {wandb_project} \\
     $RESUME_FLAG {train_extra} {user_extra}
 """
 
@@ -462,7 +466,8 @@ def _job_comment(req: MlxpSubmitRequest, variant, snapshot: dict) -> str:
     save_steps = req.save_steps or variant_int(variant, "SAVE_STEPS", 1000)
     comment = (
         f"phase=train;variant={req.variant};train_num_gpus={req.num_gpus};"
-        f"train_max_steps={max_steps};train_save_steps={save_steps}"
+        f"train_max_steps={max_steps};train_save_steps={save_steps};"
+        f"wandb_project={_wandb_project()}"
     )
     if req.global_batch_size is not None:
         comment += f";train_global_batch_size={req.global_batch_size}"

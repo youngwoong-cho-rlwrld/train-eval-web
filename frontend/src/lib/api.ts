@@ -113,6 +113,7 @@ export type ConfigSnapshot = {
   path: string | null;
   meta_path: string | null;
   text: string | null;
+  wandb_project: string | null;
   git_repo_path: string | null;
   git_repo_label: string | null;
   git_commit: string | null;
@@ -156,6 +157,7 @@ export type JobDetails = {
   variant: string | null;
   state: string;
   elapsed: string;
+  wandb_project: string | null;
   wandb_url: string | null;
   paths: Paths;
   progress: Progress;

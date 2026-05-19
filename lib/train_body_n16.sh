@@ -80,7 +80,7 @@ fi
 
 # uv may not be on PATH in non-login shells (it lives at $HOME/.local/bin)
 export PATH="$HOME/.local/bin:$PATH"
-export WANDB_PROJECT=gr00t
+export WANDB_PROJECT="${SUBMIT_WANDB_PROJECT:-${WANDB_PROJECT:-my project}}"
 export WANDB_DIR="$EXP_DIR"
 export WANDB_RESUME=allow
 
@@ -108,6 +108,7 @@ uv run torchrun --nproc_per_node="$TRAIN_NUM_GPUS" --master-port "$MASTER_PORT" 
     --dataloader-num-workers 8 \
     --experiment-name "$EXP_NAME" \
     --use-wandb \
+    --wandb-project "$WANDB_PROJECT" \
     --color-jitter-params brightness 0.2 contrast 0.2 saturation 0.2 hue 0.1 \
     "${TRAIN_EXTRA_ARGS[@]}"
 

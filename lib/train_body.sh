@@ -106,7 +106,7 @@ fi
 
 cd "$TRAIN_REPO_DIR"
 source "$TRAIN_REPO_DIR/.venv/bin/activate"
-export WANDB_PROJECT=gr00t
+export WANDB_PROJECT="${SUBMIT_WANDB_PROJECT:-${WANDB_PROJECT:-my project}}"
 export WANDB_DIR="$EXP_DIR"
 
 export WANDB_RESUME=allow

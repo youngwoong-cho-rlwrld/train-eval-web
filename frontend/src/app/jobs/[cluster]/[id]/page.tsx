@@ -331,6 +331,7 @@ function SubmissionSnapshotCard({
 }) {
   const snapshot = d?.config_snapshot;
   const isTrain = d?.phase === "train" || d?.phase === "resume";
+  const wandbProject = snapshot?.wandb_project ?? d?.wandb_project ?? null;
 
   return (
     <Card className="mt-6">
@@ -346,42 +347,47 @@ function SubmissionSnapshotCard({
         {!isLoading && !error && d && !isTrain && (
           <EmptyState message="Submission snapshots are recorded for training jobs." />
         )}
-        {!isLoading && !error && d && isTrain && !snapshot && (
+        {!isLoading && !error && d && isTrain && !snapshot && !wandbProject && (
           <EmptyState message="No submission snapshot was recorded for this job." />
         )}
-        {!isLoading && !error && snapshot && (
+        {!isLoading && !error && d && isTrain && (snapshot || wandbProject) && (
           <>
             <div className="divide-y divide-slate-100 dark:divide-slate-900">
-              {snapshot.path && (
+              {snapshot?.path && (
                 <SnapshotRow label="config" value={snapshot.path} />
               )}
-              {snapshot.meta_path && (
+              {snapshot?.meta_path && (
                 <SnapshotRow label="metadata" value={snapshot.meta_path} />
               )}
-              {snapshot.git_repo_label && (
+              {wandbProject && (
+                <SnapshotRow label="wandb project" value={wandbProject} />
+              )}
+              {snapshot?.git_repo_label && (
                 <SnapshotRow label="code repo" value={snapshot.git_repo_label} />
               )}
-              {snapshot.git_repo_path && (
+              {snapshot?.git_repo_path && (
                 <SnapshotRow label="repo path" value={snapshot.git_repo_path} />
               )}
-              {snapshot.git_commit && (
+              {snapshot?.git_commit && (
                 <SnapshotRow label="training commit" value={snapshot.git_commit} />
               )}
-              <SnapshotRow
-                label="dirty"
-                value={
-                  snapshot.git_dirty_at_submit == null
-                    ? "unknown"
-                    : snapshot.git_dirty_at_submit
-                      ? snapshot.git_committed_dirty
-                        ? "dirty changes committed before submit"
-                        : "dirty at submit"
-                      : "clean"
-                }
-              />
+              {snapshot && (
+                <SnapshotRow
+                  label="dirty"
+                  value={
+                    snapshot.git_dirty_at_submit == null
+                      ? "unknown"
+                      : snapshot.git_dirty_at_submit
+                        ? snapshot.git_committed_dirty
+                          ? "dirty changes committed before submit"
+                          : "dirty at submit"
+                        : "clean"
+                  }
+                />
+              )}
             </div>
-            {snapshot.error && <ErrorState message={snapshot.error} />}
-            {snapshot.text && (
+            {snapshot?.error && <ErrorState message={snapshot.error} />}
+            {snapshot?.text && (
               <pre className="max-h-80 overflow-auto rounded border border-slate-200 bg-slate-50 p-3 text-xs dark:border-slate-800 dark:bg-slate-950">
                 {snapshot.text}
               </pre>

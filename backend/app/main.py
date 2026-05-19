@@ -11,6 +11,7 @@ from . import clusters, copy_checkpoint, datasets, details, flags, job_resume, j
 from .paths import CLUSTER_STAGING_REL
 from .ssh import ssh_tail_lines
 from .variant_values import variant_int
+from .wandb_config import get_project as wandb_project
 
 
 app = FastAPI(title="train-eval-web")
@@ -260,6 +261,7 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
                 train_global_batch_size=train_global_batch_size,
                 train_max_steps=train_max_steps,
                 train_save_steps=train_save_steps,
+                wandb_project=wandb_project(),
                 git=None,
             )
         elif req.phase == "eval":

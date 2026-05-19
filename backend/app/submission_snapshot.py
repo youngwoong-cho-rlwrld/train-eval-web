@@ -354,6 +354,7 @@ def render_training_config_snapshot(
     train_global_batch_size: int | None,
     train_max_steps: int,
     train_save_steps: int,
+    wandb_project: str | None = None,
     git: SubmitGitInfo | None = None,
 ) -> str:
     text = base_config
@@ -375,6 +376,8 @@ def render_training_config_snapshot(
         f"SUBMIT_VARIANT={shlex.quote(variant)}",
         f"SUBMIT_CLUSTER={shlex.quote(cluster)}",
     ]
+    if wandb_project:
+        footer.append(f"SUBMIT_WANDB_PROJECT={shlex.quote(wandb_project)}")
     if partition:
         footer.append(f"SUBMIT_PARTITION={shlex.quote(partition)}")
     if node:
@@ -465,6 +468,7 @@ def snapshot_metadata(
     train_global_batch_size: int | None = None,
     train_max_steps: int | None = None,
     train_save_steps: int | None = None,
+    wandb_project: str | None = None,
     git: SubmitGitInfo | None = None,
 ) -> dict[str, Any]:
     return {
@@ -483,6 +487,7 @@ def snapshot_metadata(
             "global_batch_size": train_global_batch_size,
             "max_steps": train_max_steps,
             "save_steps": train_save_steps,
+            "wandb_project": wandb_project,
         },
         "dataset_override": dataset_override,
         "extra_args": extra_args or [],

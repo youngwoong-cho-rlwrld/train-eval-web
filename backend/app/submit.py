@@ -32,6 +32,7 @@ from .submission_snapshot import (
 from .training_models import resolve_training_model
 from .variants import load_variant
 from .variant_values import variant_int
+from .wandb_config import get_project as wandb_project
 
 
 def _is_background_partition(name: str) -> bool:
@@ -219,6 +220,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     # table columns; the job name carries phase, variant, and timestamp.
     job_name = resolve_job_name(req.job_name, req.phase, req.variant)
     host = cluster.ssh_alias
+    submitted_wandb_project = wandb_project()
 
     submit_git = None
     snapshot_rel: str | None = None
@@ -254,6 +256,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             train_global_batch_size=effective_train_global_batch_size,
             train_max_steps=train_max_steps,
             train_save_steps=train_save_steps,
+            wandb_project=submitted_wandb_project,
             git=submit_git,
         )
         snapshot_meta_text = metadata_json(snapshot_metadata(
@@ -269,6 +272,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             train_global_batch_size=effective_train_global_batch_size,
             train_max_steps=train_max_steps,
             train_save_steps=train_save_steps,
+            wandb_project=submitted_wandb_project,
             git=submit_git,
         ))
 
@@ -357,7 +361,8 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     # match the unified regex.
     comment = (
         f"phase={req.phase};variant={req.variant};"
-        f"model_id={model.id};submit_train_repo_dir={training_repo}"
+        f"model_id={model.id};submit_train_repo_dir={training_repo};"
+        f"wandb_project={submitted_wandb_project}"
     )
     if req.phase == "train":
         comment += (
@@ -391,6 +396,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         f"REPO_ROOT={repo_root_remote},RESUME_EXPECTED={resume_expected},"
         f"SUBMIT_PARTITION={shlex.quote(partition)},"
         f"SUBMIT_TRAIN_REPO_DIR={shlex.quote(training_repo)},"
+        f"SUBMIT_WANDB_PROJECT={shlex.quote(submitted_wandb_project)},"
         # Pin wandb run id to the slurm display name so the URL is stable
         # and matches MLXP's run-id format.
         f"WANDB_RUN_ID={shlex.quote(job_name)}"
@@ -458,6 +464,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         f"model_id={model.id}\n"
         f"model_label={model.label}\n"
         f"submit_train_repo_dir={training_repo}\n"
+        f"wandb_project={submitted_wandb_project}\n"
         f"job_name={job_name}\n"
         + (
             f"resume_of={req.resume_of.strip()}\n"

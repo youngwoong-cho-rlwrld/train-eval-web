@@ -10,7 +10,7 @@ import os
 import re
 import shlex
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
 from pydantic import BaseModel, Field
 
@@ -36,10 +36,8 @@ from .wandb_config import get_project
 #     (mlxp) to job_name. Already in hand here.
 #   - entity: wandb.Api().default_entity after `wandb login` on this
 #     laptop. Resolved lazily in _wandb_entity.
-#   - project: configurable in Settings (persisted via wandb_config),
-#     since launch_finetune.py / gr00t_finetune.py override our exported
-#     WANDB_PROJECT internally — no submission-side signal reveals which
-#     project the run actually lands in.
+#   - project: captured at submit time in job metadata/config snapshot; if an
+#     older job lacks that field, the current Settings value is the fallback.
 WANDB_ENTITY_OVERRIDE = os.environ.get("TRAIN_EVAL_WEB_WANDB_ENTITY")
 WANDB_WORKSPACE_OVERRIDE = os.environ.get("TRAIN_EVAL_WEB_WANDB_WORKSPACE")
 
@@ -89,6 +87,7 @@ class ConfigSnapshot(BaseModel):
     path: str | None = None
     meta_path: str | None = None
     text: str | None = None
+    wandb_project: str | None = None
     git_repo_path: str | None = None
     git_repo_label: str | None = None
     git_commit: str | None = None
@@ -105,6 +104,7 @@ class JobDetails(BaseModel):
     variant: str | None
     state: str
     elapsed: str
+    wandb_project: str | None = None
     wandb_url: str | None
     paths: Paths
     progress: Progress
@@ -121,6 +121,24 @@ def _metadata_fields(text: str | None) -> dict[str, str]:
             k, v = chunk.split("=", 1)
             fields[k.strip()] = v.strip()
     return fields
+
+
+def _snapshot_wandb_project(text: str | None) -> str | None:
+    if not text:
+        return None
+    match = re.search(r"^SUBMIT_WANDB_PROJECT=(.*)$", text, flags=re.MULTILINE)
+    if not match:
+        return None
+    raw = match.group(1).strip()
+    if not raw:
+        return None
+    try:
+        parts = shlex.split(raw, comments=False, posix=True)
+        if parts:
+            return parts[0]
+    except ValueError:
+        pass
+    return raw.strip("'\"") or None
 
 
 async def _read_slurm_meta(host: str, job_id: str) -> dict[str, str]:
@@ -314,11 +332,16 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
         isaac_logs_glob=isaac_logs_glob,
     )
     config_snapshot = await _slurm_config_snapshot(env.ssh_alias, slurm_meta)
+    job_wandb_project = (
+        slurm_meta.get("wandb_project")
+        or slurm_meta.get("submit_wandb_project")
+        or (config_snapshot.wandb_project if config_snapshot else None)
+    )
 
     wandb_url: str | None = None
     if phase in ("train", "resume"):
         # submit.py pins WANDB_RUN_ID = job_name via sbatch --export.
-        wandb_url = await _wandb_url(job_name)
+        wandb_url = await _wandb_url(job_name, project=job_wandb_project)
 
     progress = await _compute_progress(
         cluster,
@@ -330,6 +353,7 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
         ckpt_dir,
         eval_dir,
         slurm_meta,
+        wandb_project=job_wandb_project,
     )
     if phase == "eval" and variant and eval_dir:
         try:
@@ -351,6 +375,7 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
     return JobDetails(
         cluster=cluster, job_id=job_id, job_name=job_name,
         phase=phase, variant=variant, state=state, elapsed=elapsed,
+        wandb_project=job_wandb_project,
         wandb_url=wandb_url, paths=paths, progress=progress, gpu=gpu,
         config_snapshot=config_snapshot,
     )
@@ -379,19 +404,24 @@ async def _mlxp_details(
         eval_dir=None,
         isaac_logs_glob=None,
     )
+    metadata = _metadata_fields(job_comment)
+    config_snapshot = await _mlxp_config_snapshot(metadata)
+    job_wandb_project = (
+        metadata.get("wandb_project")
+        or metadata.get("submit_wandb_project")
+        or (config_snapshot.wandb_project if config_snapshot else None)
+    )
     # mlxp body pins WANDB_RUN_ID = job_name (resolved from the Job's
     # display-name annotation by get_job). The k8s job_id has no wandb
     # run behind it.
-    wandb_url = await _wandb_url(job_name)
-
-    metadata = _metadata_fields(job_comment)
-    config_snapshot = await _mlxp_config_snapshot(metadata)
-    progress = await _mlxp_progress(job_name, variant, phase, metadata)
+    wandb_url = await _wandb_url(job_name, project=job_wandb_project)
+    progress = await _mlxp_progress(job_name, variant, phase, metadata, project=job_wandb_project)
     gpu = await _mlxp_gpu_usage(pod_name, node, state) if include_gpu else None
 
     return JobDetails(
         cluster="mlxp", job_id=job_id, job_name=job_name,
         phase=phase, variant=variant, state=state, elapsed=elapsed,
+        wandb_project=job_wandb_project,
         wandb_url=wandb_url, paths=paths, progress=progress, gpu=gpu,
         config_snapshot=config_snapshot,
     )
@@ -432,6 +462,9 @@ async def _slurm_config_snapshot(host: str, meta: dict[str, str]) -> ConfigSnaps
         path=path,
         meta_path=meta_path,
         text=text,
+        wandb_project=meta.get("wandb_project")
+        or meta.get("submit_wandb_project")
+        or _snapshot_wandb_project(text),
         git_repo_path=meta.get("submit_git_repo_path") or None,
         git_repo_label=meta.get("submit_git_repo_label") or None,
         git_commit=meta.get("submit_git_commit") or None,
@@ -482,6 +515,9 @@ async def _mlxp_config_snapshot(meta: dict[str, str]) -> ConfigSnapshot | None:
         path=path,
         meta_path=meta_path,
         text=text,
+        wandb_project=meta.get("wandb_project")
+        or meta.get("submit_wandb_project")
+        or _snapshot_wandb_project(text),
         git_repo_path=meta.get("submit_git_repo_path") or None,
         git_repo_label=meta.get("submit_git_repo_label") or None,
         git_commit=meta.get("submit_git_commit") or None,
@@ -692,6 +728,7 @@ async def _mlxp_progress(
     variant: str | None,
     phase: str,
     metadata: dict[str, str] | None = None,
+    project: str | None = None,
 ) -> Progress:
     """Progress for an MLXP training job.
 
@@ -723,7 +760,7 @@ async def _mlxp_progress(
         return progress
 
     # 1. wandb — fine-grained (per logging tick).
-    step = await _wandb_step(run_id)
+    step = await _wandb_step(run_id, project=project)
     if step is not None:
         progress.current_step = step
         if progress.max_steps:
@@ -826,15 +863,16 @@ async def _wandb_workspace(entity: str) -> str | None:
 _wandb_workspace_cache: dict[str, str] = {}
 
 
-async def _wandb_url(run_id: str) -> str | None:
+async def _wandb_url(run_id: str, project: str | None = None) -> str | None:
     import asyncio
 
     entity = await _wandb_entity()
     if not entity:
         return None
+    resolved_project = project or get_project()
     workspace = await _wandb_workspace(entity)
     fallback = _append_wandb_workspace(
-        f"https://wandb.ai/{entity}/{get_project()}/runs/{run_id}",
+        f"https://wandb.ai/{quote(entity, safe='')}/{quote(resolved_project, safe='')}/runs/{quote(run_id, safe='')}",
         workspace,
     )
 
@@ -842,7 +880,7 @@ async def _wandb_url(run_id: str) -> str | None:
         try:
             import wandb
             api = wandb.Api(timeout=10)
-            run = api.run(f"{entity}/{get_project()}/{run_id}")
+            run = api.run(f"{entity}/{resolved_project}/{run_id}")
             return _append_wandb_workspace(run.url or fallback, workspace)
         except Exception:
             return fallback
@@ -873,19 +911,20 @@ async def _wandb_entity() -> str | None:
     return _wandb_entity_cache or None
 
 
-async def _wandb_step(run_id: str) -> int | None:
+async def _wandb_step(run_id: str, project: str | None = None) -> int | None:
     """Return the run's latest step (None if API unreachable / run not found)."""
     import asyncio
 
     entity = await _wandb_entity()
     if not entity:
         return None
+    resolved_project = project or get_project()
 
     def _query() -> int | None:
         try:
             import wandb
             api = wandb.Api(timeout=10)
-            run = api.run(f"{entity}/{get_project()}/{run_id}")
+            run = api.run(f"{entity}/{resolved_project}/{run_id}")
             # train/global_step is the actual training-loop step. wandb's
             # built-in `_step` counts wandb.log() calls, which is
             # global_step / logging_steps — off by ~10× for gr00t-n16.
@@ -1041,7 +1080,8 @@ _TQDM_STEP_RE = re.compile(r"(\d+)/(\d+)\s*\[")
 async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str | None,
                              stdout: str, stderr: str,
                              ckpt_dir: str | None, eval_dir: str | None,
-                             slurm_meta: dict[str, str] | None = None) -> Progress:
+                             slurm_meta: dict[str, str] | None = None,
+                             wandb_project: str | None = None) -> Progress:
     progress = Progress(phase=phase)
     if not variant:
         return progress
