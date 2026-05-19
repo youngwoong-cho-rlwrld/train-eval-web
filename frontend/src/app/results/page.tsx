@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { useIsFetching, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertCircle, Check, Copy, Database, Trophy } from "lucide-react";
+import { AlertCircle, Check, CircleHelp, Copy, Database, Trophy } from "lucide-react";
 import { toast } from "sonner";
 import { api, type ResultCell, type ResultsResponse, type ResultTask, type ResultVariant } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
@@ -11,8 +11,11 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { RefreshButton } from "@/components/refresh-button";
 import { LoadingState } from "@/components/loading-state";
+import { ImmediateTooltip } from "@/components/immediate-tooltip";
 
 const REFRESH_MS = 120_000;
+const AVERAGE_HELP =
+  "Ave is total successes divided by total episodes across all displayed eval sets for this task. It is computed from per-run eval_results/**/run_*/results.json files, not the top-level aggregate results.json.";
 
 export default function ResultsPage() {
   const qc = useQueryClient();
@@ -185,7 +188,14 @@ function ResultCard({ variant }: { variant: ResultVariant }) {
                 {evalSets.map((evalSet) => (
                   <Th key={evalSet}>{evalSet}</Th>
                 ))}
-                <Th>Ave</Th>
+                <Th>
+                  <span className="inline-flex items-center gap-1">
+                    Ave
+                    <ImmediateTooltip content={AVERAGE_HELP}>
+                      <CircleHelp className="h-3.5 w-3.5 text-slate-400" />
+                    </ImmediateTooltip>
+                  </span>
+                </Th>
               </tr>
             </thead>
             <tbody>
@@ -235,23 +245,24 @@ function CopyResultTableButton({
   }
 
   return (
-    <Button
-      type="button"
-      variant="outline"
-      size="sm"
-      className="h-6 gap-1.5 px-2 text-xs"
-      onClick={copyTable}
-      title="Copy TSV table for Google Sheets or Notion"
-    >
-      {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-      Copy table
-    </Button>
+    <ImmediateTooltip content="Copy TSV table for Google Sheets or Notion">
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        className="h-6 gap-1.5 px-2 text-xs"
+        onClick={copyTable}
+      >
+        {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+        Copy table
+      </Button>
+    </ImmediateTooltip>
   );
 }
 
 function ResultRow({ task, evalSets }: { task: ResultTask; evalSets: string[] }) {
   const byEvalSet = new Map(task.eval_sets.map((cell) => [cell.eval_set, cell]));
-  const average = mean(task.eval_sets.map((cell) => cell.mean_success_rate));
+  const average = episodeWeightedAverage(task.eval_sets);
 
   return (
     <tr className="border-b border-slate-100 last:border-0 dark:border-slate-900">
@@ -281,14 +292,21 @@ function ResultCellView({ cell }: { cell?: ResultCell }) {
     cell.expected_runs != null &&
     cell.expected_runs > 0 &&
     cell.completed_runs < cell.expected_runs;
+  const episodes = totalEpisodes(cell);
   return (
-    <div title={cell.per_run_success_rate.map((v) => formatPct(v)).join(", ")}>
+    <ImmediateTooltip
+      content={cell.per_run_success_rate.map((v) => formatPct(v)).join(", ")}
+      className="inline-flex"
+    >
+      <div>
       <div className="font-mono">{formatMeanStd(cell)}</div>
       <div className="mt-1 flex items-center gap-2 text-[11px] text-slate-500 dark:text-slate-400">
         <span>{cell.completed_runs}{cell.expected_runs ? `/${cell.expected_runs}` : ""} runs</span>
+        {episodes != null && <span>{episodes.toLocaleString()} episodes</span>}
         {incomplete && <Badge variant="warning" className="px-1 py-0 text-[10px]">partial</Badge>}
       </div>
-    </div>
+      </div>
+    </ImmediateTooltip>
   );
 }
 
@@ -296,7 +314,9 @@ function Meta({ label, value, title }: { label: string; value: string; title?: s
   return (
     <div className="min-w-0">
       <span className="mr-1 text-slate-400">{label}:</span>
-      <span className="font-mono" title={title ?? value}>{value}</span>
+      <ImmediateTooltip content={title ?? value}>
+        <span className="font-mono">{value}</span>
+      </ImmediateTooltip>
     </div>
   );
 }
@@ -337,7 +357,7 @@ function resultTableTsv(variant: ResultVariant, evalSets: string[]) {
     ["Task", ...evalSets, "Ave"],
     ...variant.tasks.map((task) => {
       const byEvalSet = new Map(task.eval_sets.map((cell) => [cell.eval_set, cell]));
-      const average = mean(task.eval_sets.map((cell) => cell.mean_success_rate));
+      const average = episodeWeightedAverage(task.eval_sets);
       return [
         displayTaskName(task),
         ...evalSets.map((evalSet) => {
@@ -363,9 +383,31 @@ function formatPct(value: number) {
   return `${(value * 100).toFixed(2)}%`;
 }
 
-function mean(vals: number[]) {
-  if (vals.length === 0) return null;
-  return vals.reduce((sum, v) => sum + v, 0) / vals.length;
+function totalEpisodes(cell: ResultCell) {
+  const total = cell.episode_counts.reduce<number>((sum, v) => sum + (v ?? 0), 0);
+  return total > 0 ? total : null;
+}
+
+function episodeWeightedAverage(cells: ResultCell[]) {
+  let successes = 0;
+  let episodes = 0;
+
+  for (const cell of cells) {
+    cell.episode_counts.forEach((episodeCount, idx) => {
+      if (episodeCount == null || episodeCount <= 0) return;
+      episodes += episodeCount;
+      const successCount = cell.success_counts[idx];
+      if (successCount != null) {
+        successes += successCount;
+        return;
+      }
+      const runRate = cell.per_run_success_rate[idx] ?? cell.mean_success_rate;
+      successes += runRate * episodeCount;
+    });
+  }
+
+  if (episodes > 0) return successes / episodes;
+  return null;
 }
 
 function Th({ children }: { children: React.ReactNode }) {

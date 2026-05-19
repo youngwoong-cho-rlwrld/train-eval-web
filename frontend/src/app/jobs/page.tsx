@@ -14,6 +14,7 @@ import { ResumeJobButton } from "@/components/resume-job-button";
 import { RefreshButton } from "@/components/refresh-button";
 import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state";
 import { JobStateBadge } from "@/components/job-state-badge";
+import { ImmediateTooltip } from "@/components/immediate-tooltip";
 import { formatJobTimestamp, parseJobTimestampMs } from "@/lib/job-time";
 
 const REFRESH_MS = 60_000;
@@ -146,9 +147,11 @@ function JobTable({ rows }: { rows: Job[] }) {
                 <Td>
                   <JobStateBadge state={j.state} />
                 </Td>
-                <td className="py-2 pr-4 font-mono text-xs" title={j.job_name}>
+                <td className="py-2 pr-4 font-mono text-xs">
                   <div className="flex items-center gap-1">
-                    <span className="max-w-[240px] truncate">{j.job_name}</span>
+                    <ImmediateTooltip content={j.job_name} className="max-w-[240px]">
+                      <span className="truncate">{j.job_name}</span>
+                    </ImmediateTooltip>
                     <CopyButton value={j.job_name} title="Copy job name" />
                   </div>
                 </td>
@@ -212,7 +215,11 @@ function CopyCheckpointShortcut({ job }: { job: Job }) {
 function Timestamp({ iso, cluster }: { iso?: string | null; cluster: string }) {
   const formatted = formatJobTimestamp(iso, cluster);
   if (!formatted) return <span className="text-slate-400">—</span>;
-  return <span title={formatted.full}>{formatted.short}</span>;
+  return (
+    <ImmediateTooltip content={formatted.full}>
+      <span>{formatted.short}</span>
+    </ImmediateTooltip>
+  );
 }
 
 function phaseOf(jobName: string): "train" | "resume" | "eval" | "other" {

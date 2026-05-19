@@ -359,6 +359,7 @@ def build_variant(meta):
     expected_runs = int_or_none(meta.get("n_runs"))
     top_path = exp_dir / "results.json"
     top = None
+    aggregate_tasks = []
     if top_path.exists():
         try:
             top = read_json(top_path)
@@ -400,7 +401,7 @@ def build_variant(meta):
                     str(top_path),
                 )
                 if cells:
-                    result["tasks"].append({
+                    aggregate_tasks.append({
                         "task": short,
                         "task_name": task_data.get("task_name") or task_name_for(short, configured_tasks, short),
                         "instruction": task_data.get("instruction") or instruction_for(short, configured_tasks),
@@ -415,18 +416,18 @@ def build_variant(meta):
                 str(top_path),
             )
             if cells:
-                result["tasks"].append({
+                aggregate_tasks.append({
                     "task": short,
                     "task_name": top.get("task_name") or task_name_for(short, configured_tasks, short),
                     "instruction": instruction_for(short, configured_tasks),
                     "eval_sets": cells,
                 })
 
-    if result["tasks"]:
-        return result
-
     eval_root = exp_dir / "eval_results"
     if not eval_root.exists():
+        if aggregate_tasks:
+            result["tasks"] = aggregate_tasks
+            return result
         return None
 
     if len(configured_tasks) > 1:
@@ -454,7 +455,13 @@ def build_variant(meta):
                 "eval_sets": cells,
             })
 
-    return result if result["tasks"] else None
+    if result["tasks"]:
+        result["source"] = str(eval_root)
+        return result
+    if aggregate_tasks:
+        result["tasks"] = aggregate_tasks
+        return result
+    return None
 
 
 rows = []

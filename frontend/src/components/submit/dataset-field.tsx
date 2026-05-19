@@ -23,6 +23,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { ImmediateTooltip } from "@/components/immediate-tooltip";
 
 export type DatasetFieldProps = {
   variant: Variant;
@@ -143,18 +144,19 @@ function DatasetDirControl({
   const [draft, setDraft] = useState(datasetDir);
   return (
     <>
-      <button
-        type="button"
-        onClick={() => {
-          setDraft(datasetDir);
-          setOpen(true);
-        }}
-        title={`Dataset directory: ${datasetDir}`}
-        className="ml-2 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-slate-500 hover:bg-slate-100 hover:text-slate-900 dark:hover:bg-slate-800 dark:hover:text-slate-50"
-      >
-        <Settings className="h-3 w-3" />
-        <code className="font-mono">{datasetDir}</code>
-      </button>
+      <ImmediateTooltip content={`Dataset directory: ${datasetDir}`}>
+        <button
+          type="button"
+          onClick={() => {
+            setDraft(datasetDir);
+            setOpen(true);
+          }}
+          className="ml-2 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-slate-500 hover:bg-slate-100 hover:text-slate-900 dark:hover:bg-slate-800 dark:hover:text-slate-50"
+        >
+          <Settings className="h-3 w-3" />
+          <code className="font-mono">{datasetDir}</code>
+        </button>
+      </ImmediateTooltip>
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent>
           <DialogHeader>
@@ -283,13 +285,14 @@ function NamesOnlyPicker({
                 ))}
               </SelectContent>
             </Select>
-            <button
-              onClick={() => removeRow(i)}
-              className="rounded p-1.5 text-slate-400 hover:bg-slate-100 hover:text-red-600 dark:hover:bg-slate-800"
-              title="Remove"
-            >
-              <X className="h-3.5 w-3.5" />
-            </button>
+            <ImmediateTooltip content="Remove">
+              <button
+                onClick={() => removeRow(i)}
+                className="rounded p-1.5 text-slate-400 hover:bg-slate-100 hover:text-red-600 dark:hover:bg-slate-800"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </ImmediateTooltip>
           </div>
         ))}
         <Button variant="outline" size="sm" onClick={addRow} className="gap-1">
@@ -367,13 +370,14 @@ function NameCfgWeightPicker({
                 onChange={(e) => updateRow(i, name, cfg, e.target.value)}
                 placeholder="1.0"
               />
-              <button
-                onClick={() => removeRow(i)}
-                className="rounded p-1.5 text-slate-400 hover:bg-slate-100 hover:text-red-600 dark:hover:bg-slate-800"
-                title="Remove"
-              >
-                <X className="h-3.5 w-3.5" />
-              </button>
+              <ImmediateTooltip content="Remove">
+                <button
+                  onClick={() => removeRow(i)}
+                  className="rounded p-1.5 text-slate-400 hover:bg-slate-100 hover:text-red-600 dark:hover:bg-slate-800"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </ImmediateTooltip>
             </div>
           );
         })}

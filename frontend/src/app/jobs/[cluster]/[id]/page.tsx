@@ -31,6 +31,7 @@ import { ResumeJobButton } from "@/components/resume-job-button";
 import { RefreshButton } from "@/components/refresh-button";
 import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state";
 import { JobStateBadge } from "@/components/job-state-badge";
+import { ImmediateTooltip } from "@/components/immediate-tooltip";
 
 const REFRESH_MS = 60_000;
 const LOG_PAGE_SIZE = 100;
@@ -313,7 +314,11 @@ function formatSacctValue(key: string, value: string, cluster: string) {
   if (key !== "Start" && key !== "End") return value;
   const formatted = formatJobTimestamp(value, cluster);
   if (!formatted) return <span className="text-slate-400">—</span>;
-  return <span title={formatted.full}>{formatted.short}</span>;
+  return (
+    <ImmediateTooltip content={formatted.full}>
+      <span>{formatted.short}</span>
+    </ImmediateTooltip>
+  );
 }
 
 function GpuUsageSection({ d }: { d: JobDetails }) {
@@ -468,9 +473,11 @@ function ProgressCard({
                   />
                 </div>
                 {etaLabel && (
-                  <div className="mt-2 text-xs text-slate-500" title={etaTitle}>
-                    ~{etaLabel} left
-                  </div>
+                  <ImmediateTooltip content={etaTitle}>
+                    <div className="mt-2 text-xs text-slate-500">
+                      ~{etaLabel} left
+                    </div>
+                  </ImmediateTooltip>
                 )}
               </>
             )}

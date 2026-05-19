@@ -11,6 +11,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { ImmediateTooltip } from "@/components/immediate-tooltip";
 
 export function AvailabilityCard({
   cluster,
@@ -60,17 +61,16 @@ export function AvailabilityCard({
                 key={p.name}
                 className="flex items-center justify-between gap-3 text-xs"
               >
-                <div
-                  className="min-w-0 flex-1 truncate font-mono"
-                  title={p.name}
-                >
-                  {p.name}
-                  {p.is_default && (
-                    <Badge variant="secondary" className="ml-1 text-[10px]">
-                      def
-                    </Badge>
-                  )}
-                </div>
+                <ImmediateTooltip content={p.name} className="min-w-0 flex-1">
+                  <div className="truncate font-mono">
+                    {p.name}
+                    {p.is_default && (
+                      <Badge variant="secondary" className="ml-1 text-[10px]">
+                        def
+                      </Badge>
+                    )}
+                  </div>
+                </ImmediateTooltip>
                 <div className="shrink-0 font-mono">
                   <span
                     className={
