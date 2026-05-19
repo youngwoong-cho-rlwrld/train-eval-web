@@ -66,8 +66,9 @@ async def login(key: str) -> WandbStatus:
 
     entity, err = await asyncio.to_thread(_do)
 
-    # Clear the cached entity in details.py so the next request re-resolves it.
+    # Clear cached wandb identity data so the next request re-resolves it.
     details._wandb_entity_cache = None
+    details._wandb_workspace_cache.clear()
     return WandbStatus(
         logged_in=entity is not None,
         entity=entity,
@@ -77,5 +78,8 @@ async def login(key: str) -> WandbStatus:
 
 
 async def set_project_endpoint(project: str) -> WandbStatus:
+    from . import details
+
     set_project(project)
+    details._wandb_workspace_cache.clear()
     return await get_status()

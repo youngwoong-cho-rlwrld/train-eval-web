@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from pydantic import BaseModel, Field
 
@@ -40,6 +41,7 @@ from .wandb_config import get_project
 #     WANDB_PROJECT internally — no submission-side signal reveals which
 #     project the run actually lands in.
 WANDB_ENTITY_OVERRIDE = os.environ.get("TRAIN_EVAL_WEB_WANDB_ENTITY")
+WANDB_WORKSPACE_OVERRIDE = os.environ.get("TRAIN_EVAL_WEB_WANDB_WORKSPACE")
 
 
 class Paths(BaseModel):
@@ -664,20 +666,72 @@ async def _mlxp_progress(
     return progress
 
 
+def _append_wandb_workspace(url: str, workspace: str | None) -> str:
+    if not workspace:
+        return url
+    parsed = urlparse(url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query.setdefault("nw", workspace)
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+async def _wandb_workspace(entity: str) -> str | None:
+    """Return W&B's browser workspace selector for the entity, if known."""
+    if WANDB_WORKSPACE_OVERRIDE:
+        return WANDB_WORKSPACE_OVERRIDE
+    if entity in _wandb_workspace_cache:
+        return _wandb_workspace_cache[entity] or None
+
+    import asyncio
+
+    def _query() -> str | None:
+        try:
+            import wandb
+            api = wandb.Api(timeout=10)
+            viewer = api.viewer
+            username = getattr(viewer, "username", None)
+            if username == entity:
+                return f"nwuser{entity}"
+            teams = getattr(viewer, "teams", None)
+            if callable(teams):
+                teams = teams()
+            if isinstance(teams, dict):
+                teams = [edge.get("node") for edge in teams.get("edges", [])]
+            teams = teams or []
+            for team in teams:
+                name = team.get("name") if isinstance(team, dict) else getattr(team, "name", None)
+                if name == entity:
+                    return f"nwteam{entity}"
+        except Exception:
+            return None
+        return None
+
+    workspace = await asyncio.to_thread(_query)
+    _wandb_workspace_cache[entity] = workspace or ""
+    return workspace
+
+
+_wandb_workspace_cache: dict[str, str] = {}
+
+
 async def _wandb_url(run_id: str) -> str | None:
     import asyncio
 
     entity = await _wandb_entity()
     if not entity:
         return None
-    fallback = f"https://wandb.ai/{entity}/{get_project()}/runs/{run_id}"
+    workspace = await _wandb_workspace(entity)
+    fallback = _append_wandb_workspace(
+        f"https://wandb.ai/{entity}/{get_project()}/runs/{run_id}",
+        workspace,
+    )
 
     def _query() -> str | None:
         try:
             import wandb
             api = wandb.Api(timeout=10)
             run = api.run(f"{entity}/{get_project()}/{run_id}")
-            return run.url or fallback
+            return _append_wandb_workspace(run.url or fallback, workspace)
         except Exception:
             return fallback
 
