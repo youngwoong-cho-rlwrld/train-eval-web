@@ -18,13 +18,13 @@ export default function ExperimentsPage() {
 
       <Card className="mt-8">
         <CardHeader>
-          <CardTitle>All variants</CardTitle>
+          <CardTitle>All experiments</CardTitle>
         </CardHeader>
         <CardContent>
-          {variants.isLoading && <LoadingState label="Loading variants..." rows={5} />}
+          {variants.isLoading && <LoadingState label="Loading experiments..." rows={5} />}
           {variants.error && <ErrorState message={(variants.error as Error).message} />}
           {!variants.isLoading && !variants.error && variants.data?.length === 0 && (
-            <EmptyState message="No variants found." />
+            <EmptyState message="No experiments found." />
           )}
           {variants.data && (
             <ul className="divide-y divide-slate-100 dark:divide-slate-900">

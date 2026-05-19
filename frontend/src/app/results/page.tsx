@@ -68,7 +68,7 @@ export default function ResultsPage() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Results</h1>
           <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-slate-500 dark:text-slate-400">
-            <span>{variants.length} variants</span>
+            <span>{variants.length} experiments</span>
             <span className="text-slate-300 dark:text-slate-700">/</span>
             <span>{taskCount} tasks</span>
             <span className="text-slate-300 dark:text-slate-700">/</span>

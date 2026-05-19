@@ -396,6 +396,7 @@ def render_eval_config_preview(
     cluster: str,
     partition: str | None = None,
     node: str | None = None,
+    dataset_override: str | list[str] | None = None,
     eval_n_episodes: int | None = None,
     eval_n_runs: int | None = None,
     eval_sets: list[str] | None = None,
@@ -404,6 +405,8 @@ def render_eval_config_preview(
     extra_args: list[str] | None = None,
 ) -> str:
     text = base_config
+    if dataset_override is not None:
+        text = apply_dataset_override(text, dataset_override)
     if eval_n_episodes is not None:
         text = _set_scalar(text, "N_EPISODES", eval_n_episodes)
     if eval_n_runs is not None:

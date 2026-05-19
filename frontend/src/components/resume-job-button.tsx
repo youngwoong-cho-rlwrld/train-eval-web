@@ -97,7 +97,7 @@ export function ResumeJobButton({
             {normalizedPhase === "train" ? (
               <p>
                 Training resumes from the latest checkpoint found for this
-                variant. New checkpoints and logs will be written by the new
+                experiment. New checkpoints and logs will be written by the new
                 Slurm job.
               </p>
             ) : normalizedPhase === "eval" ? (
@@ -109,12 +109,12 @@ export function ResumeJobButton({
               </p>
             ) : (
               <p>
-                The backend will recover the original phase and variant before
+                The backend will recover the original phase and experiment before
                 submitting the replacement Slurm job.
               </p>
             )}
             <p>
-              This can update staged result artifacts for the same variant.
+              This can update staged result artifacts for the same experiment.
               Continue only if this is the timeout you intend to resume.
             </p>
           </div>

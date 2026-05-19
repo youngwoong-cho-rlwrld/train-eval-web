@@ -2,7 +2,7 @@
 
 Local-first web UI for orchestrating GR00T training & evaluation across multi-slurm clusters (kakao + skt).
 
-Runs on your Mac, talks to clusters over SSH. Configs live in this repo (`configs/experiments/<variant>/config.sh`) and are pushed to clusters on each submit — no train-eval-scripts dependency on the cluster side.
+Runs on your Mac, talks to clusters over SSH. Configs live in this repo (`configs/experiments/<experiment>/config.sh`) and are pushed to clusters on each submit — no train-eval-scripts dependency on the cluster side.
 
 ## Layout
 
@@ -10,7 +10,7 @@ Runs on your Mac, talks to clusters over SSH. Configs live in this repo (`config
 train-eval-web/
 ├── configs/              # source of truth for experiments
 │   ├── clusters/         # kakao.env, skt.env
-│   └── experiments/      # <variant>/config.sh, editable in UI
+│   └── experiments/      # <experiment>/config.sh, editable in UI
 ├── lib/                  # body scripts run by sbatch (train_body.sh, eval_body.sh, ...)
 ├── backend/              # FastAPI + asyncssh
 ├── frontend/             # Next.js + shadcn/ui
@@ -40,12 +40,12 @@ The cluster copy at `~/.train-eval-web/` is a transient mirror — it gets overw
 
 Experiment configs and the web UI live in this repo, but GR00T model-code changes live in the actual training repos:
 
-- N1.5 variants use the configured `gr00t` repo.
-- N1.6 variants use the configured `gr00t-n16` repo.
+- N1.5 experiments use the configured `gr00t` repo.
+- N1.6 experiments use the configured `gr00t-n16` repo.
 - Slurm repo paths come from `configs/clusters/<cluster>.env` via `GROOT_DIR` and `GROOT_N16_DIR`.
 - MLXP repo paths are the DDN workspaces used by the MLXP submitter.
 
-When you submit a training job, the webapp checks the selected model repo for the chosen variant and backend. For example, an N1.6 training submission checks `gr00t-n16`, not `train-eval-web`.
+When you submit a training job, the webapp checks the selected model repo for the chosen experiment and backend. For example, an N1.6 training submission checks `gr00t-n16`, not `train-eval-web`.
 
 If the selected model repo is clean, the job submits immediately and the job detail page records that model repo commit in the Submission Snapshot. If the selected model repo has uncommitted changes, the submit UI opens a confirmation modal showing the dirty files and repo path. Clicking **Commit and submit** commits those model-code changes in the training repo, then submits the job and records the new commit hash.
 

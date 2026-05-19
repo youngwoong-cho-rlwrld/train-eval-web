@@ -118,7 +118,7 @@ export function CopyCheckpointDialog({
               <ErrorState message={(checkpoints.error as Error).message} />
             )}
             {checkpoints.data && checkpoints.data.length === 0 && (
-              <EmptyState message="No checkpoints found for this variant." />
+              <EmptyState message="No checkpoints found for this experiment." />
             )}
             {checkpoints.data && checkpoints.data.length > 0 && (
               <div className="max-h-56 overflow-y-auto rounded-md border border-slate-200 dark:border-slate-800">

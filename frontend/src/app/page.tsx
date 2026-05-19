@@ -6,10 +6,10 @@ export default function Home() {
     <div className="mx-auto max-w-7xl px-8 py-12">
       <h1 className="text-2xl font-semibold tracking-tight">train-eval-web</h1>
       <div className="mt-8 grid gap-4 sm:grid-cols-2">
-        <Tile href="/submit" icon={Send} title="Submit a job" desc="Pick cluster + variant, send to sbatch" />
+        <Tile href="/submit" icon={Send} title="Submit a job" desc="Pick cluster + experiment, send to sbatch" />
         <Tile href="/jobs" icon={Activity} title="Jobs" desc="Active and recent jobs across both clusters" />
         <Tile href="/monitor" icon={Cpu} title="GPU monitor" desc="Cluster GPU availability and node status" />
-        <Tile href="/experiments" icon={FileCog} title="Experiments" desc="Create / edit variant configs" />
+        <Tile href="/experiments" icon={FileCog} title="Experiments" desc="Create / edit experiment configs" />
         <Tile href="/results" icon={Trophy} title="Results" desc="Eval success-rate tables" />
         <Tile href="/settings" icon={Settings} title="Settings" desc="Configure integrations and local app state" />
       </div>

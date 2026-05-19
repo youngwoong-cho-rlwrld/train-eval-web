@@ -45,7 +45,11 @@ import { useMyMlxpNode } from "@/hooks/use-my-mlxp-node";
 import { DatasetField } from "@/components/submit/dataset-field";
 import { MlxpCard } from "@/components/submit/mlxp-card";
 import { AvailabilityCard } from "@/components/submit/availability-card";
-import { ConfigCard } from "@/components/config-card";
+import {
+  ConfigCard,
+  type ExtraFlagRow,
+  type FlagEditor,
+} from "@/components/config-card";
 import { useDatasetDir } from "@/hooks/use-dataset-dir";
 import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state";
 
@@ -59,7 +63,7 @@ type EvalConfigEdit = {
 type TrainConfigEdit = {
   scope: string;
   numGpus: string;
-  globalBatchSize: string;
+  batchSize: string;
   maxSteps: string;
   saveSteps: string;
 };
@@ -240,17 +244,35 @@ export default function SubmitPage() {
   const trainConfigDefaults = useMemo(() => {
     const vars = variant.data?.vars;
     const numGpus = vars?.TRAIN_NUM_GPUS ?? "2";
+    const model = vars?.MODEL_VERSION ?? "n1.5";
     const perGpuBatch = vars?.TRAIN_BATCH_SIZE ?? "";
-    let globalBatchSize =
+    const globalBatch =
       vars?.TRAIN_GLOBAL_BATCH_SIZE ?? vars?.GLOBAL_BATCH_SIZE ?? "";
+    let batchSize =
+      model === "n1.5"
+        ? perGpuBatch
+        : globalBatch;
     const parsedNumGpus = Number.parseInt(numGpus, 10);
     const parsedPerGpuBatch = Number.parseInt(perGpuBatch, 10);
-    if (!globalBatchSize && parsedNumGpus > 0 && parsedPerGpuBatch > 0) {
-      globalBatchSize = String(parsedNumGpus * parsedPerGpuBatch);
+    const parsedGlobalBatch = Number.parseInt(globalBatch, 10);
+    if (!batchSize && parsedNumGpus > 0 && parsedPerGpuBatch > 0) {
+      batchSize =
+        model === "n1.5"
+          ? String(parsedPerGpuBatch)
+          : String(parsedNumGpus * parsedPerGpuBatch);
+    }
+    if (
+      !batchSize &&
+      model === "n1.5" &&
+      parsedNumGpus > 0 &&
+      parsedGlobalBatch > 0 &&
+      parsedGlobalBatch % parsedNumGpus === 0
+    ) {
+      batchSize = String(parsedGlobalBatch / parsedNumGpus);
     }
     return {
       numGpus,
-      globalBatchSize,
+      batchSize,
       maxSteps: vars?.MAX_STEPS ?? "",
       saveSteps: vars?.SAVE_STEPS ?? "",
     };
@@ -260,9 +282,9 @@ export default function SubmitPage() {
   const trainNumGpus = activeTrainConfigEdit
     ? activeTrainConfigEdit.numGpus
     : trainConfigDefaults.numGpus;
-  const trainGlobalBatchSize = activeTrainConfigEdit
-    ? activeTrainConfigEdit.globalBatchSize
-    : trainConfigDefaults.globalBatchSize;
+  const trainBatchSize = activeTrainConfigEdit
+    ? activeTrainConfigEdit.batchSize
+    : trainConfigDefaults.batchSize;
   const trainMaxSteps = activeTrainConfigEdit
     ? activeTrainConfigEdit.maxSteps
     : trainConfigDefaults.maxSteps;
@@ -270,8 +292,8 @@ export default function SubmitPage() {
     ? activeTrainConfigEdit.saveSteps
     : trainConfigDefaults.saveSteps;
   const trainNumGpusParsed = Number.parseInt(trainNumGpus.trim(), 10);
-  const trainGlobalBatchSizeParsed = Number.parseInt(
-    trainGlobalBatchSize.trim(),
+  const trainBatchSizeParsed = Number.parseInt(
+    trainBatchSize.trim(),
     10,
   );
   const trainMaxStepsParsed = Number.parseInt(trainMaxSteps.trim(), 10);
@@ -283,18 +305,15 @@ export default function SubmitPage() {
     !wantsTrainConfig ||
     (isPositiveInteger(trainNumGpus) &&
       (isSlurm || [1, 2, 4, 8].includes(trainNumGpusParsed)));
-  const trainGlobalBatchSizeValid =
-    !wantsTrainConfig ||
-    (isPositiveInteger(trainGlobalBatchSize) &&
-      (trainModel !== "n1.5" ||
-        trainGlobalBatchSizeParsed % trainNumGpusParsed === 0));
+  const trainBatchSizeValid =
+    !wantsTrainConfig || isPositiveInteger(trainBatchSize);
   const trainMaxStepsValid =
     !wantsTrainConfig || isPositiveInteger(trainMaxSteps);
   const trainSaveStepsValid =
     !wantsTrainConfig || isPositiveInteger(trainSaveSteps);
   const trainConfigValid =
     trainNumGpusValid &&
-    trainGlobalBatchSizeValid &&
+    trainBatchSizeValid &&
     trainMaxStepsValid &&
     trainSaveStepsValid;
   const updateTrainConfig = (
@@ -303,7 +322,7 @@ export default function SubmitPage() {
     const base = activeTrainConfigEdit ?? {
       scope: trainConfigScope,
       numGpus: trainConfigDefaults.numGpus,
-      globalBatchSize: trainConfigDefaults.globalBatchSize,
+      batchSize: trainConfigDefaults.batchSize,
       maxSteps: trainConfigDefaults.maxSteps,
       saveSteps: trainConfigDefaults.saveSteps,
     };
@@ -343,6 +362,12 @@ export default function SubmitPage() {
   }, [partitions.data, partition]);
   const selectedPartition = partitions.data?.find((p) => p.name === selectedPartitionName);
   const variantError = variant.error as Error | null;
+  const submittedTrainGlobalBatchSize =
+    submitPhase === "train"
+      ? trainModel === "n1.5"
+        ? trainBatchSizeParsed * trainNumGpusParsed
+        : trainBatchSizeParsed
+      : null;
 
   const buildSubmitBody = (commitDirtyChanges: boolean) => {
       let dataset_override: string | string[] | null = null;
@@ -360,8 +385,7 @@ export default function SubmitPage() {
         dataset_override,
         extra_args: extraArgs.split(/\s+/).filter(Boolean),
         train_num_gpus: submitPhase === "train" ? trainNumGpusParsed : null,
-        train_global_batch_size:
-          submitPhase === "train" ? trainGlobalBatchSizeParsed : null,
+        train_global_batch_size: submittedTrainGlobalBatchSize,
         train_max_steps: submitPhase === "train" ? trainMaxStepsParsed : null,
         train_save_steps: submitPhase === "train" ? trainSaveStepsParsed : null,
         eval_num_envs_per_gpu: null,
@@ -394,7 +418,7 @@ export default function SubmitPage() {
       multiDatasets,
       extraArgs,
       trainNumGpus,
-      trainGlobalBatchSize,
+      trainBatchSize,
       trainMaxSteps,
       trainSaveSteps,
       evalNEpisodes,
@@ -466,97 +490,6 @@ export default function SubmitPage() {
     trainConfigValid &&
     !preflightPending &&
     !submit.isPending;
-  const trainConfigFields =
-    wantsTrainConfig && variant.isLoading ? (
-      <Field label="Training overrides">
-        <LoadingState label="Loading training defaults..." rows={4} />
-      </Field>
-    ) : wantsTrainConfig && variantError ? (
-      <Field label="Training overrides">
-        <ErrorState message={variantError.message} />
-      </Field>
-    ) : wantsTrainConfig && variant.data ? (
-      <Field label="Training overrides">
-        <div className="grid gap-4 sm:grid-cols-2">
-          <div className="space-y-1.5">
-            <Label className="text-xs text-slate-500">--num-gpus</Label>
-            <Input
-              type="number"
-              min={1}
-              step={1}
-              value={trainNumGpus}
-              onChange={(e) => updateTrainConfig({ numGpus: e.target.value })}
-            />
-            {!trainNumGpusValid && (
-              <p className="text-xs text-red-600 dark:text-red-400">
-                {isSlurm ? "Enter a positive integer." : "Use 1, 2, 4, or 8."}
-              </p>
-            )}
-          </div>
-
-          <div className="space-y-1.5">
-            <Label className="text-xs text-slate-500">--global-batch-size</Label>
-            <Input
-              type="number"
-              min={1}
-              step={1}
-              value={trainGlobalBatchSize}
-              onChange={(e) =>
-                updateTrainConfig({ globalBatchSize: e.target.value })
-              }
-            />
-            {!trainGlobalBatchSizeValid && (
-              <p className="text-xs text-red-600 dark:text-red-400">
-                {trainModel === "n1.5"
-                  ? "Must divide evenly by --num-gpus."
-                  : "Enter a positive integer."}
-              </p>
-            )}
-          </div>
-
-          <div className="space-y-1.5">
-            <Label className="text-xs text-slate-500">--max-steps</Label>
-            <Input
-              type="number"
-              min={1}
-              step={1}
-              value={trainMaxSteps}
-              onChange={(e) => updateTrainConfig({ maxSteps: e.target.value })}
-            />
-            {!trainMaxStepsValid && (
-              <p className="text-xs text-red-600 dark:text-red-400">
-                Enter a positive integer.
-              </p>
-            )}
-          </div>
-
-          <div className="space-y-1.5">
-            <Label className="text-xs text-slate-500">--save-steps</Label>
-            <Input
-              type="number"
-              min={1}
-              step={1}
-              value={trainSaveSteps}
-              onChange={(e) => updateTrainConfig({ saveSteps: e.target.value })}
-            />
-            {!trainSaveStepsValid && (
-              <p className="text-xs text-red-600 dark:text-red-400">
-                Enter a positive integer.
-              </p>
-            )}
-          </div>
-        </div>
-        {activeTrainConfigEdit && (
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setTrainConfigEdit(null)}
-          >
-            Reset train defaults
-          </Button>
-        )}
-      </Field>
-    ) : null;
   const datasetField =
     variantName && variant.isLoading ? (
       <Field label="Dataset override">
@@ -586,6 +519,237 @@ export default function SubmitPage() {
       />
     ) : null;
 
+  const datasetEditor: FlagEditor | undefined = datasetField
+    ? { content: datasetField, wide: true }
+    : undefined;
+  const evalSetsEditor: FlagEditor | undefined = wantsCheckpoint
+    ? {
+        wide: true,
+        content: (
+          <div className="space-y-3">
+            {evalSetOptions.length > 0 && (
+              <div className="grid gap-2 sm:grid-cols-3">
+                {evalSetOptions.map((evalSet) => {
+                  const checked = evalSetValues.includes(evalSet);
+                  return (
+                    <label
+                      key={evalSet}
+                      className="flex h-9 items-center justify-between gap-3 rounded border border-slate-200 px-2 text-xs dark:border-slate-800"
+                    >
+                      <span className="font-mono">{evalSet}</span>
+                      <Switch
+                        checked={checked}
+                        onCheckedChange={(nextChecked) => {
+                          const next = nextChecked
+                            ? [...evalSetValues, evalSet]
+                            : evalSetValues.filter((v) => v !== evalSet);
+                          updateEvalConfig({
+                            evalSets: formatEvalSetsInput(next),
+                          });
+                        }}
+                      />
+                    </label>
+                  );
+                })}
+              </div>
+            )}
+            <Input
+              value={evalSetsText}
+              onChange={(e) =>
+                updateEvalConfig({ evalSets: e.target.value })
+              }
+              placeholder="0cm 1cm 3cm 5cm 7cm"
+              className="font-mono text-xs"
+            />
+            {!evalSetsValid && (
+              <p className="text-xs text-red-600 dark:text-red-400">
+                Choose at least one eval set. Use letters, numbers, dot,
+                underscore, or hyphen.
+              </p>
+            )}
+            {evalTotalRuns !== null && evalTotalEpisodes !== null && (
+              <p className="text-xs text-slate-500">
+                Total: <code>{evalTotalRuns}</code> runs ·{" "}
+                <code>{evalTotalEpisodes}</code> episodes
+              </p>
+            )}
+            {activeEvalConfigEdit && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setEvalConfigEdit(null)}
+              >
+                Reset eval defaults
+              </Button>
+            )}
+          </div>
+        ),
+      }
+    : undefined;
+  const checkpointEditor: FlagEditor | undefined = wantsCheckpoint
+    ? {
+        wide: true,
+        content: (
+          <div className="space-y-2">
+            <Input
+              value={checkpointPath}
+              onChange={(e) => {
+                setCheckpointEdit({
+                  scope: checkpointScope,
+                  value: e.target.value,
+                });
+              }}
+              placeholder={
+                selectedCkpt.isLoading
+                  ? "looking up auto-pick..."
+                  : "/absolute/path/to/checkpoint-N"
+              }
+              className={
+                trimmedCkpt && checkpointExistsValue === false
+                  ? "font-mono text-xs border-red-500 focus-visible:ring-red-500"
+                  : "font-mono text-xs"
+              }
+            />
+            {!trimmedCkpt && !selectedCkpt.isLoading && (
+              <p className="text-xs text-red-600 dark:text-red-400">
+                Choose a checkpoint.
+              </p>
+            )}
+            {trimmedCkpt && checkpointExistsValue === false && (
+              <p className="text-xs text-red-600 dark:text-red-400">
+                Path not found on <code>{cluster}</code>.
+              </p>
+            )}
+            {trimmedCkpt && selectedCkpt.data?.path &&
+              trimmedCkpt !== selectedCkpt.data.path && (
+                <p className="text-xs text-slate-500">
+                  Auto-pick was <code>{selectedCkpt.data.path}</code> -
+                  overriding.
+                </p>
+              )}
+          </div>
+        ),
+      }
+    : undefined;
+  const flagEditors: Record<string, FlagEditor> = {};
+  if (datasetEditor) {
+    flagEditors["--dataset-path"] = datasetEditor;
+    flagEditors["--data-config"] = datasetEditor;
+  }
+  if (wantsTrainConfig && variant.data) {
+    flagEditors["--num-gpus"] = (
+      <NumberCellEditor
+        value={trainNumGpus}
+        onChange={(value) => updateTrainConfig({ numGpus: value })}
+        valid={trainNumGpusValid}
+        invalidMessage={isSlurm ? "Positive integer." : "Use 1, 2, 4, or 8."}
+      />
+    );
+    const batchEditor = (
+      <NumberCellEditor
+        value={trainBatchSize}
+        onChange={(value) => updateTrainConfig({ batchSize: value })}
+        valid={trainBatchSizeValid}
+        invalidMessage="Positive integer."
+      />
+    );
+    flagEditors["--global-batch-size"] = batchEditor;
+    flagEditors["--batch-size"] = batchEditor;
+    flagEditors["--max-steps"] = (
+      <NumberCellEditor
+        value={trainMaxSteps}
+        onChange={(value) => updateTrainConfig({ maxSteps: value })}
+        valid={trainMaxStepsValid}
+        invalidMessage="Positive integer."
+      />
+    );
+    flagEditors["--save-steps"] = (
+      <NumberCellEditor
+        value={trainSaveSteps}
+        onChange={(value) => updateTrainConfig({ saveSteps: value })}
+        valid={trainSaveStepsValid}
+        invalidMessage="Positive integer."
+      />
+    );
+  }
+  if (wantsCheckpoint) {
+    flagEditors["--n-episodes"] = (
+      <NumberCellEditor
+        value={evalNEpisodes}
+        onChange={(value) => updateEvalConfig({ nEpisodes: value })}
+        valid={evalNEpisodesValid}
+        invalidMessage="Positive integer."
+      />
+    );
+    flagEditors["--n-runs"] = (
+      <NumberCellEditor
+        value={evalNRuns}
+        onChange={(value) => updateEvalConfig({ nRuns: value })}
+        valid={evalNRunsValid}
+        invalidMessage="Positive integer."
+      />
+    );
+    if (evalSetsEditor) flagEditors["(eval_sets)"] = evalSetsEditor;
+  }
+  const extraFlagRows: ExtraFlagRow[] = [];
+  if (wantsTrainConfig && activeTrainConfigEdit) {
+    extraFlagRows.push({
+      key: "reset-train",
+      flag: "train overrides",
+      value: "modified",
+      editor: (
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => setTrainConfigEdit(null)}
+        >
+          Reset train defaults
+        </Button>
+      ),
+    });
+  }
+  if (wantsCheckpoint) {
+    extraFlagRows.push({
+      key: "checkpoint",
+      flag: "checkpoint",
+      value:
+        checkpointPath.trim() ||
+        selectedCkpt.data?.path ||
+        (selectedCkpt.isLoading ? "..." : "(none found - eval will fail)"),
+      editor: checkpointEditor,
+    });
+    extraFlagRows.push({
+      key: "overwrite-results",
+      flag: "overwrite results",
+      value: evalOverwriteResults ? "true" : "false",
+      editor: (
+        <Switch
+          checked={evalOverwriteResults}
+          onCheckedChange={setEvalOverwriteResults}
+        />
+      ),
+    });
+  }
+  extraFlagRows.push({
+    key: "extra-sbatch-args",
+    flag: "extra sbatch args",
+    value: extraArgs.trim() || "(none)",
+    editor: {
+      wide: true,
+      content: (
+        <Input
+          placeholder={
+            isSlurm
+              ? "--exclusive --nice=100"
+              : "--exclude=rlwrld-gpu-260504-260803-st-p5en-48xl-3"
+          }
+          value={extraArgs}
+          onChange={(e) => setExtraArgs(e.target.value)}
+        />
+      ),
+    },
+  });
+
   return (
     <div className="mx-auto max-w-7xl px-8 py-12">
       <h1 className="text-2xl font-semibold tracking-tight">Submit a job</h1>
@@ -594,9 +758,9 @@ export default function SubmitPage() {
         <div className="space-y-6">
           <Card>
             <CardHeader>
-              <CardTitle>Configuration</CardTitle>
+              <CardTitle>Job</CardTitle>
               <CardDescription>
-                All fields source from your local configs/ tree.
+                Choose where the job runs and how it is identified.
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-5">
@@ -617,10 +781,10 @@ export default function SubmitPage() {
                 {clusters.error && <ErrorState message={(clusters.error as Error).message} />}
               </Field>
 
-              <Field label="Variant">
+              <Field label="Experiment">
                 <Select value={variantName} onValueChange={setVariantName}>
                   <SelectTrigger>
-                    <SelectValue placeholder="select a variant…" />
+                    <SelectValue placeholder="select an experiment..." />
                   </SelectTrigger>
                   <SelectContent>
                     {variantNames.data?.map((v) => (
@@ -630,7 +794,7 @@ export default function SubmitPage() {
                     ))}
                   </SelectContent>
                 </Select>
-                {variantNames.isLoading && <LoadingState label="Loading variants..." rows={1} />}
+                {variantNames.isLoading && <LoadingState label="Loading experiments..." rows={1} />}
                 {variantNames.error && <ErrorState message={(variantNames.error as Error).message} />}
               </Field>
 
@@ -696,10 +860,6 @@ export default function SubmitPage() {
                     {partitions.error && <ErrorState message={(partitions.error as Error).message} />}
                   </Field>
 
-                  {datasetField}
-
-                  {trainConfigFields}
-
                   <Field
                     label={
                       <span className="flex items-center gap-2">
@@ -720,7 +880,7 @@ export default function SubmitPage() {
                         placeholder={
                           variantName
                             ? defaultJobName
-                            : "pick a variant first"
+                            : "pick an experiment first"
                         }
                         className="flex-1 font-mono text-xs"
                       />
@@ -741,164 +901,6 @@ export default function SubmitPage() {
                     </p>
                   </Field>
 
-                  {wantsCheckpoint && (
-                    <Field label="Checkpoint">
-                      <Input
-                        value={checkpointPath}
-                        onChange={(e) => {
-                          setCheckpointEdit({
-                            scope: checkpointScope,
-                            value: e.target.value,
-                          });
-                        }}
-                        placeholder={
-                          selectedCkpt.isLoading
-                            ? "looking up auto-pick…"
-                            : "/absolute/path/to/checkpoint-N"
-                        }
-                        className={
-                          trimmedCkpt && checkpointExistsValue === false
-                            ? "font-mono text-xs border-red-500 focus-visible:ring-red-500"
-                            : "font-mono text-xs"
-                        }
-                      />
-                      {!trimmedCkpt && !selectedCkpt.isLoading && (
-                        <p className="text-xs text-red-600 dark:text-red-400">
-                          Choose a checkpoint
-                        </p>
-                      )}
-                      {trimmedCkpt && checkpointExistsValue === false && (
-                        <p className="text-xs text-red-600 dark:text-red-400">
-                          Path not found on <code>{cluster}</code>.
-                        </p>
-                      )}
-                      {trimmedCkpt && selectedCkpt.data?.path &&
-                        trimmedCkpt !== selectedCkpt.data.path && (
-                          <p className="text-xs text-slate-500">
-                            Auto-pick was{" "}
-                            <code>{selectedCkpt.data.path}</code> — overriding.
-                          </p>
-                        )}
-                    </Field>
-                  )}
-
-                  {wantsCheckpoint && (
-                    <div className="grid gap-4 sm:grid-cols-2">
-                      <Field label="--n-episodes">
-                        <Input
-                          type="number"
-                          min={1}
-                          step={1}
-                          value={evalNEpisodes}
-                          onChange={(e) =>
-                            updateEvalConfig({ nEpisodes: e.target.value })
-                          }
-                        />
-                        {!evalNEpisodesValid && (
-                          <p className="text-xs text-red-600 dark:text-red-400">
-                            Enter a positive integer.
-                          </p>
-                        )}
-                      </Field>
-
-                      <Field label="--n-runs">
-                        <Input
-                          type="number"
-                          min={1}
-                          step={1}
-                          value={evalNRuns}
-                          onChange={(e) =>
-                            updateEvalConfig({ nRuns: e.target.value })
-                          }
-                        />
-                        {!evalNRunsValid && (
-                          <p className="text-xs text-red-600 dark:text-red-400">
-                            Enter a positive integer.
-                          </p>
-                        )}
-                      </Field>
-                    </div>
-                  )}
-
-                  {wantsCheckpoint && (
-                    <Field label="(eval_sets)">
-                      {evalSetOptions.length > 0 && (
-                        <div className="grid gap-2 sm:grid-cols-3">
-                          {evalSetOptions.map((evalSet) => {
-                            const checked = evalSetValues.includes(evalSet);
-                            return (
-                              <label
-                                key={evalSet}
-                                className="flex h-9 items-center justify-between gap-3 rounded border border-slate-200 px-2 text-xs dark:border-slate-800"
-                              >
-                                <span className="font-mono">{evalSet}</span>
-                                <Switch
-                                  checked={checked}
-                                  onCheckedChange={(nextChecked) => {
-                                    const next = nextChecked
-                                      ? [...evalSetValues, evalSet]
-                                      : evalSetValues.filter((v) => v !== evalSet);
-                                    updateEvalConfig({
-                                      evalSets: formatEvalSetsInput(next),
-                                    });
-                                  }}
-                                />
-                              </label>
-                            );
-                          })}
-                        </div>
-                      )}
-                      <Input
-                        value={evalSetsText}
-                        onChange={(e) =>
-                          updateEvalConfig({ evalSets: e.target.value })
-                        }
-                        placeholder="0cm 1cm 3cm 5cm 7cm"
-                        className="font-mono text-xs"
-                      />
-                      {!evalSetsValid && (
-                        <p className="text-xs text-red-600 dark:text-red-400">
-                          Choose at least one eval set. Use letters, numbers,
-                          dot, underscore, or hyphen.
-                        </p>
-                      )}
-                      {evalTotalRuns !== null && evalTotalEpisodes !== null && (
-                        <p className="text-xs text-slate-500">
-                          Total: <code>{evalTotalRuns}</code> runs ·{" "}
-                          <code>{evalTotalEpisodes}</code> episodes
-                        </p>
-                      )}
-                      {activeEvalConfigEdit && (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => setEvalConfigEdit(null)}
-                        >
-                          Reset eval defaults
-                        </Button>
-                      )}
-                    </Field>
-                  )}
-
-                  {wantsCheckpoint && (
-                    <div className="flex h-10 items-center justify-between gap-4 rounded border border-slate-200 px-3 dark:border-slate-800">
-                      <Label className="text-sm font-medium">
-                        Overwrite existing evaluation results if present
-                      </Label>
-                      <Switch
-                        checked={evalOverwriteResults}
-                        onCheckedChange={setEvalOverwriteResults}
-                      />
-                    </div>
-                  )}
-
-                  <Field label="Extra sbatch args (optional)">
-                    <Input
-                      placeholder="--exclusive --nice=100"
-                      value={extraArgs}
-                      onChange={(e) => setExtraArgs(e.target.value)}
-                    />
-                  </Field>
                 </>
               )}
 
@@ -946,10 +948,6 @@ export default function SubmitPage() {
                     </p>
                   </Field>
 
-                  {datasetField}
-
-                  {trainConfigFields}
-
                   <Field
                     label={
                       <span className="flex items-center gap-2">
@@ -970,7 +968,7 @@ export default function SubmitPage() {
                         placeholder={
                           variantName
                             ? defaultJobName
-                            : "pick a variant first"
+                            : "pick an experiment first"
                         }
                         className="flex-1 font-mono text-xs"
                       />
@@ -992,13 +990,6 @@ export default function SubmitPage() {
                     </p>
                   </Field>
 
-                  <Field label="Extra sbatch args (optional)">
-                    <Input
-                      placeholder="--exclude=rlwrld-gpu-260504-260803-st-p5en-48xl-3"
-                      value={extraArgs}
-                      onChange={(e) => setExtraArgs(e.target.value)}
-                    />
-                  </Field>
                 </>
               )}
             </CardContent>
@@ -1019,6 +1010,9 @@ export default function SubmitPage() {
               effectiveConfigLoading={configPreview.isLoading}
               effectiveConfigError={configPreview.error as Error | null}
               flagsOverride={configPreview.data?.flags ?? null}
+              flagEditors={flagEditors}
+              extraFlagRows={extraFlagRows}
+              showCheckpointPathRow={false}
               loading={variant.isLoading}
               error={variantError}
               className="mt-6"
@@ -1147,6 +1141,41 @@ function Field({
     <div className="space-y-1.5">
       <Label>{label}</Label>
       {children}
+    </div>
+  );
+}
+
+function NumberCellEditor({
+  value,
+  onChange,
+  valid,
+  invalidMessage,
+  hint,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  valid: boolean;
+  invalidMessage: string;
+  hint?: string;
+}) {
+  return (
+    <div className="space-y-1">
+      <Input
+        type="number"
+        min={1}
+        step={1}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="h-8 text-xs"
+      />
+      {!valid && (
+        <p className="text-xs text-red-600 dark:text-red-400">
+          {invalidMessage}
+        </p>
+      )}
+      {valid && hint && (
+        <p className="text-xs text-slate-500">{hint}</p>
+      )}
     </div>
   );
 }

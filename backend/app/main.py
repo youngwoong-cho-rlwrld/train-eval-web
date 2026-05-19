@@ -251,6 +251,7 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
                 cluster=req.cluster,
                 partition=partition,
                 node=node,
+                dataset_override=req.dataset_override,
                 eval_n_episodes=req.eval_n_episodes,
                 eval_n_runs=req.eval_n_runs,
                 eval_sets=eval_sets,
