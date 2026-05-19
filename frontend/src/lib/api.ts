@@ -62,6 +62,10 @@ export type ConfigPreviewFlag = {
 
 export type SubmitConfigPreview = {
   path: string | null;
+  model_id: string | null;
+  model_label: string | null;
+  model_repo_path: string | null;
+  model_repo_error: string | null;
   text: string;
   flags: ConfigPreviewFlag[];
 };

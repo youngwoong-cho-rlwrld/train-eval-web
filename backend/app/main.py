@@ -157,6 +157,10 @@ class ConfigPreviewFlag(BaseModel):
 
 class SubmitConfigPreview(BaseModel):
     path: str | None = None
+    model_id: str | None = None
+    model_label: str | None = None
+    model_repo_path: str | None = None
+    model_repo_error: str | None = None
     text: str
     flags: list[ConfigPreviewFlag]
 
@@ -194,11 +198,27 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
         job_name = submit.resolve_job_name(req.job_name, req.phase, req.variant)
         partition = req.partition
         node = req.node
+        env = None
+        model_repo_path: str | None = None
+        model_repo_error: str | None = None
         if req.cluster != "mlxp":
             env = await clusters.load_cluster(req.cluster)
             partition = partition or env.vars["PARTITION"]
+            try:
+                model_repo_path = submission_snapshot.slurm_training_repo_path(env.vars, model)
+            except ValueError as e:
+                model_repo_error = str(e)
         elif not node:
             node = mlxp_submit.DEFAULT_NODE
+            try:
+                model_repo_path = mlxp_submit.mlxp_training_repo_path(model)
+            except ValueError as e:
+                model_repo_error = str(e)
+        else:
+            try:
+                model_repo_path = mlxp_submit.mlxp_training_repo_path(model)
+            except ValueError as e:
+                model_repo_error = str(e)
 
         path: str | None = None
         if req.phase == "train":
@@ -266,6 +286,10 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
         out = flags.flags_for(effective_variant, req.cluster, req.phase)
         return {
             "path": path,
+            "model_id": model.id,
+            "model_label": model.label,
+            "model_repo_path": model_repo_path,
+            "model_repo_error": model_repo_error,
             "text": text,
             "flags": [{"flag": f, "value": val} for f, val in out],
         }

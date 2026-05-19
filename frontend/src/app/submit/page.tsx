@@ -436,6 +436,33 @@ export default function SubmitPage() {
     enabled: configPreviewEnabled,
     retry: false,
   });
+  const trainGitStatus = useQuery({
+    queryKey: ["submit-git-status", cluster, variantName],
+    queryFn: () => {
+      const qs = new URLSearchParams({ cluster, variant: variantName });
+      return api<GitStatus>(`/api/submit/git-status?${qs}`);
+    },
+    enabled:
+      submitPhase === "train" &&
+      !!variantName &&
+      !variant.isLoading &&
+      !variantError &&
+      configPreview.isSuccess &&
+      !configPreview.data.model_repo_error,
+    retry: false,
+    staleTime: 30_000,
+    refetchOnWindowFocus: false,
+  });
+  const modelRepoError =
+    configPreview.data?.model_repo_error ??
+    trainGitStatus.data?.error ??
+    ((trainGitStatus.error as Error | null)?.message ?? null);
+  const modelRepoMessage =
+    !modelRepoError && trainGitStatus.data
+      ? trainGitStatus.data.dirty
+        ? `Git ${trainGitStatus.data.short_commit ?? "unknown"} · uncommitted changes`
+        : `Git ${trainGitStatus.data.short_commit ?? "unknown"} · clean`
+      : null;
 
   const submit = useMutation({
     mutationFn: ({ commitDirtyChanges = false }: { commitDirtyChanges?: boolean } = {}) => {
@@ -488,6 +515,8 @@ export default function SubmitPage() {
         evalNRunsValid &&
         evalSetsValid)) &&
     trainConfigValid &&
+    !modelRepoError &&
+    !configPreview.error &&
     !preflightPending &&
     !submit.isPending;
   const datasetField =
@@ -1007,6 +1036,11 @@ export default function SubmitPage() {
               checkpointOverrideExists={checkpointExistsValue}
               effectiveConfigText={configPreview.data?.text ?? null}
               effectiveConfigPath={configPreview.data?.path ?? null}
+              modelLabel={configPreview.data?.model_label ?? null}
+              modelRepoPath={configPreview.data?.model_repo_path ?? null}
+              modelRepoError={modelRepoError}
+              modelRepoMessage={modelRepoMessage}
+              modelRepoChecking={submitPhase === "train" && trainGitStatus.isLoading}
               effectiveConfigLoading={configPreview.isLoading}
               effectiveConfigError={configPreview.error as Error | null}
               flagsOverride={configPreview.data?.flags ?? null}

@@ -39,6 +39,11 @@ export function ConfigCard({
   checkpointOverrideExists,
   effectiveConfigText,
   effectiveConfigPath,
+  modelLabel,
+  modelRepoPath,
+  modelRepoError,
+  modelRepoMessage,
+  modelRepoChecking = false,
   effectiveConfigLoading = false,
   effectiveConfigError,
   flagsOverride,
@@ -62,6 +67,11 @@ export function ConfigCard({
   checkpointOverrideExists?: boolean | null;
   effectiveConfigText?: string | null;
   effectiveConfigPath?: string | null;
+  modelLabel?: string | null;
+  modelRepoPath?: string | null;
+  modelRepoError?: string | null;
+  modelRepoMessage?: string | null;
+  modelRepoChecking?: boolean;
   effectiveConfigLoading?: boolean;
   effectiveConfigError?: Error | null;
   flagsOverride?: FlagEntry[] | null;
@@ -140,6 +150,27 @@ export function ConfigCard({
                 value={configPath}
                 labelHelp="The original config.sh in this repo. It is the base file before submit-time overrides are applied."
                 valueTooltip={configPath}
+              />
+            )}
+            {modelLabel && (
+              <ConfigPathRow
+                label="model"
+                value={modelLabel}
+                labelHelp="The model registry entry selected by this experiment."
+              />
+            )}
+            {(modelRepoPath || modelRepoError || modelRepoChecking) && (
+              <ConfigPathRow
+                label="model repo"
+                value={modelRepoPath ?? "(not configured)"}
+                labelHelp="The code repository used to run this job. This is different from --base-model-path, which is the pretrained checkpoint argument."
+                valueTooltip={modelRepoPath ?? undefined}
+                tone={modelRepoError ? "error" : "default"}
+                message={
+                  modelRepoError ??
+                  (modelRepoChecking ? "Checking model repository..." : modelRepoMessage)
+                }
+                copyValue={modelRepoPath ?? null}
               />
             )}
             {modalityPath && (
@@ -283,36 +314,52 @@ function ConfigPathRow({
   value,
   labelHelp,
   valueTooltip,
+  message,
+  copyValue,
   tone = "default",
 }: {
   label: string;
   value: string;
   labelHelp?: string;
   valueTooltip?: string;
+  message?: string | null;
+  copyValue?: string | null;
   tone?: "default" | "error";
 }) {
   const valueClass =
     tone === "error"
       ? "flex-1 truncate font-mono text-xs text-red-600 dark:text-red-400"
       : "flex-1 truncate font-mono text-xs";
+  const messageClass =
+    tone === "error"
+      ? "mt-1 pl-[calc(110px+1rem)] text-xs text-red-600 dark:text-red-400"
+      : "mt-1 pl-[calc(110px+1rem)] text-xs text-slate-500 dark:text-slate-400";
+  const shownCopyValue = copyValue === undefined ? value : copyValue;
   return (
-    <div className="flex items-center justify-between gap-4 py-2">
-      <div className="flex min-w-[110px] items-center gap-1.5 text-xs uppercase tracking-wide text-slate-500">
-        <span>{label}</span>
-        {labelHelp && (
-          <ImmediateTooltip content={labelHelp}>
-            <CircleHelp className="h-3.5 w-3.5 text-slate-400" />
-          </ImmediateTooltip>
+    <div className="py-2">
+      <div className="flex items-center justify-between gap-4">
+        <div className="flex min-w-[110px] items-center gap-1.5 text-xs uppercase tracking-wide text-slate-500">
+          <span>{label}</span>
+          {labelHelp && (
+            <ImmediateTooltip content={labelHelp}>
+              <CircleHelp className="h-3.5 w-3.5 text-slate-400" />
+            </ImmediateTooltip>
+          )}
+        </div>
+        <ImmediateTooltip
+          content={valueTooltip}
+          className="min-w-0 flex-1"
+          contentClassName="font-mono"
+        >
+          <span className={valueClass}>{value}</span>
+        </ImmediateTooltip>
+        {shownCopyValue ? (
+          <CopyButton value={shownCopyValue} />
+        ) : (
+          <div className="h-8 w-8" />
         )}
       </div>
-      <ImmediateTooltip
-        content={valueTooltip}
-        className="min-w-0 flex-1"
-        contentClassName="font-mono"
-      >
-        <span className={valueClass}>{value}</span>
-      </ImmediateTooltip>
-      <CopyButton value={value} />
+      {message && <div className={messageClass}>{message}</div>}
     </div>
   );
 }

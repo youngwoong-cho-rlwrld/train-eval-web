@@ -274,6 +274,8 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
         }
         effectiveConfigText={details.data?.config_snapshot?.text ?? null}
         effectiveConfigPath={details.data?.config_snapshot?.path ?? null}
+        modelLabel={details.data?.config_snapshot?.git_repo_label ?? null}
+        modelRepoPath={details.data?.config_snapshot?.git_repo_path ?? null}
         loading={details.isLoading}
         error={detailsError}
         className="mt-6"

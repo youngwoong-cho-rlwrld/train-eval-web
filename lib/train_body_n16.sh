@@ -86,7 +86,14 @@ export WANDB_RESUME=allow
 
 cd "$TRAIN_REPO_DIR"
 
-uv run torchrun --nproc_per_node="$TRAIN_NUM_GPUS" gr00t/experiment/launch_finetune.py \
+if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+    MASTER_PORT="${MASTER_PORT:-$((20000 + (SLURM_JOB_ID % 40000)))}"
+else
+    MASTER_PORT="${MASTER_PORT:-29500}"
+fi
+log "Torchrun master port: $MASTER_PORT"
+
+uv run torchrun --nproc_per_node="$TRAIN_NUM_GPUS" --master-port "$MASTER_PORT" gr00t/experiment/launch_finetune.py \
     --base-model-path nvidia/GR00T-N1.6-3B \
     --dataset-path "${DATASET_PATHS[@]}" \
     --embodiment-tag NEW_EMBODIMENT \
