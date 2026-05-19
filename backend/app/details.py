@@ -85,6 +85,16 @@ class GpuUsage(BaseModel):
     error: str | None = None
 
 
+class ConfigSnapshot(BaseModel):
+    path: str | None = None
+    meta_path: str | None = None
+    text: str | None = None
+    git_commit: str | None = None
+    git_dirty_at_submit: bool | None = None
+    git_committed_dirty: bool | None = None
+    error: str | None = None
+
+
 class JobDetails(BaseModel):
     cluster: str
     job_id: str
@@ -97,6 +107,7 @@ class JobDetails(BaseModel):
     paths: Paths
     progress: Progress
     gpu: GpuUsage | None = None
+    config_snapshot: ConfigSnapshot | None = None
 
 
 def _metadata_fields(text: str | None) -> dict[str, str]:
@@ -300,6 +311,7 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
         eval_dir=eval_dir,
         isaac_logs_glob=isaac_logs_glob,
     )
+    config_snapshot = await _slurm_config_snapshot(env.ssh_alias, slurm_meta)
 
     wandb_url: str | None = None
     if phase in ("train", "resume"):
@@ -338,6 +350,7 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
         cluster=cluster, job_id=job_id, job_name=job_name,
         phase=phase, variant=variant, state=state, elapsed=elapsed,
         wandb_url=wandb_url, paths=paths, progress=progress, gpu=gpu,
+        config_snapshot=config_snapshot,
     )
 
 
@@ -369,13 +382,106 @@ async def _mlxp_details(
     # run behind it.
     wandb_url = await _wandb_url(job_name)
 
-    progress = await _mlxp_progress(job_name, variant, phase, _metadata_fields(job_comment))
+    metadata = _metadata_fields(job_comment)
+    config_snapshot = await _mlxp_config_snapshot(metadata)
+    progress = await _mlxp_progress(job_name, variant, phase, metadata)
     gpu = await _mlxp_gpu_usage(pod_name, node, state) if include_gpu else None
 
     return JobDetails(
         cluster="mlxp", job_id=job_id, job_name=job_name,
         phase=phase, variant=variant, state=state, elapsed=elapsed,
         wandb_url=wandb_url, paths=paths, progress=progress, gpu=gpu,
+        config_snapshot=config_snapshot,
+    )
+
+
+def _meta_bool(value: str | None) -> bool | None:
+    if value is None or value == "":
+        return None
+    return value.strip().lower() in {"1", "true", "yes", "y"}
+
+
+async def _slurm_config_snapshot(host: str, meta: dict[str, str]) -> ConfigSnapshot | None:
+    path = meta.get("config_snapshot_path")
+    meta_path = meta.get("config_snapshot_meta_path")
+    rel = meta.get("config_snapshot_rel")
+    if not path and rel:
+        path = f"$HOME/{rel}"
+    if not path:
+        return None
+
+    text: str | None = None
+    error: str | None = None
+    if rel:
+        cmd = f"cat $HOME/{shlex.quote(rel)} 2>/dev/null"
+    else:
+        cat_path = path
+        if cat_path.startswith("$HOME/"):
+            cmd = f"cat $HOME/{shlex.quote(cat_path[len('$HOME/'):])} 2>/dev/null"
+        else:
+            cmd = f"cat {shlex.quote(cat_path)} 2>/dev/null"
+    r = await ssh_run(host, cmd, timeout=10.0)
+    if r.returncode == 0:
+        text = r.stdout
+    else:
+        error = (r.stderr or "config snapshot not found").strip()
+
+    return ConfigSnapshot(
+        path=path,
+        meta_path=meta_path,
+        text=text,
+        git_commit=meta.get("submit_git_commit") or None,
+        git_dirty_at_submit=_meta_bool(meta.get("submit_git_dirty_at_submit")),
+        git_committed_dirty=_meta_bool(meta.get("submit_git_committed_dirty")),
+        error=error,
+    )
+
+
+async def _mlxp_config_snapshot(meta: dict[str, str]) -> ConfigSnapshot | None:
+    path = meta.get("config_snapshot_path")
+    if not path:
+        return None
+    meta_path = meta.get("config_snapshot_meta_path")
+
+    import asyncio
+    import shutil
+    from .mlxp_data_pod import ensure_listing_pod
+
+    text: str | None = None
+    error: str | None = None
+    if shutil.which("kubectl") is None:
+        error = "kubectl not found on PATH"
+    else:
+        try:
+            pod = await ensure_listing_pod()
+            proc = await asyncio.create_subprocess_exec(
+                "kubectl",
+                "exec",
+                "-n",
+                MLXP_NAMESPACE,
+                pod,
+                "--",
+                "cat",
+                path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=12.0)
+            if proc.returncode == 0:
+                text = stdout.decode(errors="replace")
+            else:
+                error = stderr.decode(errors="replace").strip() or "config snapshot not found"
+        except Exception as exc:
+            error = str(exc)
+
+    return ConfigSnapshot(
+        path=path,
+        meta_path=meta_path,
+        text=text,
+        git_commit=meta.get("submit_git_commit") or None,
+        git_dirty_at_submit=_meta_bool(meta.get("submit_git_dirty_at_submit")),
+        git_committed_dirty=_meta_bool(meta.get("submit_git_committed_dirty")),
+        error=error,
     )
 
 

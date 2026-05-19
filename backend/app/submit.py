@@ -19,6 +19,14 @@ from pydantic import BaseModel, Field
 from .clusters import load_cluster
 from .paths import CLUSTER_STAGING_REL, CONFIGS_DIR, LIB_DIR
 from .ssh import rsync_to, ssh_run
+from .submission_snapshot import (
+    apply_dataset_override,
+    metadata_json,
+    prepare_training_git,
+    render_training_config_snapshot,
+    snapshot_metadata,
+    snapshot_suffix,
+)
 from .variants import load_variant
 from .variant_values import variant_int
 
@@ -26,40 +34,6 @@ from .variant_values import variant_int
 def _is_background_partition(name: str) -> bool:
     """Preemptible partitions (auto-add --requeue at submit time)."""
     return name == "background" or name.endswith("_background")
-
-
-def _apply_dataset_override(config_text: str, override: str | list[str]) -> str:
-    """Rewrite a variant config.sh to use the requested dataset(s).
-
-    - String override → replaces DATASET_NAME=... (single-task).
-    - List override → replaces whichever multi-dataset block the variant
-      already uses: TRAIN_DATASET_NAMES (N1.6, name-only) or DATASETS
-      (N1.5, "name|cfg|weight"). Block shape is detected from the entries.
-    """
-    if isinstance(override, str):
-        new_line = f"DATASET_NAME={override}"
-        return re.sub(
-            r"^(\s*export\s+)?DATASET_NAME=.*$",
-            lambda m: (m.group(1) or "") + new_line,
-            config_text,
-            flags=re.MULTILINE,
-        )
-
-    # N1.6 (name-only): entries have no `|` → TRAIN_DATASET_NAMES.
-    is_names_only = all("|" not in e for e in override)
-    block_name = "TRAIN_DATASET_NAMES" if is_names_only else "DATASETS"
-    new_block_lines = [f"{block_name}=("]
-    new_block_lines.extend(f'    "{entry}"' for entry in override)
-    new_block_lines.append(")")
-    new_block = "\n".join(new_block_lines)
-    pattern = rf"^{block_name}=\(.*?^\)\s*$"
-    return re.sub(
-        pattern,
-        new_block,
-        config_text,
-        count=1,
-        flags=re.MULTILINE | re.DOTALL,
-    )
 
 
 class SubmitRequest(BaseModel):
@@ -106,6 +80,8 @@ class SubmitRequest(BaseModel):
     # `{train|eval}_<anything>_<YYYYMMDD>_<HHMMSS>` so the parser
     # keeps working. None → server builds the default.
     job_name: str | None = None
+    # Train-only: set after explicit user approval when the repo is dirty.
+    commit_dirty_changes: bool = False
 
 
 def make_default_job_name(phase: str, variant: str) -> str:
@@ -165,6 +141,18 @@ _BODY_BY_PHASE_MODEL = {
 MAX_EVAL_NUM_ENVS_PER_GPU = 1
 
 
+async def _rsync_text(host: str, text: str, remote_rel: str) -> None:
+    with tempfile.NamedTemporaryFile(mode="w", suffix="_submit_snapshot", delete=False) as fp:
+        fp.write(text)
+        tmp_path = fp.name
+    try:
+        r = await rsync_to(host, tmp_path, remote_rel)
+        if r.returncode != 0:
+            raise RuntimeError(f"rsync snapshot failed: {r.stderr}")
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
 async def submit(req: SubmitRequest) -> SubmitResponse:
     if req.resume and req.phase != "train":
         raise ValueError("resume=true is only valid for phase=train")
@@ -216,10 +204,75 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     train_num_gpus = req.train_num_gpus or variant_int(variant, "TRAIN_NUM_GPUS", 2)
     train_max_steps = req.train_max_steps or variant_int(variant, "MAX_STEPS", 30000)
     train_save_steps = req.train_save_steps or variant_int(variant, "SAVE_STEPS", 1000)
+    effective_train_global_batch_size = req.train_global_batch_size
+    if req.phase == "train" and effective_train_global_batch_size is None:
+        for key in ("TRAIN_GLOBAL_BATCH_SIZE", "GLOBAL_BATCH_SIZE"):
+            raw = variant.vars.get(key)
+            if raw:
+                try:
+                    effective_train_global_batch_size = int(raw)
+                    break
+                except ValueError:
+                    pass
+        if effective_train_global_batch_size is None:
+            effective_train_global_batch_size = variant_int(variant, "TRAIN_BATCH_SIZE", 64) * train_num_gpus
     if req.phase == "train" and req.train_global_batch_size is not None and model == "n1.5":
         if req.train_global_batch_size % train_num_gpus != 0:
             raise ValueError("train_global_batch_size must be divisible by train_num_gpus for n1.5 training")
     gpus = str(train_num_gpus)
+
+    # Unified shape across slurm + MLXP. The cluster/partition are shown in
+    # table columns; the job name carries phase, variant, and timestamp.
+    job_name = resolve_job_name(req.job_name, req.phase, req.variant)
+
+    submit_git = None
+    snapshot_rel: str | None = None
+    snapshot_meta_rel: str | None = None
+    snapshot_path: str | None = None
+    snapshot_meta_path: str | None = None
+    snapshot_text: str | None = None
+    snapshot_meta_text: str | None = None
+    if req.phase == "train":
+        submit_git = await prepare_training_git(
+            job_name,
+            req.commit_dirty_changes,
+            require_clean=not req.resume,
+        )
+        suffix = snapshot_suffix(job_name)
+        snapshot_rel = f"{CLUSTER_STAGING_REL}/experiments/{req.variant}/config_{suffix}.sh"
+        snapshot_meta_rel = f"{CLUSTER_STAGING_REL}/experiments/{req.variant}/config_{suffix}.meta.json"
+        snapshot_path = f"$HOME/{snapshot_rel}"
+        snapshot_meta_path = f"$HOME/{snapshot_meta_rel}"
+        snapshot_text = render_training_config_snapshot(
+            base_config=variant.raw,
+            variant=req.variant,
+            model=model,
+            job_name=job_name,
+            cluster=req.cluster,
+            partition=partition,
+            dataset_override=req.dataset_override,
+            extra_args=req.extra_args,
+            train_num_gpus=train_num_gpus,
+            train_global_batch_size=effective_train_global_batch_size,
+            train_max_steps=train_max_steps,
+            train_save_steps=train_save_steps,
+            git=submit_git,
+        )
+        snapshot_meta_text = metadata_json(snapshot_metadata(
+            job_name=job_name,
+            cluster=req.cluster,
+            variant=req.variant,
+            path=snapshot_path,
+            meta_path=snapshot_meta_path,
+            partition=partition,
+            dataset_override=req.dataset_override,
+            extra_args=req.extra_args,
+            train_num_gpus=train_num_gpus,
+            train_global_batch_size=effective_train_global_batch_size,
+            train_max_steps=train_max_steps,
+            train_save_steps=train_save_steps,
+            git=submit_git,
+        ))
 
     # ── Sync code to cluster staging ──
     # Body scripts expect $REPO_ROOT/{clusters,experiments,lib}/ at the staging
@@ -252,7 +305,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
 
     # Apply dataset override to the staged config.sh, if requested.
     if req.dataset_override is not None:
-        modified = _apply_dataset_override(variant.raw, req.dataset_override)
+        modified = apply_dataset_override(variant.raw, req.dataset_override)
         if modified != variant.raw:
             with tempfile.NamedTemporaryFile(
                 mode="w", suffix="_config.sh", delete=False,
@@ -267,6 +320,10 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
                 rsync_results.append(r)
             finally:
                 Path(tmp_path).unlink(missing_ok=True)
+
+    if snapshot_rel and snapshot_text and snapshot_meta_rel and snapshot_meta_text:
+        await _rsync_text(host, snapshot_text, snapshot_rel)
+        await _rsync_text(host, snapshot_meta_text, snapshot_meta_rel)
 
     if req.phase == "eval" and req.seed_eval_results_from:
         dst_rel = f"{CLUSTER_STAGING_REL}/experiments/{req.variant}/eval_results"
@@ -291,10 +348,6 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
                 raise RuntimeError(f"seeding eval results failed: {seeded.stderr or seeded.stdout}")
 
     # ── Build sbatch command ──
-    # Unified shape across slurm + MLXP. The cluster/partition were
-    # cosmetic in the slurm filename — drop them; the table column shows
-    # both, and `parse_phase_and_variant` now expects this exact format.
-    job_name = resolve_job_name(req.job_name, req.phase, req.variant)
     log_dir = cluster.vars["LOG_DIR"]
     resume_expected = "1" if req.resume else "0"
 
@@ -313,6 +366,10 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         )
         if req.train_global_batch_size is not None:
             comment += f";train_global_batch_size={req.train_global_batch_size}"
+        if snapshot_path:
+            comment += f";config_snapshot_path={snapshot_path}"
+        if submit_git and submit_git.commit:
+            comment += f";submit_git_commit={submit_git.commit}"
 
     sbatch_parts = [
         "/opt/slurm/bin/sbatch",
@@ -413,6 +470,21 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         + (
             f"train_global_batch_size={req.train_global_batch_size}\n"
             if req.phase == "train" and req.train_global_batch_size is not None
+            else ""
+        )
+        + (
+            f"config_snapshot_path={snapshot_path}\n"
+            f"config_snapshot_rel={snapshot_rel}\n"
+            f"config_snapshot_meta_path={snapshot_meta_path}\n"
+            f"config_snapshot_meta_rel={snapshot_meta_rel}\n"
+            if req.phase == "train" and snapshot_path and snapshot_rel and snapshot_meta_path and snapshot_meta_rel
+            else ""
+        )
+        + (
+            f"submit_git_commit={submit_git.commit}\n"
+            f"submit_git_dirty_at_submit={'true' if submit_git.dirty_before else 'false'}\n"
+            f"submit_git_committed_dirty={'true' if submit_git.committed_dirty else 'false'}\n"
+            if req.phase == "train" and submit_git
             else ""
         )
         + (

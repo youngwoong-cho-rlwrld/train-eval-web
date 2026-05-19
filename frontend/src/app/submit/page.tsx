@@ -11,6 +11,7 @@ import {
   type Partition,
   type Dataset,
   type MlxpNode,
+  type GitStatus,
 } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import {
@@ -31,6 +32,14 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { useMyMlxpNode } from "@/hooks/use-my-mlxp-node";
 import { DatasetField } from "@/components/submit/dataset-field";
 import { MlxpCard } from "@/components/submit/mlxp-card";
@@ -84,6 +93,9 @@ export default function SubmitPage() {
   } | null>(null);
   const [jobName, setJobName] = useState<string>("");
   const [jobNameTouched, setJobNameTouched] = useState<boolean>(false);
+  const [gitDialogOpen, setGitDialogOpen] = useState<boolean>(false);
+  const [dirtyGitStatus, setDirtyGitStatus] = useState<GitStatus | null>(null);
+  const [preflightPending, setPreflightPending] = useState<boolean>(false);
 
   // Dataset override state. For single-task variants, `singleDataset` holds
   // the chosen name. For multi-task, `multiDatasets` holds the array of
@@ -329,37 +341,42 @@ export default function SubmitPage() {
     return (partitions.data.find((p) => p.is_default) ?? partitions.data[0])?.name ?? "";
   }, [partitions.data, partition]);
 
-  const submit = useMutation({
-    mutationFn: () => {
+  const buildSubmitBody = (commitDirtyChanges: boolean) => {
       let dataset_override: string | string[] | null = null;
       if (datasetTouched) {
         if (variant.data?.arrays.TRAIN_DATASET_NAMES) dataset_override = multiDatasets;
         else if (variant.data?.arrays.DATASETS) dataset_override = multiDatasets;
         else if (variant.data?.vars.DATASET_NAME) dataset_override = singleDataset;
       }
+      return {
+        cluster,
+        variant: variantName,
+        phase: submitPhase,
+        partition: isSlurm ? selectedPartitionName : null,
+        node: isSlurm ? null : mlxpNode,
+        dataset_override,
+        extra_args: extraArgs.split(/\s+/).filter(Boolean),
+        train_num_gpus: submitPhase === "train" ? trainNumGpusParsed : null,
+        train_global_batch_size:
+          submitPhase === "train" ? trainGlobalBatchSizeParsed : null,
+        train_max_steps: submitPhase === "train" ? trainMaxStepsParsed : null,
+        train_save_steps: submitPhase === "train" ? trainSaveStepsParsed : null,
+        eval_num_envs_per_gpu: null,
+        eval_n_episodes: wantsCheckpoint ? evalNEpisodesParsed : null,
+        eval_n_runs: wantsCheckpoint ? evalNRunsParsed : null,
+        eval_sets: wantsCheckpoint ? evalSetValues : null,
+        eval_overwrite_results: wantsCheckpoint ? evalOverwriteResults : false,
+        checkpoint_path: wantsCheckpoint ? checkpointPath.trim() : null,
+        job_name: jobNameTouched ? jobName.trim() : null,
+        commit_dirty_changes: commitDirtyChanges,
+      };
+  };
+
+  const submit = useMutation({
+    mutationFn: ({ commitDirtyChanges = false }: { commitDirtyChanges?: boolean } = {}) => {
       return api<SubmitResponse>("/api/submit", {
         method: "POST",
-        body: JSON.stringify({
-          cluster,
-          variant: variantName,
-          phase: submitPhase,
-          partition: isSlurm ? selectedPartitionName : null,
-          node: isSlurm ? null : mlxpNode,
-          dataset_override,
-          extra_args: extraArgs.split(/\s+/).filter(Boolean),
-          train_num_gpus: submitPhase === "train" ? trainNumGpusParsed : null,
-          train_global_batch_size:
-            submitPhase === "train" ? trainGlobalBatchSizeParsed : null,
-          train_max_steps: submitPhase === "train" ? trainMaxStepsParsed : null,
-          train_save_steps: submitPhase === "train" ? trainSaveStepsParsed : null,
-          eval_num_envs_per_gpu: null,
-          eval_n_episodes: wantsCheckpoint ? evalNEpisodesParsed : null,
-          eval_n_runs: wantsCheckpoint ? evalNRunsParsed : null,
-          eval_sets: wantsCheckpoint ? evalSetValues : null,
-          eval_overwrite_results: wantsCheckpoint ? evalOverwriteResults : false,
-          checkpoint_path: wantsCheckpoint ? checkpointPath.trim() : null,
-          job_name: jobNameTouched ? jobName.trim() : null,
-        }),
+        body: JSON.stringify(buildSubmitBody(commitDirtyChanges)),
       });
     },
     onSuccess: (data) => {
@@ -369,6 +386,31 @@ export default function SubmitPage() {
     },
     onError: (err: Error) => toast.error(`Submit failed: ${err.message}`),
   });
+
+  async function handleSubmitClick() {
+    if (submitPhase !== "train") {
+      submit.mutate({ commitDirtyChanges: false });
+      return;
+    }
+    setPreflightPending(true);
+    try {
+      const status = await api<GitStatus>("/api/submit/git-status");
+      if (status.error) {
+        toast.error(`Git status failed: ${status.error}`);
+        return;
+      }
+      if (status.dirty) {
+        setDirtyGitStatus(status);
+        setGitDialogOpen(true);
+        return;
+      }
+      submit.mutate({ commitDirtyChanges: false });
+    } catch (err) {
+      toast.error(`Git preflight failed: ${(err as Error).message}`);
+    } finally {
+      setPreflightPending(false);
+    }
+  }
 
   const canSubmit =
     !!variantName &&
@@ -380,6 +422,7 @@ export default function SubmitPage() {
         evalNRunsValid &&
         evalSetsValid)) &&
     trainConfigValid &&
+    !preflightPending &&
     !submit.isPending;
   const selectedPartition = partitions.data?.find((p) => p.name === selectedPartitionName);
   const variantError = variant.error as Error | null;
@@ -938,8 +981,8 @@ export default function SubmitPage() {
           )}
 
           <div className="flex justify-end">
-            <Button onClick={() => submit.mutate()} disabled={!canSubmit}>
-              {submit.isPending
+            <Button onClick={handleSubmitClick} disabled={!canSubmit}>
+              {submit.isPending || preflightPending
                 ? "Submitting…"
                 : isSlurm
                   ? `Submit ${phase} → ${cluster}/${selectedPartitionName || "?"}`
@@ -975,6 +1018,42 @@ export default function SubmitPage() {
           )}
         </aside>
       </div>
+
+      <Dialog open={gitDialogOpen} onOpenChange={setGitDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Commit uncommitted changes before training?</DialogTitle>
+            <DialogDescription>
+              Training submissions record the train-eval-web git commit. The
+              current working tree is dirty, so the backend will commit these
+              changes before submitting and store that hash in the job snapshot.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="max-h-56 overflow-auto rounded border border-slate-200 bg-slate-50 p-3 font-mono text-xs dark:border-slate-800 dark:bg-slate-950">
+            {dirtyGitStatus?.files.map((line) => (
+              <div key={line}>{line}</div>
+            ))}
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setGitDialogOpen(false)}
+              disabled={submit.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={() => {
+                setGitDialogOpen(false);
+                submit.mutate({ commitDirtyChanges: true });
+              }}
+              disabled={submit.isPending}
+            >
+              {submit.isPending ? "Submitting..." : "Commit and submit"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

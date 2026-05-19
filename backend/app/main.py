@@ -6,7 +6,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
-from . import clusters, copy_checkpoint, datasets, details, flags, job_resume, jobs, mlxp, mlxp_submit, partitions, results, submit, variants, wandb_auth
+from . import clusters, copy_checkpoint, datasets, details, flags, job_resume, jobs, mlxp, mlxp_submit, partitions, results, submission_snapshot, submit, variants, wandb_auth
 from .ssh import ssh_tail_lines
 
 
@@ -147,6 +147,11 @@ async def get_selected_checkpoint(name: str, cluster: str):
 
 # ── submit ──
 
+@app.get("/api/submit/git-status", response_model=submission_snapshot.GitStatus)
+async def get_submit_git_status():
+    return await submission_snapshot.git_status()
+
+
 @app.post("/api/submit")
 async def post_submit(req: submit.SubmitRequest):
     """Dispatches to the per-cluster submitter.
@@ -177,6 +182,7 @@ async def post_submit(req: submit.SubmitRequest):
                 dataset_override=req.dataset_override,
                 extra_args=req.extra_args,
                 job_name=req.job_name,
+                commit_dirty_changes=req.commit_dirty_changes,
             )
             r = await mlxp_submit.submit_mlxp(mlxp_req)
             return {

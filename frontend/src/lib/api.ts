@@ -94,6 +94,16 @@ export type GpuUsage = {
   error: string | null;
 };
 
+export type ConfigSnapshot = {
+  path: string | null;
+  meta_path: string | null;
+  text: string | null;
+  git_commit: string | null;
+  git_dirty_at_submit: boolean | null;
+  git_committed_dirty: boolean | null;
+  error: string | null;
+};
+
 export type Dataset = {
   name: string;
   path: string;
@@ -133,6 +143,15 @@ export type JobDetails = {
   paths: Paths;
   progress: Progress;
   gpu: GpuUsage | null;
+  config_snapshot: ConfigSnapshot | null;
+};
+
+export type GitStatus = {
+  commit: string | null;
+  short_commit: string | null;
+  dirty: boolean;
+  files: string[];
+  error: string | null;
 };
 
 export type ResultCell = {

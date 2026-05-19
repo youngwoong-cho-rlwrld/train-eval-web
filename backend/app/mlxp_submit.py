@@ -36,6 +36,13 @@ from .mlxp_config import (
     labels,
 )
 from .paths import EXPERIMENTS_DIR
+from .submission_snapshot import (
+    metadata_json,
+    prepare_training_git,
+    render_training_config_snapshot,
+    snapshot_metadata,
+    snapshot_suffix,
+)
 from .variant_values import variant_int
 from .wandb_config import get_project as _wandb_project
 from .variants import load_variant
@@ -69,6 +76,7 @@ class MlxpSubmitRequest(BaseModel):
     # Optional override for the auto-generated display job_name. Validated
     # against the unified regex in submit.resolve_job_name.
     job_name: str | None = None
+    commit_dirty_changes: bool = False
 
 
 class MlxpSubmitResponse(BaseModel):
@@ -97,9 +105,18 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
     from .submit import resolve_job_name
     job_id = "m" + uuid.uuid4().hex[:5]
     job_name = resolve_job_name(req.job_name, "train", req.variant)
+    submit_git = await prepare_training_git(job_name, req.commit_dirty_changes)
 
     node = req.node or DEFAULT_NODE
-    body_script = _render_body_script(variant, req, job_name)
+    snapshot = _build_snapshot_payload(
+        variant=variant,
+        req=req,
+        job_id=job_id,
+        job_name=job_name,
+        node=node,
+        submit_git=submit_git,
+    )
+    body_script = _render_body_script(variant, req, job_name, snapshot)
     spec = _render_job_yaml(
         job_id,
         job_name,
@@ -109,7 +126,7 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
         mem,
         req.wandb_secret,
         node,
-        _job_comment(req, variant),
+        _job_comment(req, variant, snapshot),
     )
     yaml_text = yaml.safe_dump(spec, sort_keys=False)
 
@@ -132,7 +149,75 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
     )
 
 
-def _render_body_script(variant, req: MlxpSubmitRequest, job_name: str) -> str:
+def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job_name: str,
+                            node: str, submit_git) -> dict:
+    model = (variant.vars.get("MODEL_VERSION") or "n1.5").strip()
+    train_num_gpus = req.num_gpus
+    train_max_steps = req.max_steps or variant_int(variant, "MAX_STEPS", 30000)
+    train_save_steps = req.save_steps or variant_int(variant, "SAVE_STEPS", 1000)
+    per_gpu_batch = int(variant.vars.get("TRAIN_BATCH_SIZE", "64"))
+    train_global_batch_size = req.global_batch_size or per_gpu_batch * train_num_gpus
+    suffix = snapshot_suffix(job_name)
+    exp_dir = f"{MLXP_EXPERIMENTS_DIR}/{variant.name}"
+    path = f"{exp_dir}/config_{suffix}.sh"
+    meta_path = f"{exp_dir}/config_{suffix}.meta.json"
+    config_text = render_training_config_snapshot(
+        base_config=variant.raw,
+        variant=variant.name,
+        model=model,
+        job_name=job_name,
+        cluster="mlxp",
+        node=node,
+        dataset_override=req.dataset_override,
+        extra_args=req.extra_args,
+        train_num_gpus=train_num_gpus,
+        train_global_batch_size=train_global_batch_size,
+        train_max_steps=train_max_steps,
+        train_save_steps=train_save_steps,
+        git=submit_git,
+    )
+    meta = snapshot_metadata(
+        job_id=job_id,
+        job_name=job_name,
+        cluster="mlxp",
+        variant=variant.name,
+        path=path,
+        meta_path=meta_path,
+        node=node,
+        dataset_override=req.dataset_override,
+        extra_args=req.extra_args,
+        train_num_gpus=train_num_gpus,
+        train_global_batch_size=train_global_batch_size,
+        train_max_steps=train_max_steps,
+        train_save_steps=train_save_steps,
+        git=submit_git,
+    )
+    return {
+        "path": path,
+        "meta_path": meta_path,
+        "config_text": config_text,
+        "meta_text": metadata_json(meta),
+        "git_commit": submit_git.commit,
+        "git_dirty_at_submit": submit_git.dirty_before,
+        "git_committed_dirty": submit_git.committed_dirty,
+    }
+
+
+def _snapshot_preamble(snapshot: dict) -> str:
+    config_text = snapshot["config_text"]
+    meta_text = snapshot["meta_text"]
+    path = snapshot["path"]
+    meta_path = snapshot["meta_path"]
+    return f"""\
+mkdir -p {shlex.quote(path.rsplit('/', 1)[0])}
+cat > {shlex.quote(path)} <<'TRAIN_EVAL_CONFIG_SNAPSHOT'
+{config_text}TRAIN_EVAL_CONFIG_SNAPSHOT
+cat > {shlex.quote(meta_path)} <<'TRAIN_EVAL_CONFIG_META'
+{meta_text}TRAIN_EVAL_CONFIG_META
+"""
+
+
+def _render_body_script(variant, req: MlxpSubmitRequest, job_name: str, snapshot: dict) -> str:
     """Render the inline bash the container runs.
 
     Resolves the variant's dataset list, then dispatches to the right gr00t
@@ -186,6 +271,7 @@ def _render_body_script(variant, req: MlxpSubmitRequest, job_name: str) -> str:
             variant=variant, req=req, job_name=job_name, names=names,
             max_steps=max_steps, save_steps=save_steps, batch_size=batch_size,
             train_extra=train_extra, user_extra=user_extra, ckpt_dir=ckpt_dir,
+            snapshot=snapshot,
         )
 
     # ── N1.5: build the data_config.yaml rows ──
@@ -229,6 +315,7 @@ export TOKENIZERS_PARALLELISM=false
 cd {GR00T_DIR}
 source .venv/bin/activate
 
+{_snapshot_preamble(snapshot)}
 mkdir -p {ckpt_dir}
 RUN_LOG_DIR={shlex.quote(run_log_dir)}
 mkdir -p "$RUN_LOG_DIR"
@@ -268,7 +355,7 @@ torchrun --nproc_per_node={req.num_gpus} scripts/gr00t_finetune.py \\
 def _render_body_n16(*, variant, req: MlxpSubmitRequest, job_name: str,
                      names: list[str], max_steps: str, save_steps: str,
                      batch_size: str, train_extra: str, user_extra: str,
-                     ckpt_dir: str) -> str:
+                     ckpt_dir: str, snapshot: dict) -> str:
     """Body script for GR00T N1.6 (launch_finetune.py).
 
     Unlike N1.5, N1.6 takes --dataset-path (multiple) + --modality-config-path
@@ -302,6 +389,7 @@ export OMNI_KIT_ACCEPT_EULA=Y
 cd {GR00T_N16_DIR}
 source .venv/bin/activate
 
+{_snapshot_preamble(snapshot)}
 mkdir -p {ckpt_dir}
 RUN_LOG_DIR={shlex.quote(run_log_dir)}
 mkdir -p "$RUN_LOG_DIR"
@@ -338,7 +426,7 @@ torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/launch_finetune.py \\
 """
 
 
-def _job_comment(req: MlxpSubmitRequest, variant) -> str:
+def _job_comment(req: MlxpSubmitRequest, variant, snapshot: dict) -> str:
     max_steps = req.max_steps or variant_int(variant, "MAX_STEPS", 30000)
     save_steps = req.save_steps or variant_int(variant, "SAVE_STEPS", 1000)
     comment = (
@@ -347,6 +435,16 @@ def _job_comment(req: MlxpSubmitRequest, variant) -> str:
     )
     if req.global_batch_size is not None:
         comment += f";train_global_batch_size={req.global_batch_size}"
+    comment += (
+        f";config_snapshot_path={snapshot['path']}"
+        f";config_snapshot_meta_path={snapshot['meta_path']}"
+    )
+    if snapshot.get("git_commit"):
+        comment += f";submit_git_commit={snapshot['git_commit']}"
+    comment += (
+        f";submit_git_dirty_at_submit={'true' if snapshot.get('git_dirty_at_submit') else 'false'}"
+        f";submit_git_committed_dirty={'true' if snapshot.get('git_committed_dirty') else 'false'}"
+    )
     return comment
 
 

@@ -277,6 +277,12 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
         className="mt-6"
       />
 
+      <SubmissionSnapshotCard
+        d={details.data}
+        isLoading={details.isLoading}
+        error={detailsError}
+      />
+
       <PathsCard
         d={details.data}
         cluster={cluster}
@@ -306,6 +312,85 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
           />
         </CardContent>
       </Card>
+    </div>
+  );
+}
+
+function SubmissionSnapshotCard({
+  d,
+  isLoading = false,
+  error,
+}: {
+  d?: JobDetails;
+  isLoading?: boolean;
+  error?: Error | null;
+}) {
+  const snapshot = d?.config_snapshot;
+  const isTrain = d?.phase === "train" || d?.phase === "resume";
+
+  return (
+    <Card className="mt-6">
+      <CardHeader>
+        <CardTitle>Submission Snapshot</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {isLoading && <LoadingState label="Loading submission snapshot..." />}
+        {!isLoading && error && <ErrorState message={error.message} />}
+        {!isLoading && !error && !d && (
+          <EmptyState message="Submission snapshot unavailable." />
+        )}
+        {!isLoading && !error && d && !isTrain && (
+          <EmptyState message="Submission snapshots are recorded for training jobs." />
+        )}
+        {!isLoading && !error && d && isTrain && !snapshot && (
+          <EmptyState message="No submission snapshot was recorded for this job." />
+        )}
+        {!isLoading && !error && snapshot && (
+          <>
+            <div className="divide-y divide-slate-100 dark:divide-slate-900">
+              {snapshot.path && (
+                <SnapshotRow label="config" value={snapshot.path} />
+              )}
+              {snapshot.meta_path && (
+                <SnapshotRow label="metadata" value={snapshot.meta_path} />
+              )}
+              {snapshot.git_commit && (
+                <SnapshotRow label="git commit" value={snapshot.git_commit} />
+              )}
+              <SnapshotRow
+                label="dirty"
+                value={
+                  snapshot.git_dirty_at_submit == null
+                    ? "unknown"
+                    : snapshot.git_dirty_at_submit
+                      ? snapshot.git_committed_dirty
+                        ? "dirty changes committed before submit"
+                        : "dirty at submit"
+                      : "clean"
+                }
+              />
+            </div>
+            {snapshot.error && <ErrorState message={snapshot.error} />}
+            {snapshot.text && (
+              <pre className="max-h-80 overflow-auto rounded border border-slate-200 bg-slate-50 p-3 text-xs dark:border-slate-800 dark:bg-slate-950">
+                {snapshot.text}
+              </pre>
+            )}
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function SnapshotRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-center justify-between gap-4 py-2">
+      <div className="min-w-[110px] text-xs uppercase tracking-wide text-slate-500">
+        {label}
+      </div>
+      <div className="flex-1 truncate font-mono text-xs">{value}</div>
+      <CopyButton value={value} />
     </div>
   );
 }
