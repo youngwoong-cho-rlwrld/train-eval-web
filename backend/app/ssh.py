@@ -102,7 +102,7 @@ async def rsync_to(
     )
 
 
-async def ssh_tail_lines(host: str, remote_pattern: str):
+async def ssh_tail_lines(host: str, remote_pattern: str, start_line: int = 1):
     """Async generator yielding `tail -F` lines from a remote file glob.
 
     `remote_pattern` may contain globs (`*`); we explicitly avoid shlex.quote
@@ -115,9 +115,10 @@ async def ssh_tail_lines(host: str, remote_pattern: str):
     """
     # Stream the entire file from the start, then follow forever. Frontend
     # owns the scrollback policy.
+    safe_start = max(1, int(start_line))
     cmd = (
         f'while ! ls {remote_pattern} >/dev/null 2>&1; do sleep 2; done; '
-        f'exec tail -n +1 -F {remote_pattern}'
+        f'exec tail -n +{safe_start} -F {remote_pattern}'
     )
     # 1MB stream limit + split on both \n and \r so tqdm progress lines
     # don't overflow asyncio's default 64KB readline buffer.
@@ -155,8 +156,7 @@ async def ssh_tail_lines(host: str, remote_pattern: str):
                     break
                 line = buf[:idx]
                 buf = buf[idx + 1:]
-                if line:
-                    yield line.decode(errors="replace")
+                yield line.decode(errors="replace")
     finally:
         if proc.returncode is None:
             proc.kill()

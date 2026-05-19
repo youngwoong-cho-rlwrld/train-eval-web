@@ -288,7 +288,7 @@ async def cancel_job(name: str) -> None:
         raise RuntimeError(f"kubectl delete failed: {stderr.decode(errors='replace').strip()}")
 
 
-async def tail_logs(job_name: str, follow: bool = True):
+async def tail_logs(job_name: str, follow: bool = True, start_line: int = 1):
     """Stream log lines for an MLXP job.
 
     Primary source is `kubectl logs` on the job's pod. Once a job's k8s
@@ -300,7 +300,7 @@ async def tail_logs(job_name: str, follow: bool = True):
     pod_data = await _kubectl_json("get", "pods", "-n", _NS, "-l", f"job-name={job_name}")
     pods = pod_data.get("items", [])
     if not pods:
-        async for line in _tail_archived_log(job_name):
+        async for line in _tail_archived_log(job_name, start_line=start_line):
             yield line
         return
     pod_name = pods[0]["metadata"]["name"]
@@ -320,15 +320,18 @@ async def tail_logs(job_name: str, follow: bool = True):
     )
     assert proc.stdout is not None
     try:
+        line_no = 1
         async for line in _iter_logical_lines(proc.stdout):
-            yield line
+            if line_no >= start_line:
+                yield line
+            line_no += 1
     finally:
         if proc.returncode is None:
             proc.kill()
             await proc.wait()
 
 
-async def _tail_archived_log(job_name: str):
+async def _tail_archived_log(job_name: str, start_line: int = 1):
     """Serve <variant>/checkpoints/logs/training_rank0.log via the data pod,
     holding the connection open with tail -F so EventSource doesn't loop."""
     from .job_identity import parse_comment_metadata, parse_phase_and_variant
@@ -351,9 +354,10 @@ async def _tail_archived_log(job_name: str):
     except Exception:
         return
     tests = " ".join(shlex.quote(p) for p in log_paths)
+    safe_start = max(1, int(start_line))
     cmd = (
         f"for p in {tests}; do "
-        '  if [ -f "$p" ]; then exec tail -n +1 -F "$p"; fi; '
+        f'  if [ -f "$p" ]; then exec tail -n +{safe_start} -F "$p"; fi; '
         "done; "
         "echo '(archived MLXP pod logs are unavailable for this run; no persisted training log was found)'; "
         "sleep 86400"
@@ -399,8 +403,7 @@ async def _iter_logical_lines(reader):
                 break
             line = buf[:idx]
             buf = buf[idx + 1:]
-            if line:
-                yield line.decode(errors="replace")
+            yield line.decode(errors="replace")
 
 
 async def _archived_record(name: str) -> dict[str, Any] | None:

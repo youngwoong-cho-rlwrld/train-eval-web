@@ -1,6 +1,8 @@
 """FastAPI entrypoint."""
 
-from fastapi import FastAPI, HTTPException
+import asyncio
+
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
@@ -254,8 +256,16 @@ async def get_results(cluster: str | None = None):
         raise HTTPException(500, str(e))
 
 
+def _sse_next_line(request: Request) -> int:
+    last_event_id = request.headers.get("last-event-id", "").strip()
+    try:
+        return max(1, int(last_event_id) + 1)
+    except ValueError:
+        return 1
+
+
 @app.get("/api/jobs/{cluster}/{job_id}/logs")
-async def stream_logs(cluster: str, job_id: str, stream: str = "out"):
+async def stream_logs(request: Request, cluster: str, job_id: str, stream: str = "out"):
     """Server-Sent Events stream of log lines.
 
     stream (slurm clusters):
@@ -264,14 +274,24 @@ async def stream_logs(cluster: str, job_id: str, stream: str = "out"):
       isaac — Isaac Sim server logs ($EXP_DIR/logs/server_*.log)
     MLXP has a single container log, so `stream` is ignored.
     """
+    start_line = _sse_next_line(request)
     if cluster == "mlxp":
         from . import mlxp_jobs
         async def gen_mlxp():
-            try:
-                async for line in mlxp_jobs.tail_logs(job_id):
-                    yield {"event": "line", "data": line}
-            except RuntimeError as e:
-                yield {"event": "line", "data": f"(kubectl error: {e})"}
+            line_no = start_line
+            while not await request.is_disconnected():
+                saw_line = False
+                try:
+                    async for line in mlxp_jobs.tail_logs(job_id, start_line=line_no):
+                        if await request.is_disconnected():
+                            return
+                        saw_line = True
+                        yield {"event": "line", "id": str(line_no), "retry": 10000, "data": line}
+                        line_no += 1
+                except RuntimeError as e:
+                    yield {"event": "line", "id": str(line_no), "retry": 10000, "data": f"(kubectl error: {e})"}
+                    line_no += 1
+                await asyncio.sleep(1 if saw_line else 2)
         return EventSourceResponse(gen_mlxp())
 
     if stream not in ("out", "err", "isaac"):
@@ -291,8 +311,16 @@ async def stream_logs(cluster: str, job_id: str, stream: str = "out"):
         pattern = f"{log_dir}/*_{job_id}.{stream}"
 
     async def gen():
-        async for line in ssh_tail_lines(env.ssh_alias, pattern):
-            yield {"event": "line", "data": line}
+        line_no = start_line
+        while not await request.is_disconnected():
+            saw_line = False
+            async for line in ssh_tail_lines(env.ssh_alias, pattern, start_line=line_no):
+                if await request.is_disconnected():
+                    return
+                saw_line = True
+                yield {"event": "line", "id": str(line_no), "retry": 10000, "data": line}
+                line_no += 1
+            await asyncio.sleep(1 if saw_line else 2)
 
     return EventSourceResponse(gen())
 

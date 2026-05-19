@@ -1,6 +1,6 @@
 "use client";
 
-import { use, useEffect, useRef, useState } from "react";
+import { use, useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import {
   useIsFetching,
@@ -24,22 +24,15 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { ConfigCard } from "@/components/config-card";
 import { CopyButton } from "@/components/copy-button";
+import { CopyCheckpointDialog } from "@/components/copy-checkpoint-dialog";
 import { RefreshButton } from "@/components/refresh-button";
 import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state";
-import { startCopyWatcher } from "@/lib/copy-watcher";
+import { JobStateBadge } from "@/components/job-state-badge";
 
 const REFRESH_MS = 60_000;
+const LOG_PAGE_SIZE = 100;
 
 export default function JobDetail({ params }: { params: Promise<{ cluster: string; id: string }> }) {
   const { cluster, id } = use(params);
@@ -243,7 +236,7 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
                     <div key={k} className="flex flex-col">
                       <dt className="text-xs uppercase tracking-wide text-slate-500">{k}</dt>
                       <dd className="font-mono text-xs">
-                        {k === "State" ? <Badge>{sacct.data[k]}</Badge> : formatSacctValue(k, sacct.data[k], cluster)}
+                        {k === "State" ? <JobStateBadge state={sacct.data[k]} /> : formatSacctValue(k, sacct.data[k], cluster)}
                       </dd>
                     </div>
                   ) : null,
@@ -538,15 +531,62 @@ function LogStream({
   stream: "out" | "err" | "isaac";
   enabled?: boolean;
 }) {
-  const [lines, setLines] = useState<string[]>([]);
+  const [visibleLines, setVisibleLines] = useState<string[]>([]);
+  const [receivedCount, setReceivedCount] = useState(0);
+  const [hiddenOlderCount, setHiddenOlderCount] = useState(0);
   const preRef = useRef<HTMLPreElement>(null);
+  const allLinesRef = useRef<string[]>([]);
+  const visibleStartRef = useRef(0);
+  const visibleEndRef = useRef(0);
+  const frameRef = useRef<number | null>(null);
+  const prependScrollHeightRef = useRef<number | null>(null);
   // Whether the user was at the bottom *before* the next line arrived. If
   // they scrolled up to read history, we don't yank them back down.
   const stickToBottomRef = useRef(true);
 
+  const renderWindow = useCallback((start: number, end: number) => {
+    const all = allLinesRef.current;
+    const boundedStart = Math.max(0, Math.min(start, all.length));
+    const boundedEnd = Math.max(boundedStart, Math.min(end, all.length));
+    visibleStartRef.current = boundedStart;
+    visibleEndRef.current = boundedEnd;
+    setReceivedCount(all.length);
+    setHiddenOlderCount(boundedStart);
+    setVisibleLines(all.slice(boundedStart, boundedEnd));
+  }, []);
+
+  const renderLatestWindow = useCallback(() => {
+    const all = allLinesRef.current;
+    const currentWindowSize = visibleEndRef.current > visibleStartRef.current
+      ? visibleEndRef.current - visibleStartRef.current
+      : LOG_PAGE_SIZE;
+    const windowSize = Math.max(LOG_PAGE_SIZE, currentWindowSize);
+    renderWindow(Math.max(0, all.length - windowSize), all.length);
+  }, [renderWindow]);
+
+  const flushReceivedLines = useCallback(() => {
+    if (stickToBottomRef.current) {
+      renderLatestWindow();
+      return;
+    }
+    setReceivedCount(allLinesRef.current.length);
+  }, [renderLatestWindow]);
+
   useEffect(() => {
+    allLinesRef.current = [];
+    visibleStartRef.current = 0;
+    visibleEndRef.current = 0;
     stickToBottomRef.current = true;
     if (!enabled) return;
+
+    function scheduleFlush() {
+      if (frameRef.current !== null) return;
+      frameRef.current = window.requestAnimationFrame(() => {
+        frameRef.current = null;
+        flushReceivedLines();
+      });
+    }
+
     const es = new EventSource(logStreamUrl(cluster, jobId, stream));
     es.addEventListener("line", (e: MessageEvent) => {
       // Sample scroll position before the state update — once React
@@ -557,205 +597,70 @@ function LogStream({
         stickToBottomRef.current =
           el.scrollHeight - el.scrollTop - el.clientHeight < 8;
       }
-      setLines((prev) => prev.concat(e.data as string));
+      allLinesRef.current.push(e.data as string);
+      scheduleFlush();
     });
-    return () => es.close();
-  }, [cluster, jobId, stream, enabled]);
+    return () => {
+      es.close();
+      if (frameRef.current !== null) {
+        window.cancelAnimationFrame(frameRef.current);
+        frameRef.current = null;
+      }
+    };
+  }, [cluster, jobId, stream, enabled, flushReceivedLines]);
 
   useEffect(() => {
-    if (preRef.current && stickToBottomRef.current) {
-      preRef.current.scrollTop = preRef.current.scrollHeight;
+    const el = preRef.current;
+    if (!el) return;
+    if (prependScrollHeightRef.current !== null) {
+      el.scrollTop = el.scrollHeight - prependScrollHeightRef.current;
+      prependScrollHeightRef.current = null;
+      return;
     }
-  }, [lines]);
+    if (stickToBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [visibleLines]);
+
+  function revealOlderLines() {
+    const currentStart = visibleStartRef.current;
+    if (currentStart <= 0) return;
+    const el = preRef.current;
+    prependScrollHeightRef.current = el?.scrollHeight ?? null;
+    renderWindow(Math.max(0, currentStart - LOG_PAGE_SIZE), visibleEndRef.current);
+  }
+
+  function onScroll() {
+    const el = preRef.current;
+    if (!el) return;
+    const isAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 8;
+    stickToBottomRef.current = isAtBottom;
+    if (el.scrollTop <= 0) {
+      revealOlderLines();
+    } else if (isAtBottom && visibleEndRef.current < allLinesRef.current.length) {
+      renderLatestWindow();
+    }
+  }
+
+  const logText = !enabled
+    ? "(logs unavailable - k8s pod has been garbage-collected)"
+    : receivedCount === 0
+      ? "(waiting for log lines...)"
+      : [
+          hiddenOlderCount > 0
+            ? `(${hiddenOlderCount.toLocaleString()} earlier lines hidden - scroll to top to load ${Math.min(LOG_PAGE_SIZE, hiddenOlderCount)} more)`
+            : null,
+          ...visibleLines,
+        ].filter((line) => line !== null).join("\n");
 
   return (
     <pre
       ref={preRef}
+      onScroll={onScroll}
+      aria-label={`Showing ${visibleLines.length} of ${receivedCount} log lines`}
       className="h-96 overflow-auto rounded-md bg-slate-950 p-4 font-mono text-xs leading-relaxed text-slate-100"
     >
-      {!enabled
-        ? "(logs unavailable — k8s pod has been garbage-collected)"
-        : lines.length === 0
-          ? "(waiting for log lines…)"
-          : lines.join("\n")}
+      {logText}
     </pre>
-  );
-}
-
-type CheckpointEntry = { path: string; job_name: string; step: number };
-
-function CopyCheckpointDialog({
-  open,
-  onOpenChange,
-  cluster,
-  jobId,
-}: {
-  open: boolean;
-  onOpenChange: (v: boolean) => void;
-  cluster: string;
-  jobId: string;
-}) {
-  const clusters = useQuery({
-    queryKey: ["clusters"],
-    queryFn: () =>
-      api<{ clusters: string[] }>("/api/clusters").then((d) => d.clusters),
-  });
-  const checkpoints = useQuery({
-    queryKey: ["checkpoints", cluster, jobId],
-    queryFn: () =>
-      api<CheckpointEntry[]>(`/api/jobs/${cluster}/${jobId}/checkpoints`),
-    enabled: open,
-  });
-  const [destCluster, setDestCluster] = useState<string>("");
-  const [destPathRoot, setDestPathRoot] = useState<string>("");
-  const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [deleteSource, setDeleteSource] = useState<boolean>(false);
-
-  const copy = useMutation({
-    mutationFn: () =>
-      api<{ copy_id: string }>(
-        `/api/jobs/${cluster}/${jobId}/copy-checkpoint`,
-        {
-          method: "POST",
-          body: JSON.stringify({
-            dest_cluster: destCluster,
-            dest_path_root: destPathRoot || null,
-            sources: Array.from(selected),
-            delete_source: deleteSource,
-          }),
-        },
-      ),
-    onSuccess: (r) => {
-      const dest = destCluster;
-      // Close the dialog immediately; track progress as a toast. The
-      // watcher writes the copy-id to localStorage so a refresh resumes it.
-      resetAndClose();
-      startCopyWatcher(r.copy_id, dest);
-    },
-    onError: (e: Error) => toast.error(e.message),
-  });
-
-  function resetAndClose() {
-    onOpenChange(false);
-    setSelected(new Set());
-    setDestCluster("");
-    setDestPathRoot("");
-    setDeleteSource(false);
-  }
-
-  const options = (clusters.data ?? []).filter((c) => c !== cluster);
-
-  function toggle(path: string) {
-    const next = new Set(selected);
-    if (next.has(path)) next.delete(path);
-    else next.add(path);
-    setSelected(next);
-  }
-
-  return (
-    <Dialog open={open} onOpenChange={(v) => (v ? onOpenChange(true) : resetAndClose())}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Copy checkpoint</DialogTitle>
-          <DialogDescription>
-            Copies the selected <code>checkpoint-N</code> dirs from{" "}
-            <span className="font-mono">{cluster}</span> to another cluster.
-            Slurm → slurm uses rsync; mlxp transfers use tar piped through
-            kubectl exec.
-          </DialogDescription>
-        </DialogHeader>
-
-        <div className="space-y-3">
-            <div className="space-y-1.5">
-              <Label>Checkpoints</Label>
-              {checkpoints.isLoading && (
-                <LoadingState label="Loading checkpoints..." rows={3} />
-              )}
-              {checkpoints.error && (
-                <ErrorState message={(checkpoints.error as Error).message} />
-              )}
-              {checkpoints.data && checkpoints.data.length === 0 && (
-                <EmptyState message="No checkpoints found for this variant." />
-              )}
-              {checkpoints.data && checkpoints.data.length > 0 && (
-                <div className="max-h-56 overflow-y-auto rounded-md border border-slate-200 dark:border-slate-800">
-                  {checkpoints.data.map((c) => (
-                    <label
-                      key={c.path}
-                      className="flex cursor-pointer items-center gap-2 border-b border-slate-100 px-3 py-1.5 text-xs last:border-0 hover:bg-slate-50 dark:border-slate-900 dark:hover:bg-slate-900/40"
-                    >
-                      <input
-                        type="checkbox"
-                        checked={selected.has(c.path)}
-                        onChange={() => toggle(c.path)}
-                        className="h-4 w-4 rounded border-slate-300 dark:border-slate-700"
-                      />
-                      <span className="font-mono">step {c.step.toLocaleString()}</span>
-                      <span className="ml-auto truncate font-mono text-[10px] text-slate-500">
-                        {c.job_name}
-                      </span>
-                    </label>
-                  ))}
-                </div>
-              )}
-            </div>
-            <div className="space-y-1.5">
-              <Label>Destination cluster</Label>
-              <Select value={destCluster} onValueChange={setDestCluster}>
-                <SelectTrigger>
-                  <SelectValue placeholder="pick a cluster…" />
-                </SelectTrigger>
-                <SelectContent>
-                  {options.map((c) => (
-                    <SelectItem key={c} value={c}>
-                      {c}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              {clusters.isLoading && (
-                <LoadingState label="Loading destination clusters..." rows={1} />
-              )}
-              {clusters.error && (
-                <ErrorState message={(clusters.error as Error).message} />
-              )}
-            </div>
-            <div className="space-y-1.5">
-              <Label>Destination directory (optional)</Label>
-              <Input
-                value={destPathRoot}
-                onChange={(e) => setDestPathRoot(e.target.value)}
-                placeholder="/abs/dir (each checkpoint-N is created under it)"
-                className="font-mono text-xs"
-              />
-            </div>
-            <label className="flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                checked={deleteSource}
-                onChange={(e) => setDeleteSource(e.target.checked)}
-                className="h-4 w-4 rounded border-slate-300 dark:border-slate-700"
-              />
-              <span>Remove checkpoint after copy</span>
-            </label>
-          </div>
-
-        <DialogFooter>
-          <Button variant="outline" onClick={resetAndClose}>
-            Cancel
-          </Button>
-          <Button
-            onClick={() => copy.mutate()}
-            disabled={!destCluster || selected.size === 0 || copy.isPending}
-          >
-            {copy.isPending
-              ? "Starting…"
-              : selected.size > 1
-                ? `Copy ${selected.size}`
-                : "Copy"}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
   );
 }

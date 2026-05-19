@@ -11,8 +11,10 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { CopyButton } from "@/components/copy-button";
+import { CopyCheckpointDialog } from "@/components/copy-checkpoint-dialog";
 import { RefreshButton } from "@/components/refresh-button";
 import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state";
+import { JobStateBadge } from "@/components/job-state-badge";
 import { formatDuration, parseSlurmDuration } from "@/lib/duration";
 import { formatJobTimestamp, parseJobTimestampMs } from "@/lib/job-time";
 
@@ -123,6 +125,7 @@ function JobTable({ rows, kind }: { rows: Job[]; kind: "active" | "recent" }) {
             <Th>Phase</Th>
             <Th>Cluster</Th>
             <Th>State</Th>
+            {kind === "recent" && <Th>Actions</Th>}
             <Th>Partition</Th>
             <Th>Elapsed</Th>
             {kind === "active" && <Th>Time Left</Th>}
@@ -147,13 +150,23 @@ function JobTable({ rows, kind }: { rows: Job[]; kind: "active" | "recent" }) {
                 <Td><PhaseBadge phase={phase} /></Td>
                 <Td>{j.cluster}</Td>
                 <Td>
-                  <div className="flex items-center gap-2">
-                    <StateBadge state={j.state} />
-                    {kind === "recent" && isTimeout(j.state) && (
-                      <ResumeButton job={j} />
-                    )}
-                  </div>
+                  <JobStateBadge state={j.state} />
                 </Td>
+                {kind === "recent" && (
+                  <Td>
+                    <div className="flex items-center gap-2">
+                      {kind === "recent" && isTimeout(j.state) && (
+                        <ResumeButton job={j} />
+                      )}
+                      {canCopyCheckpoint(j, phase) && (
+                        <CopyCheckpointShortcut job={j} />
+                      )}
+                      {!isTimeout(j.state) && !canCopyCheckpoint(j, phase) && (
+                        <span className="text-slate-400">—</span>
+                      )}
+                    </div>
+                  </Td>
+                )}
                 <Td className="font-mono text-xs">{j.partition}</Td>
                 <Td className="font-mono text-xs">{j.elapsed}</Td>
                 {kind === "active" && (
@@ -188,6 +201,29 @@ function JobTable({ rows, kind }: { rows: Job[]; kind: "active" | "recent" }) {
         </tbody>
       </table>
     </div>
+  );
+}
+
+function CopyCheckpointShortcut({ job }: { job: Job }) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <>
+      <Button
+        variant="outline"
+        size="sm"
+        className="h-7 px-2 text-xs"
+        onClick={() => setOpen(true)}
+      >
+        Copy checkpoint
+      </Button>
+      <CopyCheckpointDialog
+        open={open}
+        onOpenChange={setOpen}
+        cluster={job.cluster}
+        jobId={job.job_id}
+      />
+    </>
   );
 }
 
@@ -303,18 +339,15 @@ function PhaseBadge({ phase }: { phase: ReturnType<typeof phaseOf> }) {
   return <Badge variant="secondary">other</Badge>;
 }
 
-function StateBadge({ state }: { state: string }) {
-  const v =
-    state === "RUNNING" ? "success"
-    : state === "PENDING" ? "warning"
-    : state === "FAILED" || state === "TIMEOUT" || state.startsWith("CANCEL") ? "danger"
-    : state === "COMPLETED" ? "secondary"
-    : "outline";
-  return <Badge variant={v}>{state}</Badge>;
-}
-
 function isTimeout(state: string): boolean {
   return state.toUpperCase().startsWith("TIMEOUT");
+}
+
+function canCopyCheckpoint(job: Job, phase: ReturnType<typeof phaseOf>): boolean {
+  return (
+    (phase === "train" || phase === "resume") &&
+    job.state.toUpperCase().startsWith("COMPLET")
+  );
 }
 
 function compareEndedDesc(a: Job, b: Job): number {
