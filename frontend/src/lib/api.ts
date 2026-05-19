@@ -98,6 +98,8 @@ export type ConfigSnapshot = {
   path: string | null;
   meta_path: string | null;
   text: string | null;
+  git_repo_path: string | null;
+  git_repo_label: string | null;
   git_commit: string | null;
   git_dirty_at_submit: boolean | null;
   git_committed_dirty: boolean | null;
@@ -147,6 +149,8 @@ export type JobDetails = {
 };
 
 export type GitStatus = {
+  repo_path: string | null;
+  repo_label: string | null;
   commit: string | null;
   short_commit: string | null;
   dirty: boolean;

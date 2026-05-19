@@ -354,8 +354,14 @@ function SubmissionSnapshotCard({
               {snapshot.meta_path && (
                 <SnapshotRow label="metadata" value={snapshot.meta_path} />
               )}
+              {snapshot.git_repo_label && (
+                <SnapshotRow label="code repo" value={snapshot.git_repo_label} />
+              )}
+              {snapshot.git_repo_path && (
+                <SnapshotRow label="repo path" value={snapshot.git_repo_path} />
+              )}
               {snapshot.git_commit && (
-                <SnapshotRow label="git commit" value={snapshot.git_commit} />
+                <SnapshotRow label="training commit" value={snapshot.git_commit} />
               )}
               <SnapshotRow
                 label="dirty"

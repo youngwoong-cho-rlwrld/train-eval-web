@@ -89,6 +89,8 @@ class ConfigSnapshot(BaseModel):
     path: str | None = None
     meta_path: str | None = None
     text: str | None = None
+    git_repo_path: str | None = None
+    git_repo_label: str | None = None
     git_commit: str | None = None
     git_dirty_at_submit: bool | None = None
     git_committed_dirty: bool | None = None
@@ -430,6 +432,8 @@ async def _slurm_config_snapshot(host: str, meta: dict[str, str]) -> ConfigSnaps
         path=path,
         meta_path=meta_path,
         text=text,
+        git_repo_path=meta.get("submit_git_repo_path") or None,
+        git_repo_label=meta.get("submit_git_repo_label") or None,
         git_commit=meta.get("submit_git_commit") or None,
         git_dirty_at_submit=_meta_bool(meta.get("submit_git_dirty_at_submit")),
         git_committed_dirty=_meta_bool(meta.get("submit_git_committed_dirty")),
@@ -478,6 +482,8 @@ async def _mlxp_config_snapshot(meta: dict[str, str]) -> ConfigSnapshot | None:
         path=path,
         meta_path=meta_path,
         text=text,
+        git_repo_path=meta.get("submit_git_repo_path") or None,
+        git_repo_label=meta.get("submit_git_repo_label") or None,
         git_commit=meta.get("submit_git_commit") or None,
         git_dirty_at_submit=_meta_bool(meta.get("submit_git_dirty_at_submit")),
         git_committed_dirty=_meta_bool(meta.get("submit_git_committed_dirty")),

@@ -3,7 +3,7 @@
 The variant `config.sh` is only the starting point. A real training
 submission may override datasets, GPU count, batch size, step counts, and
 extra scheduler/job args. This module renders the effective config record and
-captures the train-eval-web git revision used for the submission.
+captures the actual model-code git revision used for the submission.
 """
 
 from __future__ import annotations
@@ -14,14 +14,16 @@ import re
 import shlex
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from pydantic import BaseModel, Field
 
-from .paths import REPO_ROOT
+from .ssh import ssh_run
 
 
 class GitStatus(BaseModel):
+    repo_path: str | None = None
+    repo_label: str | None = None
     commit: str | None
     short_commit: str | None
     dirty: bool
@@ -31,6 +33,8 @@ class GitStatus(BaseModel):
 
 @dataclass(frozen=True)
 class SubmitGitInfo:
+    repo_path: str
+    repo_label: str
     commit: str | None
     dirty_before: bool
     committed_dirty: bool
@@ -38,46 +42,55 @@ class SubmitGitInfo:
     commit_message: str | None = None
 
 
-async def _git(*args: str, timeout: float = 20.0) -> tuple[int, str, str]:
-    proc = await asyncio.create_subprocess_exec(
-        "git",
-        *args,
-        cwd=REPO_ROOT,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        raise RuntimeError(f"git {' '.join(args)} timed out after {timeout:g}s")
-    return (
-        proc.returncode,
-        stdout.decode(errors="replace"),
-        stderr.decode(errors="replace"),
-    )
+GitRunner = Callable[[str, float], Awaitable[tuple[int, str, str]]]
 
 
 def _short(commit: str | None) -> str | None:
     return commit[:12] if commit else None
 
 
-async def git_status() -> GitStatus:
-    rc, head, err = await _git("rev-parse", "HEAD")
+def training_repo_var(model: str) -> str:
+    return "GROOT_N16_DIR" if model.strip() == "n1.6" else "GROOT_DIR"
+
+
+def training_repo_label(model: str) -> str:
+    return f"GR00T {model.strip() or 'n1.5'}"
+
+
+def slurm_training_repo_path(cluster_vars: dict[str, str], model: str) -> str:
+    key = training_repo_var(model)
+    path = (cluster_vars.get(key) or "").strip()
+    if not path:
+        raise ValueError(f"cluster config missing {key}")
+    return path
+
+
+async def _git_status(
+    run: GitRunner,
+    *,
+    repo_path: str,
+    repo_label: str,
+) -> GitStatus:
+    repo = shlex.quote(repo_path)
+    rc, head, err = await run(f"cd {repo} && git rev-parse HEAD", 20.0)
     if rc != 0:
         return GitStatus(
+            repo_path=repo_path,
+            repo_label=repo_label,
             commit=None,
             short_commit=None,
             dirty=True,
             files=[],
             error=(err or head).strip() or "git rev-parse failed",
         )
-    rc, status, err = await _git("status", "--short")
+    rc, status, err = await run(f"cd {repo} && git status --short", 20.0)
     if rc != 0:
+        commit = head.strip()
         return GitStatus(
-            commit=head.strip(),
-            short_commit=_short(head.strip()),
+            repo_path=repo_path,
+            repo_label=repo_label,
+            commit=commit,
+            short_commit=_short(commit),
             dirty=True,
             files=[],
             error=(err or status).strip() or "git status failed",
@@ -85,6 +98,8 @@ async def git_status() -> GitStatus:
     files = [line for line in status.splitlines() if line.strip()]
     commit = head.strip()
     return GitStatus(
+        repo_path=repo_path,
+        repo_label=repo_label,
         commit=commit,
         short_commit=_short(commit),
         dirty=bool(files),
@@ -92,17 +107,22 @@ async def git_status() -> GitStatus:
     )
 
 
-async def prepare_training_git(
+async def _prepare_training_git(
+    run: GitRunner,
+    *,
+    repo_path: str,
+    repo_label: str,
     job_name: str,
     commit_dirty_changes: bool,
-    *,
     require_clean: bool = True,
 ) -> SubmitGitInfo:
-    status = await git_status()
+    status = await _git_status(run, repo_path=repo_path, repo_label=repo_label)
     if status.error:
         raise RuntimeError(status.error)
     if not status.dirty:
         return SubmitGitInfo(
+            repo_path=repo_path,
+            repo_label=repo_label,
             commit=status.commit,
             dirty_before=False,
             committed_dirty=False,
@@ -110,6 +130,8 @@ async def prepare_training_git(
         )
     if not require_clean:
         return SubmitGitInfo(
+            repo_path=repo_path,
+            repo_label=repo_label,
             commit=status.commit,
             dirty_before=True,
             committed_dirty=False,
@@ -122,21 +144,118 @@ async def prepare_training_git(
         )
 
     message = f"chore(training): snapshot state for {job_name}"
-    rc, _, err = await _git("add", "-A", timeout=30.0)
+    repo = shlex.quote(repo_path)
+    rc, _, err = await run(f"cd {repo} && git add -A", 30.0)
     if rc != 0:
         raise RuntimeError(err.strip() or "git add failed")
-    rc, out, err = await _git("commit", "-m", message, timeout=60.0)
+    rc, out, err = await run(f"cd {repo} && git commit -m {shlex.quote(message)}", 60.0)
     if rc != 0:
         raise RuntimeError((err or out).strip() or "git commit failed")
-    clean = await git_status()
+    clean = await _git_status(run, repo_path=repo_path, repo_label=repo_label)
     if clean.error:
         raise RuntimeError(clean.error)
     return SubmitGitInfo(
+        repo_path=repo_path,
+        repo_label=repo_label,
         commit=clean.commit,
         dirty_before=True,
         committed_dirty=True,
         dirty_files=status.files,
         commit_message=message,
+    )
+
+
+async def _slurm_git_run(host: str, cmd: str, timeout: float) -> tuple[int, str, str]:
+    r = await ssh_run(host, cmd, timeout=timeout)
+    return r.returncode, r.stdout, r.stderr
+
+
+async def slurm_git_status(*, host: str, repo_path: str, repo_label: str) -> GitStatus:
+    return await _git_status(
+        lambda cmd, timeout: _slurm_git_run(host, cmd, timeout),
+        repo_path=repo_path,
+        repo_label=repo_label,
+    )
+
+
+async def prepare_slurm_training_git(
+    *,
+    host: str,
+    repo_path: str,
+    repo_label: str,
+    job_name: str,
+    commit_dirty_changes: bool,
+    require_clean: bool = True,
+) -> SubmitGitInfo:
+    return await _prepare_training_git(
+        lambda cmd, timeout: _slurm_git_run(host, cmd, timeout),
+        repo_path=repo_path,
+        repo_label=repo_label,
+        job_name=job_name,
+        commit_dirty_changes=commit_dirty_changes,
+        require_clean=require_clean,
+    )
+
+
+async def _mlxp_git_run(cmd: str, timeout: float) -> tuple[int, str, str]:
+    import shutil
+
+    from .mlxp_config import NAMESPACE
+    from .mlxp_data_pod import ensure_listing_pod
+
+    if shutil.which("kubectl") is None:
+        raise RuntimeError("kubectl not found on PATH")
+
+    pod = await ensure_listing_pod()
+    proc = await asyncio.create_subprocess_exec(
+        "kubectl",
+        "exec",
+        "-n",
+        NAMESPACE,
+        pod,
+        "--",
+        "bash",
+        "-lc",
+        cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise RuntimeError(f"MLXP git command timed out after {timeout:g}s")
+    return (
+        proc.returncode or 0,
+        stdout.decode(errors="replace"),
+        stderr.decode(errors="replace"),
+    )
+
+
+async def mlxp_git_status(*, repo_path: str, repo_label: str) -> GitStatus:
+    return await _git_status(
+        _mlxp_git_run,
+        repo_path=repo_path,
+        repo_label=repo_label,
+    )
+
+
+async def prepare_mlxp_training_git(
+    *,
+    repo_path: str,
+    repo_label: str,
+    job_name: str,
+    commit_dirty_changes: bool,
+    require_clean: bool = True,
+) -> SubmitGitInfo:
+    return await _prepare_training_git(
+        _mlxp_git_run,
+        repo_path=repo_path,
+        repo_label=repo_label,
+        job_name=job_name,
+        commit_dirty_changes=commit_dirty_changes,
+        require_clean=require_clean,
     )
 
 
@@ -236,6 +355,8 @@ def render_training_config_snapshot(
     if node:
         footer.append(f"SUBMIT_NODE={shlex.quote(node)}")
     if git:
+        footer.append(f"SUBMIT_GIT_REPO_LABEL={shlex.quote(git.repo_label)}")
+        footer.append(f"SUBMIT_GIT_REPO_PATH={shlex.quote(git.repo_path)}")
         if git.commit:
             footer.append(f"SUBMIT_GIT_COMMIT={shlex.quote(git.commit)}")
         footer.append(f"SUBMIT_GIT_DIRTY_AT_SUBMIT={'1' if git.dirty_before else '0'}")
@@ -292,6 +413,8 @@ def snapshot_metadata(
         "dataset_override": dataset_override,
         "extra_args": extra_args or [],
         "git": {
+            "repo_path": git.repo_path if git else None,
+            "repo_label": git.repo_label if git else None,
             "commit": git.commit if git else None,
             "dirty_at_submit": git.dirty_before if git else None,
             "committed_dirty": git.committed_dirty if git else None,

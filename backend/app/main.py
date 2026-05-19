@@ -148,8 +148,29 @@ async def get_selected_checkpoint(name: str, cluster: str):
 # ── submit ──
 
 @app.get("/api/submit/git-status", response_model=submission_snapshot.GitStatus)
-async def get_submit_git_status():
-    return await submission_snapshot.git_status()
+async def get_submit_git_status(cluster: str, variant: str):
+    try:
+        v = await variants.load_variant(variant)
+        model = (v.vars.get("MODEL_VERSION") or "n1.5").strip()
+        repo_label = submission_snapshot.training_repo_label(model)
+        if cluster == "mlxp":
+            return await submission_snapshot.mlxp_git_status(
+                repo_path=mlxp_submit.mlxp_training_repo_path(model),
+                repo_label=repo_label,
+            )
+
+        env = await clusters.load_cluster(cluster)
+        return await submission_snapshot.slurm_git_status(
+            host=env.ssh_alias,
+            repo_path=submission_snapshot.slurm_training_repo_path(env.vars, model),
+            repo_label=repo_label,
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
 
 
 @app.post("/api/submit")

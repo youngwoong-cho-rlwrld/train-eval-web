@@ -394,7 +394,8 @@ export default function SubmitPage() {
     }
     setPreflightPending(true);
     try {
-      const status = await api<GitStatus>("/api/submit/git-status");
+      const qs = new URLSearchParams({ cluster, variant: variantName });
+      const status = await api<GitStatus>(`/api/submit/git-status?${qs}`);
       if (status.error) {
         toast.error(`Git status failed: ${status.error}`);
         return;
@@ -1024,11 +1025,18 @@ export default function SubmitPage() {
           <DialogHeader>
             <DialogTitle>Commit uncommitted changes before training?</DialogTitle>
             <DialogDescription>
-              Training submissions record the train-eval-web git commit. The
-              current working tree is dirty, so the backend will commit these
-              changes before submitting and store that hash in the job snapshot.
+              Training submissions record the selected model-code git commit.
+              The current {dirtyGitStatus?.repo_label ?? "training repo"} working
+              tree is dirty, so the backend will commit these changes before
+              submitting and store that hash in the job snapshot.
             </DialogDescription>
           </DialogHeader>
+          {dirtyGitStatus?.repo_path && (
+            <div className="rounded border border-slate-200 bg-slate-50 p-3 text-xs dark:border-slate-800 dark:bg-slate-950">
+              <div className="text-slate-500 dark:text-slate-400">Repo</div>
+              <div className="break-all font-mono">{dirtyGitStatus.repo_path}</div>
+            </div>
+          )}
           <div className="max-h-56 overflow-auto rounded border border-slate-200 bg-slate-50 p-3 font-mono text-xs dark:border-slate-800 dark:bg-slate-950">
             {dirtyGitStatus?.files.map((line) => (
               <div key={line}>{line}</div>

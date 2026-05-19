@@ -22,10 +22,12 @@ from .ssh import rsync_to, ssh_run
 from .submission_snapshot import (
     apply_dataset_override,
     metadata_json,
-    prepare_training_git,
+    prepare_slurm_training_git,
     render_training_config_snapshot,
     snapshot_metadata,
     snapshot_suffix,
+    slurm_training_repo_path,
+    training_repo_label,
 )
 from .variants import load_variant
 from .variant_values import variant_int
@@ -224,6 +226,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     # Unified shape across slurm + MLXP. The cluster/partition are shown in
     # table columns; the job name carries phase, variant, and timestamp.
     job_name = resolve_job_name(req.job_name, req.phase, req.variant)
+    host = cluster.ssh_alias
 
     submit_git = None
     snapshot_rel: str | None = None
@@ -233,9 +236,13 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     snapshot_text: str | None = None
     snapshot_meta_text: str | None = None
     if req.phase == "train":
-        submit_git = await prepare_training_git(
-            job_name,
-            req.commit_dirty_changes,
+        training_repo = slurm_training_repo_path(cluster.vars, model)
+        submit_git = await prepare_slurm_training_git(
+            host=host,
+            repo_path=training_repo,
+            repo_label=training_repo_label(model),
+            job_name=job_name,
+            commit_dirty_changes=req.commit_dirty_changes,
             require_clean=not req.resume,
         )
         suffix = snapshot_suffix(job_name)
@@ -278,7 +285,6 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     # Body scripts expect $REPO_ROOT/{clusters,experiments,lib}/ at the staging
     # root, so flatten configs/ on the way out: configs/clusters → clusters/,
     # configs/experiments → experiments/.
-    host = cluster.ssh_alias
     staging = f"$HOME/{CLUSTER_STAGING_REL}"
     mkdir_result = await ssh_run(host, f"mkdir -p {staging}/clusters {staging}/experiments {staging}/lib")
     if mkdir_result.returncode != 0:
@@ -368,6 +374,11 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             comment += f";train_global_batch_size={req.train_global_batch_size}"
         if snapshot_path:
             comment += f";config_snapshot_path={snapshot_path}"
+        if submit_git:
+            comment += (
+                f";submit_git_repo_path={submit_git.repo_path}"
+                f";submit_git_repo_label={submit_git.repo_label}"
+            )
         if submit_git and submit_git.commit:
             comment += f";submit_git_commit={submit_git.commit}"
 
@@ -481,6 +492,8 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             else ""
         )
         + (
+            f"submit_git_repo_path={submit_git.repo_path}\n"
+            f"submit_git_repo_label={submit_git.repo_label}\n"
             f"submit_git_commit={submit_git.commit}\n"
             f"submit_git_dirty_at_submit={'true' if submit_git.dirty_before else 'false'}\n"
             f"submit_git_committed_dirty={'true' if submit_git.committed_dirty else 'false'}\n"

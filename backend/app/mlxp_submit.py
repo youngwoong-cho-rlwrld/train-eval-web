@@ -38,10 +38,11 @@ from .mlxp_config import (
 from .paths import EXPERIMENTS_DIR
 from .submission_snapshot import (
     metadata_json,
-    prepare_training_git,
+    prepare_mlxp_training_git,
     render_training_config_snapshot,
     snapshot_metadata,
     snapshot_suffix,
+    training_repo_label,
 )
 from .variant_values import variant_int
 from .wandb_config import get_project as _wandb_project
@@ -59,6 +60,10 @@ _GPU_RESOURCES = {
 
 GR00T_DIR = f"{DDN_USER_HOME}/workspace/gr00t"
 GR00T_N16_DIR = f"{DDN_USER_HOME}/workspace/gr00t-n16"
+
+
+def mlxp_training_repo_path(model: str) -> str:
+    return GR00T_N16_DIR if model.strip() == "n1.6" else GR00T_DIR
 
 
 class MlxpSubmitRequest(BaseModel):
@@ -105,7 +110,13 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
     from .submit import resolve_job_name
     job_id = "m" + uuid.uuid4().hex[:5]
     job_name = resolve_job_name(req.job_name, "train", req.variant)
-    submit_git = await prepare_training_git(job_name, req.commit_dirty_changes)
+    repo_path = mlxp_training_repo_path(model)
+    submit_git = await prepare_mlxp_training_git(
+        repo_path=repo_path,
+        repo_label=training_repo_label(model),
+        job_name=job_name,
+        commit_dirty_changes=req.commit_dirty_changes,
+    )
 
     node = req.node or DEFAULT_NODE
     snapshot = _build_snapshot_payload(
@@ -198,6 +209,8 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
         "config_text": config_text,
         "meta_text": metadata_json(meta),
         "git_commit": submit_git.commit,
+        "git_repo_path": submit_git.repo_path,
+        "git_repo_label": submit_git.repo_label,
         "git_dirty_at_submit": submit_git.dirty_before,
         "git_committed_dirty": submit_git.committed_dirty,
     }
@@ -438,6 +451,8 @@ def _job_comment(req: MlxpSubmitRequest, variant, snapshot: dict) -> str:
     comment += (
         f";config_snapshot_path={snapshot['path']}"
         f";config_snapshot_meta_path={snapshot['meta_path']}"
+        f";submit_git_repo_path={snapshot['git_repo_path']}"
+        f";submit_git_repo_label={snapshot['git_repo_label']}"
     )
     if snapshot.get("git_commit"):
         comment += f";submit_git_commit={snapshot['git_commit']}"
