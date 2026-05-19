@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useMemo, useState } from "react";
 import { useIsFetching, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, type Job } from "@/lib/api";
+import { api, type Job, type JobDetails } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -78,7 +78,7 @@ export default function JobsPage() {
           {!isLoading && !error && active.length === 0 && (
             <EmptyState message="No active jobs." />
           )}
-          {active.length > 0 && <JobTable rows={active} />}
+          {active.length > 0 && <JobTable rows={active} showProgress showActions={false} />}
         </CardContent>
       </Card>
 
@@ -114,7 +114,15 @@ export default function JobsPage() {
   );
 }
 
-function JobTable({ rows }: { rows: Job[] }) {
+function JobTable({
+  rows,
+  showProgress = false,
+  showActions = true,
+}: {
+  rows: Job[];
+  showProgress?: boolean;
+  showActions?: boolean;
+}) {
   return (
     <div className="overflow-x-auto">
       <table className="w-full text-sm">
@@ -123,8 +131,9 @@ function JobTable({ rows }: { rows: Job[] }) {
             <Th>Job ID</Th>
             <Th>Phase</Th>
             <Th>State</Th>
+            {showProgress && <Th>Progress</Th>}
             <Th>Name</Th>
-            <Th>Actions</Th>
+            {showActions && <Th>Actions</Th>}
             <Th>Cluster</Th>
             <Th>Partition</Th>
             <Th>Node</Th>
@@ -147,6 +156,11 @@ function JobTable({ rows }: { rows: Job[] }) {
                 <Td>
                   <JobStateBadge state={j.state} />
                 </Td>
+                {showProgress && (
+                  <Td className="min-w-[220px]">
+                    <ActiveProgressCell job={j} />
+                  </Td>
+                )}
                 <td className="py-2 pr-4 font-mono text-xs">
                   <div className="flex items-center gap-1">
                     <ImmediateTooltip content={j.job_name} className="max-w-[240px]">
@@ -155,25 +169,27 @@ function JobTable({ rows }: { rows: Job[] }) {
                     <CopyButton value={j.job_name} title="Copy job name" />
                   </div>
                 </td>
-                <Td>
-                  <div className="flex items-center gap-2">
-                    {canResumeJob(j) && (
-                      <ResumeJobButton
-                        cluster={j.cluster}
-                        jobId={j.job_id}
-                        phase={phase}
-                        jobName={j.job_name}
-                        className="h-7 px-2 text-xs"
-                      />
-                    )}
-                    {canCopyCheckpoint(j, phase) && (
-                      <CopyCheckpointShortcut job={j} />
-                    )}
-                    {!canResumeJob(j) && !canCopyCheckpoint(j, phase) && (
-                      <span className="text-slate-400">—</span>
-                    )}
-                  </div>
-                </Td>
+                {showActions && (
+                  <Td>
+                    <div className="flex items-center gap-2">
+                      {canResumeJob(j) && (
+                        <ResumeJobButton
+                          cluster={j.cluster}
+                          jobId={j.job_id}
+                          phase={phase}
+                          jobName={j.job_name}
+                          className="h-7 px-2 text-xs"
+                        />
+                      )}
+                      {canCopyCheckpoint(j, phase) && (
+                        <CopyCheckpointShortcut job={j} />
+                      )}
+                      {!canResumeJob(j) && !canCopyCheckpoint(j, phase) && (
+                        <span className="text-slate-400">—</span>
+                      )}
+                    </div>
+                  </Td>
+                )}
                 <Td>{j.cluster}</Td>
                 <Td className="font-mono text-xs">{j.partition}</Td>
                 <Td className="font-mono text-xs text-slate-500 min-w-[180px]">{j.nodelist}</Td>
@@ -185,6 +201,79 @@ function JobTable({ rows }: { rows: Job[] }) {
           })}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+function ActiveProgressCell({ job }: { job: Job }) {
+  const shouldFetch = /^(RUNNING|COMPLETING)$/i.test(job.state);
+  const details = useQuery({
+    queryKey: ["job-details", job.cluster, job.job_id, "progress"],
+    queryFn: () =>
+      api<JobDetails>(`/api/jobs/${job.cluster}/${job.job_id}/details`),
+    enabled: shouldFetch,
+    refetchInterval: REFRESH_MS,
+    staleTime: 10_000,
+    retry: false,
+  });
+
+  if (!shouldFetch) {
+    return <span className="text-xs text-slate-500">{job.state.toLowerCase()}</span>;
+  }
+
+  if (details.isLoading) {
+    return (
+      <div className="space-y-1.5" aria-busy="true">
+        <div className="h-3 w-24 animate-pulse rounded bg-slate-100 dark:bg-slate-800" />
+        <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800" />
+      </div>
+    );
+  }
+
+  if (details.error) {
+    return (
+      <ImmediateTooltip content={(details.error as Error).message}>
+        <span className="text-xs text-slate-500">unavailable</span>
+      </ImmediateTooltip>
+    );
+  }
+
+  const p = details.data?.progress;
+  const percent = p?.percent ?? null;
+  const hasStepProgress =
+    p?.current_step !== null &&
+    p?.current_step !== undefined &&
+    p.max_steps !== null &&
+    p.max_steps !== undefined;
+  const hasRunProgress =
+    p?.completed_runs !== null &&
+    p?.completed_runs !== undefined &&
+    p.total_runs !== null &&
+    p.total_runs !== undefined;
+  const showBar = percent !== null || hasStepProgress || hasRunProgress;
+  if (!showBar) {
+    return <span className="text-xs text-slate-500">{p?.current_label ?? "waiting for progress"}</span>;
+  }
+
+  const effectivePercent = Math.max(0, Math.min(100, percent ?? 0));
+  const label = p?.current_label ?? `${effectivePercent.toFixed(1)}%`;
+
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between gap-3 text-xs">
+        <span className="min-w-0 truncate font-mono" title={label}>
+          {label}
+        </span>
+        <span className="shrink-0 font-mono text-slate-500">
+          {effectivePercent.toFixed(1)}%
+        </span>
+      </div>
+      <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
+        <div
+          className="h-full rounded-full bg-slate-900 transition-all dark:bg-slate-50"
+          style={{ width: `${effectivePercent}%` }}
+        />
+      </div>
     </div>
   );
 }
