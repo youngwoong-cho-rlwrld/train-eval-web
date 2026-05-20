@@ -6,7 +6,7 @@ MODEL_VERSION=n1.6
 
 # Reuse the N1.6 Cube Stack modality config; path is relative to this
 # experiment directory after configs/experiments is staged.
-TRAIN_MODALITY_CONFIG=../n16_cube_stack_3cm_right_480/allex_egostereo_ck40_config_absolute.py
+TRAIN_MODALITY_CONFIG=allex_egostereo_ck40_config_absolute.py
 
 export DATA_DIR="$HOME/datasets"
 DATASET_NAME=v4_cube_stack_3cm_right_480

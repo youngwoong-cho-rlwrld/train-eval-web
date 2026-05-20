@@ -134,6 +134,7 @@ async def _find_running_with_ddn() -> str | None:
 
 
 async def _apply_yaml(yaml_text: str) -> None:
+    global _pods_cache
     proc = await asyncio.create_subprocess_exec(
         "kubectl", "create", "-f", "-", "--validate=false", "-n", NAMESPACE,
         stdin=asyncio.subprocess.PIPE,
@@ -146,6 +147,7 @@ async def _apply_yaml(yaml_text: str) -> None:
             f"kubectl apply (data-pod) failed: "
             f"{stderr.decode(errors='replace').strip()}"
         )
+    _pods_cache = None
 
 
 async def _wait_until_running(name: str, timeout: float = 90.0) -> None:
@@ -178,13 +180,11 @@ async def ensure_listing_pod() -> str:
     if shutil.which("kubectl") is None:
         raise RuntimeError("kubectl not found on PATH")
 
-    existing = await _find_running_with_ddn()
-    if existing:
-        return existing
-
     # Pod may already exist without our label (e.g. left over from the
     # manual YAML pre-this-session). Don't double-apply; just wait.
     stale = await _get_pod_by_name(DATA_POD_NAME)
+    if stale and (stale.get("status") or {}).get("phase") == "Running":
+        return DATA_POD_NAME
     if not stale:
         await _apply_yaml(DATA_POD_YAML)
     elif (stale.get("status") or {}).get("phase") in ("Failed", "Succeeded"):
@@ -192,14 +192,24 @@ async def ensure_listing_pod() -> str:
         await _delete_pod(DATA_POD_NAME)
         await _apply_yaml(DATA_POD_YAML)
 
+    if await _get_pod_by_name(DATA_POD_NAME):
+        await _wait_until_running(DATA_POD_NAME)
+        return DATA_POD_NAME
+
+    existing = await _find_running_with_ddn()
+    if existing:
+        return existing
+
     await _wait_until_running(DATA_POD_NAME)
     return DATA_POD_NAME
 
 
 async def _delete_pod(name: str) -> None:
+    global _pods_cache
     proc = await asyncio.create_subprocess_exec(
         "kubectl", "delete", "pod", name, "-n", NAMESPACE, "--wait=false",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     await asyncio.wait_for(proc.communicate(), timeout=15.0)
+    _pods_cache = None

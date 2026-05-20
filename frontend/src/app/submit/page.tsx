@@ -66,7 +66,6 @@ type TrainConfigEdit = {
   batchSize: string;
   maxSteps: string;
   saveSteps: string;
-  actionHorizon: string;
 };
 
 function buildDefaultJobName(phase: Phase, variant: string): string {
@@ -276,7 +275,6 @@ export default function SubmitPage() {
       batchSize,
       maxSteps: vars?.MAX_STEPS ?? "",
       saveSteps: vars?.SAVE_STEPS ?? "",
-      actionHorizon: vars?.ACTION_HORIZON ?? "",
     };
   }, [variant.data]);
   const activeTrainConfigEdit =
@@ -293,9 +291,6 @@ export default function SubmitPage() {
   const trainSaveSteps = activeTrainConfigEdit
     ? activeTrainConfigEdit.saveSteps
     : trainConfigDefaults.saveSteps;
-  const trainActionHorizon = activeTrainConfigEdit
-    ? activeTrainConfigEdit.actionHorizon ?? trainConfigDefaults.actionHorizon
-    : trainConfigDefaults.actionHorizon;
   const trainNumGpusParsed = Number.parseInt(trainNumGpus.trim(), 10);
   const trainBatchSizeParsed = Number.parseInt(
     trainBatchSize.trim(),
@@ -303,15 +298,9 @@ export default function SubmitPage() {
   );
   const trainMaxStepsParsed = Number.parseInt(trainMaxSteps.trim(), 10);
   const trainSaveStepsParsed = Number.parseInt(trainSaveSteps.trim(), 10);
-  const trainActionHorizonTrimmed = trainActionHorizon.trim();
-  const trainActionHorizonParsed = Number.parseInt(
-    trainActionHorizonTrimmed,
-    10,
-  );
   const isPositiveInteger = (value: string) => /^[1-9]\d*$/.test(value.trim());
   const trainModel = variant.data?.vars.MODEL_VERSION ?? "n1.5";
   const wantsTrainConfig = submitPhase === "train" && !!variantName;
-  const wantsTrainActionHorizon = wantsTrainConfig && trainModel === "n1.6";
   const trainNumGpusValid =
     !wantsTrainConfig ||
     (isPositiveInteger(trainNumGpus) &&
@@ -322,16 +311,11 @@ export default function SubmitPage() {
     !wantsTrainConfig || isPositiveInteger(trainMaxSteps);
   const trainSaveStepsValid =
     !wantsTrainConfig || isPositiveInteger(trainSaveSteps);
-  const trainActionHorizonValid =
-    !wantsTrainActionHorizon ||
-    !trainActionHorizonTrimmed ||
-    isPositiveInteger(trainActionHorizon);
   const trainConfigValid =
     trainNumGpusValid &&
     trainBatchSizeValid &&
     trainMaxStepsValid &&
-    trainSaveStepsValid &&
-    trainActionHorizonValid;
+    trainSaveStepsValid;
   const updateTrainConfig = (
     patch: Partial<Omit<TrainConfigEdit, "scope">>,
   ) => {
@@ -341,7 +325,6 @@ export default function SubmitPage() {
       batchSize: trainConfigDefaults.batchSize,
       maxSteps: trainConfigDefaults.maxSteps,
       saveSteps: trainConfigDefaults.saveSteps,
-      actionHorizon: trainConfigDefaults.actionHorizon,
     };
     setTrainConfigEdit({ ...base, ...patch, scope: trainConfigScope });
   };
@@ -405,10 +388,6 @@ export default function SubmitPage() {
         train_global_batch_size: submittedTrainGlobalBatchSize,
         train_max_steps: submitPhase === "train" ? trainMaxStepsParsed : null,
         train_save_steps: submitPhase === "train" ? trainSaveStepsParsed : null,
-        train_action_horizon:
-          wantsTrainActionHorizon && trainActionHorizonTrimmed
-            ? trainActionHorizonParsed
-            : null,
         eval_num_envs_per_gpu: null,
         eval_n_episodes: wantsCheckpoint ? evalNEpisodesParsed : null,
         eval_n_runs: wantsCheckpoint ? evalNRunsParsed : null,
@@ -442,7 +421,6 @@ export default function SubmitPage() {
       trainBatchSize,
       trainMaxSteps,
       trainSaveSteps,
-      trainActionHorizon,
       evalNEpisodes,
       evalNRuns,
       evalSetValues,
@@ -722,16 +700,6 @@ export default function SubmitPage() {
         invalidMessage="Positive integer."
       />
     );
-    if (trainModel === "n1.6") {
-      flagEditors["--action-horizon"] = (
-        <NumberCellEditor
-          value={trainActionHorizon}
-          onChange={(value) => updateTrainConfig({ actionHorizon: value })}
-          valid={trainActionHorizonValid}
-          invalidMessage="Positive integer, or leave blank for model default."
-        />
-      );
-    }
   }
   if (wantsCheckpoint) {
     flagEditors["--n-episodes"] = (
@@ -812,10 +780,10 @@ export default function SubmitPage() {
   });
 
   return (
-    <div className="mx-auto max-w-7xl px-8 py-12">
+    <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8 lg:py-12">
       <h1 className="text-2xl font-semibold tracking-tight">Submit a job</h1>
 
-      <div className="mt-8 grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
+      <div className="mt-8 grid gap-6 xl:grid-cols-[minmax(0,1fr)_360px]">
         <div className="space-y-6">
           <Card>
             <CardHeader>

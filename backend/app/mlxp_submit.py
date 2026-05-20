@@ -31,6 +31,7 @@ from .mlxp_config import (
     DDN_USER_HOME,
     DEFAULT_NODE,
     EXPERIMENTS_DIR as MLXP_EXPERIMENTS_DIR,
+    HF_HOME,
     IMAGE,
     IMAGE_PULL_SECRET,
     NAMESPACE,
@@ -53,7 +54,7 @@ from .training_models import (
     mlxp_repo_path,
     resolve_training_model,
 )
-from .variant_values import variant_int, variant_optional_int
+from .variant_values import variant_int
 from .wandb_config import get_project as _wandb_project
 from .variants import load_variant
 
@@ -66,6 +67,15 @@ _GPU_RESOURCES = {
     4: ("56",  "880Gi"),
     8: ("100", "1500Gi"),
 }
+
+
+def _hf_cache_exports() -> str:
+    hf_home = shlex.quote(HF_HOME)
+    return f"""\
+export HF_HOME={hf_home}
+export HF_HUB_CACHE="$HF_HOME/hub"
+mkdir -p "$HF_HOME" "$HF_HUB_CACHE"
+"""
 
 def mlxp_training_repo_path(model: str | TrainingModel) -> str:
     resolved = model if isinstance(model, TrainingModel) else load_training_model(model)
@@ -84,7 +94,6 @@ class MlxpSubmitRequest(BaseModel):
     global_batch_size: int | None = None
     max_steps: int | None = None
     save_steps: int | None = None
-    action_horizon: int | None = Field(default=None, ge=1)
     # The k8s node to pin via nodeAffinity. Leave None to fall back to the
     # configured default node.
     node: str | None = None
@@ -116,9 +125,6 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
     model = resolve_training_model(variant)
     if req.global_batch_size is not None and model.family == "n1.5" and req.global_batch_size % req.num_gpus != 0:
         raise ValueError("global_batch_size must be divisible by num_gpus for n1.5 training")
-    if req.action_horizon is not None and model.family != "n1.6":
-        raise ValueError("action_horizon is only supported for n1.6 training")
-
     # job_id is the k8s Job resource name — 6-char alpha-leading so it's
     # DNS-safe and URL-short. job_name is the display name carried as an
     # annotation; same shape as slurm's job_name.
@@ -182,12 +188,9 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
     train_num_gpus = req.num_gpus
     train_max_steps = req.max_steps or variant_int(variant, "MAX_STEPS", 30000)
     train_save_steps = req.save_steps or variant_int(variant, "SAVE_STEPS", 1000)
-    train_action_horizon = req.action_horizon or variant_optional_int(variant, "ACTION_HORIZON")
-    if train_action_horizon is not None and model.family != "n1.6":
-        raise ValueError("action_horizon is only supported for n1.6 training")
     per_gpu_batch = int(variant.vars.get("TRAIN_BATCH_SIZE", "64"))
     train_global_batch_size = req.global_batch_size or per_gpu_batch * train_num_gpus
-    suffix = snapshot_suffix(job_name)
+    suffix = f"{snapshot_suffix(job_name)}_{job_id}"
     exp_dir = f"{MLXP_EXPERIMENTS_DIR}/{variant.name}"
     path = f"{exp_dir}/config_{suffix}.sh"
     meta_path = f"{exp_dir}/config_{suffix}.meta.json"
@@ -204,7 +207,6 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
         train_global_batch_size=train_global_batch_size,
         train_max_steps=train_max_steps,
         train_save_steps=train_save_steps,
-        train_action_horizon=train_action_horizon,
         wandb_project=_wandb_project(),
         git=submit_git,
     )
@@ -222,7 +224,6 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
         train_global_batch_size=train_global_batch_size,
         train_max_steps=train_max_steps,
         train_save_steps=train_save_steps,
-        train_action_horizon=train_action_horizon,
         wandb_project=_wandb_project(),
         git=submit_git,
     )
@@ -408,6 +409,7 @@ export WANDB_RUN_ID="{job_name}"
 export WANDB_RESUME=allow
 export NO_ALBUMENTATIONS_UPDATE=1
 export TOKENIZERS_PARALLELISM=false
+{_hf_cache_exports()}
 
 cd {shlex.quote(repo_path)}
 source .venv/bin/activate
@@ -471,12 +473,6 @@ def _render_body_n16(*, variant, req: MlxpSubmitRequest, job_name: str,
         f"{DATASETS_DIR}/{n}" for n in names
     )
     global_batch = req.global_batch_size or int(batch_size) * req.num_gpus
-    action_horizon = req.action_horizon or variant_optional_int(variant, "ACTION_HORIZON")
-    action_horizon_arg = (
-        f"    --action-horizon {action_horizon} \\\n"
-        if action_horizon is not None
-        else ""
-    )
     run_log_dir = f"{ckpt_dir}/logs"
     wandb_project = shlex.quote(_wandb_project())
     uv_userbase = shlex.quote(f"{DDN_USER_HOME}/.local")
@@ -491,6 +487,7 @@ export WANDB_RESUME=allow
 export NO_ALBUMENTATIONS_UPDATE=1
 export TOKENIZERS_PARALLELISM=false
 export OMNI_KIT_ACCEPT_EULA=Y
+{_hf_cache_exports()}
 
 if ! command -v uv >/dev/null 2>&1; then
     PYTHONUSERBASE={uv_userbase} python3 -m pip install --user uv
@@ -526,7 +523,6 @@ uv run torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/launch_finetune
     --learning-rate 1e-4 \\
     --max-steps {max_steps} \\
     --save-steps {save_steps} \\
-{action_horizon_arg}\
     --save-total-limit 5 \\
     --dataloader-num-workers 8 \\
     --experiment-name "{job_name}" \\
@@ -539,14 +535,11 @@ uv run torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/launch_finetune
 def _job_comment(req: MlxpSubmitRequest, variant, snapshot: dict) -> str:
     max_steps = req.max_steps or variant_int(variant, "MAX_STEPS", 30000)
     save_steps = req.save_steps or variant_int(variant, "SAVE_STEPS", 1000)
-    action_horizon = req.action_horizon or variant_optional_int(variant, "ACTION_HORIZON")
     comment = (
         f"phase=train;variant={req.variant};train_num_gpus={req.num_gpus};"
         f"train_max_steps={max_steps};train_save_steps={save_steps};"
         f"wandb_project={_wandb_project()}"
     )
-    if action_horizon is not None:
-        comment += f";train_action_horizon={action_horizon}"
     if req.global_batch_size is not None:
         comment += f";train_global_batch_size={req.global_batch_size}"
     comment += (

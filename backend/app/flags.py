@@ -82,7 +82,6 @@ def _train_n16(v: Variant, cluster: str) -> list[tuple[str, str]]:
         ("--learning-rate", "1e-4"),
         ("--max-steps", v.vars.get("MAX_STEPS", "")),
         ("--save-steps", v.vars.get("SAVE_STEPS", "")),
-        ("--action-horizon", v.vars.get("ACTION_HORIZON", "")),
         ("--save-total-limit", "5"),
         ("--dataloader-num-workers", "8"),
         ("--experiment-name", "<job-name>"),

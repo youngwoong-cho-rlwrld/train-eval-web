@@ -91,6 +91,56 @@ def _elapsed(start: str | None, end: str | None) -> str:
     return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
 
+def _parse_k8s_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _latest_k8s_time(values: list[str | None]) -> str | None:
+    latest: tuple[datetime, str] | None = None
+    for value in values:
+        parsed = _parse_k8s_time(value)
+        if parsed is None or value is None:
+            continue
+        if latest is None or parsed > latest[0]:
+            latest = (parsed, value)
+    return latest[1] if latest else None
+
+
+def _terminated_container_times(pod: dict | None) -> list[str | None]:
+    if not pod:
+        return []
+    status = pod.get("status") or {}
+    out: list[str | None] = []
+    for cs in status.get("containerStatuses", []) or []:
+        for key in ("state", "lastState"):
+            term = (cs.get(key) or {}).get("terminated")
+            if term:
+                out.append(term.get("finishedAt"))
+    return out
+
+
+def _end_time(job_status: dict, pod: dict | None = None) -> str | None:
+    """Kubernetes does not consistently set Job.status.completionTime for
+    failed Jobs. Use condition transition and container termination times as
+    fallbacks so failed jobs sort by actual termination time in the UI."""
+    candidates = [job_status.get("completionTime")]
+    for cond in job_status.get("conditions", []) or []:
+        if cond.get("status") == "True" and cond.get("type") in {
+            "Complete",
+            "SuccessCriteriaMet",
+            "Failed",
+            "FailureTarget",
+        }:
+            candidates.append(cond.get("lastTransitionTime"))
+    candidates.extend(_terminated_container_times(pod))
+    return _latest_k8s_time(candidates)
+
+
 async def list_jobs() -> list[Job]:
     """All MLXP jobs we know about: live k8s Jobs + archived runs derived
     from DDN checkpoint directories.
@@ -132,7 +182,7 @@ async def _list_live_jobs() -> list[Job]:
         pod = pods_by_job.get(job_id)
         state = _state_from_pod_and_job(status, pod)
         start = status.get("startTime")
-        end = status.get("completionTime")
+        end = _end_time(status, pod)
         elapsed = _elapsed(start, end)
 
         nodelist = (pod or {}).get("spec", {}).get("nodeName") or "(unscheduled)"
@@ -229,8 +279,6 @@ async def get_job(name: str) -> dict[str, Any]:
         raise FileNotFoundError(f"mlxp job not found: {name}")
     status = job_data.get("status", {}) or {}
     start = status.get("startTime") or ""
-    end = status.get("completionTime") or ""
-
     pod_data = await _kubectl_json("get", "pods", "-n", _NS, "-l", f"job-name={name}")
     pods = pod_data.get("items", [])
     pod = pods[0] if pods else {}
@@ -238,6 +286,7 @@ async def get_job(name: str) -> dict[str, Any]:
     pod_name = pod.get("metadata", {}).get("name", "")
     node = pod.get("spec", {}).get("nodeName", "") or ""
     state = _state_from_pod_and_job(status, pod if pods else None)
+    end = _end_time(status, pod if pods else None) or ""
 
     # Per-container exit code if available
     exit_code = ""

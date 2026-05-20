@@ -31,7 +31,7 @@ from .submission_snapshot import (
 )
 from .training_models import resolve_training_model
 from .variants import load_variant
-from .variant_values import variant_int, variant_optional_int
+from .variant_values import variant_int
 from .wandb_config import get_project as wandb_project
 
 
@@ -65,7 +65,6 @@ class SubmitRequest(BaseModel):
     train_global_batch_size: int | None = Field(default=None, ge=1)
     train_max_steps: int | None = Field(default=None, ge=1)
     train_save_steps: int | None = Field(default=None, ge=1)
-    train_action_horizon: int | None = Field(default=None, ge=1)
     # Eval-only: override Isaac's native vectorized env count per GPU.
     eval_num_envs_per_gpu: int | None = Field(default=None, ge=1)
     # Legacy request field accepted from older frontends/resume metadata.
@@ -139,17 +138,6 @@ class SubmitResponse(BaseModel):
 MAX_EVAL_NUM_ENVS_PER_GPU = 1
 
 
-def resolve_train_action_horizon(req: SubmitRequest, variant, model) -> int | None:
-    if req.phase != "train":
-        return None
-    action_horizon = req.train_action_horizon
-    if action_horizon is None:
-        action_horizon = variant_optional_int(variant, "ACTION_HORIZON")
-    if action_horizon is not None and model.family != "n1.6":
-        raise ValueError("train_action_horizon is only supported for n1.6 training")
-    return action_horizon
-
-
 async def _rsync_text(host: str, text: str, remote_rel: str) -> None:
     with tempfile.NamedTemporaryFile(mode="w", suffix="_submit_snapshot", delete=False) as fp:
         fp.write(text)
@@ -180,7 +168,6 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         req.train_global_batch_size is not None,
         req.train_max_steps is not None,
         req.train_save_steps is not None,
-        req.train_action_horizon is not None,
     )):
         raise ValueError("train overrides are only valid for phase=train")
     if (
@@ -212,7 +199,6 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     train_num_gpus = req.train_num_gpus or variant_int(variant, "TRAIN_NUM_GPUS", 2)
     train_max_steps = req.train_max_steps or variant_int(variant, "MAX_STEPS", 30000)
     train_save_steps = req.train_save_steps or variant_int(variant, "SAVE_STEPS", 1000)
-    train_action_horizon = resolve_train_action_horizon(req, variant, model)
     effective_train_global_batch_size = req.train_global_batch_size
     if req.phase == "train" and effective_train_global_batch_size is None:
         for key in ("TRAIN_GLOBAL_BATCH_SIZE", "GLOBAL_BATCH_SIZE"):
@@ -270,7 +256,6 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             train_global_batch_size=effective_train_global_batch_size,
             train_max_steps=train_max_steps,
             train_save_steps=train_save_steps,
-            train_action_horizon=train_action_horizon,
             wandb_project=submitted_wandb_project,
             git=submit_git,
         )
@@ -287,7 +272,6 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             train_global_batch_size=effective_train_global_batch_size,
             train_max_steps=train_max_steps,
             train_save_steps=train_save_steps,
-            train_action_horizon=train_action_horizon,
             wandb_project=submitted_wandb_project,
             git=submit_git,
         ))
@@ -386,8 +370,6 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             f";train_max_steps={train_max_steps}"
             f";train_save_steps={train_save_steps}"
         )
-        if train_action_horizon is not None:
-            comment += f";train_action_horizon={train_action_horizon}"
         if req.train_global_batch_size is not None:
             comment += f";train_global_batch_size={req.train_global_batch_size}"
         if snapshot_path:
@@ -423,10 +405,6 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             f"SUBMIT_TRAIN_MAX_STEPS={train_max_steps},"
             f"SUBMIT_TRAIN_SAVE_STEPS={train_save_steps}"
             if req.phase == "train" else ""
-        )
-        + (
-            f",SUBMIT_TRAIN_ACTION_HORIZON={train_action_horizon}"
-            if req.phase == "train" and train_action_horizon is not None else ""
         )
         + (
             f",SUBMIT_TRAIN_GLOBAL_BATCH_SIZE={req.train_global_batch_size}"
@@ -504,11 +482,6 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             f"train_max_steps={train_max_steps}\n"
             f"train_save_steps={train_save_steps}\n"
             if req.phase == "train"
-            else ""
-        )
-        + (
-            f"train_action_horizon={train_action_horizon}\n"
-            if req.phase == "train" and train_action_horizon is not None
             else ""
         )
         + (

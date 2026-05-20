@@ -13,13 +13,3 @@ def variant_int(variant: Any, key: str, default: int) -> int:
         return int(raw)
     except ValueError:
         raise ValueError(f"variant {variant.name}: {key} must be an integer")
-
-
-def variant_optional_int(variant: Any, key: str) -> int | None:
-    raw = variant.vars.get(key)
-    if raw is None or not str(raw).strip():
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        raise ValueError(f"variant {variant.name}: {key} must be an integer")

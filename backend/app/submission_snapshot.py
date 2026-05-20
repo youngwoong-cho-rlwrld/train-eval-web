@@ -12,6 +12,7 @@ import asyncio
 import json
 import re
 import shlex
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
@@ -223,31 +224,217 @@ async def _mlxp_git_run(cmd: str, timeout: float) -> tuple[int, str, str]:
     if shutil.which("kubectl") is None:
         raise RuntimeError("kubectl not found on PATH")
 
-    pod = await ensure_listing_pod()
-    proc = await asyncio.create_subprocess_exec(
-        "kubectl",
-        "exec",
-        "-n",
-        NAMESPACE,
-        pod,
-        "--",
-        "bash",
-        "-lc",
-        cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
     try:
+        pod = await ensure_listing_pod()
+        proc = await asyncio.create_subprocess_exec(
+            "kubectl",
+            "exec",
+            "-n",
+            NAMESPACE,
+            pod,
+            "--",
+            "bash",
+            "-lc",
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
-        raise RuntimeError(f"MLXP git command timed out after {timeout:g}s")
-    return (
-        proc.returncode or 0,
-        stdout.decode(errors="replace"),
-        stderr.decode(errors="replace"),
+        return await _mlxp_git_run_with_pod(cmd, timeout)
+    except RuntimeError as e:
+        if _is_mlxp_exec_transport_error(str(e)):
+            return await _mlxp_git_run_with_pod(cmd, timeout)
+        raise
+
+    out = stdout.decode(errors="replace")
+    err = stderr.decode(errors="replace")
+    if (proc.returncode or 0) != 0 and _is_mlxp_exec_transport_error(err or out):
+        return await _mlxp_git_run_with_pod(cmd, timeout)
+    return proc.returncode or 0, out, err
+
+
+def _is_mlxp_exec_transport_error(message: str) -> bool:
+    lower = message.lower()
+    return any(
+        token in lower
+        for token in (
+            "internal error occurred",
+            "error sending request",
+            "cannot assign requested address",
+            "connection refused",
+            "i/o timeout",
+            "tls handshake timeout",
+            "context deadline exceeded",
+        )
     )
+
+
+async def _mlxp_git_run_with_pod(cmd: str, timeout: float) -> tuple[int, str, str]:
+    """Run git on MLXP DDN without kubectl exec.
+
+    MLXP's exec path occasionally fails at the apiserver/kubelet proxy layer
+    while pod creation and logs still work. A short-lived pod gives the submit
+    preflight the same filesystem view without depending on exec.
+    """
+    from .mlxp_config import (
+        DDN_MOUNT,
+        DDN_PVC,
+        DEFAULT_NODE,
+        IMAGE,
+        IMAGE_PULL_SECRET,
+        NAMESPACE,
+        OWNER_LABEL,
+        TOOL_LABEL,
+        ZONE,
+    )
+
+    pod_name = f"tew-git-{uuid.uuid4().hex[:10]}"
+    marker = f"__TRAIN_EVAL_WEB_RC_{uuid.uuid4().hex}__"
+    wrapped_cmd = f"{cmd}\nrc=$?\nprintf '\\n{marker}%s\\n' \"$rc\"\nexit \"$rc\""
+    spec = {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": pod_name,
+            "namespace": NAMESPACE,
+            "annotations": {
+                "mlx.navercorp.com/zone": ZONE,
+                "sidecar.istio.io/inject": "false",
+            },
+            "labels": {
+                "owner": OWNER_LABEL,
+                "tool": TOOL_LABEL,
+            },
+        },
+        "spec": {
+            "restartPolicy": "Never",
+            "imagePullSecrets": [{"name": IMAGE_PULL_SECRET}],
+            "volumes": [
+                {
+                    "name": "ddn",
+                    "persistentVolumeClaim": {"claimName": DDN_PVC},
+                }
+            ],
+            "affinity": {
+                "nodeAffinity": {
+                    "requiredDuringSchedulingIgnoredDuringExecution": {
+                        "nodeSelectorTerms": [
+                            {
+                                "matchExpressions": [
+                                    {
+                                        "key": "kubernetes.io/hostname",
+                                        "operator": "In",
+                                        "values": [DEFAULT_NODE],
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }
+            },
+            "containers": [
+                {
+                    "name": "main",
+                    "image": IMAGE,
+                    "command": ["bash", "-lc"],
+                    "args": [wrapped_cmd],
+                    "env": [{"name": "NVIDIA_VISIBLE_DEVICES", "value": "none"}],
+                    "resources": {
+                        # Keep requests tiny so this can schedule even when
+                        # all GPUs are occupied by training jobs on the node.
+                        "requests": {"cpu": "10m", "memory": "128Mi"},
+                        "limits": {"cpu": "1", "memory": "512Mi"},
+                    },
+                    "volumeMounts": [{"name": "ddn", "mountPath": DDN_MOUNT}],
+                }
+            ],
+        },
+    }
+
+    async def kubectl(*args: str, stdin: bytes | None = None, deadline: float = 30.0) -> tuple[int, str, str]:
+        proc = await asyncio.create_subprocess_exec(
+            "kubectl",
+            *args,
+            stdin=asyncio.subprocess.PIPE if stdin is not None else None,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(input=stdin), timeout=deadline)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return 124, "", f"kubectl {' '.join(args)} timed out after {deadline:g}s"
+        return (
+            proc.returncode or 0,
+            stdout.decode(errors="replace"),
+            stderr.decode(errors="replace"),
+        )
+
+    try:
+        create_rc = 1
+        create_err = ""
+        for attempt in range(4):
+            create_rc, _, create_err = await kubectl(
+                "create",
+                "-f",
+                "-",
+                "--validate=false",
+                "-n",
+                NAMESPACE,
+                stdin=json.dumps(spec).encode(),
+                deadline=30.0,
+            )
+            if create_rc == 0:
+                break
+            if not _is_mlxp_exec_transport_error(create_err) or attempt == 3:
+                return create_rc, "", create_err.strip() or "kubectl create git pod failed"
+            await asyncio.sleep(1.5 * (attempt + 1))
+
+        deadline_at = asyncio.get_event_loop().time() + timeout
+        phase = ""
+        exit_code: int | None = None
+        while asyncio.get_event_loop().time() < deadline_at:
+            rc, out, err = await kubectl("get", "pod", pod_name, "-n", NAMESPACE, "-o", "json", deadline=15.0)
+            if rc != 0:
+                return rc, "", err.strip() or out.strip() or "kubectl get git pod failed"
+            try:
+                pod = json.loads(out)
+            except json.JSONDecodeError:
+                return 1, "", "kubectl get git pod returned invalid JSON"
+            phase = (pod.get("status") or {}).get("phase") or ""
+            statuses = (pod.get("status") or {}).get("containerStatuses") or []
+            if statuses:
+                state = statuses[0].get("state") or {}
+                terminated = state.get("terminated")
+                if terminated:
+                    exit_code = terminated.get("exitCode")
+            if phase in ("Succeeded", "Failed") or exit_code is not None:
+                break
+            await asyncio.sleep(0.5)
+
+        if not phase:
+            return 124, "", f"MLXP git pod {pod_name} did not start"
+        if phase not in ("Succeeded", "Failed") and exit_code is None:
+            return 124, "", f"MLXP git pod {pod_name} timed out after {timeout:g}s"
+
+        logs_rc, logs, logs_err = await kubectl("logs", pod_name, "-n", NAMESPACE, deadline=30.0)
+        if logs_rc != 0:
+            return logs_rc, "", logs_err.strip() or "kubectl logs git pod failed"
+        parsed_rc = exit_code if exit_code is not None else (0 if phase == "Succeeded" else 1)
+        output = logs
+        marker_match = re.search(rf"\n?{re.escape(marker)}(\d+)\s*$", output)
+        if marker_match:
+            parsed_rc = int(marker_match.group(1))
+            output = output[: marker_match.start()].rstrip("\n")
+            if output:
+                output += "\n"
+        return parsed_rc, output, ""
+    finally:
+        await kubectl("delete", "pod", pod_name, "-n", NAMESPACE, "--wait=false", deadline=15.0)
 
 
 async def mlxp_git_status(*, repo_path: str, repo_label: str) -> GitStatus:
@@ -360,7 +547,6 @@ def render_training_config_snapshot(
     train_global_batch_size: int | None,
     train_max_steps: int,
     train_save_steps: int,
-    train_action_horizon: int | None = None,
     wandb_project: str | None = None,
     git: SubmitGitInfo | None = None,
 ) -> str:
@@ -371,8 +557,6 @@ def render_training_config_snapshot(
     text = _set_scalar(text, "TRAIN_NUM_GPUS", train_num_gpus)
     text = _set_scalar(text, "MAX_STEPS", train_max_steps)
     text = _set_scalar(text, "SAVE_STEPS", train_save_steps)
-    if train_action_horizon is not None:
-        text = _set_scalar(text, "ACTION_HORIZON", train_action_horizon)
     if train_global_batch_size is not None:
         text = _set_scalar(text, "TRAIN_GLOBAL_BATCH_SIZE", train_global_batch_size)
         if model == "n1.5" and train_num_gpus > 0:
@@ -391,8 +575,6 @@ def render_training_config_snapshot(
         footer.append(f"SUBMIT_PARTITION={shlex.quote(partition)}")
     if node:
         footer.append(f"SUBMIT_NODE={shlex.quote(node)}")
-    if train_action_horizon is not None:
-        footer.append(f"SUBMIT_TRAIN_ACTION_HORIZON={train_action_horizon}")
     if git:
         footer.append(f"SUBMIT_GIT_REPO_LABEL={shlex.quote(git.repo_label)}")
         footer.append(f"SUBMIT_GIT_REPO_PATH={shlex.quote(git.repo_path)}")
@@ -479,7 +661,6 @@ def snapshot_metadata(
     train_global_batch_size: int | None = None,
     train_max_steps: int | None = None,
     train_save_steps: int | None = None,
-    train_action_horizon: int | None = None,
     wandb_project: str | None = None,
     git: SubmitGitInfo | None = None,
 ) -> dict[str, Any]:
@@ -499,7 +680,6 @@ def snapshot_metadata(
             "global_batch_size": train_global_batch_size,
             "max_steps": train_max_steps,
             "save_steps": train_save_steps,
-            "action_horizon": train_action_horizon,
             "wandb_project": wandb_project,
         },
         "dataset_override": dataset_override,

@@ -226,7 +226,6 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
             train_num_gpus = req.train_num_gpus or variant_int(variant, "TRAIN_NUM_GPUS", 2)
             train_max_steps = req.train_max_steps or variant_int(variant, "MAX_STEPS", 30000)
             train_save_steps = req.train_save_steps or variant_int(variant, "SAVE_STEPS", 1000)
-            train_action_horizon = submit.resolve_train_action_horizon(req, variant, model)
             train_global_batch_size = req.train_global_batch_size
             if train_global_batch_size is None:
                 for key in ("TRAIN_GLOBAL_BATCH_SIZE", "GLOBAL_BATCH_SIZE"):
@@ -262,7 +261,6 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
                 train_global_batch_size=train_global_batch_size,
                 train_max_steps=train_max_steps,
                 train_save_steps=train_save_steps,
-                train_action_horizon=train_action_horizon,
                 wandb_project=wandb_project(),
                 git=None,
             )
@@ -331,7 +329,6 @@ async def post_submit(req: submit.SubmitRequest):
                 global_batch_size=req.train_global_batch_size,
                 max_steps=req.train_max_steps,
                 save_steps=req.train_save_steps,
-                action_horizon=req.train_action_horizon,
                 node=req.node,
                 dataset_override=req.dataset_override,
                 extra_args=req.extra_args,

@@ -228,28 +228,32 @@ export function ConfigCard({
         )}
         {!loading && !error && variantName && shownFlags && (shownFlags.length > 0 || extraFlagRows.length > 0) && (
           <div className="space-y-2">
-            <div className="grid gap-3 border-b border-slate-100 pb-1 text-xs font-medium uppercase tracking-wide text-slate-500 dark:border-slate-900 md:grid-cols-[minmax(160px,220px)_minmax(0,1fr)_minmax(220px,340px)]">
-              <div>Setting</div>
-              <div>Effective</div>
-              <div>Override</div>
-            </div>
-            <div className="divide-y divide-slate-100 dark:divide-slate-900">
-              {shownFlags.map((f, i) => (
-                <ConfigFlagRow
-                  key={`${f.flag}-${i}`}
-                  flag={f.flag}
-                  value={f.value}
-                  editor={flagEditors?.[f.flag]}
-                />
-              ))}
-              {extraFlagRows.map((row) => (
-                <ConfigFlagRow
-                  key={row.key}
-                  flag={row.flag}
-                  value={row.value}
-                  editor={row.editor}
-                />
-              ))}
+            <div className="overflow-x-auto pb-1">
+              <div className="min-w-[42rem]">
+                <div className="grid grid-cols-[minmax(8rem,12rem)_minmax(10rem,1fr)_minmax(12rem,18rem)] gap-3 border-b border-slate-100 pb-1 text-xs font-medium uppercase tracking-wide text-slate-500 dark:border-slate-900">
+                  <div>Setting</div>
+                  <div>Effective</div>
+                  <div>Override</div>
+                </div>
+                <div className="divide-y divide-slate-100 dark:divide-slate-900">
+                  {shownFlags.map((f, i) => (
+                    <ConfigFlagRow
+                      key={`${f.flag}-${i}`}
+                      flag={f.flag}
+                      value={f.value}
+                      editor={flagEditors?.[f.flag]}
+                    />
+                  ))}
+                  {extraFlagRows.map((row) => (
+                    <ConfigFlagRow
+                      key={row.key}
+                      flag={row.flag}
+                      value={row.value}
+                      editor={row.editor}
+                    />
+                  ))}
+                </div>
+              </div>
             </div>
           </div>
         )}
@@ -286,7 +290,7 @@ function ConfigFlagRow({
 }) {
   const normalizedEditor = normalizeEditor(editor);
   return (
-    <div className="grid gap-2 py-2 text-xs md:grid-cols-[minmax(160px,220px)_minmax(0,1fr)_minmax(220px,340px)] md:items-start">
+    <div className="grid grid-cols-[minmax(8rem,12rem)_minmax(10rem,1fr)_minmax(12rem,18rem)] items-start gap-3 py-2 text-xs">
       <code className="font-mono text-slate-600 dark:text-slate-300">
         {flag}
       </code>
@@ -296,12 +300,12 @@ function ConfigFlagRow({
       {normalizedEditor && !normalizedEditor.wide ? (
         <div className="min-w-0">{normalizedEditor.content}</div>
       ) : (
-        <div className="hidden text-slate-400 md:block">
+        <div className="text-slate-400">
           {normalizedEditor ? "" : "read-only"}
         </div>
       )}
       {normalizedEditor?.wide && (
-        <div className="rounded-md border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-950 md:col-span-3">
+        <div className="col-span-3 rounded-md border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-950">
           {normalizedEditor.content}
         </div>
       )}
