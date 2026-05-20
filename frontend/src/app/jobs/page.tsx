@@ -17,10 +17,16 @@ import { JobStateBadge } from "@/components/job-state-badge";
 import { ImmediateTooltip } from "@/components/immediate-tooltip";
 import { formatDuration, parseSlurmDuration } from "@/lib/duration";
 import { formatJobTimestamp, parseJobTimestampMs } from "@/lib/job-time";
+import {
+  isActiveJobState,
+  isCompletedJobState,
+  isTimeoutJobState,
+  isTrainJobPhase,
+  jobPhase,
+  type JobPhase,
+} from "@/lib/job-status";
 
 const REFRESH_MS = 60_000;
-
-const ACTIVE_STATES = new Set(["RUNNING", "PENDING", "COMPLETING", "CONFIGURING", "SUSPENDED"]);
 
 export default function JobsPage() {
   const qc = useQueryClient();
@@ -49,10 +55,10 @@ export default function JobsPage() {
   const { active, finished } = useMemo(() => {
     const all = data ?? [];
     const active = all
-      .filter((j) => ACTIVE_STATES.has(j.state))
-      .sort((a, b) => Number(b.job_id) - Number(a.job_id));
+      .filter((j) => isActiveJobState(j.state))
+      .sort((a, b) => compareActiveDesc(a, b));
     const finished = all
-      .filter((j) => !ACTIVE_STATES.has(j.state))
+      .filter((j) => !isActiveJobState(j.state))
       .sort((a, b) => compareEndedDesc(a, b));
     return { active, finished };
   }, [data]);
@@ -146,7 +152,7 @@ function JobTable({
         </thead>
         <tbody>
           {rows.map((j) => {
-            const phase = phaseOf(j.job_name);
+            const phase = jobPhase(j.job_name);
             return (
               <tr key={`${j.cluster}-${j.job_id}`} className="border-b border-slate-100 last:border-0 hover:bg-slate-50 dark:border-slate-900 dark:hover:bg-slate-900/40">
                 <td className="py-2 pr-4 font-mono">
@@ -335,33 +341,18 @@ function Timestamp({ iso, cluster }: { iso?: string | null; cluster: string }) {
   );
 }
 
-function phaseOf(jobName: string): "train" | "resume" | "eval" | "other" {
-  // Slurm names:  train_<variant>_<cluster>_<partition>_<ts>
-  // MLXP names:   train_<variant>_<ts> or <user>-train-<variant>-<ts>
-  // Anchor on (start | hyphen | underscore) + phase + (hyphen | underscore).
-  const m = jobName.match(/(?:^|[-_])(train|resume|eval)[-_]/);
-  return (m?.[1] as "train" | "resume" | "eval") ?? "other";
-}
-
-function PhaseBadge({ phase }: { phase: ReturnType<typeof phaseOf> }) {
-  if (phase === "train" || phase === "resume") return <Badge variant="default">{phase}</Badge>;
+function PhaseBadge({ phase }: { phase: JobPhase }) {
+  if (isTrainJobPhase(phase)) return <Badge variant="default">{phase}</Badge>;
   if (phase === "eval") return <Badge variant="outline">eval</Badge>;
   return <Badge variant="secondary">other</Badge>;
 }
 
-function isTimeout(state: string): boolean {
-  return state.toUpperCase().startsWith("TIMEOUT");
-}
-
 function canResumeJob(job: Job): boolean {
-  return job.cluster !== "mlxp" && isTimeout(job.state);
+  return job.cluster !== "mlxp" && isTimeoutJobState(job.state);
 }
 
-function canCopyCheckpoint(job: Job, phase: ReturnType<typeof phaseOf>): boolean {
-  return (
-    (phase === "train" || phase === "resume") &&
-    job.state.toUpperCase().startsWith("COMPLET")
-  );
+function canCopyCheckpoint(job: Job, phase: JobPhase): boolean {
+  return isTrainJobPhase(phase) && isCompletedJobState(job.state);
 }
 
 function compareEndedDesc(a: Job, b: Job): number {
@@ -372,7 +363,22 @@ function compareEndedDesc(a: Job, b: Job): number {
   const aStart = parseJobTimestampMs(a.start, a.cluster);
   const bStart = parseJobTimestampMs(b.start, b.cluster);
   if (aStart !== bStart) return bStart - aStart;
-  return Number(b.job_id) - Number(a.job_id);
+  return compareJobIdDesc(a.job_id, b.job_id);
+}
+
+function compareActiveDesc(a: Job, b: Job): number {
+  const aStart = parseJobTimestampMs(a.start, a.cluster);
+  const bStart = parseJobTimestampMs(b.start, b.cluster);
+  if (aStart !== bStart) return bStart - aStart;
+
+  const aEnd = parseJobTimestampMs(a.end, a.cluster);
+  const bEnd = parseJobTimestampMs(b.end, b.cluster);
+  if (aEnd !== bEnd) return bEnd - aEnd;
+  return compareJobIdDesc(a.job_id, b.job_id);
+}
+
+function compareJobIdDesc(a: string, b: string): number {
+  return b.localeCompare(a, undefined, { numeric: true, sensitivity: "base" });
 }
 
 function Th({ children }: { children: React.ReactNode }) {

@@ -408,6 +408,8 @@ async def delete_job(cluster: str, job_id: str):
     try:
         await jobs.cancel_job(cluster, job_id)
     except RuntimeError as e:
+        if cluster == "mlxp" and "transient Kubernetes transport failure" in str(e):
+            raise HTTPException(503, str(e))
         raise HTTPException(500, str(e))
     return {"status": "cancelled"}
 

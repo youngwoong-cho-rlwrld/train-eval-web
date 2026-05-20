@@ -13,6 +13,12 @@ import { ArrowLeft, ExternalLink } from "lucide-react";
 import { api, logStreamUrl, type JobDetails } from "@/lib/api";
 import { formatDuration, parseSlurmDuration } from "@/lib/duration";
 import { formatJobTimestamp } from "@/lib/job-time";
+import {
+  isCompletedJobState,
+  isTerminalJobState,
+  isTimeoutJobState,
+  isTrainJobPhase,
+} from "@/lib/job-status";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -40,18 +46,11 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
   const { cluster, id } = use(params);
   const qc = useQueryClient();
 
-  // Once a job is in a terminal state (COMPLETED / FAILED / CANCELLED /
-  // TIMEOUT) none of the data changes, so the refetch loop is wasted work
-  // and the countdown on the RefreshButton is misleading.
-  const isTerminal = (state: string | undefined) =>
-    !!state &&
-    /^(COMPLET|FAIL|CANCEL|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL|PREEMPT)/i.test(state);
-
   const sacct = useQuery({
     queryKey: ["job", cluster, id],
     queryFn: () => api<Record<string, string>>(`/api/jobs/${cluster}/${id}`),
     refetchInterval: (q) =>
-      isTerminal((q.state.data as Record<string, string> | undefined)?.State)
+      isTerminalJobState((q.state.data as Record<string, string> | undefined)?.State)
         ? false
         : REFRESH_MS,
   });
@@ -60,12 +59,12 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
     queryKey: ["job-details", cluster, id, "gpu"],
     queryFn: () => api<JobDetails>(`/api/jobs/${cluster}/${id}/details?include_gpu=true`),
     refetchInterval: (q) =>
-      isTerminal((q.state.data as JobDetails | undefined)?.state)
+      isTerminalJobState((q.state.data as JobDetails | undefined)?.state)
         ? false
         : REFRESH_MS,
   });
 
-  const stopped = isTerminal(sacct.data?.State) || isTerminal(details.data?.state);
+  const stopped = isTerminalJobState(sacct.data?.State) || isTerminalJobState(details.data?.state);
 
   const refreshAll = () => {
     qc.invalidateQueries({ queryKey: ["job", cluster, id] });
@@ -98,10 +97,10 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
 
   const phase = details.data?.phase;
   const isEval = phase === "eval";
-  const isTrainPhase = phase === "train" || phase === "resume";
-  const isComplete = (sacct.data?.State ?? "").toUpperCase().startsWith("COMPLET");
+  const isTrainPhase = isTrainJobPhase(phase);
+  const isComplete = isCompletedJobState(sacct.data?.State);
   const stateForActions = sacct.data?.State ?? details.data?.state ?? "";
-  const canResume = cluster !== "mlxp" && stateForActions.toUpperCase().startsWith("TIMEOUT");
+  const canResume = cluster !== "mlxp" && isTimeoutJobState(stateForActions);
   const canCopy = isTrainPhase && isComplete;
   const detailsError = details.error as Error | null;
   const [stream, setStream] = useState<"out" | "err" | "isaac">("out");
@@ -330,7 +329,7 @@ function SubmissionSnapshotCard({
   error?: Error | null;
 }) {
   const snapshot = d?.config_snapshot;
-  const isTrain = d?.phase === "train" || d?.phase === "resume";
+  const isTrain = isTrainJobPhase(d?.phase);
   const wandbProject = snapshot?.wandb_project ?? d?.wandb_project ?? null;
 
   return (
@@ -481,7 +480,7 @@ function ProgressCard({
   error?: Error | null;
 }) {
   const p = d?.progress;
-  const isComplete = (d?.state ?? "").toUpperCase().startsWith("COMPLET");
+  const isComplete = isCompletedJobState(d?.state);
   // Treat a completed job as 100% even when the backend signal didn't make
   // it (e.g. wandb run already archived, checkpoint path moved off DDN).
   const effectivePercent = isComplete ? 100 : (p?.percent ?? 0);
@@ -495,10 +494,10 @@ function ProgressCard({
   const wandbStatus = useQuery({
     queryKey: ["wandb-status"],
     queryFn: () => api<{ logged_in: boolean; entity: string | null; project: string; error: string | null }>("/api/wandb/status"),
-    enabled: !!d && (d.phase === "train" || d.phase === "resume") && !isComplete,
+    enabled: !!d && isTrainJobPhase(d.phase) && !isComplete,
     staleTime: 60_000,
   });
-  const isTrain = d?.phase === "train" || d?.phase === "resume";
+  const isTrain = isTrainJobPhase(d?.phase);
   const wandbMissing =
     !isComplete && isTrain && wandbStatus.data && !wandbStatus.data.logged_in;
   const showGpu = /^(RUNNING|COMPLETING)/i.test(d?.state ?? "");
@@ -520,7 +519,7 @@ function ProgressCard({
   // Training jobs deserve a tidy "step N/N" at completion even if the live
   // current_label decayed; eval/other phases already carry a meaningful
   // current_label (e.g. "15/15 runs · episode 70/70") so respect it.
-  const isTrainPhase = d?.phase === "train" || d?.phase === "resume";
+  const isTrainPhase = isTrainJobPhase(d?.phase);
   const label = isComplete && isTrainPhase
     ? p?.max_steps
       ? `step ${p.max_steps.toLocaleString()}/${p.max_steps.toLocaleString()}`

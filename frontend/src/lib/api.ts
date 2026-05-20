@@ -60,23 +60,6 @@ export type ConfigPreviewFlag = {
   value: string;
 };
 
-export type ActionConfigSummary = {
-  index: number;
-  key: string | null;
-  rep: string | null;
-  type: string | null;
-  format: string | null;
-};
-
-export type DataInterfaceModality = {
-  name: string;
-  delta_indices: number[] | null;
-  delta_indices_expr: string | null;
-  horizon: number | null;
-  modality_keys: string[];
-  action_configs: ActionConfigSummary[];
-};
-
 export type DataInterfaceSummary = {
   variant: string;
   source: string | null;
@@ -84,7 +67,6 @@ export type DataInterfaceSummary = {
   text: string | null;
   config_name: string | null;
   embodiment_tag: string | null;
-  modalities: DataInterfaceModality[];
   error: string | null;
 };
 

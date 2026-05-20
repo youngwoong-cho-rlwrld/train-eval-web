@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
@@ -107,6 +107,19 @@ export default function SubmitPage() {
   const [submitStep, setSubmitStep] = useState<SubmitStep>("job");
   const [datasetDialogOpen, setDatasetDialogOpen] = useState<boolean>(false);
 
+  const changeCluster = (next: string) => {
+    setCluster(next);
+    setSubmitStep("job");
+  };
+  const changeVariantName = (next: string) => {
+    setVariantName(next);
+    setSubmitStep("job");
+  };
+  const changePhase = (next: Phase) => {
+    setPhase(next);
+    setSubmitStep("job");
+  };
+
   // Dataset override state. For single-task variants, `singleDataset` holds
   // the chosen name. For multi-task, `multiDatasets` holds the array of
   // "name|cfg|weight" strings (N1.5) or plain "name" strings (N1.6). Both
@@ -147,9 +160,6 @@ export default function SubmitPage() {
   const trainConfigScope = `${checkpointScope}:train-config`;
 
   const [datasetDir, setDatasetDir] = useDatasetDir(cluster);
-  useEffect(() => {
-    setSubmitStep("job");
-  }, [cluster, variantName, submitPhase]);
   const datasets = useQuery({
     queryKey: ["datasets", cluster, datasetDir],
     queryFn: () =>
@@ -826,7 +836,7 @@ export default function SubmitPage() {
             </CardHeader>
             <CardContent className="space-y-5">
               <Field label="Cluster">
-                <Select value={cluster} onValueChange={setCluster}>
+                <Select value={cluster} onValueChange={changeCluster}>
                   <SelectTrigger>
                     <SelectValue />
                   </SelectTrigger>
@@ -843,7 +853,7 @@ export default function SubmitPage() {
               </Field>
 
               <Field label="Experiment">
-                <Select value={variantName} onValueChange={setVariantName}>
+                <Select value={variantName} onValueChange={changeVariantName}>
                   <SelectTrigger>
                     <SelectValue placeholder="select an experiment..." />
                   </SelectTrigger>
@@ -864,7 +874,7 @@ export default function SubmitPage() {
                   <Field label="Phase">
                     <Select
                       value={phase}
-                      onValueChange={(v) => setPhase(v as Phase)}
+                      onValueChange={(v) => changePhase(v as Phase)}
                     >
                       <SelectTrigger>
                         <SelectValue />

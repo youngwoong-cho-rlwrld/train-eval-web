@@ -327,14 +327,74 @@ async def get_job(name: str) -> dict[str, Any]:
 async def cancel_job(name: str) -> None:
     if shutil.which("kubectl") is None:
         raise RuntimeError("kubectl not found on PATH")
-    proc = await asyncio.create_subprocess_exec(
-        "kubectl", "delete", "job", name, "-n", _NS,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    last_error = ""
+    for attempt in range(5):
+        proc = await asyncio.create_subprocess_exec(
+            "kubectl",
+            "delete",
+            "job",
+            name,
+            "-n",
+            _NS,
+            "--wait=false",
+            "--ignore-not-found=true",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        out = stdout.decode(errors="replace").strip()
+        err = stderr.decode(errors="replace").strip()
+        if proc.returncode == 0:
+            return
+        last_error = err or out or "kubectl delete failed"
+        if _kubectl_not_found(last_error) or await _job_deleted(name):
+            return
+        if not _kubectl_transport_error(last_error) or attempt == 4:
+            break
+        await asyncio.sleep(1.5 * (attempt + 1))
+
+    if _kubectl_transport_error(last_error):
+        raise RuntimeError(
+            "transient Kubernetes transport failure while deleting job after retries: "
+            f"{last_error}"
+        )
+    raise RuntimeError(f"kubectl delete failed: {last_error}")
+
+
+def _kubectl_transport_error(message: str) -> bool:
+    lower = message.lower()
+    return any(
+        token in lower
+        for token in (
+            "failed calling webhook",
+            "failed to call webhook",
+            "error sending request",
+            "cannot assign requested address",
+            "connection refused",
+            "i/o timeout",
+            "tls handshake timeout",
+            "context deadline exceeded",
+            "internal error occurred",
+        )
     )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(f"kubectl delete failed: {stderr.decode(errors='replace').strip()}")
+
+
+def _kubectl_not_found(message: str) -> bool:
+    lower = message.lower()
+    return "notfound" in lower or "not found" in lower
+
+
+async def _job_deleted(name: str) -> bool:
+    try:
+        await _kubectl_json("get", "job", name, "-n", _NS, timeout=10.0)
+    except RuntimeError as e:
+        message = str(e)
+        if _kubectl_not_found(message):
+            return True
+        # A transport failure during verification is not proof that delete
+        # succeeded, so keep retrying the original delete path.
+        return False
+    return False
 
 
 async def tail_logs(job_name: str, follow: bool = True, start_line: int = 1):
