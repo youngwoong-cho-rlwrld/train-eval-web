@@ -54,8 +54,8 @@ export function DatasetField({
 }: DatasetFieldProps) {
   // Multi-task variants come in two shapes:
   //   - N1.5: DATASETS=("name|cfg|weight" ...) — three editable fields per row
-  //   - N1.6: TRAIN_DATASET_NAMES=("name" ...)  — name-only (cfg/weight live
-  //          in the modality config python file)
+  //   - N1.6: TRAIN_DATASET_NAMES=("name" ...)  — name-only; the model-facing
+  //          schema lives in the data interface Python file.
   const namesArray = variant.arrays.TRAIN_DATASET_NAMES;
   const datasetsArray = variant.arrays.DATASETS;
   const multiKind: "names" | "datasets" | null = namesArray
@@ -300,8 +300,8 @@ function NamesOnlyPicker({
         </Button>
       </div>
       <p className="text-xs text-slate-500">
-        N1.6 multi-task: list of dataset names. Weights and per-dataset cfg live
-        in the modality config python file.
+        N1.6 multi-task: list of dataset names. The model-facing schema lives
+        in the data interface Python file.
       </p>
     </div>
   );

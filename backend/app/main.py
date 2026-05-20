@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from . import clusters, copy_checkpoint, datasets, details, flags, job_resume, jobs, mlxp, mlxp_submit, partitions, results, submission_snapshot, submit, training_models, variants, wandb_auth
+from . import clusters, copy_checkpoint, data_interface, datasets, details, flags, job_resume, jobs, mlxp, mlxp_submit, partitions, results, submission_snapshot, submit, training_models, variants, wandb_auth
 from .paths import CLUSTER_STAGING_REL
 from .ssh import ssh_tail_lines
 from .variant_values import variant_int
@@ -120,6 +120,14 @@ async def get_variant_flags(name: str, cluster: str, phase: str = "train"):
     return {"flags": [{"flag": f, "value": val} for f, val in out]}
 
 
+@app.get("/api/variants/{name}/data-interface", response_model=data_interface.DataInterfaceSummary)
+async def get_variant_data_interface(name: str):
+    try:
+        return await data_interface.load_data_interface(name)
+    except FileNotFoundError:
+        raise HTTPException(404, f"variant {name} not found")
+
+
 @app.get("/api/variants/{name}/selected-checkpoint")
 async def get_selected_checkpoint(name: str, cluster: str):
     """The checkpoint path the eval body would pick at runtime, mirroring
@@ -172,10 +180,13 @@ async def get_submit_git_status(cluster: str, variant: str):
         model = training_models.resolve_training_model(v)
         repo_label = submission_snapshot.training_repo_label(model)
         if cluster == "mlxp":
-            return await submission_snapshot.mlxp_git_status(
+            status = await submission_snapshot.mlxp_git_status(
                 repo_path=mlxp_submit.mlxp_training_repo_path(model),
                 repo_label=repo_label,
             )
+            if status.error and submission_snapshot.is_mlxp_transport_error(status.error):
+                raise HTTPException(503, status.error)
+            return status
 
         env = await clusters.load_cluster(cluster)
         return await submission_snapshot.slurm_git_status(

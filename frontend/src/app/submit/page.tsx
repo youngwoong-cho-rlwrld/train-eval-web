@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
@@ -32,6 +32,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
+import { ChevronRight } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
 import {
   Dialog,
@@ -47,6 +48,7 @@ import { MlxpCard } from "@/components/submit/mlxp-card";
 import { AvailabilityCard } from "@/components/submit/availability-card";
 import {
   ConfigCard,
+  DataInterfaceCard,
   type ExtraFlagRow,
   type FlagEditor,
 } from "@/components/config-card";
@@ -67,6 +69,7 @@ type TrainConfigEdit = {
   maxSteps: string;
   saveSteps: string;
 };
+type SubmitStep = "job" | "config" | "modality";
 
 function buildDefaultJobName(phase: Phase, variant: string): string {
   if (!variant) return "";
@@ -101,6 +104,8 @@ export default function SubmitPage() {
   const [gitDialogOpen, setGitDialogOpen] = useState<boolean>(false);
   const [dirtyGitStatus, setDirtyGitStatus] = useState<GitStatus | null>(null);
   const [preflightPending, setPreflightPending] = useState<boolean>(false);
+  const [submitStep, setSubmitStep] = useState<SubmitStep>("job");
+  const [datasetDialogOpen, setDatasetDialogOpen] = useState<boolean>(false);
 
   // Dataset override state. For single-task variants, `singleDataset` holds
   // the chosen name. For multi-task, `multiDatasets` holds the array of
@@ -142,6 +147,9 @@ export default function SubmitPage() {
   const trainConfigScope = `${checkpointScope}:train-config`;
 
   const [datasetDir, setDatasetDir] = useDatasetDir(cluster);
+  useEffect(() => {
+    setSubmitStep("job");
+  }, [cluster, variantName, submitPhase]);
   const datasets = useQuery({
     queryKey: ["datasets", cluster, datasetDir],
     queryFn: () =>
@@ -453,15 +461,16 @@ export default function SubmitPage() {
     staleTime: 30_000,
     refetchOnWindowFocus: false,
   });
+  const gitStatusFetchError = trainGitStatus.error as Error | null;
   const modelRepoError =
-    configPreview.data?.model_repo_error ??
-    trainGitStatus.data?.error ??
-    ((trainGitStatus.error as Error | null)?.message ?? null);
+    configPreview.data?.model_repo_error ?? trainGitStatus.data?.error ?? null;
   const modelRepoMessage =
     !modelRepoError && trainGitStatus.data
       ? trainGitStatus.data.dirty
         ? `Git ${trainGitStatus.data.short_commit ?? "unknown"} · uncommitted changes`
         : `Git ${trainGitStatus.data.short_commit ?? "unknown"} · clean`
+      : gitStatusFetchError
+        ? "Git status will be checked again when submitting."
       : null;
 
   const submit = useMutation({
@@ -549,7 +558,15 @@ export default function SubmitPage() {
     ) : null;
 
   const datasetEditor: FlagEditor | undefined = datasetField
-    ? { content: datasetField, wide: true }
+    ? (
+        <Button
+          variant={datasetTouched ? "default" : "outline"}
+          size="sm"
+          onClick={() => setDatasetDialogOpen(true)}
+        >
+          {datasetTouched ? "Edit override" : "Override datasets"}
+        </Button>
+      )
     : undefined;
   const evalSetsEditor: FlagEditor | undefined = wantsCheckpoint
     ? {
@@ -778,13 +795,28 @@ export default function SubmitPage() {
       ),
     },
   });
+  const selectedVariantName = variant.data?.name ?? variantName;
+  const canReviewConfig = !!variantName;
+  const submitButtonLabel =
+    submit.isPending || preflightPending
+      ? "Submitting..."
+      : isSlurm
+        ? `Submit ${phase} -> ${cluster}/${selectedPartitionName || "?"}`
+        : `Submit train -> mlxp/${mlxpNode}/${trainNumGpus || "?"}xH200`;
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8 lg:py-12">
       <h1 className="text-2xl font-semibold tracking-tight">Submit a job</h1>
+      <SubmitStepper
+        activeStep={submitStep}
+        configEnabled={canReviewConfig}
+        modalityEnabled={canReviewConfig}
+        onStepChange={setSubmitStep}
+      />
 
       <div className="mt-8 grid gap-6 xl:grid-cols-[minmax(0,1fr)_360px]">
         <div className="space-y-6">
+          {submitStep === "job" && (
           <Card>
             <CardHeader>
               <CardTitle>Job</CardTitle>
@@ -1021,47 +1053,79 @@ export default function SubmitPage() {
 
                 </>
               )}
+              <div className="flex justify-end border-t border-slate-100 pt-5 dark:border-slate-900">
+                <Button
+                  onClick={() => setSubmitStep("config")}
+                  disabled={!canReviewConfig}
+                  className="gap-1"
+                >
+                  Review config.sh
+                  <ChevronRight className="h-4 w-4" />
+                </Button>
+              </div>
             </CardContent>
           </Card>
-
-          {variantName && (
-            <ConfigCard
-              variantName={variant.data?.name ?? variantName}
-              flagsUrl={`/api/variants/${variantName}/flags?cluster=${cluster}&phase=${submitPhase}`}
-              queryKey={["variant-flags", variantName, cluster, submitPhase]}
-              modalityConfigFile={variant.data?.vars.TRAIN_MODALITY_CONFIG ?? null}
-              cluster={cluster}
-              phase={submitPhase}
-              checkpointOverride={wantsCheckpoint ? checkpointPath : null}
-              checkpointOverrideExists={checkpointExistsValue}
-              effectiveConfigText={configPreview.data?.text ?? null}
-              effectiveConfigPath={configPreview.data?.path ?? null}
-              modelLabel={configPreview.data?.model_label ?? null}
-              modelRepoPath={configPreview.data?.model_repo_path ?? null}
-              modelRepoError={modelRepoError}
-              modelRepoMessage={modelRepoMessage}
-              modelRepoChecking={submitPhase === "train" && trainGitStatus.isLoading}
-              effectiveConfigLoading={configPreview.isLoading}
-              effectiveConfigError={configPreview.error as Error | null}
-              flagsOverride={configPreview.data?.flags ?? null}
-              flagEditors={flagEditors}
-              extraFlagRows={extraFlagRows}
-              showCheckpointPathRow={false}
-              loading={variant.isLoading}
-              error={variantError}
-              className="mt-6"
-            />
           )}
 
-          <div className="flex justify-end">
-            <Button onClick={handleSubmitClick} disabled={!canSubmit}>
-              {submit.isPending || preflightPending
-                ? "Submitting…"
-                : isSlurm
-                  ? `Submit ${phase} → ${cluster}/${selectedPartitionName || "?"}`
-                  : `Submit train → mlxp/${mlxpNode}/${trainNumGpus || "?"}×H200`}
-            </Button>
-          </div>
+          {submitStep === "config" && variantName && (
+            <>
+              <ConfigCard
+                variantName={selectedVariantName}
+                flagsUrl={`/api/variants/${variantName}/flags?cluster=${cluster}&phase=${submitPhase}`}
+                queryKey={["variant-flags", variantName, cluster, submitPhase]}
+                cluster={cluster}
+                phase={submitPhase}
+                checkpointOverride={wantsCheckpoint ? checkpointPath : null}
+                checkpointOverrideExists={checkpointExistsValue}
+                effectiveConfigText={configPreview.data?.text ?? null}
+                effectiveConfigPath={configPreview.data?.path ?? null}
+                modelLabel={configPreview.data?.model_label ?? null}
+                modelRepoPath={configPreview.data?.model_repo_path ?? null}
+                modelRepoError={modelRepoError}
+                modelRepoMessage={modelRepoMessage}
+                modelRepoChecking={submitPhase === "train" && trainGitStatus.isLoading}
+                effectiveConfigLoading={configPreview.isLoading}
+                effectiveConfigError={configPreview.error as Error | null}
+                flagsOverride={configPreview.data?.flags ?? null}
+                flagEditors={flagEditors}
+                extraFlagRows={extraFlagRows}
+                showCheckpointPathRow={false}
+                loading={variant.isLoading}
+                error={variantError}
+              />
+              <div className="flex justify-between">
+                <Button variant="outline" onClick={() => setSubmitStep("job")}>
+                  Back to Job
+                </Button>
+                <Button
+                  onClick={() => setSubmitStep("modality")}
+                  disabled={!canReviewConfig}
+                  className="gap-1"
+                >
+                  Review modality.py
+                  <ChevronRight className="h-4 w-4" />
+                </Button>
+              </div>
+            </>
+          )}
+
+          {submitStep === "modality" && variantName && (
+            <>
+              <DataInterfaceCard
+                variantName={selectedVariantName}
+                loading={variant.isLoading}
+                error={variantError}
+              />
+              <div className="flex justify-between">
+                <Button variant="outline" onClick={() => setSubmitStep("config")}>
+                  Back to config.sh
+                </Button>
+                <Button onClick={handleSubmitClick} disabled={!canSubmit}>
+                  {submitButtonLabel}
+                </Button>
+              </div>
+            </>
+          )}
         </div>
 
         <aside className="space-y-4 lg:sticky lg:top-6 lg:self-start">
@@ -1091,6 +1155,37 @@ export default function SubmitPage() {
           )}
         </aside>
       </div>
+
+      <Dialog open={datasetDialogOpen} onOpenChange={setDatasetDialogOpen}>
+        <DialogContent className="max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>Dataset override</DialogTitle>
+            <DialogDescription>
+              Edit the dataset values used for <code>--dataset-path</code> in
+              this submission.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="max-h-[70vh] overflow-y-auto pr-1">
+            {datasetField ?? (
+              <EmptyState message="Pick an experiment before editing datasets." />
+            )}
+          </div>
+          <DialogFooter>
+            {datasetTouched && (
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setDatasetEdit(null);
+                  setDatasetDialogOpen(false);
+                }}
+              >
+                Reset override
+              </Button>
+            )}
+            <Button onClick={() => setDatasetDialogOpen(false)}>Done</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={gitDialogOpen} onOpenChange={setGitDialogOpen}>
         <DialogContent>
@@ -1161,6 +1256,61 @@ function AsideStatusCard({
         {!loading && !error && <EmptyState message="No data available." />}
       </CardContent>
     </Card>
+  );
+}
+
+function SubmitStepper({
+  activeStep,
+  configEnabled,
+  modalityEnabled,
+  onStepChange,
+}: {
+  activeStep: SubmitStep;
+  configEnabled: boolean;
+  modalityEnabled: boolean;
+  onStepChange: (step: SubmitStep) => void;
+}) {
+  const steps: Array<{ key: SubmitStep; label: string; enabled: boolean }> = [
+    { key: "job", label: "Job", enabled: true },
+    { key: "config", label: "config.sh", enabled: configEnabled },
+    { key: "modality", label: "modality.py", enabled: modalityEnabled },
+  ];
+  return (
+    <div className="mt-6 rounded-lg border border-slate-200 bg-white p-2 shadow-sm dark:border-slate-800 dark:bg-slate-950">
+      <div className="grid gap-2 sm:grid-cols-3">
+        {steps.map((step, index) => {
+          const active = step.key === activeStep;
+          return (
+            <button
+              key={step.key}
+              type="button"
+              disabled={!step.enabled}
+              onClick={() => onStepChange(step.key)}
+              aria-current={active ? "step" : undefined}
+              className={[
+                "flex min-h-11 items-center gap-3 rounded-md border border-transparent px-3 text-left text-sm transition",
+                active
+                  ? "text-slate-950 dark:text-slate-50"
+                  : "text-slate-400 hover:bg-slate-50 hover:text-slate-600 dark:text-slate-600 dark:hover:bg-slate-900 dark:hover:text-slate-300",
+                !step.enabled ? "cursor-not-allowed opacity-50" : "",
+              ].join(" ")}
+            >
+              <span
+                className={[
+                  "flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-xs font-semibold",
+                  active
+                    ? "bg-slate-950 text-white dark:bg-slate-50 dark:text-slate-950"
+                    : "bg-slate-100 text-slate-500 dark:bg-slate-900 dark:text-slate-400",
+                ].join(" ")}
+              >
+                {index + 1}
+              </span>
+              <span className="font-medium">{step.label}</span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 

@@ -3,7 +3,7 @@
 import type { ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { CircleHelp } from "lucide-react";
-import { api } from "@/lib/api";
+import { api, type DataInterfaceSummary } from "@/lib/api";
 import {
   Card,
   CardContent,
@@ -30,7 +30,6 @@ export type ExtraFlagRow = {
 
 export function ConfigCard({
   variantName,
-  modalityConfigFile,
   flagsUrl,
   queryKey,
   cluster,
@@ -55,7 +54,6 @@ export function ConfigCard({
   className,
 }: {
   variantName: string | null;
-  modalityConfigFile?: string | null;
   flagsUrl: string;
   queryKey: unknown[];
   cluster?: string;
@@ -107,16 +105,12 @@ export function ConfigCard({
   const shownFlags = flagsOverride ?? flags.data?.flags;
   const flagsLoading = !flagsOverride && flags.isLoading;
   const flagsError = !flagsOverride ? (flags.error as Error | null) : null;
-  const modalityPath =
-    variantName && modalityConfigFile
-      ? `configs/experiments/${variantName}/${modalityConfigFile}`
-      : null;
 
   return (
     <Card className={className}>
       <CardHeader>
         <CardTitle>
-          Config{" "}
+          config.sh{" "}
           <span className="text-xs font-normal text-slate-500">
             {loading
               ? "(loading experiment...)"
@@ -125,20 +119,20 @@ export function ConfigCard({
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-4">
-        {loading && <LoadingState label="Loading config..." />}
+        {loading && <LoadingState label="Loading config.sh..." />}
         {!loading && error && <ErrorState message={error.message} />}
         {!loading && !error && !variantName && (
-          <EmptyState message="Config unavailable because the experiment could not be resolved." />
+          <EmptyState message="config.sh unavailable because the experiment could not be resolved." />
         )}
         {!loading && !error && variantName && (
           <div className="divide-y divide-slate-100 dark:divide-slate-900">
             {shownConfigPath && (
               <ConfigPathRow
-                label={effectiveConfigPath ? "effective config" : "config"}
+                label={effectiveConfigPath ? "effective config.sh" : "config.sh"}
                 value={shownConfigPath}
                 labelHelp={
                   effectiveConfigPath
-                    ? "The config that will be used for this submission after applying UI overrides."
+                    ? "The config.sh that will be used for this submission after applying UI overrides."
                     : undefined
                 }
                 valueTooltip={effectiveConfigPath ? shownConfigPath : undefined}
@@ -146,7 +140,7 @@ export function ConfigCard({
             )}
             {effectiveConfigPath && configPath && (
               <ConfigPathRow
-                label="source config"
+                label="source config.sh"
                 value={configPath}
                 labelHelp="The original config.sh in this repo. It is the base file before submit-time overrides are applied."
                 valueTooltip={configPath}
@@ -173,13 +167,6 @@ export function ConfigCard({
                 copyValue={modelRepoPath ?? null}
               />
             )}
-            {modalityPath && (
-              <ConfigPathRow
-                label="modality"
-                value={modalityPath}
-                valueTooltip={modalityPath}
-              />
-            )}
             {wantsCheckpoint && showCheckpointPathRow && (
               <ConfigPathRow
                 label="checkpoint"
@@ -196,25 +183,6 @@ export function ConfigCard({
                 }
               />
             )}
-          </div>
-        )}
-        {!loading && !error && variantName && effectiveConfigLoading && (
-          <LoadingState label="Rendering config preview..." rows={3} />
-        )}
-        {!loading && !error && variantName && effectiveConfigError && (
-          <ErrorState message={effectiveConfigError.message} />
-        )}
-        {!loading && !error && variantName && effectiveConfigText && (
-          <div className="space-y-2">
-            <div className="flex items-center justify-between gap-3">
-              <div className="text-xs font-medium uppercase tracking-wide text-slate-500">
-                Effective config preview
-              </div>
-              <CopyButton value={effectiveConfigText} />
-            </div>
-            <pre className="max-h-80 overflow-auto rounded border border-slate-200 bg-slate-50 p-3 text-xs dark:border-slate-800 dark:bg-slate-950">
-              {effectiveConfigText}
-            </pre>
           </div>
         )}
         {!loading && !error && variantName && flagsLoading && (
@@ -257,6 +225,25 @@ export function ConfigCard({
             </div>
           </div>
         )}
+        {!loading && !error && variantName && effectiveConfigLoading && (
+          <LoadingState label="Rendering config.sh preview..." rows={3} />
+        )}
+        {!loading && !error && variantName && effectiveConfigError && (
+          <ErrorState message={effectiveConfigError.message} />
+        )}
+        {!loading && !error && variantName && effectiveConfigText && (
+          <div className="space-y-2">
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                Effective config.sh preview
+              </div>
+              <CopyButton value={effectiveConfigText} />
+            </div>
+            <pre className="max-h-80 overflow-auto rounded border border-slate-200 bg-slate-50 p-3 text-xs dark:border-slate-800 dark:bg-slate-950">
+              {effectiveConfigText}
+            </pre>
+          </div>
+        )}
       </CardContent>
     </Card>
   );
@@ -277,6 +264,123 @@ function normalizeEditor(editor?: FlagEditor):
     };
   }
   return { content: editor, wide: false };
+}
+
+export function DataInterfaceCard({
+  variantName,
+  loading = false,
+  error,
+  className,
+}: {
+  variantName: string | null;
+  loading?: boolean;
+  error?: Error | null;
+  className?: string;
+}) {
+  const dataInterface = useQuery({
+    queryKey: ["variant-data-interface", variantName],
+    queryFn: () => api<DataInterfaceSummary>(`/api/variants/${variantName}/data-interface`),
+    enabled: !!variantName && !loading && !error,
+  });
+
+  return (
+    <Card className={className}>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          modality.py{" "}
+          <ImmediateTooltip content="GR00T calls this the modality config. It defines the model-facing video/state/action/language schema selected by TRAIN_MODALITY_CONFIG in config.sh.">
+            <CircleHelp className="h-4 w-4 text-slate-400" />
+          </ImmediateTooltip>
+          <span className="text-xs font-normal text-slate-500">
+            {loading
+              ? "(loading experiment...)"
+              : variantName ?? "(experiment unknown - couldn't parse job_name)"}
+          </span>
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {loading && <LoadingState label="Loading modality.py..." />}
+        {!loading && error && <ErrorState message={error.message} />}
+        {!loading && !error && !variantName && (
+          <EmptyState message="modality.py unavailable because the experiment could not be resolved." />
+        )}
+        {!loading && !error && variantName && (
+          <DataInterfaceContent
+            loading={dataInterface.isLoading}
+            error={dataInterface.error as Error | null}
+            summary={dataInterface.data ?? null}
+          />
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function DataInterfaceContent({
+  loading,
+  error,
+  summary,
+}: {
+  loading: boolean;
+  error: Error | null;
+  summary: DataInterfaceSummary | null;
+}) {
+  if (loading) return <LoadingState label="Loading data interface..." rows={3} />;
+  if (error) return <ErrorState message={error.message} />;
+  if (!summary) return null;
+  if (summary.error) {
+    return (
+      <div className="space-y-2">
+        <EmptyState message={summary.error} />
+        {summary.text && <ModalityPreview text={summary.text} />}
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-3">
+      <div className="divide-y divide-slate-100 dark:divide-slate-900">
+        {summary.path && (
+          <ConfigPathRow
+            label="modality.py"
+            value={summary.path}
+            labelHelp="The Python file referenced by TRAIN_MODALITY_CONFIG in config.sh."
+            valueTooltip={summary.path}
+          />
+        )}
+        {summary.config_name && (
+          <ConfigPathRow
+            label="registered schema"
+            value={summary.config_name}
+            labelHelp="The Python dictionary passed to GR00T's register_modality_config."
+          />
+        )}
+        {summary.embodiment_tag && (
+          <ConfigPathRow
+            label="embodiment tag"
+            value={summary.embodiment_tag}
+            labelHelp="The GR00T embodiment tag used when registering this data interface."
+          />
+        )}
+      </div>
+      {summary.text && <ModalityPreview text={summary.text} />}
+    </div>
+  );
+}
+
+function ModalityPreview({ text }: { text: string }) {
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-3">
+        <div className="text-xs font-medium uppercase tracking-wide text-slate-500">
+          modality.py preview
+        </div>
+        <CopyButton value={text} />
+      </div>
+      <pre className="max-h-80 overflow-auto rounded border border-slate-200 bg-slate-50 p-3 text-xs dark:border-slate-800 dark:bg-slate-950">
+        {text}
+      </pre>
+    </div>
+  );
 }
 
 function ConfigFlagRow({

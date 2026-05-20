@@ -10,7 +10,7 @@ import {
 } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ArrowLeft, ExternalLink } from "lucide-react";
-import { api, logStreamUrl, type JobDetails, type Variant } from "@/lib/api";
+import { api, logStreamUrl, type JobDetails } from "@/lib/api";
 import { formatDuration, parseSlurmDuration } from "@/lib/duration";
 import { formatJobTimestamp } from "@/lib/job-time";
 import { Button } from "@/components/ui/button";
@@ -24,7 +24,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { ConfigCard } from "@/components/config-card";
+import { ConfigCard, DataInterfaceCard } from "@/components/config-card";
 import { CopyButton } from "@/components/copy-button";
 import { CopyCheckpointDialog } from "@/components/copy-checkpoint-dialog";
 import { ResumeJobButton } from "@/components/resume-job-button";
@@ -63,12 +63,6 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
       isTerminal((q.state.data as JobDetails | undefined)?.state)
         ? false
         : REFRESH_MS,
-  });
-
-  const variantQuery = useQuery({
-    queryKey: ["variant", details.data?.variant],
-    queryFn: () => api<Variant>(`/api/variants/${details.data!.variant}`),
-    enabled: !!details.data?.variant,
   });
 
   const stopped = isTerminal(sacct.data?.State) || isTerminal(details.data?.state);
@@ -264,7 +258,6 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
         variantName={details.data?.variant ?? null}
         flagsUrl={`/api/jobs/${cluster}/${id}/flags`}
         queryKey={["job-flags", cluster, id]}
-        modalityConfigFile={variantQuery.data?.vars.TRAIN_MODALITY_CONFIG ?? null}
         cluster={cluster}
         phase={details.data?.phase}
         checkpointOverride={
@@ -276,6 +269,13 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
         effectiveConfigPath={details.data?.config_snapshot?.path ?? null}
         modelLabel={details.data?.config_snapshot?.git_repo_label ?? null}
         modelRepoPath={details.data?.config_snapshot?.git_repo_path ?? null}
+        loading={details.isLoading}
+        error={detailsError}
+        className="mt-6"
+      />
+
+      <DataInterfaceCard
+        variantName={details.data?.variant ?? null}
         loading={details.isLoading}
         error={detailsError}
         className="mt-6"

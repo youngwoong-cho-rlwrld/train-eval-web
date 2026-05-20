@@ -272,6 +272,10 @@ def _is_mlxp_exec_transport_error(message: str) -> bool:
     )
 
 
+def is_mlxp_transport_error(message: str) -> bool:
+    return _is_mlxp_exec_transport_error(message)
+
+
 async def _mlxp_git_run_with_pod(cmd: str, timeout: float) -> tuple[int, str, str]:
     """Run git on MLXP DDN without kubectl exec.
 
@@ -293,7 +297,47 @@ async def _mlxp_git_run_with_pod(cmd: str, timeout: float) -> tuple[int, str, st
 
     pod_name = f"tew-git-{uuid.uuid4().hex[:10]}"
     marker = f"__TRAIN_EVAL_WEB_RC_{uuid.uuid4().hex}__"
-    wrapped_cmd = f"{cmd}\nrc=$?\nprintf '\\n{marker}%s\\n' \"$rc\"\nexit \"$rc\""
+    wrapped_cmd = (
+        "set +e\n"
+        f"{cmd} >/tmp/tew-git.out 2>/tmp/tew-git.err\n"
+        "rc=$?\n"
+        "TEW_RC=\"$rc\" python3 - <<'PY'\n"
+        "import json, os\n"
+        "\n"
+        "LIMIT = 3200\n"
+        "\n"
+        "def read_text(path):\n"
+        "    try:\n"
+        "        with open(path, 'r', encoding='utf-8', errors='replace') as f:\n"
+        "            return f.read()\n"
+        "    except FileNotFoundError:\n"
+        "        return ''\n"
+        "\n"
+        "stdout = read_text('/tmp/tew-git.out')\n"
+        "stderr = read_text('/tmp/tew-git.err')\n"
+        "payload = {\n"
+        "    'rc': int(os.environ.get('TEW_RC') or '1'),\n"
+        "    'stdout': stdout,\n"
+        "    'stderr': stderr,\n"
+        "    'truncated': False,\n"
+        "}\n"
+        "\n"
+        "def encode(data):\n"
+        "    return json.dumps(data, ensure_ascii=True, separators=(',', ':'))\n"
+        "\n"
+        "encoded = encode(payload)\n"
+        "if len(encoded) > LIMIT:\n"
+        "    payload['truncated'] = True\n"
+        "    budget = max(256, (LIMIT - 200) // 2)\n"
+        "    payload['stdout'] = stdout[:budget]\n"
+        "    payload['stderr'] = stderr[:budget]\n"
+        "    encoded = encode(payload)\n"
+        "\n"
+        "with open('/dev/termination-log', 'w', encoding='utf-8') as f:\n"
+        "    f.write(encoded[:LIMIT])\n"
+        "PY\n"
+        "exit \"$rc\"\n"
+    )
     spec = {
         "apiVersion": "v1",
         "kind": "Pod",
@@ -341,6 +385,8 @@ async def _mlxp_git_run_with_pod(cmd: str, timeout: float) -> tuple[int, str, st
                     "image": IMAGE,
                     "command": ["bash", "-lc"],
                     "args": [wrapped_cmd],
+                    "terminationMessagePath": "/dev/termination-log",
+                    "terminationMessagePolicy": "File",
                     "env": [{"name": "NVIDIA_VISIBLE_DEVICES", "value": "none"}],
                     "resources": {
                         # Keep requests tiny so this can schedule even when
@@ -397,6 +443,7 @@ async def _mlxp_git_run_with_pod(cmd: str, timeout: float) -> tuple[int, str, st
         deadline_at = asyncio.get_event_loop().time() + timeout
         phase = ""
         exit_code: int | None = None
+        termination_message = ""
         while asyncio.get_event_loop().time() < deadline_at:
             rc, out, err = await kubectl("get", "pod", pod_name, "-n", NAMESPACE, "-o", "json", deadline=15.0)
             if rc != 0:
@@ -412,6 +459,7 @@ async def _mlxp_git_run_with_pod(cmd: str, timeout: float) -> tuple[int, str, st
                 terminated = state.get("terminated")
                 if terminated:
                     exit_code = terminated.get("exitCode")
+                    termination_message = terminated.get("message") or ""
             if phase in ("Succeeded", "Failed") or exit_code is not None:
                 break
             await asyncio.sleep(0.5)
@@ -420,6 +468,11 @@ async def _mlxp_git_run_with_pod(cmd: str, timeout: float) -> tuple[int, str, st
             return 124, "", f"MLXP git pod {pod_name} did not start"
         if phase not in ("Succeeded", "Failed") and exit_code is None:
             return 124, "", f"MLXP git pod {pod_name} timed out after {timeout:g}s"
+
+        if termination_message:
+            parsed = _parse_mlxp_git_termination_message(termination_message)
+            if parsed is not None:
+                return parsed
 
         logs_rc, logs, logs_err = await kubectl("logs", pod_name, "-n", NAMESPACE, deadline=30.0)
         if logs_rc != 0:
@@ -435,6 +488,29 @@ async def _mlxp_git_run_with_pod(cmd: str, timeout: float) -> tuple[int, str, st
         return parsed_rc, output, ""
     finally:
         await kubectl("delete", "pod", pod_name, "-n", NAMESPACE, "--wait=false", deadline=15.0)
+
+
+def _parse_mlxp_git_termination_message(message: str) -> tuple[int, str, str] | None:
+    try:
+        payload = json.loads(message)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    rc = payload.get("rc")
+    if not isinstance(rc, int):
+        return None
+    stdout = payload.get("stdout")
+    stderr = payload.get("stderr")
+    if not isinstance(stdout, str) or not isinstance(stderr, str):
+        return None
+    if payload.get("truncated"):
+        suffix = "\n[train-eval-web: output truncated from MLXP git helper]\n"
+        if stderr:
+            stderr = stderr.rstrip("\n") + suffix
+        else:
+            stdout = stdout.rstrip("\n") + suffix
+    return rc, stdout, stderr
 
 
 async def mlxp_git_status(*, repo_path: str, repo_label: str) -> GitStatus:
@@ -488,12 +564,16 @@ def apply_dataset_override(config_text: str, override: str | list[str]) -> str:
     new_block_lines.append(")")
     new_block = "\n".join(new_block_lines)
     pattern = rf"^{block_name}=\(.*?^\)\s*$"
-    return re.sub(
+    updated = re.sub(
         pattern,
         new_block,
+        config_text,
         count=1,
         flags=re.MULTILINE | re.DOTALL,
     )
+    if updated == config_text:
+        raise ValueError(f"config has no {block_name} array to override")
+    return updated
 
 
 def _set_scalar(config_text: str, name: str, value: int | str) -> str:
@@ -525,6 +605,7 @@ def _set_array(config_text: str, name: str, values: list[str]) -> str:
         return re.sub(
             pattern,
             rendered,
+            config_text,
             count=1,
             flags=re.MULTILINE | re.DOTALL,
         )
