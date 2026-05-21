@@ -1,7 +1,12 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import {
@@ -452,8 +457,10 @@ export default function SubmitPage() {
         body: JSON.stringify(buildSubmitBody(false)),
       }),
     enabled: configPreviewEnabled,
+    placeholderData: keepPreviousData,
     retry: false,
   });
+  const displayedConfigPreview = configPreview.data ?? null;
   const trainGitStatus = useQuery({
     queryKey: ["submit-git-status", cluster, variantName],
     queryFn: () => {
@@ -1087,16 +1094,16 @@ export default function SubmitPage() {
                 phase={submitPhase}
                 checkpointOverride={wantsCheckpoint ? checkpointPath : null}
                 checkpointOverrideExists={checkpointExistsValue}
-                effectiveConfigText={configPreview.data?.text ?? null}
-                effectiveConfigPath={configPreview.data?.path ?? null}
-                modelLabel={configPreview.data?.model_label ?? null}
-                modelRepoPath={configPreview.data?.model_repo_path ?? null}
+                effectiveConfigText={displayedConfigPreview?.text ?? null}
+                effectiveConfigPath={displayedConfigPreview?.path ?? null}
+                modelLabel={displayedConfigPreview?.model_label ?? null}
+                modelRepoPath={displayedConfigPreview?.model_repo_path ?? null}
                 modelRepoError={modelRepoError}
                 modelRepoMessage={modelRepoMessage}
                 modelRepoChecking={submitPhase === "train" && trainGitStatus.isLoading}
-                effectiveConfigLoading={configPreview.isLoading}
+                effectiveConfigLoading={configPreview.isLoading && !displayedConfigPreview}
                 effectiveConfigError={configPreview.error as Error | null}
-                flagsOverride={configPreview.data?.flags ?? null}
+                flagsOverride={displayedConfigPreview?.flags ?? null}
                 flagEditors={flagEditors}
                 extraFlagRows={extraFlagRows}
                 showCheckpointPathRow={false}

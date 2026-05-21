@@ -18,6 +18,7 @@ class DataInterfaceSummary(BaseModel):
     text: str | None = None
     config_name: str | None = None
     embodiment_tag: str | None = None
+    action_horizon: int | None = None
     error: str | None = None
 
 
@@ -58,25 +59,25 @@ def load_data_interface_for_variant(variant: Variant) -> DataInterfaceSummary:
         "text": text,
     }
     try:
-        config_name, embodiment_tag = _registered_metadata(ast.parse(text))
+        tree = ast.parse(text)
+        config_name, embodiment_tag = _registered_metadata(tree)
+        action_horizon = _action_horizon(tree, config_name)
     except SyntaxError as e:
         return DataInterfaceSummary(**base, error=f"could not parse Python file: {e.msg}")
     return DataInterfaceSummary(
         **base,
         config_name=config_name,
         embodiment_tag=embodiment_tag,
+        action_horizon=action_horizon,
     )
 
 
 def _registered_metadata(tree: ast.Module) -> tuple[str | None, str | None]:
-    dict_names: list[str] = []
+    dict_names = list(_top_level_dicts(tree))
     registered_name: str | None = None
     embodiment_tag: str | None = None
 
     for node in tree.body:
-        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict):
-            dict_names.extend(target.id for target in node.targets if isinstance(target, ast.Name))
-            continue
         if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
             continue
         call = node.value
@@ -90,6 +91,93 @@ def _registered_metadata(tree: ast.Module) -> tuple[str | None, str | None]:
 
     config_name = registered_name or (dict_names[0] if len(dict_names) == 1 else None)
     return config_name, embodiment_tag
+
+
+def _action_horizon(tree: ast.Module, config_name: str | None) -> int | None:
+    dicts = _top_level_dicts(tree)
+    candidates = _candidate_config_dicts(dicts, config_name)
+    for config in candidates:
+        value = _dict_value(config, "action")
+        if value is None:
+            continue
+        delta_indices = _call_keyword(value, "delta_indices")
+        if delta_indices is None:
+            continue
+        length = _sequence_len(delta_indices)
+        if length is not None:
+            return length
+    return None
+
+
+def _top_level_dicts(tree: ast.Module) -> dict[str, ast.Dict]:
+    dicts: dict[str, ast.Dict] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Dict):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                dicts[target.id] = node.value
+    return dicts
+
+
+def _candidate_config_dicts(
+    dicts: dict[str, ast.Dict],
+    config_name: str | None,
+) -> list[ast.Dict]:
+    candidates: list[ast.Dict] = []
+    if config_name and config_name in dicts:
+        candidates.append(dicts[config_name])
+    candidates.extend(value for key, value in dicts.items() if key != config_name)
+    return candidates
+
+
+def _dict_value(node: ast.Dict, key: str) -> ast.AST | None:
+    for k, v in zip(node.keys, node.values):
+        if isinstance(k, ast.Constant) and k.value == key:
+            return v
+    return None
+
+
+def _call_keyword(node: ast.AST, key: str) -> ast.AST | None:
+    if not isinstance(node, ast.Call):
+        return None
+    for kw in node.keywords:
+        if kw.arg == key:
+            return kw.value
+    return None
+
+
+def _sequence_len(node: ast.AST) -> int | None:
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return len(node.elts)
+    if isinstance(node, ast.Call) and _call_name(node.func) == "list":
+        if len(node.args) == 1 and isinstance(node.args[0], ast.Call):
+            return _range_len(node.args[0])
+    if isinstance(node, ast.Call) and _call_name(node.func) == "range":
+        return _range_len(node)
+    return None
+
+
+def _range_len(node: ast.Call) -> int | None:
+    if _call_name(node.func) != "range":
+        return None
+    values: list[int] = []
+    for arg in node.args:
+        if not isinstance(arg, ast.Constant) or not isinstance(arg.value, int):
+            return None
+        values.append(arg.value)
+    if len(values) == 1:
+        start, stop, step = 0, values[0], 1
+    elif len(values) == 2:
+        start, stop = values
+        step = 1
+    elif len(values) == 3:
+        start, stop, step = values
+    else:
+        return None
+    if step == 0:
+        return None
+    return len(range(start, stop, step))
 
 
 def _call_name(node: ast.AST) -> str | None:

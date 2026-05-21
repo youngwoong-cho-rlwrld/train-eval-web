@@ -212,11 +212,13 @@ async def _list_archived_jobs(seen: set[str]) -> list[Job]:
     experiments_root = shlex.quote(MLXP_EXPERIMENTS_DIR)
     script = r"""
 shopt -s nullglob
-for d in __EXPERIMENTS_ROOT__/*/checkpoints/*/; do
+for d in __EXPERIMENTS_ROOT__/*/checkpoints/ __EXPERIMENTS_ROOT__/*/checkpoints/*/ __EXPERIMENTS_ROOT__/*/checkpoints/*/*/; do
     matches=( "$d"checkpoint-* )
     [ ${#matches[@]} -eq 0 ] && continue
     job_name=$(basename "$d")
-    variant=$(basename "$(dirname "$(dirname "$d")")")
+    rel="${d#__EXPERIMENTS_ROOT__/}"
+    variant="${rel%%/*}"
+    [ "$job_name" = "checkpoints" ] && job_name="$variant"
     latest=$(for m in "${matches[@]}"; do basename "$m" | sed 's:^checkpoint-::'; done | sort -n | tail -1)
     start_epoch=$(stat -c %Y "$d" 2>/dev/null || echo 0)
     end_epoch=$(stat -c %Y "$d"checkpoint-$latest 2>/dev/null || echo "$start_epoch")
@@ -529,10 +531,11 @@ async def _archived_record(name: str) -> dict[str, Any] | None:
     quoted_name = shlex.quote(name)
     script = r"""
 shopt -s nullglob
-for d in __EXPERIMENTS_ROOT__/*/checkpoints/__JOB_NAME__/; do
+for d in __EXPERIMENTS_ROOT__/*/checkpoints/__JOB_NAME__/ __EXPERIMENTS_ROOT__/*/checkpoints/__JOB_NAME__/__JOB_NAME__/; do
     matches=( "$d"checkpoint-* )
     [ ${#matches[@]} -eq 0 ] && continue
-    variant=$(basename "$(dirname "$(dirname "$d")")")
+    rel="${d#__EXPERIMENTS_ROOT__/}"
+    variant="${rel%%/*}"
     job_name=$(basename "$d")
     latest=$(for m in "${matches[@]}"; do basename "$m" | sed 's:^checkpoint-::'; done | sort -n | tail -1)
     start_epoch=$(stat -c %Y "$d" 2>/dev/null || echo 0)

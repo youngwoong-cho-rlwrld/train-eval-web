@@ -15,6 +15,7 @@ Transfer mechanism:
 """
 
 import asyncio
+import os
 import shlex
 import time
 import uuid
@@ -29,6 +30,12 @@ from .jobs import get_job
 from .mlxp_config import EXPERIMENTS_DIR as MLXP_EXPERIMENTS_DIR, NAMESPACE as MLXP_NS
 from .mlxp_data_pod import ensure_listing_pod
 from .ssh import ssh_run, _CM_OPTS
+from .submission_snapshot import is_mlxp_transport_error
+
+
+_MLXP_TAR_PIPE_ATTEMPTS = 5
+_MLXP_COPY_STREAMS = max(1, int(os.environ.get("TRAIN_EVAL_MLXP_COPY_STREAMS", "2")))
+_KUBECTL_EXEC_ATTEMPTS = 3
 
 
 class CopyCheckpointRequest(BaseModel):
@@ -46,17 +53,6 @@ class CheckpointEntry(BaseModel):
     path: str
     job_name: str
     step: int
-
-
-class CopyResult(BaseModel):
-    source: str
-    dest: str
-
-
-class CopyCheckpointResponse(BaseModel):
-    dest_cluster: str
-    copies: list[CopyResult]
-    stdout: str = ""
 
 
 class CopyCheckpointStartResponse(BaseModel):
@@ -83,6 +79,7 @@ _COPY_JOBS: dict[str, CopyJobStatus] = {}
 # Parallel registry for runtime handles (asyncio Task + current subprocess).
 # Lets `cancel_copy` interrupt an in-flight transfer.
 _COPY_HANDLES: dict[str, dict] = {}
+_MLXP_STREAM_SEMAPHORE = asyncio.Semaphore(_MLXP_COPY_STREAMS)
 
 
 def _track_proc(copy_id: str, proc: asyncio.subprocess.Process) -> None:
@@ -116,6 +113,39 @@ def cancel_copy(copy_id: str) -> bool:
 
 # ── list checkpoints ────────────────────────────────────────────────────
 
+async def _kubectl_exec_text(
+    pod: str,
+    *command: str,
+    timeout: float = 15.0,
+    attempts: int = _KUBECTL_EXEC_ATTEMPTS,
+) -> str:
+    """Run a short kubectl exec command and return stdout.
+
+    MLXP's API proxy occasionally returns transient transport errors. Keep
+    retries local to Kubernetes reads so callers don't copy/paste retry loops.
+    """
+    last_error = "kubectl exec failed"
+    for attempt in range(1, attempts + 1):
+        proc = await asyncio.create_subprocess_exec(
+            "kubectl", "exec", "-n", MLXP_NS, pod, "--", *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            last_error = "kubectl exec timed out"
+        else:
+            if proc.returncode == 0:
+                return out.decode(errors="replace")
+            last_error = err.decode(errors="replace").strip() or "kubectl exec failed"
+        if attempt == attempts or not is_mlxp_transport_error(last_error):
+            break
+        await asyncio.sleep(0.5 * attempt)
+    raise RuntimeError(last_error)
+
 async def list_checkpoints(cluster: str, job_id: str) -> list[CheckpointEntry]:
     """One entry per run folder.
 
@@ -137,21 +167,16 @@ async def list_checkpoints(cluster: str, job_id: str) -> list[CheckpointEntry]:
             r"""
 shopt -s nullglob
 root=__EXPERIMENTS_ROOT__/__VARIANT__/checkpoints
-for d in "$root" "$root"/*/; do
+for d in "$root"/ "$root"/*/ "$root"/*/*/; do
     matches=( "$d"checkpoint-* )
     [ ${#matches[@]} -eq 0 ] && continue
     latest=$(for m in "${matches[@]}"; do basename "$m" | sed 's:^checkpoint-::'; done | sort -n | tail -1)
     printf '%s|%s\n' "${d%/}" "$latest"
 done
 """.replace("__EXPERIMENTS_ROOT__", experiments_root).replace("__VARIANT__", quoted_variant))
-        proc = await asyncio.create_subprocess_exec(
-            "kubectl", "exec", "-n", MLXP_NS, pod, "--", "bash", "-c", script,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+        out_text = await _kubectl_exec_text(pod, "bash", "-c", script)
         result: list[CheckpointEntry] = []
-        for line in out.decode().splitlines():
+        for line in out_text.splitlines():
             parts = line.split("|")
             if len(parts) != 2 or not parts[1].isdigit():
                 continue
@@ -258,16 +283,11 @@ def get_copy_status(copy_id: str) -> CopyJobStatus | None:
 
 async def _children_of(cluster: str, path: str) -> list[str]:
     """ls -1 names of immediate children under `path`. [] if missing."""
-    cmd = f"ls -1 {shlex.quote(path)} 2>/dev/null"
+    cmd = f"ls -1 {shlex.quote(path)} 2>/dev/null || true"
     if cluster == "mlxp":
         pod = await ensure_listing_pod()
-        proc = await asyncio.create_subprocess_exec(
-            "kubectl", "exec", "-n", MLXP_NS, pod, "--", "bash", "-c", cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
-        return [s for s in out.decode().splitlines() if s]
+        out = await _kubectl_exec_text(pod, "bash", "-c", cmd)
+        return [s for s in out.splitlines() if s]
     env = await load_cluster(cluster)
     r = await ssh_run(env.ssh_alias, cmd, timeout=15.0)
     return [s for s in r.stdout.splitlines() if s]
@@ -404,12 +424,39 @@ async def _pump_bytes(copy_id: str, src: asyncio.subprocess.Process,
             sent += len(chunk)
             if state is not None:
                 state.dest_size_bytes = sent
+                if state.src_size_bytes is not None and sent > state.src_size_bytes:
+                    state.src_size_bytes = sent
     finally:
         try:
             dst.stdin.close()
         except Exception:
             pass
         await asyncio.gather(src.wait(), dst.wait(), return_exceptions=True)
+
+
+async def _pump_and_check_tar_pipe(
+    copy_id: str,
+    label: str,
+    src_proc: asyncio.subprocess.Process,
+    dst_proc: asyncio.subprocess.Process,
+) -> None:
+    _track_proc(copy_id, src_proc)
+    try:
+        await _pump_bytes(copy_id, src_proc, dst_proc)
+    finally:
+        if src_proc.returncode is None:
+            src_proc.kill()
+            await src_proc.wait()
+        if dst_proc.returncode is None:
+            await dst_proc.wait()
+    if src_proc.returncode != 0 or dst_proc.returncode != 0:
+        src_err = (await src_proc.stderr.read()).decode(errors="replace").strip() if src_proc.stderr else ""
+        dst_err = (await dst_proc.stderr.read()).decode(errors="replace").strip() if dst_proc.stderr else ""
+        raise RuntimeError(
+            f"{label} tar pipe failed "
+            f"(src rc={src_proc.returncode}, dst rc={dst_proc.returncode}): "
+            f"{src_err or dst_err or 'no stderr'}"
+        )
 
 
 async def _poll_dest_size(state: CopyJobStatus, cluster: str, path: str) -> None:
@@ -434,18 +481,7 @@ async def _size(cluster: str, path: str) -> int:
     try:
         if cluster == "mlxp":
             pod = await ensure_listing_pod()
-            proc = await asyncio.create_subprocess_exec(
-                "kubectl", "exec", "-n", MLXP_NS, pod, "--", "bash", "-c", cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                out, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                return 0
-            s = out.decode().strip()
+            s = (await _kubectl_exec_text(pod, "bash", "-c", cmd)).strip()
         else:
             env = await load_cluster(cluster)
             r = await ssh_run(env.ssh_alias, cmd, timeout=15.0)
@@ -526,9 +562,53 @@ async def _slurm_to_slurm(copy_id: str, src_cluster: str, src_path: str,
     return r.stdout
 
 
-async def _mlxp_to_slurm(copy_id: str, src_path: str, dest_cluster: str, dest_path: str,
-                          include_only: list[str] | None = None) -> str:
-    pod = await ensure_listing_pod()
+def _remote_shell_path(path: str) -> str:
+    """Quote a remote path while preserving an intentional leading $HOME."""
+    if path == "$HOME":
+        return "$HOME"
+    if path.startswith("$HOME/"):
+        rest = path[len("$HOME/"):]
+        return "$HOME/" + shlex.quote(rest)
+    return shlex.quote(path)
+
+
+def _mlxp_tar_create_cmd(src_parent: str, tar_args: list[str]) -> str:
+    quoted_args = " ".join(shlex.quote(arg) for arg in tar_args)
+    return f"tar c -C {shlex.quote(src_parent)} {quoted_args}"
+
+
+def _slurm_tar_extract_cmd(dest_parent: str, dest_path: str, leaf: str, copy_id: str) -> str:
+    """Extract into a temporary sibling, then atomically promote to dest.
+
+    A failed tar pipe should not leave a half-written checkpoint at the final
+    path, especially because retries may follow immediately.
+    """
+    tmp_template = f".{leaf}.copy-{copy_id}.XXXXXX"
+    dest_parent_q = _remote_shell_path(dest_parent)
+    dest_path_q = _remote_shell_path(dest_path)
+    leaf_q = shlex.quote(leaf)
+    return (
+        f"mkdir -p {dest_parent_q} && "
+        f"tmp_dir=$(mktemp -d {dest_parent_q}/{shlex.quote(tmp_template)}) && "
+        f"cleanup() {{ rm -rf \"$tmp_dir\"; }} && "
+        f"trap cleanup EXIT && "
+        f"tar x -C \"$tmp_dir\" && "
+        f"test -e \"$tmp_dir\"/{leaf_q} && "
+        f"rm -rf {dest_path_q} && "
+        f"mv \"$tmp_dir\"/{leaf_q} {dest_path_q} && "
+        f"trap - EXIT && "
+        f"rm -rf \"$tmp_dir\""
+    )
+
+
+async def _mlxp_to_slurm_once(
+    copy_id: str,
+    pod: str,
+    src_path: str,
+    dest_cluster: str,
+    dest_path: str,
+    include_only: list[str] | None = None,
+) -> str:
     dest_env = await load_cluster(dest_cluster)
     src_parent = str(Path(src_path).parent)
     src_leaf = Path(src_path).name
@@ -537,37 +617,43 @@ async def _mlxp_to_slurm(copy_id: str, src_path: str, dest_cluster: str, dest_pa
 
     src_proc = await asyncio.create_subprocess_exec(
         "kubectl", "exec", "-i", "-n", MLXP_NS, pod, "--",
-        "tar", "c", "-C", src_parent, *tar_args,
+        "bash", "-lc", _mlxp_tar_create_cmd(src_parent, tar_args),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         limit=1 << 22,
     )
     dst_proc = await asyncio.create_subprocess_exec(
         "ssh", "-o", "BatchMode=yes", *_CM_OPTS, dest_env.ssh_alias,
-        f"mkdir -p {shlex.quote(dest_parent)} && tar x -C {shlex.quote(dest_parent)}",
+        _slurm_tar_extract_cmd(dest_parent, dest_path, src_leaf, copy_id),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         limit=1 << 22,
     )
-    _track_proc(copy_id, src_proc)
-    try:
-        await _pump_bytes(copy_id, src_proc, dst_proc)
-    finally:
-        if src_proc.returncode is None:
-            src_proc.kill()
-            await src_proc.wait()
-        if dst_proc.returncode is None:
-            await dst_proc.wait()
-    if src_proc.returncode != 0 or dst_proc.returncode != 0:
-        src_err = (await src_proc.stderr.read()).decode(errors="replace").strip() if src_proc.stderr else ""
-        dst_err = (await dst_proc.stderr.read()).decode(errors="replace").strip() if dst_proc.stderr else ""
-        raise RuntimeError(
-            f"mlxp→slurm tar pipe failed "
-            f"(src rc={src_proc.returncode}, dst rc={dst_proc.returncode}): "
-            f"{src_err or dst_err or 'no stderr'}"
-        )
+    await _pump_and_check_tar_pipe(copy_id, "mlxp→slurm", src_proc, dst_proc)
     return f"copied {src_path} → {dest_env.ssh_alias}:{dest_path}"
+
+
+async def _mlxp_to_slurm(copy_id: str, src_path: str, dest_cluster: str, dest_path: str,
+                          include_only: list[str] | None = None) -> str:
+    last_error: Exception | None = None
+    for attempt in range(1, _MLXP_TAR_PIPE_ATTEMPTS + 1):
+        pod = await ensure_listing_pod()
+        state = _COPY_JOBS.get(copy_id)
+        if state is not None and attempt > 1:
+            state.dest_size_bytes = 0
+        try:
+            async with _MLXP_STREAM_SEMAPHORE:
+                return await _mlxp_to_slurm_once(
+                    copy_id, pod, src_path, dest_cluster, dest_path, include_only
+                )
+        except RuntimeError as e:
+            last_error = e
+            if not is_mlxp_transport_error(str(e)) or attempt == _MLXP_TAR_PIPE_ATTEMPTS:
+                raise
+            await asyncio.sleep(2.0 * attempt)
+    assert last_error is not None
+    raise last_error
 
 
 async def _slurm_to_mlxp(copy_id: str, src_cluster: str, src_path: str, dest_path: str,
@@ -579,39 +665,24 @@ async def _slurm_to_mlxp(copy_id: str, src_cluster: str, src_path: str, dest_pat
     dest_parent = str(Path(dest_path).parent)
     tar_args = " ".join(shlex.quote(it) for it in (include_only or [src_leaf]))
 
-    src_proc = await asyncio.create_subprocess_exec(
-        "ssh", "-o", "BatchMode=yes", *_CM_OPTS, src_env.ssh_alias,
-        f"tar c -C {shlex.quote(src_parent)} {tar_args}",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        limit=1 << 22,
-    )
-    dst_proc = await asyncio.create_subprocess_exec(
-        "kubectl", "exec", "-i", "-n", MLXP_NS, pod, "--",
-        "bash", "-c",
-        f"mkdir -p {shlex.quote(dest_parent)} && tar x -C {shlex.quote(dest_parent)}",
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        limit=1 << 22,
-    )
-    _track_proc(copy_id, src_proc)
-    try:
-        await _pump_bytes(copy_id, src_proc, dst_proc)
-    finally:
-        if src_proc.returncode is None:
-            src_proc.kill()
-            await src_proc.wait()
-        if dst_proc.returncode is None:
-            await dst_proc.wait()
-    if src_proc.returncode != 0 or dst_proc.returncode != 0:
-        src_err = (await src_proc.stderr.read()).decode(errors="replace").strip() if src_proc.stderr else ""
-        dst_err = (await dst_proc.stderr.read()).decode(errors="replace").strip() if dst_proc.stderr else ""
-        raise RuntimeError(
-            f"slurm→mlxp tar pipe failed "
-            f"(src rc={src_proc.returncode}, dst rc={dst_proc.returncode}): "
-            f"{src_err or dst_err or 'no stderr'}"
+    async with _MLXP_STREAM_SEMAPHORE:
+        src_proc = await asyncio.create_subprocess_exec(
+            "ssh", "-o", "BatchMode=yes", *_CM_OPTS, src_env.ssh_alias,
+            f"tar c -C {shlex.quote(src_parent)} {tar_args}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=1 << 22,
         )
+        dst_proc = await asyncio.create_subprocess_exec(
+            "kubectl", "exec", "-i", "-n", MLXP_NS, pod, "--",
+            "bash", "-c",
+            f"mkdir -p {shlex.quote(dest_parent)} && tar x -C {shlex.quote(dest_parent)}",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=1 << 22,
+        )
+        await _pump_and_check_tar_pipe(copy_id, "slurm→mlxp", src_proc, dst_proc)
     return f"copied {src_env.ssh_alias}:{src_path} → mlxp:{dest_path}"
 
 

@@ -97,7 +97,7 @@ export function CopyCheckpointDialog({
 
   return (
     <Dialog open={open} onOpenChange={(v) => (v ? onOpenChange(true) : resetAndClose())}>
-      <DialogContent>
+      <DialogContent className="w-[calc(100vw-2rem)] max-w-xl overflow-hidden">
         <DialogHeader>
           <DialogTitle>Copy checkpoint</DialogTitle>
           <DialogDescription>
@@ -108,8 +108,8 @@ export function CopyCheckpointDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-3">
-          <div className="space-y-1.5">
+        <div className="min-w-0 space-y-3">
+          <div className="min-w-0 space-y-1.5">
             <Label>Checkpoints</Label>
             {checkpoints.isLoading && (
               <LoadingState label="Loading checkpoints..." rows={3} />
@@ -121,11 +121,11 @@ export function CopyCheckpointDialog({
               <EmptyState message="No checkpoints found for this experiment." />
             )}
             {checkpoints.data && checkpoints.data.length > 0 && (
-              <div className="max-h-56 overflow-y-auto rounded-md border border-slate-200 dark:border-slate-800">
+              <div className="max-h-56 min-w-0 overflow-hidden overflow-y-auto rounded-md border border-slate-200 dark:border-slate-800">
                 {checkpoints.data.map((c) => (
                   <label
                     key={c.path}
-                    className="flex cursor-pointer items-center gap-2 border-b border-slate-100 px-3 py-1.5 text-xs last:border-0 hover:bg-slate-50 dark:border-slate-900 dark:hover:bg-slate-900/40"
+                    className="grid min-w-0 cursor-pointer grid-cols-[auto_auto_minmax(0,1fr)] items-center gap-2 border-b border-slate-100 px-3 py-1.5 text-xs last:border-0 hover:bg-slate-50 dark:border-slate-900 dark:hover:bg-slate-900/40"
                   >
                     <input
                       type="checkbox"
@@ -133,8 +133,13 @@ export function CopyCheckpointDialog({
                       onChange={() => toggle(c.path)}
                       className="h-4 w-4 rounded border-slate-300 dark:border-slate-700"
                     />
-                    <span className="font-mono">step {c.step.toLocaleString()}</span>
-                    <span className="ml-auto truncate font-mono text-[10px] text-slate-500">
+                    <span className="whitespace-nowrap font-mono">
+                      step {c.step.toLocaleString()}
+                    </span>
+                    <span
+                      className="min-w-0 truncate text-right font-mono text-[10px] text-slate-500"
+                      title={c.job_name}
+                    >
                       {c.job_name}
                     </span>
                   </label>
@@ -145,7 +150,7 @@ export function CopyCheckpointDialog({
           <div className="space-y-1.5">
             <Label>Destination cluster</Label>
             <Select value={destCluster} onValueChange={setDestCluster}>
-              <SelectTrigger>
+              <SelectTrigger className="min-w-0">
                 <SelectValue placeholder="pick a cluster..." />
               </SelectTrigger>
               <SelectContent>
@@ -169,7 +174,7 @@ export function CopyCheckpointDialog({
               value={destPathRoot}
               onChange={(e) => setDestPathRoot(e.target.value)}
               placeholder="/abs/dir (each checkpoint-N is created under it)"
-              className="font-mono text-xs"
+              className="min-w-0 font-mono text-xs"
             />
           </div>
           <label className="flex items-center gap-2 text-sm">

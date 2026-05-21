@@ -67,6 +67,7 @@ export type DataInterfaceSummary = {
   text: string | null;
   config_name: string | null;
   embodiment_tag: string | null;
+  action_horizon: number | null;
   error: string | null;
 };
 

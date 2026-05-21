@@ -15,6 +15,7 @@ import { ImmediateTooltip } from "@/components/immediate-tooltip";
 import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state";
 
 type FlagEntry = { flag: string; value: string };
+type FlagRow = { key: string; entry: FlagEntry };
 export type FlagEditor =
   | ReactNode
   | {
@@ -83,7 +84,7 @@ export function ConfigCard({
   const flags = useQuery({
     queryKey,
     queryFn: () => api<{ flags: FlagEntry[] }>(flagsUrl),
-    enabled: !!variantName && !loading && !error && !flagsOverride,
+    enabled: !!variantName && !loading && !error,
   });
   const wantsCheckpoint =
     !!variantName && phase === "eval" && !!cluster && cluster !== "mlxp";
@@ -102,7 +103,12 @@ export function ConfigCard({
     ? `configs/experiments/${variantName}/config.sh`
     : null;
   const shownConfigPath = effectiveConfigPath || configPath;
-  const shownFlags = flagsOverride ?? flags.data?.flags;
+  const shownFlags = resolveShownFlags({
+    override: flagsOverride,
+    loaded: flags.data?.flags,
+    editors: flagEditors,
+  });
+  const flagRows = shownFlags ? toFlagRows(shownFlags) : undefined;
   const flagsLoading = !flagsOverride && flags.isLoading;
   const flagsError = !flagsOverride ? (flags.error as Error | null) : null;
 
@@ -191,10 +197,10 @@ export function ConfigCard({
         {!loading && !error && variantName && flagsError && (
           <ErrorState message={flagsError.message} />
         )}
-        {!loading && !error && variantName && shownFlags && shownFlags.length === 0 && extraFlagRows.length === 0 && (
+        {!loading && !error && variantName && flagRows && flagRows.length === 0 && extraFlagRows.length === 0 && (
           <EmptyState message="No flags resolved for this job." />
         )}
-        {!loading && !error && variantName && shownFlags && (shownFlags.length > 0 || extraFlagRows.length > 0) && (
+        {!loading && !error && variantName && flagRows && (flagRows.length > 0 || extraFlagRows.length > 0) && (
           <div className="space-y-2">
             <div className="overflow-x-auto pb-1">
               <div className="min-w-[42rem]">
@@ -204,12 +210,12 @@ export function ConfigCard({
                   <div>Override</div>
                 </div>
                 <div className="divide-y divide-slate-100 dark:divide-slate-900">
-                  {shownFlags.map((f, i) => (
+                  {flagRows.map(({ key, entry }) => (
                     <ConfigFlagRow
-                      key={`${f.flag}-${i}`}
-                      flag={f.flag}
-                      value={f.value}
-                      editor={flagEditors?.[f.flag]}
+                      key={key}
+                      flag={entry.flag}
+                      value={entry.value}
+                      editor={flagEditors?.[entry.flag]}
                     />
                   ))}
                   {extraFlagRows.map((row) => (
@@ -247,6 +253,35 @@ export function ConfigCard({
       </CardContent>
     </Card>
   );
+}
+
+function resolveShownFlags({
+  override,
+  loaded,
+  editors,
+}: {
+  override?: FlagEntry[] | null;
+  loaded?: FlagEntry[];
+  editors?: Record<string, FlagEditor>;
+}): FlagEntry[] | undefined {
+  if (override) return override;
+  if (loaded) return loaded;
+  const editableFlags = editors ? Object.keys(editors) : [];
+  return editableFlags.length > 0
+    ? editableFlags.map((flag) => ({ flag, value: "" }))
+    : undefined;
+}
+
+function toFlagRows(flags: FlagEntry[]): FlagRow[] {
+  const seen = new Map<string, number>();
+  return flags.map((entry) => {
+    const occurrence = seen.get(entry.flag) ?? 0;
+    seen.set(entry.flag, occurrence + 1);
+    return {
+      key: `${entry.flag}:${occurrence}`,
+      entry,
+    };
+  });
 }
 
 function normalizeEditor(editor?: FlagEditor):
@@ -359,6 +394,13 @@ function DataInterfaceContent({
             label="embodiment tag"
             value={summary.embodiment_tag}
             labelHelp="The GR00T embodiment tag used when registering this data interface."
+          />
+        )}
+        {summary.action_horizon != null && (
+          <ConfigPathRow
+            label="action horizon"
+            value={String(summary.action_horizon)}
+            labelHelp="Parsed from action.delta_indices in the registered modality config."
           />
         )}
       </div>

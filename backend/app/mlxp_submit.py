@@ -15,6 +15,7 @@ Different from slurm:
 
 import asyncio
 import io
+import re
 import shlex
 import shutil
 import tarfile
@@ -228,6 +229,8 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
         git=submit_git,
     )
     return {
+        "job_id": job_id,
+        "job_name": job_name,
         "path": path,
         "meta_path": meta_path,
         "config_text": config_text,
@@ -238,6 +241,78 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
         "git_dirty_at_submit": submit_git.dirty_before,
         "git_committed_dirty": submit_git.committed_dirty,
     }
+
+
+def _path_slug(value: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-")
+    return slug or "job"
+
+
+def _mlxp_worktree_path(snapshot: dict) -> str:
+    job_id = snapshot.get("job_id")
+    if isinstance(job_id, str) and job_id:
+        leaf = job_id
+    else:
+        leaf = _path_slug(str(snapshot.get("job_name") or "job"))
+    return f"{MLXP_EXPERIMENTS_DIR}/.worktrees/{leaf}"
+
+
+def _repo_checkout_preamble(repo_path: str, snapshot: dict) -> str:
+    """Pin the runtime checkout to the commit captured at submit time.
+
+    MLXP jobs can sit pending for hours. Running directly from the shared DDN
+    checkout means a queued job may execute code that changed after submit.
+    A detached worktree keeps the runtime code equal to the recorded commit.
+    """
+    commit = snapshot.get("git_commit")
+    if not isinstance(commit, str) or not commit:
+        repo = shlex.quote(repo_path)
+        return f"REPO_SRC={repo}\ncd \"$REPO_SRC\"\n"
+
+    worktree_path = _mlxp_worktree_path(snapshot)
+    repo = shlex.quote(repo_path)
+    worktree = shlex.quote(worktree_path)
+    commit_q = shlex.quote(commit)
+    return f"""\
+REPO_SRC={repo}
+REPO_WORKTREE={worktree}
+REPO_COMMIT={commit_q}
+mkdir -p "$(dirname "$REPO_WORKTREE")"
+git -c safe.directory="$REPO_SRC" -C "$REPO_SRC" worktree prune || true
+if [ ! -e "$REPO_WORKTREE/.git" ]; then
+    if [ -e "$REPO_WORKTREE" ]; then
+        echo "[mlxp] refusing to use non-git worktree path: $REPO_WORKTREE" >&2
+        exit 1
+    fi
+    for attempt in 1 2 3 4 5; do
+        if git -c safe.directory="$REPO_SRC" -C "$REPO_SRC" worktree add --detach "$REPO_WORKTREE" "$REPO_COMMIT"; then
+            break
+        fi
+        rc=$?
+        if [ "$attempt" = "5" ]; then
+            exit "$rc"
+        fi
+        sleep $((attempt * 2))
+    done
+fi
+cd "$REPO_WORKTREE"
+CURRENT_COMMIT="$(git -c safe.directory="$REPO_WORKTREE" rev-parse HEAD)"
+if [ "$CURRENT_COMMIT" != "$REPO_COMMIT" ]; then
+    echo "[mlxp] worktree commit mismatch: expected $REPO_COMMIT got $CURRENT_COMMIT" >&2
+    exit 1
+fi
+echo "[mlxp] running submitted code commit $CURRENT_COMMIT from $REPO_WORKTREE"
+"""
+
+
+def _repo_runtime_preamble(repo_path: str, snapshot: dict) -> str:
+    return f"""\
+{_repo_checkout_preamble(repo_path, snapshot)}
+if [ -d "$REPO_SRC/.venv" ] && [ ! -e .venv ]; then
+    ln -s "$REPO_SRC/.venv" .venv
+fi
+export PYTHONPATH="$PWD${{PYTHONPATH:+:$PYTHONPATH}}"
+"""
 
 
 def _snapshot_preamble(snapshot: dict) -> str:
@@ -411,7 +486,7 @@ export NO_ALBUMENTATIONS_UPDATE=1
 export TOKENIZERS_PARALLELISM=false
 {_hf_cache_exports()}
 
-cd {shlex.quote(repo_path)}
+{_repo_runtime_preamble(repo_path, snapshot)}
 source .venv/bin/activate
 
 {_snapshot_preamble(snapshot)}
@@ -493,7 +568,11 @@ if ! command -v uv >/dev/null 2>&1; then
     PYTHONUSERBASE={uv_userbase} python3 -m pip install --user uv
 fi
 
-cd {shlex.quote(repo_path)}
+{_repo_runtime_preamble(repo_path, snapshot)}
+UV_RUN_ARGS=""
+if [ -e .venv ]; then
+    UV_RUN_ARGS="--no-sync"
+fi
 
 {_snapshot_preamble(snapshot)}
 mkdir -p {ckpt_dir}
@@ -511,7 +590,7 @@ if compgen -G "{ckpt_dir}/checkpoint-*" > /dev/null; then
     RESUME_FLAG="--resume"
 fi
 
-uv run torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/launch_finetune.py \\
+uv run $UV_RUN_ARGS torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/launch_finetune.py \\
     --base-model-path nvidia/GR00T-N1.6-3B \\
     --dataset-path \\
         {dataset_paths_arg} \\

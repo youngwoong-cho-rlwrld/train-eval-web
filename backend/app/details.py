@@ -775,7 +775,7 @@ async def _mlxp_progress(
     if shutil.which("kubectl") is None:
         return progress
     ckpt_root = f"{MLXP_EXPERIMENTS_DIR}/{variant}/checkpoints"
-    ckpt_dirs = [f"{ckpt_root}/{run_id}", ckpt_root]
+    ckpt_dirs = [f"{ckpt_root}/{run_id}", f"{ckpt_root}/{run_id}/{run_id}", ckpt_root]
     from .mlxp_data_pod import ensure_listing_pod
     try:
         pod = await ensure_listing_pod()

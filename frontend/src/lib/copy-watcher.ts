@@ -4,6 +4,8 @@ import { toast } from "sonner";
 import { api } from "@/lib/api";
 
 const STORAGE_KEY = "copy-checkpoint.active";
+const POLL_MS = 2000;
+const STATUS_RECONNECT_MS = 60_000;
 
 export type CopyJobStatus = {
   copy_id: string;
@@ -91,24 +93,42 @@ async function watch({ copyId, destCluster }: ActiveCopy) {
     },
   };
 
-  const toastId = toast.loading("Copying checkpoint…", {
+  const toastId = `copy-checkpoint:${copyId}`;
+  toast.loading("Copying checkpoint...", {
+    id: toastId,
     duration: Infinity,
     action: cancelAction,
   });
+  let lastStatusAt = Date.now();
   try {
     while (true) {
       let s: CopyJobStatus;
       try {
         s = await api<CopyJobStatus>(`/api/copy-jobs/${copyId}`);
+        lastStatusAt = Date.now();
       } catch (e) {
-        // 404 means the backend forgot about this copy (process restart).
-        // Drop it silently — the toast clears below.
-        if (/^404/.test((e as Error).message)) {
+        const message = (e as Error).message;
+        if (/^404\b/.test(message)) {
           toast.dismiss(toastId);
           removeActive(copyId);
           return;
         }
-        throw e;
+        const elapsed = Date.now() - lastStatusAt;
+        if (elapsed >= STATUS_RECONNECT_MS) {
+          toast.dismiss(toastId);
+          toast.error(
+            `Copy status unavailable: ${message}`,
+            { duration: 10_000 },
+          );
+          removeActive(copyId);
+          return;
+        }
+        toast.loading(
+          `Copying checkpoint... reconnecting (${Math.ceil((STATUS_RECONNECT_MS - elapsed) / 1000)}s)`,
+          { id: toastId, duration: Infinity, action: cancelAction },
+        );
+        await new Promise((r) => setTimeout(r, POLL_MS));
+        continue;
       }
       if (s.status === "done") {
         toast.success(
@@ -134,9 +154,13 @@ async function watch({ copyId, destCluster }: ActiveCopy) {
       }
       const src = s.src_size_bytes;
       const dst = s.dest_size_bytes;
-      const pct =
+      const shownDst =
         src && src > 0 && dst != null
-          ? Math.min(100, Math.round((dst / src) * 100))
+          ? Math.min(dst, src)
+          : dst;
+      const pct =
+        src && src > 0 && shownDst != null
+          ? Math.min(100, Math.round((shownDst / src) * 100))
           : null;
       const summary = `${s.copies_done + 1}/${s.copies_total}`;
       const name = s.current_source
@@ -147,11 +171,11 @@ async function watch({ copyId, destCluster }: ActiveCopy) {
         : `Copying ${summary}`;
       toast.loading(
         pct != null
-          ? `${prefix} — ${pct}% (${formatBytes(dst)} / ${formatBytes(src)})`
+          ? `${prefix} — ${pct}% (${formatBytes(shownDst)} / ${formatBytes(src)})`
           : `${prefix}…`,
         { id: toastId, duration: Infinity, action: cancelAction },
       );
-      await new Promise((r) => setTimeout(r, 2000));
+      await new Promise((r) => setTimeout(r, POLL_MS));
     }
   } catch (e) {
     toast.error(
