@@ -21,6 +21,7 @@ import shutil
 import tarfile
 import time
 import uuid
+from pathlib import Path
 
 import yaml
 from pydantic import BaseModel, Field
@@ -459,19 +460,11 @@ def _render_body_script(
         cfg = variant.vars.get("DATA_CONFIG", "allex_thetwo_ck40_egostereo")
         datasets_decl = [f"{names[0]}|{cfg}|1.0"]
 
-    yaml_rows = []
-    for entry in datasets_decl:
-        parts = entry.split("|", 2)
-        if len(parts) != 3:
-            raise ValueError(f"bad DATASETS entry (need name|cfg|weight): {entry!r}")
-        name, cfg, weight = parts
-        yaml_rows.append(
-            f"    - path: {DATASETS_DIR}/{name}\n"
-            f"      embodiment_tag: new_embodiment\n"
-            f"      data_config: {cfg}\n"
-            f"      weight: {weight}"
-        )
-    data_config_yaml = "train:\n  datasets:\n" + "\n".join(yaml_rows)
+    data_config_yaml = _n15_data_config_yaml(
+        variant,
+        datasets_decl,
+        use_file=override is None,
+    )
 
     # No leading indentation — keeps the embedded heredoc YAML well-formed.
     return f"""\
@@ -524,6 +517,43 @@ torchrun --nproc_per_node={req.num_gpus} scripts/gr00t_finetune.py \\
     --seed 42 \\
     $RESUME_FLAG {train_extra} {user_extra}
 """
+
+
+def _n15_data_config_yaml(variant, datasets_decl: list[str], *, use_file: bool) -> str:
+    rel = (variant.vars.get("TRAIN_DATA_CONFIG") or "data_config.yaml").strip()
+    path = EXPERIMENTS_DIR / variant.name / rel
+    if use_file and _safe_yaml_relpath(rel) and path.is_file():
+        return (
+            path.read_text()
+            .replace("${DATA_DIR}", DATASETS_DIR)
+            .replace("$DATA_DIR", DATASETS_DIR)
+        )
+
+    yaml_rows = []
+    for entry in datasets_decl:
+        parts = entry.split("|", 2)
+        if len(parts) != 3:
+            raise ValueError(f"bad DATASETS entry (need name|cfg|weight): {entry!r}")
+        name, cfg, weight = parts
+        yaml_rows.append(
+            f"    - path: {DATASETS_DIR}/{name}\n"
+            f"      embodiment_tag: new_embodiment\n"
+            f"      data_config: {cfg}\n"
+            f"      weight: {weight}"
+        )
+    return "train:\n  datasets:\n" + "\n".join(yaml_rows)
+
+
+def _safe_yaml_relpath(rel: str) -> bool:
+    path = Path(rel)
+    return (
+        bool(rel)
+        and not path.is_absolute()
+        and path.name == rel
+        and not rel.startswith(".")
+        and ".." not in path.parts
+        and path.suffix in {".yaml", ".yml"}
+    )
 
 
 def _render_body_n16(*, variant, req: MlxpSubmitRequest, job_name: str,

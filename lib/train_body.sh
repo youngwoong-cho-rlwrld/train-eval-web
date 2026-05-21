@@ -45,30 +45,38 @@ log "  cluster=$CLUSTER  partition=${SUBMIT_PARTITION:-$PARTITION}  gpu=$GPU_INS
 log "  variant note: $TRAIN_NOTE"
 log "========================================="
 
-# Render data_config.yaml from cluster + variant config.
-# Two modes:
-#   (a) DATASETS=("name|data_config|weight" ...) — multi-dataset co-training.
-#   (b) DATASET_NAME=<name> + DATA_CONFIG=<cfg>  — legacy single-dataset (weight 1.0).
-# Each <name> is joined with $DATA_DIR to form the dataset path on disk.
-DATA_CONFIG_YAML="$EXP_DIR/data_config.yaml"
-{
-    echo "train:"
-    echo "  datasets:"
-    if [[ "${DATASETS+set}" == set ]] && [ "${#DATASETS[@]}" -gt 0 ]; then
-        for entry in "${DATASETS[@]}"; do
-            IFS='|' read -r dname dcfg dweight <<<"$entry"
-            echo "    - path: $DATA_DIR/$dname"
+# N1.5 consumes a YAML data config. Prefer the editable per-experiment YAML
+# when present; otherwise render the legacy config.sh-derived YAML.
+DATA_CONFIG_SOURCE="$EXP_DIR/${TRAIN_DATA_CONFIG:-data_config.yaml}"
+DATA_CONFIG_YAML="$EXP_DIR/.resolved_data_config.yaml"
+USING_DATA_CONFIG_SOURCE=0
+if [ -f "$DATA_CONFIG_SOURCE" ]; then
+    USING_DATA_CONFIG_SOURCE=1
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line//\$\{DATA_DIR\}/$DATA_DIR}"
+        line="${line//\$DATA_DIR/$DATA_DIR}"
+        printf '%s\n' "$line"
+    done < "$DATA_CONFIG_SOURCE" > "$DATA_CONFIG_YAML"
+else
+    {
+        echo "train:"
+        echo "  datasets:"
+        if [[ "${DATASETS+set}" == set ]] && [ "${#DATASETS[@]}" -gt 0 ]; then
+            for entry in "${DATASETS[@]}"; do
+                IFS='|' read -r dname dcfg dweight <<<"$entry"
+                echo "    - path: $DATA_DIR/$dname"
+                echo "      embodiment_tag: new_embodiment"
+                echo "      data_config: $dcfg"
+                echo "      weight: $dweight"
+            done
+        else
+            echo "    - path: $DATA_DIR/$DATASET_NAME"
             echo "      embodiment_tag: new_embodiment"
-            echo "      data_config: $dcfg"
-            echo "      weight: $dweight"
-        done
-    else
-        echo "    - path: $DATA_DIR/$DATASET_NAME"
-        echo "      embodiment_tag: new_embodiment"
-        echo "      data_config: $DATA_CONFIG"
-        echo "      weight: 1.0"
-    fi
-} > "$DATA_CONFIG_YAML"
+            echo "      data_config: $DATA_CONFIG"
+            echo "      weight: 1.0"
+        fi
+    } > "$DATA_CONFIG_YAML"
+fi
 
 if [[ "${DATASETS+set}" == set ]] && [ "${#DATASETS[@]}" -gt 0 ]; then
     log "Datasets (${#DATASETS[@]}):"
@@ -77,9 +85,14 @@ if [[ "${DATASETS+set}" == set ]] && [ "${#DATASETS[@]}" -gt 0 ]; then
         log "  - $DATA_DIR/$dname  (data_config=$dcfg, weight=$dweight)"
     done
 else
-    log "Dataset:        $DATA_DIR/$DATASET_NAME"
-    log "Data config:    $DATA_CONFIG"
+    if [ "${USING_DATA_CONFIG_SOURCE}" = "1" ]; then
+        log "Datasets:       from $DATA_CONFIG_SOURCE"
+    else
+        log "Dataset:        $DATA_DIR/$DATASET_NAME"
+        log "Data config:    $DATA_CONFIG"
+    fi
 fi
+log "Data config YAML: $DATA_CONFIG_YAML"
 log "Output:         $CKPT_DIR"
 log "Max steps:      $MAX_STEPS"
 log "Save steps:     $SAVE_STEPS"

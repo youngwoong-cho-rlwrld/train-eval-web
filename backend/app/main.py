@@ -110,6 +110,43 @@ async def get_variant(name: str):
         raise HTTPException(404, f"variant {name} not found")
 
 
+@app.get("/api/variants/{name}/files", response_model=variants.VariantFiles)
+async def get_variant_files(name: str):
+    try:
+        return await variants.load_variant_files(name)
+    except FileNotFoundError:
+        raise HTTPException(404, f"variant {name} not found")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.put("/api/variants/{name}/files", response_model=variants.SaveVariantFilesResponse)
+async def put_variant_files(name: str, req: variants.SaveVariantFilesRequest):
+    try:
+        return await variants.save_variant_files(name, req)
+    except FileNotFoundError:
+        raise HTTPException(404, f"variant {name} not found")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post(
+    "/api/variants/{name}/files/versions/{version}/restore",
+    response_model=variants.SaveVariantFilesResponse,
+)
+async def restore_variant_files(name: str, version: str):
+    try:
+        return await variants.restore_variant_file_version(name, version)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+
+
 @app.get("/api/variants/{name}/flags")
 async def get_variant_flags(name: str, cluster: str, phase: str = "train"):
     try:

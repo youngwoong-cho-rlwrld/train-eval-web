@@ -71,6 +71,34 @@ export type DataInterfaceSummary = {
   error: string | null;
 };
 
+export type ExperimentFile = {
+  kind: string;
+  label: string;
+  title: string;
+  path: string;
+  content: string;
+  exists: boolean;
+  purpose: string;
+};
+
+export type ExperimentFileVersion = {
+  created_at: string;
+  path: string;
+  files: string[];
+};
+
+export type ExperimentFiles = {
+  variant: string;
+  model_family: string;
+  config: ExperimentFile;
+  second_file: ExperimentFile;
+  versions: ExperimentFileVersion[];
+};
+
+export type SaveExperimentFilesResponse = ExperimentFiles & {
+  saved_version_path: string | null;
+};
+
 export type SubmitConfigPreview = {
   path: string | null;
   model_id: string | null;
