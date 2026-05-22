@@ -28,14 +28,46 @@ from .clusters import load_cluster
 from .details import get_details, resolve_phase_and_variant
 from .jobs import get_job
 from .mlxp_config import EXPERIMENTS_DIR as MLXP_EXPERIMENTS_DIR, NAMESPACE as MLXP_NS
-from .mlxp_data_pod import ensure_listing_pod
+from .mlxp_data_pod import ensure_listing_pod, invalidate_pods_cache
 from .ssh import ssh_run, _CM_OPTS
 from .submission_snapshot import is_mlxp_transport_error
 
 
 _MLXP_TAR_PIPE_ATTEMPTS = 5
-_MLXP_COPY_STREAMS = max(1, int(os.environ.get("TRAIN_EVAL_MLXP_COPY_STREAMS", "2")))
+_MLXP_COPY_STREAMS = max(1, int(os.environ.get("TRAIN_EVAL_MLXP_COPY_STREAMS", "1")))
 _KUBECTL_EXEC_ATTEMPTS = 3
+
+_MODEL_ARTIFACT_EXCLUDES = (
+    "checkpoint-*",
+    "*/checkpoint-*",
+    "optimizer*",
+    "*/optimizer*",
+    "scheduler.pt",
+    "*/scheduler.pt",
+    "rng_state_*.pth",
+    "*/rng_state_*.pth",
+    "trainer_state.json",
+    "*/trainer_state.json",
+    "global_step*",
+    "*/global_step*",
+    "latest",
+    "*/latest",
+    "zero_to_fp32.py",
+    "*/zero_to_fp32.py",
+    "logs",
+    "logs/*",
+    "*/logs",
+    "*/logs/*",
+)
+
+
+def _is_completed_pod_exec_error(message: str) -> bool:
+    lower = message.lower()
+    return (
+        "cannot exec into a container in a completed pod" in lower
+        or "current phase is succeeded" in lower
+        or "current phase is failed" in lower
+    )
 
 
 class CopyCheckpointRequest(BaseModel):
@@ -125,9 +157,10 @@ async def _kubectl_exec_text(
     retries local to Kubernetes reads so callers don't copy/paste retry loops.
     """
     last_error = "kubectl exec failed"
+    current_pod = pod
     for attempt in range(1, attempts + 1):
         proc = await asyncio.create_subprocess_exec(
-            "kubectl", "exec", "-n", MLXP_NS, pod, "--", *command,
+            "kubectl", "exec", "-n", MLXP_NS, current_pod, "--", *command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -141,6 +174,12 @@ async def _kubectl_exec_text(
             if proc.returncode == 0:
                 return out.decode(errors="replace")
             last_error = err.decode(errors="replace").strip() or "kubectl exec failed"
+            if _is_completed_pod_exec_error(last_error):
+                invalidate_pods_cache()
+                try:
+                    current_pod = await ensure_listing_pod()
+                except Exception:
+                    pass
         if attempt == attempts or not is_mlxp_transport_error(last_error):
             break
         await asyncio.sleep(0.5 * attempt)
@@ -293,12 +332,29 @@ async def _children_of(cluster: str, path: str) -> list[str]:
     return [s for s in r.stdout.splitlines() if s]
 
 
+async def _resolve_model_source_path(cluster: str, src_path: str) -> str:
+    """Return the directory that holds deployable model artifacts.
+
+    MLXP training output sometimes wraps the actual model directory one level
+    deeper as `<run>/<run>/...`, with logs next to it. Prefer that inner
+    directory so the copy target is the model artifact folder, not the wrapper.
+    """
+    names = await _children_of(cluster, src_path)
+    leaf = Path(src_path).name
+    if leaf in names:
+        nested = f"{src_path.rstrip('/')}/{leaf}"
+        nested_names = await _children_of(cluster, nested)
+        if nested_names:
+            return nested
+    return src_path
+
+
 async def _resolve_run_layout(cluster: str, src_path: str) -> tuple[bool, str | None]:
     """Return (is_run_folder, latest_checkpoint_basename).
 
-    True when `src_path` contains at least one `checkpoint-N` child — we
-    treat it as a per-run folder and copy top-level files + the highest
-    `checkpoint-N` only. Otherwise it's the checkpoint dir itself.
+    True when `src_path` contains at least one `checkpoint-N` child. The latest
+    checkpoint is still detected for display/compatibility, but copy operations
+    intentionally exclude trainer checkpoints and transfer model artifacts only.
     """
     names = await _children_of(cluster, src_path)
     steps: list[tuple[int, str]] = []
@@ -315,16 +371,37 @@ async def _resolve_run_layout(cluster: str, src_path: str) -> tuple[bool, str | 
     return True, steps[-1][1]
 
 
-def _selective_tar_files(parent_basename: str, names: list[str], latest: str) -> list[str]:
-    """Build the tar arg list for a per-run folder: every non-`checkpoint-*`
-    child + the chosen `checkpoint-N`."""
-    items = [
+def _should_copy_model_artifact(name: str) -> bool:
+    lower = name.lower()
+    if name.startswith("checkpoint-"):
+        return False
+    if name.startswith("global_step"):
+        return False
+    if name.startswith("rng_state_") and name.endswith(".pth"):
+        return False
+    if "optimizer" in lower:
+        return False
+    return name not in {
+        "scheduler.pt",
+        "trainer_state.json",
+        "latest",
+        "zero_to_fp32.py",
+        "logs",
+    }
+
+
+def _select_model_artifact_files(parent_basename: str, names: list[str]) -> list[str]:
+    """Build tar args for deployable model artifacts only.
+
+    This excludes nested Hugging Face/DeepSpeed trainer checkpoints, optimizer
+    state, scheduler/RNG state, and logs. It keeps top-level model shards,
+    config files, processor files, and experiment metadata.
+    """
+    return [
         f"{parent_basename}/{n}"
         for n in names
-        if not n.startswith("checkpoint-")
+        if _should_copy_model_artifact(n)
     ]
-    items.append(f"{parent_basename}/{latest}")
-    return items
 
 
 async def _run_copy(
@@ -334,21 +411,20 @@ async def _run_copy(
     state = _COPY_JOBS[copy_id]
     try:
         for i, src_path in enumerate(sources):
+            src_path = await _resolve_model_source_path(src_cluster, src_path)
             leaf = Path(src_path).name
             dest_path = f"{dest_path_root.rstrip('/')}/{leaf}"
             state.current_source = src_path
             state.current_dest = dest_path
             state.dest_size_bytes = 0
 
-            # Per-run folder (has checkpoint-* children) → copy top-level
-            # files + the latest checkpoint-N only. Otherwise copy as-is.
-            is_run, latest = await _resolve_run_layout(src_cluster, src_path)
+            # Copy deployable model artifacts only. Exclude nested trainer
+            # checkpoints and optimizer/scheduler/RNG state.
+            names = await _children_of(src_cluster, src_path)
             include_only = None
-            if is_run and latest:
-                names = await _children_of(src_cluster, src_path)
-                include_only = _selective_tar_files(leaf, names, latest)
-                # Sum sizes of just the picks for the progress denominator.
-                picks = [n for n in names if not n.startswith("checkpoint-")] + [latest]
+            if names:
+                include_only = _select_model_artifact_files(leaf, names)
+                picks = [item.split("/", 1)[1] for item in include_only]
                 sizes = await asyncio.gather(*[
                     _size(src_cluster, f"{src_path}/{name}") for name in picks
                 ])
@@ -498,24 +574,14 @@ async def _mlxp_to_mlxp(copy_id: str, src: str, dest: str,
                          include_only: list[str] | None = None) -> str:
     pod = await ensure_listing_pod()
     src_parent = str(Path(src).parent)
-    leaf = Path(src).name
+    src_leaf = Path(src).name
     dest_parent = str(Path(dest).parent)
-    if include_only:
-        # Reproduce just the selected children under dest/.
-        copies = " && ".join(
-            f"cp -r {shlex.quote(src_parent)}/{shlex.quote(item)} "
-            f"{shlex.quote(dest_parent)}/{shlex.quote(item)}"
-            for item in include_only
-        )
-        cmd = (
-            f"mkdir -p {shlex.quote(dest)} && "
-            + copies
-        )
-    else:
-        cmd = (
-            f"mkdir -p {shlex.quote(dest_parent)} && "
-            f"cp -r {shlex.quote(src)} {shlex.quote(dest)}"
-        )
+    tar_args = list(include_only or [src_leaf])
+    cmd = (
+        f"mkdir -p {shlex.quote(dest_parent)} && "
+        f"{_mlxp_tar_create_cmd(src_parent, tar_args)} | "
+        f"tar x -C {shlex.quote(dest_parent)}"
+    )
     proc = await asyncio.create_subprocess_exec(
         "kubectl", "exec", "-n", MLXP_NS, pod, "--", "bash", "-c", cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -534,28 +600,15 @@ async def _slurm_to_slurm(copy_id: str, src_cluster: str, src_path: str,
     src_env = await load_cluster(src_cluster)
     dest_env = await load_cluster(dest_cluster)
     dest_alias = shlex.quote(dest_env.ssh_alias)
-    if include_only:
-        # Two-step: top-level files (exclude every other checkpoint-*), then
-        # the chosen checkpoint-N as a single rsync.
-        leaf = Path(src_path).name
-        wanted = {it.split("/", 1)[1] for it in include_only}
-        latest_ck = next((n for n in wanted if n.startswith("checkpoint-")), None)
-        cmd = (
-            f"mkdir -p {shlex.quote(dest_path)} >/dev/null 2>&1 && "
-            f"rsync -az --exclude='checkpoint-*' "
-            f"{shlex.quote(src_path)}/ {dest_alias}:{shlex.quote(dest_path)}/"
-        )
-        if latest_ck:
-            cmd += (
-                f" && rsync -az {shlex.quote(src_path)}/{shlex.quote(latest_ck)} "
-                f"{dest_alias}:{shlex.quote(dest_path)}/"
-            )
-    else:
-        cmd = (
-            f"mkdir -p {shlex.quote(str(Path(dest_path).parent.as_posix()))} >/dev/null 2>&1; "
-            f"rsync -az {shlex.quote(src_path)}/ "
-            f"{dest_alias}:{shlex.quote(dest_path)}/"
-        )
+    excludes = " ".join(
+        f"--exclude={shlex.quote(pattern)}"
+        for pattern in _MODEL_ARTIFACT_EXCLUDES
+    )
+    cmd = (
+        f"mkdir -p {shlex.quote(dest_path)} >/dev/null 2>&1 && "
+        f"rsync -az {excludes} {shlex.quote(src_path)}/ "
+        f"{dest_alias}:{shlex.quote(dest_path)}/"
+    )
     r = await ssh_run(src_env.ssh_alias, cmd, timeout=3600.0)
     if r.returncode != 0:
         raise RuntimeError(f"rsync failed: {r.stderr.strip() or r.stdout.strip()}")
@@ -574,7 +627,11 @@ def _remote_shell_path(path: str) -> str:
 
 def _mlxp_tar_create_cmd(src_parent: str, tar_args: list[str]) -> str:
     quoted_args = " ".join(shlex.quote(arg) for arg in tar_args)
-    return f"tar c -C {shlex.quote(src_parent)} {quoted_args}"
+    excludes = " ".join(
+        f"--exclude={shlex.quote(pattern)}"
+        for pattern in _MODEL_ARTIFACT_EXCLUDES
+    )
+    return f"tar c -C {shlex.quote(src_parent)} {excludes} {quoted_args}"
 
 
 def _slurm_tar_extract_cmd(dest_parent: str, dest_path: str, leaf: str, copy_id: str) -> str:
@@ -649,6 +706,8 @@ async def _mlxp_to_slurm(copy_id: str, src_path: str, dest_cluster: str, dest_pa
                 )
         except RuntimeError as e:
             last_error = e
+            if is_mlxp_transport_error(str(e)):
+                invalidate_pods_cache()
             if not is_mlxp_transport_error(str(e)) or attempt == _MLXP_TAR_PIPE_ATTEMPTS:
                 raise
             await asyncio.sleep(2.0 * attempt)
@@ -663,12 +722,12 @@ async def _slurm_to_mlxp(copy_id: str, src_cluster: str, src_path: str, dest_pat
     src_parent = str(Path(src_path).parent.as_posix())
     src_leaf = Path(src_path).name
     dest_parent = str(Path(dest_path).parent)
-    tar_args = " ".join(shlex.quote(it) for it in (include_only or [src_leaf]))
+    tar_args = list(include_only or [src_leaf])
 
     async with _MLXP_STREAM_SEMAPHORE:
         src_proc = await asyncio.create_subprocess_exec(
             "ssh", "-o", "BatchMode=yes", *_CM_OPTS, src_env.ssh_alias,
-            f"tar c -C {shlex.quote(src_parent)} {tar_args}",
+            _mlxp_tar_create_cmd(src_parent, tar_args),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=1 << 22,

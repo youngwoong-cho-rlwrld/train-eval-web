@@ -268,6 +268,9 @@ def _is_mlxp_exec_transport_error(message: str) -> bool:
             "i/o timeout",
             "tls handshake timeout",
             "context deadline exceeded",
+            "cannot exec into a container in a completed pod",
+            "current phase is succeeded",
+            "current phase is failed",
         )
     )
 
