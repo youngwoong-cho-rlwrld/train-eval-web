@@ -478,9 +478,9 @@ export default function SubmitPage() {
     configPreview.data?.model_repo_error ?? trainGitStatus.data?.error ?? null;
   const modelRepoMessage =
     !modelRepoError && trainGitStatus.data
-      ? trainGitStatus.data.dirty
-        ? `Git ${trainGitStatus.data.short_commit ?? "unknown"} · uncommitted changes`
-        : `Git ${trainGitStatus.data.short_commit ?? "unknown"} · clean`
+      ? `Git ${trainGitStatus.data.branch ? `${trainGitStatus.data.branch} @ ` : ""}${
+          trainGitStatus.data.short_commit ?? "unknown"
+        } · ${trainGitStatus.data.dirty ? "uncommitted changes" : "clean"}`
       : gitStatusFetchError
         ? "Git status will be checked again when submitting."
       : null;

@@ -32,6 +32,7 @@ class GitStatus(BaseModel):
     repo_label: str | None = None
     commit: str | None
     short_commit: str | None
+    branch: str | None = None
     dirty: bool
     files: list[str] = Field(default_factory=list)
     error: str | None = None
@@ -42,6 +43,7 @@ class SubmitGitInfo:
     repo_path: str
     repo_label: str
     commit: str | None
+    branch: str | None
     dirty_before: bool
     committed_dirty: bool
     dirty_files: list[str]
@@ -53,6 +55,11 @@ GitRunner = Callable[[str, float], Awaitable[tuple[int, str, str]]]
 
 def _short(commit: str | None) -> str | None:
     return commit[:12] if commit else None
+
+
+def _clean_branch(branch: str | None) -> str | None:
+    branch = (branch or "").strip()
+    return branch or None
 
 
 def _coerce_model(model: str | TrainingModel) -> TrainingModel:
@@ -96,10 +103,13 @@ async def _git_status(
             repo_label=repo_label,
             commit=None,
             short_commit=None,
+            branch=None,
             dirty=True,
             files=[],
             error=(err or head).strip() or "git rev-parse failed",
         )
+    rc, branch, _ = await run(f"cd {repo} && {git} branch --show-current", 20.0)
+    branch = branch if rc == 0 else ""
     rc, status, err = await run(f"cd {repo} && {git} status --short", 20.0)
     if rc != 0:
         commit = head.strip()
@@ -108,6 +118,7 @@ async def _git_status(
             repo_label=repo_label,
             commit=commit,
             short_commit=_short(commit),
+            branch=_clean_branch(branch),
             dirty=True,
             files=[],
             error=(err or status).strip() or "git status failed",
@@ -119,6 +130,7 @@ async def _git_status(
         repo_label=repo_label,
         commit=commit,
         short_commit=_short(commit),
+        branch=_clean_branch(branch),
         dirty=bool(files),
         files=files,
     )
@@ -141,6 +153,7 @@ async def _prepare_training_git(
             repo_path=repo_path,
             repo_label=repo_label,
             commit=status.commit,
+            branch=status.branch,
             dirty_before=False,
             committed_dirty=False,
             dirty_files=[],
@@ -150,6 +163,7 @@ async def _prepare_training_git(
             repo_path=repo_path,
             repo_label=repo_label,
             commit=status.commit,
+            branch=status.branch,
             dirty_before=True,
             committed_dirty=False,
             dirty_files=status.files,
@@ -176,6 +190,7 @@ async def _prepare_training_git(
         repo_path=repo_path,
         repo_label=repo_label,
         commit=clean.commit,
+        branch=clean.branch,
         dirty_before=True,
         committed_dirty=True,
         dirty_files=status.files,
@@ -667,6 +682,8 @@ def render_training_config_snapshot(
     if git:
         footer.append(f"SUBMIT_GIT_REPO_LABEL={shlex.quote(git.repo_label)}")
         footer.append(f"SUBMIT_GIT_REPO_PATH={shlex.quote(git.repo_path)}")
+        if git.branch:
+            footer.append(f"SUBMIT_GIT_BRANCH={shlex.quote(git.branch)}")
         if git.commit:
             footer.append(f"SUBMIT_GIT_COMMIT={shlex.quote(git.commit)}")
         footer.append(f"SUBMIT_GIT_DIRTY_AT_SUBMIT={'1' if git.dirty_before else '0'}")
@@ -776,6 +793,7 @@ def snapshot_metadata(
         "git": {
             "repo_path": git.repo_path if git else None,
             "repo_label": git.repo_label if git else None,
+            "branch": git.branch if git else None,
             "commit": git.commit if git else None,
             "dirty_at_submit": git.dirty_before if git else None,
             "committed_dirty": git.committed_dirty if git else None,

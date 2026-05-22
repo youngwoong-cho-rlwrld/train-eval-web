@@ -237,6 +237,7 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
         "config_text": config_text,
         "meta_text": metadata_json(meta),
         "git_commit": submit_git.commit,
+        "git_branch": submit_git.branch,
         "git_repo_path": submit_git.repo_path,
         "git_repo_label": submit_git.repo_label,
         "git_dirty_at_submit": submit_git.dirty_before,
@@ -657,6 +658,8 @@ def _job_comment(req: MlxpSubmitRequest, variant, snapshot: dict) -> str:
         f";submit_git_repo_path={snapshot['git_repo_path']}"
         f";submit_git_repo_label={snapshot['git_repo_label']}"
     )
+    if snapshot.get("git_branch"):
+        comment += f";submit_git_branch={snapshot['git_branch']}"
     if snapshot.get("git_commit"):
         comment += f";submit_git_commit={snapshot['git_commit']}"
     comment += (

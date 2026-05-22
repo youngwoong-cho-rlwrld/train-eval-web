@@ -155,6 +155,7 @@ export type ConfigSnapshot = {
   wandb_project: string | null;
   git_repo_path: string | null;
   git_repo_label: string | null;
+  git_branch: string | null;
   git_commit: string | null;
   git_dirty_at_submit: boolean | null;
   git_committed_dirty: boolean | null;
@@ -209,6 +210,7 @@ export type GitStatus = {
   repo_label: string | null;
   commit: string | null;
   short_commit: string | null;
+  branch: string | null;
   dirty: boolean;
   files: string[];
   error: string | null;

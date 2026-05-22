@@ -235,7 +235,7 @@ function CopyResultTableButton({
 
   async function copyTable() {
     try {
-      await navigator.clipboard.writeText(resultTableTsv(variant, evalSets));
+      await writeResultTableToClipboard(variant, evalSets);
       setCopied(true);
       toast.success("Result table copied");
       setTimeout(() => setCopied(false), 1500);
@@ -258,6 +258,22 @@ function CopyResultTableButton({
       </Button>
     </ImmediateTooltip>
   );
+}
+
+async function writeResultTableToClipboard(variant: ResultVariant, evalSets: string[]) {
+  const tsv = resultTableTsv(variant, evalSets);
+  if (!("ClipboardItem" in window) || !navigator.clipboard.write) {
+    await navigator.clipboard.writeText(tsv);
+    return;
+  }
+
+  const html = resultTableHtml(variant, evalSets);
+  await navigator.clipboard.write([
+    new ClipboardItem({
+      "text/html": new Blob([html], { type: "text/html" }),
+      "text/plain": new Blob([tsv], { type: "text/plain" }),
+    }),
+  ]);
 }
 
 function ResultRow({ task, evalSets }: { task: ResultTask; evalSets: string[] }) {
@@ -353,6 +369,24 @@ function basename(path: string) {
 }
 
 function resultTableTsv(variant: ResultVariant, evalSets: string[]) {
+  return resultTableRows(variant, evalSets).map((row) => row.map(tsvCell).join("\t")).join("\n");
+}
+
+function resultTableHtml(variant: ResultVariant, evalSets: string[]) {
+  const [header, ...body] = resultTableRows(variant, evalSets);
+  return [
+    '<table border="1" cellspacing="0" cellpadding="4">',
+    "<thead>",
+    `<tr>${header.map((value) => `<th>${htmlCell(value)}</th>`).join("")}</tr>`,
+    "</thead>",
+    "<tbody>",
+    ...body.map((row) => `<tr>${row.map((value) => `<td>${htmlCell(value)}</td>`).join("")}</tr>`),
+    "</tbody>",
+    "</table>",
+  ].join("");
+}
+
+function resultTableRows(variant: ResultVariant, evalSets: string[]) {
   const rows = [
     ["Task", ...evalSets, "Ave"],
     ...variant.tasks.map((task) => {
@@ -368,11 +402,20 @@ function resultTableTsv(variant: ResultVariant, evalSets: string[]) {
       ];
     }),
   ];
-  return rows.map((row) => row.map(tsvCell).join("\t")).join("\n");
+  return rows;
 }
 
 function tsvCell(value: string) {
   return value.replace(/\s+/g, " ").trim();
+}
+
+function htmlCell(value: string) {
+  return tsvCell(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function formatMeanStd(cell: ResultCell) {

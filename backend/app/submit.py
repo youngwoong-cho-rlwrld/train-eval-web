@@ -388,6 +388,8 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
                 f";submit_git_repo_path={submit_git.repo_path}"
                 f";submit_git_repo_label={submit_git.repo_label}"
             )
+            if submit_git.branch:
+                comment += f";submit_git_branch={submit_git.branch}"
         if submit_git and submit_git.commit:
             comment += f";submit_git_commit={submit_git.commit}"
 
@@ -509,6 +511,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         + (
             f"submit_git_repo_path={submit_git.repo_path}\n"
             f"submit_git_repo_label={submit_git.repo_label}\n"
+            f"submit_git_branch={submit_git.branch or ''}\n"
             f"submit_git_commit={submit_git.commit}\n"
             f"submit_git_dirty_at_submit={'true' if submit_git.dirty_before else 'false'}\n"
             f"submit_git_committed_dirty={'true' if submit_git.committed_dirty else 'false'}\n"

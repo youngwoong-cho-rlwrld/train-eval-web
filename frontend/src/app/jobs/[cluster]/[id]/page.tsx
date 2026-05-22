@@ -331,6 +331,7 @@ function SubmissionSnapshotCard({
   const snapshot = d?.config_snapshot;
   const isTrain = isTrainJobPhase(d?.phase);
   const wandbProject = snapshot?.wandb_project ?? d?.wandb_project ?? null;
+  const extraArgs = snapshotExtraArgs(snapshot?.text);
 
   return (
     <Card className="mt-6">
@@ -367,8 +368,14 @@ function SubmissionSnapshotCard({
               {snapshot?.git_repo_path && (
                 <SnapshotRow label="repo path" value={snapshot.git_repo_path} />
               )}
+              {snapshot?.git_branch && (
+                <SnapshotRow label="training branch" value={snapshot.git_branch} />
+              )}
               {snapshot?.git_commit && (
                 <SnapshotRow label="training commit" value={snapshot.git_commit} />
+              )}
+              {extraArgs && (
+                <SnapshotRow label="extra args" value={extraArgs} />
               )}
               {snapshot && (
                 <SnapshotRow
@@ -396,6 +403,18 @@ function SubmissionSnapshotCard({
       </CardContent>
     </Card>
   );
+}
+
+function snapshotExtraArgs(text?: string | null) {
+  if (!text) return null;
+  const match = text.match(/^SUBMIT_EXTRA_ARGS=\(\n([\s\S]*?)^\)$/m);
+  if (!match) return null;
+
+  const args = match[1]
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"));
+  return args.length ? args.join(" ") : null;
 }
 
 function SnapshotRow({ label, value }: { label: string; value: string }) {
