@@ -10,17 +10,20 @@ job-name dir on slurm, because the slurm body never created one).
 Transfer mechanism:
 - slurm → slurm: rsync over ssh (host A → host B).
 - slurm → mlxp:  ssh tar | kubectl exec tar x on a DDN-mounted pod.
-- mlxp  → slurm: kubectl exec tar | ssh tar x on the dest host.
+- mlxp  → slurm: kubectl cp each model artifact to local staging, then
+  rsync local staging to the dest host and atomically promote it.
 - mlxp  → mlxp:  cp inside one pod (same DDN PVC).
 """
 
 import asyncio
+import contextlib
 import os
+import shutil
 import shlex
+import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any
 
 from pydantic import BaseModel
 
@@ -33,8 +36,12 @@ from .ssh import ssh_run, _CM_OPTS
 from .submission_snapshot import is_mlxp_transport_error
 
 
-_MLXP_TAR_PIPE_ATTEMPTS = 5
 _MLXP_COPY_STREAMS = max(1, int(os.environ.get("TRAIN_EVAL_MLXP_COPY_STREAMS", "1")))
+_MLXP_KUBECTL_CP_ATTEMPTS = max(1, int(os.environ.get("TRAIN_EVAL_MLXP_KUBECTL_CP_ATTEMPTS", "10")))
+_MLXP_KUBECTL_CP_RETRIES = max(0, int(os.environ.get("TRAIN_EVAL_MLXP_KUBECTL_CP_RETRIES", "10")))
+_MLXP_KUBECTL_CP_TIMEOUT = float(os.environ.get("TRAIN_EVAL_MLXP_KUBECTL_CP_TIMEOUT", "3600"))
+_MLXP_LOCAL_RSYNC_ATTEMPTS = max(1, int(os.environ.get("TRAIN_EVAL_MLXP_LOCAL_RSYNC_ATTEMPTS", "3")))
+_MLXP_LOCAL_RSYNC_TIMEOUT = float(os.environ.get("TRAIN_EVAL_MLXP_LOCAL_RSYNC_TIMEOUT", "7200"))
 _KUBECTL_EXEC_ATTEMPTS = 3
 
 _MODEL_ARTIFACT_EXCLUDES = (
@@ -95,6 +102,7 @@ class CopyJobStatus(BaseModel):
     copy_id: str
     status: str  # "running" | "done" | "error"
     error: str | None = None
+    phase: str | None = None
     copies_total: int
     copies_done: int
     current_source: str | None = None
@@ -349,28 +357,6 @@ async def _resolve_model_source_path(cluster: str, src_path: str) -> str:
     return src_path
 
 
-async def _resolve_run_layout(cluster: str, src_path: str) -> tuple[bool, str | None]:
-    """Return (is_run_folder, latest_checkpoint_basename).
-
-    True when `src_path` contains at least one `checkpoint-N` child. The latest
-    checkpoint is still detected for display/compatibility, but copy operations
-    intentionally exclude trainer checkpoints and transfer model artifacts only.
-    """
-    names = await _children_of(cluster, src_path)
-    steps: list[tuple[int, str]] = []
-    for n in names:
-        if not n.startswith("checkpoint-"):
-            continue
-        try:
-            steps.append((int(n.split("-", 1)[1]), n))
-        except ValueError:
-            continue
-    if not steps:
-        return False, None
-    steps.sort()
-    return True, steps[-1][1]
-
-
 def _should_copy_model_artifact(name: str) -> bool:
     lower = name.lower()
     if name.startswith("checkpoint-"):
@@ -391,7 +377,7 @@ def _should_copy_model_artifact(name: str) -> bool:
 
 
 def _select_model_artifact_files(parent_basename: str, names: list[str]) -> list[str]:
-    """Build tar args for deployable model artifacts only.
+    """Build deployable model-artifact paths relative to the source parent.
 
     This excludes nested Hugging Face/DeepSpeed trainer checkpoints, optimizer
     state, scheduler/RNG state, and logs. It keeps top-level model shards,
@@ -416,6 +402,7 @@ async def _run_copy(
             dest_path = f"{dest_path_root.rstrip('/')}/{leaf}"
             state.current_source = src_path
             state.current_dest = dest_path
+            state.phase = "preparing"
             state.dest_size_bytes = 0
 
             # Copy deployable model artifacts only. Exclude nested trainer
@@ -432,15 +419,14 @@ async def _run_copy(
             else:
                 state.src_size_bytes = await _size(src_cluster, src_path)
 
-            # Tar-pipe transports update dest_size_bytes directly from the
-            # Python pump (accurate "bytes streamed this run"). Skip the
-            # du-based poller for those — otherwise it'd overwrite the live
-            # counter with the destination's apparent size (which includes
-            # stale bytes from a prior killed run).
-            is_tar_pipe = (
+            # MLXP boundary transports report progress themselves: slurm→mlxp
+            # via the Python tar pump, mlxp→slurm via local staging size. Skip
+            # the du-based destination poller so it does not overwrite that
+            # live counter with stale bytes from a prior killed run.
+            self_reports_size = (
                 (src_cluster == "mlxp") != (dest_cluster == "mlxp")
             )
-            poll_task = None if is_tar_pipe else asyncio.create_task(
+            poll_task = None if self_reports_size else asyncio.create_task(
                 _poll_dest_size(state, dest_cluster, dest_path)
             )
             try:
@@ -453,8 +439,7 @@ async def _run_copy(
                 else:
                     await _slurm_to_slurm(copy_id, src_cluster, src_path, dest_cluster, dest_path, include_only)
             finally:
-                if poll_task is not None:
-                    poll_task.cancel()
+                await _cancel_task(poll_task)
 
             # Snapshot final size before the next source overwrites state.
             state.dest_size_bytes = state.src_size_bytes
@@ -463,6 +448,7 @@ async def _run_copy(
             if delete_source:
                 await _delete_source(src_cluster, src_path)
 
+        state.phase = None
         state.status = "done"
         state.finished_at = time.time()
     except asyncio.CancelledError:
@@ -477,6 +463,14 @@ async def _run_copy(
         state.finished_at = time.time()
     finally:
         _COPY_HANDLES.pop(copy_id, None)
+
+
+async def _cancel_task(task: asyncio.Task | None) -> None:
+    if task is None:
+        return
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
 
 
 async def _pump_bytes(copy_id: str, src: asyncio.subprocess.Process,
@@ -570,13 +564,193 @@ async def _size(cluster: str, path: str) -> int:
         return 0
 
 
+def _remove_local_path(path: Path) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _local_size_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    if path.is_file() or path.is_symlink():
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+    total = 0
+    for root, dirs, files in os.walk(path):
+        root_path = Path(root)
+        try:
+            total += root_path.stat().st_size
+        except OSError:
+            pass
+        for name in dirs + files:
+            try:
+                total += (root_path / name).stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+async def _poll_local_size(state: CopyJobStatus, path: Path) -> None:
+    try:
+        while True:
+            state.dest_size_bytes = await asyncio.to_thread(_local_size_bytes, path)
+            await asyncio.sleep(2.0)
+    except asyncio.CancelledError:
+        pass
+
+
+def _model_artifact_relpaths(src_leaf: str, include_only: list[str] | None) -> list[str]:
+    if include_only is None:
+        return [""]
+    prefix = f"{src_leaf}/"
+    relpaths: list[str] = []
+    for item in include_only:
+        if item == src_leaf:
+            relpaths.append("")
+        elif item.startswith(prefix):
+            relpaths.append(item[len(prefix):])
+        else:
+            relpaths.append(Path(item).name)
+    return relpaths
+
+
+def _tar_artifact_args(src_leaf: str, include_only: list[str] | None) -> list[str]:
+    if include_only is None:
+        return [src_leaf]
+    if not include_only:
+        raise RuntimeError(f"no deployable model artifacts found under {src_leaf}")
+    return list(include_only)
+
+
+async def _run_checked_exec(
+    copy_id: str,
+    args: list[str],
+    *,
+    label: str,
+    timeout: float,
+) -> str:
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        limit=1 << 22,
+    )
+    _track_proc(copy_id, proc)
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.CancelledError:
+        proc.kill()
+        await proc.wait()
+        raise
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise RuntimeError(f"{label} timed out after {timeout:g}s")
+    stdout = out.decode(errors="replace")
+    stderr = err.decode(errors="replace")
+    if proc.returncode != 0:
+        msg = (stderr or stdout).strip() or "no stderr"
+        raise RuntimeError(f"{label} failed rc={proc.returncode}: {msg}")
+    return stdout
+
+
+async def _run_checked_exec_with_retries(
+    copy_id: str,
+    args: list[str],
+    *,
+    label: str,
+    attempts: int,
+    timeout: float,
+) -> str:
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await _run_checked_exec(
+                copy_id,
+                args,
+                label=f"{label} attempt {attempt}",
+                timeout=timeout,
+            )
+        except Exception as e:
+            last_error = e
+            if attempt == attempts:
+                raise
+            await asyncio.sleep(min(60.0, 5.0 * attempt))
+    assert last_error is not None
+    raise last_error
+
+
+async def _kubectl_cp_model_artifact(
+    copy_id: str,
+    pod: str,
+    remote_path: str,
+    local_path: Path,
+    *,
+    label: str,
+) -> None:
+    last_error: Exception | None = None
+    for attempt in range(1, _MLXP_KUBECTL_CP_ATTEMPTS + 1):
+        _remove_local_path(local_path)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        proc = await asyncio.create_subprocess_exec(
+            "kubectl", "cp", "-n", MLXP_NS,
+            f"{pod}:{remote_path}", str(local_path),
+            f"--retries={_MLXP_KUBECTL_CP_RETRIES}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=1 << 22,
+        )
+        _track_proc(copy_id, proc)
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=_MLXP_KUBECTL_CP_TIMEOUT)
+        except asyncio.CancelledError:
+            proc.kill()
+            await proc.wait()
+            raise
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            last_error = RuntimeError(
+                f"kubectl cp {label} attempt {attempt} timed out after "
+                f"{_MLXP_KUBECTL_CP_TIMEOUT:g}s"
+            )
+        else:
+            stdout = out.decode(errors="replace")
+            stderr = err.decode(errors="replace")
+            if proc.returncode == 0:
+                return
+            message = (stderr or stdout).strip() or "kubectl cp failed"
+            last_error = RuntimeError(
+                f"kubectl cp {label} attempt {attempt} failed rc={proc.returncode}: {message}"
+            )
+            lower = message.lower()
+            if "no such file" in lower or "cannot stat" in lower:
+                break
+            if is_mlxp_transport_error(message):
+                invalidate_pods_cache()
+                try:
+                    pod = await ensure_listing_pod()
+                except Exception:
+                    pass
+        if attempt < _MLXP_KUBECTL_CP_ATTEMPTS:
+            await asyncio.sleep(min(60.0, 5.0 * attempt))
+    assert last_error is not None
+    raise last_error
+
+
 async def _mlxp_to_mlxp(copy_id: str, src: str, dest: str,
                          include_only: list[str] | None = None) -> str:
     pod = await ensure_listing_pod()
     src_parent = str(Path(src).parent)
     src_leaf = Path(src).name
     dest_parent = str(Path(dest).parent)
-    tar_args = list(include_only or [src_leaf])
+    tar_args = _tar_artifact_args(src_leaf, include_only)
     cmd = (
         f"mkdir -p {shlex.quote(dest_parent)} && "
         f"{_mlxp_tar_create_cmd(src_parent, tar_args)} | "
@@ -658,6 +832,108 @@ def _slurm_tar_extract_cmd(dest_parent: str, dest_path: str, leaf: str, copy_id:
     )
 
 
+async def _copy_mlxp_artifacts_to_local(
+    copy_id: str,
+    pod: str,
+    src_path: str,
+    local_leaf: Path,
+    include_only: list[str] | None,
+) -> None:
+    src_leaf = Path(src_path).name
+    relpaths = _model_artifact_relpaths(src_leaf, include_only)
+    if not relpaths:
+        raise RuntimeError(f"no deployable model artifacts found under {src_leaf}")
+    for relpath in relpaths:
+        if relpath:
+            remote_item = f"{src_path.rstrip('/')}/{relpath}"
+            local_item = local_leaf / relpath
+            label = f"{src_leaf}/{relpath}"
+        else:
+            remote_item = src_path
+            local_item = local_leaf
+            label = src_leaf
+        await _kubectl_cp_model_artifact(
+            copy_id, pod, remote_item, local_item, label=label,
+        )
+
+
+async def _create_remote_checkpoint_staging(
+    dest_alias: str,
+    dest_parent: str,
+    src_leaf: str,
+    copy_id: str,
+) -> str:
+    dest_parent_q = _remote_shell_path(dest_parent)
+    tmp_template = f".{src_leaf}.copy-{copy_id}.XXXXXX"
+    mktemp = await ssh_run(
+        dest_alias,
+        (
+            f"mkdir -p {dest_parent_q} && "
+            f"mktemp -d {dest_parent_q}/{shlex.quote(tmp_template)}"
+        ),
+        timeout=60.0,
+    )
+    if mktemp.returncode != 0:
+        raise RuntimeError(f"remote temp dir creation failed: {mktemp.stderr or mktemp.stdout}")
+    remote_tmp = mktemp.stdout.strip().splitlines()[-1]
+    if not remote_tmp:
+        raise RuntimeError("remote temp dir creation returned an empty path")
+
+    mkdir_leaf = await ssh_run(
+        dest_alias,
+        f"mkdir -p {shlex.quote(remote_tmp)}/{shlex.quote(src_leaf)}",
+        timeout=60.0,
+    )
+    if mkdir_leaf.returncode != 0:
+        raise RuntimeError(f"remote staging mkdir failed: {mkdir_leaf.stderr or mkdir_leaf.stdout}")
+    return remote_tmp
+
+
+async def _rsync_local_checkpoint_to_remote(
+    copy_id: str,
+    dest_alias: str,
+    local_leaf: Path,
+    remote_tmp: str,
+    src_leaf: str,
+) -> None:
+    ssh_e = "ssh -o BatchMode=yes " + " ".join(_CM_OPTS)
+    rsync_args = [
+        "rsync", "-az", "--delete", "--partial", "-e", ssh_e,
+        f"{local_leaf}/",
+        f"{dest_alias}:{remote_tmp}/{src_leaf}/",
+    ]
+    await _run_checked_exec_with_retries(
+        copy_id,
+        rsync_args,
+        label=f"rsync staged {src_leaf}",
+        attempts=_MLXP_LOCAL_RSYNC_ATTEMPTS,
+        timeout=_MLXP_LOCAL_RSYNC_TIMEOUT,
+    )
+
+
+async def _promote_remote_checkpoint(
+    dest_alias: str,
+    remote_tmp: str,
+    src_leaf: str,
+    dest_path: str,
+) -> None:
+    leaf_q = shlex.quote(src_leaf)
+    remote_tmp_q = shlex.quote(remote_tmp)
+    dest_path_q = _remote_shell_path(dest_path)
+    promote = await ssh_run(
+        dest_alias,
+        (
+            f"test -d {remote_tmp_q}/{leaf_q} && "
+            f"rm -rf {dest_path_q} && "
+            f"mv {remote_tmp_q}/{leaf_q} {dest_path_q} && "
+            f"rmdir {remote_tmp_q}"
+        ),
+        timeout=300.0,
+    )
+    if promote.returncode != 0:
+        raise RuntimeError(f"remote promote failed: {promote.stderr or promote.stdout}")
+
+
 async def _mlxp_to_slurm_once(
     copy_id: str,
     pod: str,
@@ -667,52 +943,77 @@ async def _mlxp_to_slurm_once(
     include_only: list[str] | None = None,
 ) -> str:
     dest_env = await load_cluster(dest_cluster)
-    src_parent = str(Path(src_path).parent)
+    dest_alias = dest_env.ssh_alias
     src_leaf = Path(src_path).name
     dest_parent = str(Path(dest_path).parent.as_posix())
-    tar_args = list(include_only or [src_leaf])
+    staging_parent = os.environ.get("TRAIN_EVAL_MLXP_LOCAL_STAGING_DIR") or None
+    with tempfile.TemporaryDirectory(
+        prefix=f"train-eval-web-{src_leaf}-",
+        dir=staging_parent,
+    ) as staging_root:
+        local_leaf = Path(staging_root) / src_leaf
+        state = _COPY_JOBS.get(copy_id)
+        if state is not None:
+            state.phase = "staging from MLXP"
+        poll_task = (
+            asyncio.create_task(_poll_local_size(state, local_leaf))
+            if state is not None else None
+        )
+        try:
+            await _copy_mlxp_artifacts_to_local(
+                copy_id, pod, src_path, local_leaf, include_only,
+            )
+            if state is not None:
+                state.dest_size_bytes = await asyncio.to_thread(_local_size_bytes, local_leaf)
+        finally:
+            await _cancel_task(poll_task)
 
-    src_proc = await asyncio.create_subprocess_exec(
-        "kubectl", "exec", "-i", "-n", MLXP_NS, pod, "--",
-        "bash", "-lc", _mlxp_tar_create_cmd(src_parent, tar_args),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        limit=1 << 22,
+        remote_tmp: str | None = None
+        remote_poll_task: asyncio.Task | None = None
+        try:
+            remote_tmp = await _create_remote_checkpoint_staging(
+                dest_alias, dest_parent, src_leaf, copy_id,
+            )
+            if state is not None:
+                state.phase = f"uploading to {dest_cluster}"
+                state.dest_size_bytes = 0
+                remote_leaf = f"{remote_tmp.rstrip('/')}/{src_leaf}"
+                remote_poll_task = asyncio.create_task(
+                    _poll_dest_size(state, dest_cluster, remote_leaf)
+                )
+
+            await _rsync_local_checkpoint_to_remote(
+                copy_id, dest_alias, local_leaf, remote_tmp, src_leaf,
+            )
+            await _cancel_task(remote_poll_task)
+            remote_poll_task = None
+            if state is not None:
+                state.dest_size_bytes = state.src_size_bytes
+                state.phase = "promoting"
+
+            await _promote_remote_checkpoint(
+                dest_alias, remote_tmp, src_leaf, dest_path,
+            )
+        except BaseException:
+            await _cancel_task(remote_poll_task)
+            if remote_tmp:
+                with contextlib.suppress(Exception):
+                    await ssh_run(dest_alias, f"rm -rf {shlex.quote(remote_tmp)}", timeout=300.0)
+            raise
+
+    return (
+        f"copied {src_path} → {dest_alias}:{dest_path} "
+        "via kubectl cp local staging"
     )
-    dst_proc = await asyncio.create_subprocess_exec(
-        "ssh", "-o", "BatchMode=yes", *_CM_OPTS, dest_env.ssh_alias,
-        _slurm_tar_extract_cmd(dest_parent, dest_path, src_leaf, copy_id),
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        limit=1 << 22,
-    )
-    await _pump_and_check_tar_pipe(copy_id, "mlxp→slurm", src_proc, dst_proc)
-    return f"copied {src_path} → {dest_env.ssh_alias}:{dest_path}"
 
 
 async def _mlxp_to_slurm(copy_id: str, src_path: str, dest_cluster: str, dest_path: str,
                           include_only: list[str] | None = None) -> str:
-    last_error: Exception | None = None
-    for attempt in range(1, _MLXP_TAR_PIPE_ATTEMPTS + 1):
-        pod = await ensure_listing_pod()
-        state = _COPY_JOBS.get(copy_id)
-        if state is not None and attempt > 1:
-            state.dest_size_bytes = 0
-        try:
-            async with _MLXP_STREAM_SEMAPHORE:
-                return await _mlxp_to_slurm_once(
-                    copy_id, pod, src_path, dest_cluster, dest_path, include_only
-                )
-        except RuntimeError as e:
-            last_error = e
-            if is_mlxp_transport_error(str(e)):
-                invalidate_pods_cache()
-            if not is_mlxp_transport_error(str(e)) or attempt == _MLXP_TAR_PIPE_ATTEMPTS:
-                raise
-            await asyncio.sleep(2.0 * attempt)
-    assert last_error is not None
-    raise last_error
+    pod = await ensure_listing_pod()
+    async with _MLXP_STREAM_SEMAPHORE:
+        return await _mlxp_to_slurm_once(
+            copy_id, pod, src_path, dest_cluster, dest_path, include_only
+        )
 
 
 async def _slurm_to_mlxp(copy_id: str, src_cluster: str, src_path: str, dest_path: str,
@@ -722,7 +1023,7 @@ async def _slurm_to_mlxp(copy_id: str, src_cluster: str, src_path: str, dest_pat
     src_parent = str(Path(src_path).parent.as_posix())
     src_leaf = Path(src_path).name
     dest_parent = str(Path(dest_path).parent)
-    tar_args = list(include_only or [src_leaf])
+    tar_args = _tar_artifact_args(src_leaf, include_only)
 
     async with _MLXP_STREAM_SEMAPHORE:
         src_proc = await asyncio.create_subprocess_exec(

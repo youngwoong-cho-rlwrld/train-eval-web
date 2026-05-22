@@ -74,8 +74,8 @@ class SubmitRequest(BaseModel):
     eval_n_runs: int | None = Field(default=None, ge=1)
     eval_sets: list[str] | None = None
     eval_overwrite_results: bool = False
-    # Eval-only: absolute path to the checkpoint dir on the cluster. The
-    # eval body uses this verbatim when set; otherwise it auto-picks.
+    # Eval-only: absolute path to the checkpoint dir on the cluster.
+    # Eval submissions must provide this explicitly.
     checkpoint_path: str | None = None
     # Internal eval resume: remote eval_results dir from the timed-out job.
     # Seed the staged eval_results before sbatch so completed runs are skipped.
@@ -126,6 +126,13 @@ def _normalize_eval_sets(eval_sets: list[str] | None) -> list[str] | None:
     return out
 
 
+def require_eval_checkpoint_path(req: SubmitRequest) -> str:
+    path = (req.checkpoint_path or "").strip()
+    if req.phase == "eval" and not path:
+        raise ValueError("checkpoint_path is required for eval")
+    return path
+
+
 class SubmitResponse(BaseModel):
     job_id: str
     job_name: str
@@ -155,12 +162,14 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         raise ValueError("resume=true is only valid for phase=train")
     eval_num_envs_per_gpu = req.eval_num_envs_per_gpu or req.eval_parallel_sims_per_gpu
     eval_sets = _normalize_eval_sets(req.eval_sets)
+    eval_checkpoint = require_eval_checkpoint_path(req) if req.phase == "eval" else None
     if req.phase != "eval" and any((
         eval_num_envs_per_gpu is not None,
         req.eval_n_episodes is not None,
         req.eval_n_runs is not None,
         eval_sets is not None,
         req.eval_overwrite_results,
+        bool(req.checkpoint_path and req.checkpoint_path.strip()),
     )):
         raise ValueError("eval overrides are only valid for phase=eval")
     if req.phase != "train" and any((
@@ -431,8 +440,8 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             if req.phase == "eval" and req.eval_overwrite_results else ""
         )
         + (
-            f",EVAL_CHECKPOINT={shlex.quote(req.checkpoint_path)}"
-            if req.phase == "eval" and req.checkpoint_path else ""
+            f",EVAL_CHECKPOINT={shlex.quote(eval_checkpoint)}"
+            if req.phase == "eval" and eval_checkpoint else ""
         ),
         *sbatch_flags,
         *[shlex.quote(a) for a in req.extra_args],
@@ -532,8 +541,8 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             else ""
         )
         + (
-            f"checkpoint_path={req.checkpoint_path.strip()}\n"
-            if req.phase == "eval" and req.checkpoint_path and req.checkpoint_path.strip()
+            f"checkpoint_path={eval_checkpoint}\n"
+            if req.phase == "eval" and eval_checkpoint
             else ""
         )
     )

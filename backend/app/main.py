@@ -165,35 +165,6 @@ async def get_variant_data_interface(name: str):
         raise HTTPException(404, f"variant {name} not found")
 
 
-@app.get("/api/variants/{name}/selected-checkpoint")
-async def get_selected_checkpoint(name: str, cluster: str):
-    """The checkpoint path the eval body would pick at runtime, mirroring
-    lib/eval_body_n16.sh's nested-then-flat lookup. Slurm-only — MLXP eval
-    isn't wired."""
-    if cluster == "mlxp":
-        return {"path": None, "step": None}
-    try:
-        env = await clusters.load_cluster(cluster)
-    except FileNotFoundError:
-        raise HTTPException(404, f"cluster {cluster} not found")
-    cmd = (
-        f'D=$HOME/.train-eval-web/experiments/{name}/checkpoints; '
-        f'p=$(ls -d "$D"/*/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1); '
-        f'[ -z "$p" ] && p=$(ls -d "$D"/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1); '
-        f'printf "%s\\n" "$p"'
-    )
-    from .ssh import ssh_run
-    r = await ssh_run(env.ssh_alias, cmd, timeout=15.0)
-    path = r.stdout.strip()
-    if not path:
-        return {"path": None, "step": None}
-    try:
-        step = int(path.rsplit("-", 1)[-1])
-    except ValueError:
-        step = None
-    return {"path": path, "step": step}
-
-
 # ── submit ──
 
 class ConfigPreviewFlag(BaseModel):
@@ -313,6 +284,7 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
                 git=None,
             )
         elif req.phase == "eval":
+            checkpoint_path = submit.require_eval_checkpoint_path(req)
             eval_sets = submit._normalize_eval_sets(req.eval_sets)
             text = submission_snapshot.render_eval_config_preview(
                 base_config=variant.raw,
@@ -326,7 +298,7 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
                 eval_n_runs=req.eval_n_runs,
                 eval_sets=eval_sets,
                 eval_overwrite_results=req.eval_overwrite_results,
-                checkpoint_path=req.checkpoint_path,
+                checkpoint_path=checkpoint_path,
                 extra_args=req.extra_args,
             )
         else:

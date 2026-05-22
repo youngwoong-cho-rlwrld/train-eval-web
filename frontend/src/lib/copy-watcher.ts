@@ -11,6 +11,7 @@ export type CopyJobStatus = {
   copy_id: string;
   status: "running" | "done" | "error";
   error: string | null;
+  phase: string | null;
   copies_total: number;
   copies_done: number;
   current_source: string | null;
@@ -169,9 +170,10 @@ async function watch({ copyId, destCluster }: ActiveCopy) {
       const prefix = name
         ? `Copying ${name} (${summary})`
         : `Copying ${summary}`;
+      const phase = s.phase ? `${s.phase}: ` : "";
       toast.loading(
         pct != null
-          ? `${prefix} — ${pct}% (${formatBytes(shownDst)} / ${formatBytes(src)})`
+          ? `${prefix} — ${phase}${pct}% (${formatBytes(shownDst)} / ${formatBytes(src)})`
           : `${prefix}…`,
         { id: toastId, duration: Infinity, action: cancelAction },
       );

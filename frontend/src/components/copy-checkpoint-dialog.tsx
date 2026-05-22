@@ -103,8 +103,8 @@ export function CopyCheckpointDialog({
           <DialogDescription>
             Copies the selected <code>checkpoint-N</code> dirs from{" "}
             <span className="font-mono">{cluster}</span> to another cluster.
-            Slurm to slurm uses rsync; mlxp transfers use tar piped through
-            kubectl exec.
+            Slurm to slurm uses rsync; mlxp to slurm stages model artifacts
+            with kubectl cp, then rsyncs them to the destination.
           </DialogDescription>
         </DialogHeader>
 

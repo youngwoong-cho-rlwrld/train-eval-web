@@ -91,14 +91,6 @@ export function ConfigCard({
   const overridePath = checkpointOverride?.trim() || null;
   const overrideMissing = overridePath && checkpointOverrideExists === false;
   const overrideChecking = overridePath && checkpointOverrideExists === null;
-  const selectedCkpt = useQuery({
-    queryKey: ["selected-checkpoint", variantName, cluster],
-    queryFn: () =>
-      api<{ path: string | null; step: number | null }>(
-        `/api/variants/${variantName}/selected-checkpoint?cluster=${cluster}`,
-      ),
-    enabled: showCheckpointPathRow && wantsCheckpoint && !overridePath && !loading && !error,
-  });
   const configPath = variantName
     ? `configs/experiments/${variantName}/config.sh`
     : null;
@@ -184,8 +176,7 @@ export function ConfigCard({
                       : overrideMissing
                         ? `${overridePath}  (not found on ${cluster})`
                         : overridePath
-                    : selectedCkpt.data?.path ??
-                      (selectedCkpt.isLoading ? "..." : "(none found - eval will fail)")
+                    : "(not set)"
                 }
               />
             )}

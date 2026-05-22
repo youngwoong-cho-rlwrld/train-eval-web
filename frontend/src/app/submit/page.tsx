@@ -182,19 +182,9 @@ export default function SubmitPage() {
     enabled: !isSlurm,
   });
   const wantsCheckpoint = phase === "eval" && isSlurm && !!variantName;
-  const selectedCkpt = useQuery({
-    queryKey: ["selected-checkpoint", variantName, cluster],
-    queryFn: () =>
-      api<{ path: string | null; step: number | null }>(
-        `/api/variants/${variantName}/selected-checkpoint?cluster=${cluster}`,
-      ),
-    enabled: wantsCheckpoint,
-  });
   const activeCheckpointEdit =
     checkpointEdit?.scope === checkpointScope ? checkpointEdit : null;
-  const checkpointPath = activeCheckpointEdit
-    ? activeCheckpointEdit.value
-    : selectedCkpt.data?.path ?? "";
+  const checkpointPath = activeCheckpointEdit ? activeCheckpointEdit.value : "";
   const trimmedCkpt = checkpointPath.trim();
   const checkpointExists = useQuery({
     queryKey: ["path-exists", cluster, trimmedCkpt],
@@ -208,7 +198,7 @@ export default function SubmitPage() {
     ? null
     : checkpointExists.isLoading || checkpointExists.data === undefined
       ? null
-      : checkpointExists.data.exists;
+      : checkpointExists.data.exists && checkpointExists.data.kind === "dir";
 
   const defaultJobName = useMemo(
     () => buildDefaultJobName(submitPhase, variantName),
@@ -416,7 +406,7 @@ export default function SubmitPage() {
         eval_n_runs: wantsCheckpoint ? evalNRunsParsed : null,
         eval_sets: wantsCheckpoint ? evalSetValues : null,
         eval_overwrite_results: wantsCheckpoint ? evalOverwriteResults : false,
-        checkpoint_path: wantsCheckpoint ? checkpointPath.trim() : null,
+        checkpoint_path: wantsCheckpoint ? trimmedCkpt : null,
         job_name: shownJobName.trim() || null,
         commit_dirty_changes: commitDirtyChanges,
       };
@@ -427,7 +417,12 @@ export default function SubmitPage() {
     !variant.isLoading &&
     !variantError &&
     (submitPhase !== "train" || trainConfigValid) &&
-    (!wantsCheckpoint || (evalNEpisodesValid && evalNRunsValid && evalSetsValid));
+    (!wantsCheckpoint ||
+      (!!trimmedCkpt &&
+        checkpointExistsValue === true &&
+        evalNEpisodesValid &&
+        evalNRunsValid &&
+        evalSetsValid));
   const configPreview = useQuery({
     queryKey: [
       "submit-config-preview",
@@ -662,34 +657,23 @@ export default function SubmitPage() {
                   value: e.target.value,
                 });
               }}
-              placeholder={
-                selectedCkpt.isLoading
-                  ? "looking up auto-pick..."
-                  : "/absolute/path/to/checkpoint-N"
-              }
+              placeholder="/absolute/path/to/checkpoint-directory"
               className={
                 trimmedCkpt && checkpointExistsValue === false
                   ? "font-mono text-xs border-red-500 focus-visible:ring-red-500"
                   : "font-mono text-xs"
               }
             />
-            {!trimmedCkpt && !selectedCkpt.isLoading && (
+            {!trimmedCkpt && (
               <p className="text-xs text-red-600 dark:text-red-400">
                 Choose a checkpoint.
               </p>
             )}
             {trimmedCkpt && checkpointExistsValue === false && (
               <p className="text-xs text-red-600 dark:text-red-400">
-                Path not found on <code>{cluster}</code>.
+                Path not found as a directory on <code>{cluster}</code>.
               </p>
             )}
-            {trimmedCkpt && selectedCkpt.data?.path &&
-              trimmedCkpt !== selectedCkpt.data.path && (
-                <p className="text-xs text-slate-500">
-                  Auto-pick was <code>{selectedCkpt.data.path}</code> -
-                  overriding.
-                </p>
-              )}
           </div>
         ),
       }
@@ -777,8 +761,7 @@ export default function SubmitPage() {
       flag: "checkpoint",
       value:
         checkpointPath.trim() ||
-        selectedCkpt.data?.path ||
-        (selectedCkpt.isLoading ? "..." : "(none found - eval will fail)"),
+        "(required)",
       editor: checkpointEditor,
     });
     extraFlagRows.push({

@@ -35,11 +35,11 @@ log "$EXP_NAME"
 log "  cluster=$CLUSTER  partition=${SUBMIT_PARTITION:-$PARTITION}  gpu=$GPU_INSTANCE"
 log "========================================================"
 
-if [ -n "${EVAL_CHECKPOINT:-}" ]; then
-    LAST_CKPT="$EVAL_CHECKPOINT"
-else
-    LAST_CKPT=$(ls -d ${CKPT_DIR}/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1)
+if [ -z "${EVAL_CHECKPOINT:-}" ]; then
+    log "ERROR: EVAL_CHECKPOINT is required"
+    exit 1
 fi
+LAST_CKPT="$EVAL_CHECKPOINT"
 if [ -z "$LAST_CKPT" ] || [ ! -d "$LAST_CKPT" ]; then
     log "ERROR: no checkpoint at '$LAST_CKPT'"
     exit 1

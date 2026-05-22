@@ -35,17 +35,11 @@ log "  cluster=$CLUSTER  partition=${SUBMIT_PARTITION:-$PARTITION}  gpu=$GPU_INS
 log "  train repo=$TRAIN_REPO_DIR"
 log "========================================================"
 
-# Honor explicit `--export EVAL_CHECKPOINT=<path>` from the submit wrapper.
-# Otherwise auto-pick: N1.6 nests under <experiment_name>/checkpoint-N (from
-# launch_finetune.py's --experiment-name); fall back to the flat layout.
-if [ -n "${EVAL_CHECKPOINT:-}" ]; then
-    LAST_CKPT="$EVAL_CHECKPOINT"
-else
-    LAST_CKPT="$(ls -d "$CKPT_DIR"/*/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1)"
-    if [ -z "$LAST_CKPT" ]; then
-        LAST_CKPT="$(ls -d "$CKPT_DIR"/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1)"
-    fi
+if [ -z "${EVAL_CHECKPOINT:-}" ]; then
+    log "ERROR: EVAL_CHECKPOINT is required"
+    exit 1
 fi
+LAST_CKPT="$EVAL_CHECKPOINT"
 if [ -z "$LAST_CKPT" ] || [ ! -d "$LAST_CKPT" ]; then
     log "ERROR: no checkpoint at '$LAST_CKPT'"
     exit 1

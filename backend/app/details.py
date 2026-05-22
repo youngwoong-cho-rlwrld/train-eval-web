@@ -1001,8 +1001,7 @@ async def _resolve_eval_checkpoint(
 
     Completed/running eval logs are the most accurate source because the body
     only logs `Checkpoint:` after verifying the directory exists. For pending
-    or pre-log jobs, fall back to the submit sidecar's explicit checkpoint,
-    then the same nested-then-flat auto-pick used by eval_body_n16.sh.
+    or pre-log jobs, fall back to the submit sidecar's explicit checkpoint.
     """
     stdout_q = shlex.quote(stdout_path)
     r = await ssh_run(
@@ -1022,17 +1021,7 @@ async def _resolve_eval_checkpoint(
         if checkpoint:
             return checkpoint
 
-    ckpt_dir = f"{exp_dir}/checkpoints"
-    ckpt_dir_expr = _remote_path_expr(ckpt_dir)
-    cmd = (
-        f"D={ckpt_dir_expr}; "
-        'p=$(ls -d "$D"/*/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1); '
-        '[ -z "$p" ] && p=$(ls -d "$D"/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1); '
-        'printf "%s\\n" "$p"'
-    )
-    r = await ssh_run(host, cmd, timeout=15.0)
-    checkpoint = r.stdout.strip()
-    return checkpoint or None
+    return None
 
 
 async def _resolve_exp_dir(host: str, job_id: str, variant: str) -> str:
