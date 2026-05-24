@@ -81,7 +81,7 @@ export function AvailabilityCard({
                   >
                     {p.gpu_idle}
                   </span>
-                  <span className="text-slate-400"> / {p.gpu_total} GPU</span>
+                  <span className="text-slate-400"> / {p.gpu_total} {p.gpu_type ?? "GPU"}</span>
                 </div>
               </div>
             ))}

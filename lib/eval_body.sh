@@ -16,13 +16,18 @@ source "$REPO_ROOT/clusters/${CLUSTER}.env"
 REPO_ROOT="$SUBMIT_REPO_ROOT"
 source "$REPO_ROOT/lib/_common.sh"
 
-EXP_DIR="$REPO_ROOT/experiments/$VARIANT"
+EXP_DIR="${SUBMIT_EXP_DIR:-$REPO_ROOT/experiments/$VARIANT}"
 [ -d "$EXP_DIR" ] || { echo "ERROR: experiment dir not found: $EXP_DIR"; exit 1; }
-source "$EXP_DIR/config.sh"
+CONFIG_FILE="${SUBMIT_CONFIG_FILE:-$EXP_DIR/config.sh}"
+[ -f "$CONFIG_FILE" ] || { echo "ERROR: config not found: $CONFIG_FILE"; exit 1; }
+source "$CONFIG_FILE"
+if [ -n "${SUBMIT_DATA_DIR:-}" ]; then
+    DATA_DIR="$SUBMIT_DATA_DIR"
+fi
 TRAIN_REPO_DIR="${SUBMIT_TRAIN_REPO_DIR:-${TRAIN_REPO_DIR:-$GROOT_DIR}}"
 
 GPU_INSTANCE="$(detect_gpu_instance)"
-EXP_NAME="${VARIANT}_eval_${GPU_INSTANCE}_$(date +%Y%m%d%H%M%S)"
+EXP_NAME="${SLURM_JOB_NAME:-${VARIANT}_eval_${GPU_INSTANCE}_$(date +%Y%m%d%H%M%S)}"
 
 CKPT_DIR="$EXP_DIR/checkpoints"
 EVAL_DIR="$EXP_DIR/eval_results"
@@ -209,6 +214,7 @@ PIDS=()
 PORTS=()
 FAILED=0
 LAUNCH_IDX=0
+EVAL_LAUNCHED=0
 
 cleanup_all() {
     for pid in "${PIDS[@]}"; do
@@ -549,6 +555,7 @@ for task_entry in "${TASKS[@]}"; do
                 "$PORT" \
                 "$START_SLOT" &
             PIDS+=("$!")
+            EVAL_LAUNCHED=$((EVAL_LAUNCHED + 1))
         done
         EVAL_SET_IDX=$((EVAL_SET_IDX + 1))
     done
@@ -558,10 +565,7 @@ done
 if ! wait_for_all; then
     FAILED=1
 fi
-if [ "$FAILED" -ne 0 ]; then
-    log "ERROR: one or more eval runs failed"
-    exit 1
-fi
+finish_eval_launch_phase "$EVAL_LAUNCHED" "$FAILED" "$EXP_DIR/results.json"
 
 ###############################################################################
 # Phase 3: Aggregate

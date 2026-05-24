@@ -22,6 +22,7 @@ TRAIN_REPO_DIR="${SUBMIT_TRAIN_REPO_DIR:-${TRAIN_REPO_DIR:-$GROOT_N16_DIR}}"
 TRAIN_NUM_GPUS="${SUBMIT_TRAIN_NUM_GPUS:-$TRAIN_NUM_GPUS}"
 MAX_STEPS="${SUBMIT_TRAIN_MAX_STEPS:-$MAX_STEPS}"
 SAVE_STEPS="${SUBMIT_TRAIN_SAVE_STEPS:-$SAVE_STEPS}"
+append_submit_extra_train_args
 
 GPU_INSTANCE="$(detect_gpu_instance)"
 # EXP_NAME mirrors the slurm job name when launched via submit; fallback for ad-hoc runs.

@@ -123,6 +123,7 @@ export WANDB_PROJECT="${SUBMIT_WANDB_PROJECT:-${WANDB_PROJECT:-my project}}"
 export WANDB_DIR="$EXP_DIR"
 
 export WANDB_RESUME=allow
+append_submit_extra_train_args
 
 python scripts/gr00t_finetune.py \
     --num-gpus "$TRAIN_NUM_GPUS" \

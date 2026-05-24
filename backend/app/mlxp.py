@@ -19,7 +19,7 @@ from collections import defaultdict
 
 from pydantic import BaseModel
 
-from .mlxp_config import DEFAULT_NODE, GPUS_PER_NODE, GPU_NODE_PREFIX, NAMESPACE
+from .mlxp_config import get_settings
 
 
 class MlxpNode(BaseModel):
@@ -27,14 +27,16 @@ class MlxpNode(BaseModel):
     gpu_used: int
     gpu_total: int
     gpu_free: int
+    gpu_type: str | None = None
 
 
 async def list_nodes() -> list[MlxpNode]:
     if shutil.which("kubectl") is None:
         raise RuntimeError("kubectl not found on PATH")
+    settings = get_settings()
 
     proc = await asyncio.create_subprocess_exec(
-        "kubectl", "get", "pod", "-n", NAMESPACE,
+        "kubectl", "get", "pod", "-n", settings.namespace,
         "--field-selector", "status.phase=Running",
         "-o", "json",
         stdout=asyncio.subprocess.PIPE,
@@ -61,21 +63,30 @@ async def list_nodes() -> list[MlxpNode]:
     for name in sorted(used):
         # GPU nodes only. CPU/control-plane nodes show up if we have a data
         # pod or pipeline pod there; those aren't GPU-relevant.
-        if not name.startswith(GPU_NODE_PREFIX):
+        if settings.gpu_node_prefix and not name.startswith(settings.gpu_node_prefix):
             continue
         u = used[name]
         out.append(MlxpNode(
             name=name,
             gpu_used=u,
-            gpu_total=GPUS_PER_NODE,
-            gpu_free=max(0, GPUS_PER_NODE - u),
+            gpu_total=settings.gpus_per_node,
+            gpu_free=max(0, settings.gpus_per_node - u),
+            gpu_type=_gpu_type_for_node(name, settings.gpu_type),
         ))
-    if DEFAULT_NODE and all(n.name != DEFAULT_NODE for n in out):
+    if settings.default_node and all(n.name != settings.default_node for n in out):
         out.append(MlxpNode(
-            name=DEFAULT_NODE,
+            name=settings.default_node,
             gpu_used=0,
-            gpu_total=GPUS_PER_NODE,
-            gpu_free=GPUS_PER_NODE,
+            gpu_total=settings.gpus_per_node,
+            gpu_free=settings.gpus_per_node,
+            gpu_type=_gpu_type_for_node(settings.default_node, settings.gpu_type),
         ))
         out.sort(key=lambda n: n.name)
     return out
+
+
+def _gpu_type_for_node(node: str, fallback: str | None) -> str | None:
+    prefix = node.split("-", 1)[0].strip()
+    if prefix and any(ch.isdigit() for ch in prefix):
+        return prefix.upper()
+    return fallback or None

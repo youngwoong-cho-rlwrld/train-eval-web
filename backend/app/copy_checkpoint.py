@@ -30,7 +30,8 @@ from pydantic import BaseModel
 from .clusters import load_cluster
 from .details import get_details, resolve_phase_and_variant
 from .jobs import get_job
-from .mlxp_config import EXPERIMENTS_DIR as MLXP_EXPERIMENTS_DIR, NAMESPACE as MLXP_NS
+from .kubectl_errors import is_completed_pod_exec_error
+from .mlxp_config import get_settings
 from .mlxp_data_pod import ensure_listing_pod, invalidate_pods_cache
 from .ssh import ssh_run, _CM_OPTS
 from .submission_snapshot import is_mlxp_transport_error
@@ -66,15 +67,6 @@ _MODEL_ARTIFACT_EXCLUDES = (
     "*/logs",
     "*/logs/*",
 )
-
-
-def _is_completed_pod_exec_error(message: str) -> bool:
-    lower = message.lower()
-    return (
-        "cannot exec into a container in a completed pod" in lower
-        or "current phase is succeeded" in lower
-        or "current phase is failed" in lower
-    )
 
 
 class CopyCheckpointRequest(BaseModel):
@@ -167,8 +159,9 @@ async def _kubectl_exec_text(
     last_error = "kubectl exec failed"
     current_pod = pod
     for attempt in range(1, attempts + 1):
+        settings = get_settings()
         proc = await asyncio.create_subprocess_exec(
-            "kubectl", "exec", "-n", MLXP_NS, current_pod, "--", *command,
+            "kubectl", "exec", "-n", settings.namespace, current_pod, "--", *command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -182,7 +175,7 @@ async def _kubectl_exec_text(
             if proc.returncode == 0:
                 return out.decode(errors="replace")
             last_error = err.decode(errors="replace").strip() or "kubectl exec failed"
-            if _is_completed_pod_exec_error(last_error):
+            if is_completed_pod_exec_error(last_error):
                 invalidate_pods_cache()
                 try:
                     current_pod = await ensure_listing_pod()
@@ -208,7 +201,7 @@ async def list_checkpoints(cluster: str, job_id: str) -> list[CheckpointEntry]:
         pod = await ensure_listing_pod()
         # Emit one row for each per-job checkpoint dir. Also include the
         # historical direct-root layout used by older MLXP jobs.
-        experiments_root = shlex.quote(MLXP_EXPERIMENTS_DIR)
+        experiments_root = shlex.quote(get_settings().experiments_dir)
         quoted_variant = shlex.quote(variant)
         script = (
             r"""
@@ -304,7 +297,7 @@ async def start_copy(
 
     if not dest_path_root:
         if dest_cluster == "mlxp":
-            dest_path_root = f"{MLXP_EXPERIMENTS_DIR}/{variant}/checkpoints"
+            dest_path_root = f"{get_settings().experiments_dir}/{variant}/checkpoints"
         else:
             dest_path_root = f"$HOME/.train-eval-web/experiments/{variant}/checkpoints"
 
@@ -698,8 +691,9 @@ async def _kubectl_cp_model_artifact(
     for attempt in range(1, _MLXP_KUBECTL_CP_ATTEMPTS + 1):
         _remove_local_path(local_path)
         local_path.parent.mkdir(parents=True, exist_ok=True)
+        settings = get_settings()
         proc = await asyncio.create_subprocess_exec(
-            "kubectl", "cp", "-n", MLXP_NS,
+            "kubectl", "cp", "-n", settings.namespace,
             f"{pod}:{remote_path}", str(local_path),
             f"--retries={_MLXP_KUBECTL_CP_RETRIES}",
             stdout=asyncio.subprocess.PIPE,
@@ -756,8 +750,9 @@ async def _mlxp_to_mlxp(copy_id: str, src: str, dest: str,
         f"{_mlxp_tar_create_cmd(src_parent, tar_args)} | "
         f"tar x -C {shlex.quote(dest_parent)}"
     )
+    settings = get_settings()
     proc = await asyncio.create_subprocess_exec(
-        "kubectl", "exec", "-n", MLXP_NS, pod, "--", "bash", "-c", cmd,
+        "kubectl", "exec", "-n", settings.namespace, pod, "--", "bash", "-c", cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -1026,6 +1021,7 @@ async def _slurm_to_mlxp(copy_id: str, src_cluster: str, src_path: str, dest_pat
     tar_args = _tar_artifact_args(src_leaf, include_only)
 
     async with _MLXP_STREAM_SEMAPHORE:
+        settings = get_settings()
         src_proc = await asyncio.create_subprocess_exec(
             "ssh", "-o", "BatchMode=yes", *_CM_OPTS, src_env.ssh_alias,
             _mlxp_tar_create_cmd(src_parent, tar_args),
@@ -1034,7 +1030,7 @@ async def _slurm_to_mlxp(copy_id: str, src_cluster: str, src_path: str, dest_pat
             limit=1 << 22,
         )
         dst_proc = await asyncio.create_subprocess_exec(
-            "kubectl", "exec", "-i", "-n", MLXP_NS, pod, "--",
+            "kubectl", "exec", "-i", "-n", settings.namespace, pod, "--",
             "bash", "-c",
             f"mkdir -p {shlex.quote(dest_parent)} && tar x -C {shlex.quote(dest_parent)}",
             stdin=asyncio.subprocess.PIPE,
@@ -1049,8 +1045,9 @@ async def _slurm_to_mlxp(copy_id: str, src_cluster: str, src_path: str, dest_pat
 async def _delete_source(src_cluster: str, src_path: str) -> None:
     if src_cluster == "mlxp":
         pod = await ensure_listing_pod()
+        settings = get_settings()
         proc = await asyncio.create_subprocess_exec(
-            "kubectl", "exec", "-n", MLXP_NS, pod, "--",
+            "kubectl", "exec", "-n", settings.namespace, pod, "--",
             "rm", "-rf", src_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

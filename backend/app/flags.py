@@ -93,7 +93,7 @@ def _train_n16(v: Variant, cluster: str) -> list[tuple[str, str]]:
     return out
 
 
-# ── eval (currently slurm-only — mlxp eval not wired yet) ────────────
+# ── eval ─────────────────────────────────────────────────────────────
 
 def _eval_n15(v: Variant, cluster: str) -> list[tuple[str, str]]:
     """Mirror lib/eval_body.sh — gr00t inference + isaac client run."""

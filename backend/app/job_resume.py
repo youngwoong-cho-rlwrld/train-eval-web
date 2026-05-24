@@ -2,6 +2,7 @@
 
 from . import details, jobs, submit
 from .clusters import load_cluster
+from .slurm_meta import read_slurm_meta
 
 
 def _is_timeout(state: str) -> bool:
@@ -37,7 +38,7 @@ async def resume_timed_out_job(cluster: str, job_id: str) -> submit.SubmitRespon
 
     if phase == "train":
         env = await load_cluster(cluster)
-        meta = await details._read_slurm_meta(env.ssh_alias, job_id)
+        meta = await read_slurm_meta(env.ssh_alias, job_id)
 
         def int_meta(key: str) -> int | None:
             try:
@@ -68,7 +69,7 @@ async def resume_timed_out_job(cluster: str, job_id: str) -> submit.SubmitRespon
 
     seed_eval_dirs = [det.paths.eval_dir] if det.paths.eval_dir else []
     env = await load_cluster(cluster)
-    meta = await details._read_slurm_meta(env.ssh_alias, job_id)
+    meta = await read_slurm_meta(env.ssh_alias, job_id)
     eval_num_envs = (meta.get("eval_num_envs_per_gpu") or meta.get("eval_parallel_sims_per_gpu") or "").strip()
     try:
         eval_num_envs_per_gpu = int(eval_num_envs) if eval_num_envs else None

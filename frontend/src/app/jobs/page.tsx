@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { CopyButton } from "@/components/copy-button";
 import { CopyCheckpointDialog } from "@/components/copy-checkpoint-dialog";
 import { ResumeJobButton } from "@/components/resume-job-button";
@@ -34,6 +35,9 @@ export default function JobsPage() {
   const qc = useQueryClient();
   const [draftHistoryRange, setDraftHistoryRange] = useState(() => defaultHistoryRange());
   const [appliedHistoryRange, setAppliedHistoryRange] = useState(() => defaultHistoryRange());
+  const [recentNameFilter, setRecentNameFilter] = useState("");
+  const [recentPhaseFilter, setRecentPhaseFilter] = useState<RecentPhaseFilter>("all");
+  const [recentStateFilter, setRecentStateFilter] = useState("all");
   const historyQuery = useMemo(
     () => historyRangeQuery(appliedHistoryRange),
     [appliedHistoryRange],
@@ -72,6 +76,21 @@ export default function JobsPage() {
       .sort((a, b) => compareEndedDesc(a, b));
     return { active, finished };
   }, [data]);
+  const recentStateOptions = useMemo(() => {
+    const values = new Set(finished.map((j) => normalizeStateFilterValue(j.state)));
+    return Array.from(values).sort();
+  }, [finished]);
+  const filteredFinished = useMemo(
+    () =>
+      finished.filter((job) =>
+        recentJobMatchesFilters(job, {
+          name: recentNameFilter,
+          phase: recentPhaseFilter,
+          state: recentStateFilter,
+        }),
+      ),
+    [finished, recentNameFilter, recentPhaseFilter, recentStateFilter],
+  );
 
   return (
     <div className="mx-auto max-w-7xl px-8 py-12">
@@ -104,11 +123,52 @@ export default function JobsPage() {
           <div>
             <CardTitle>Recent</CardTitle>
             <CardDescription>
-              {finished.length} finished {finished.length === 1 ? "job" : "jobs"} from{" "}
+              {filteredFinished.length} of {finished.length} finished {finished.length === 1 ? "job" : "jobs"} from{" "}
               {formatDateRange(appliedHistoryRange)}.
             </CardDescription>
           </div>
-          <div className="flex items-end gap-3">
+          <div className="flex flex-wrap items-end justify-end gap-3">
+            <div className="space-y-1">
+              <Label htmlFor="recent-name" className="text-xs text-slate-500">Name</Label>
+              <Input
+                id="recent-name"
+                value={recentNameFilter}
+                onChange={(e) => setRecentNameFilter(e.target.value)}
+                placeholder="job or variant"
+                className="h-8 w-[180px] font-mono text-xs"
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="recent-phase" className="text-xs text-slate-500">Phase</Label>
+              <Select value={recentPhaseFilter} onValueChange={(v) => setRecentPhaseFilter(v as RecentPhaseFilter)}>
+                <SelectTrigger id="recent-phase" className="h-8 w-[110px]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All</SelectItem>
+                  <SelectItem value="train">train</SelectItem>
+                  <SelectItem value="resume">resume</SelectItem>
+                  <SelectItem value="eval">eval</SelectItem>
+                  <SelectItem value="other">other</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="recent-state" className="text-xs text-slate-500">State</Label>
+              <Select value={recentStateFilter} onValueChange={setRecentStateFilter}>
+                <SelectTrigger id="recent-state" className="h-8 w-[150px]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All</SelectItem>
+                  {recentStateOptions.map((state) => (
+                    <SelectItem key={state} value={state}>
+                      {state.toLowerCase()}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
             <div className="space-y-1">
               <Label htmlFor="recent-start" className="text-xs text-slate-500">From</Label>
               <Input
@@ -156,7 +216,10 @@ export default function JobsPage() {
           {!isLoading && !error && finished.length === 0 && (
             <EmptyState message="Nothing in this window." />
           )}
-          {finished.length > 0 && <JobTable rows={finished} />}
+          {!isLoading && !error && finished.length > 0 && filteredFinished.length === 0 && (
+            <EmptyState message="No jobs match these filters." />
+          )}
+          {filteredFinished.length > 0 && <JobTable rows={filteredFinished} />}
         </CardContent>
       </Card>
     </div>
@@ -167,6 +230,37 @@ type HistoryRange = {
   startDate: string;
   endDate: string;
 };
+
+type RecentPhaseFilter = JobPhase | "all";
+
+type RecentJobFilters = {
+  name: string;
+  phase: RecentPhaseFilter;
+  state: string;
+};
+
+function normalizeStateFilterValue(state: string) {
+  return state.trim().split(/\s+/, 1)[0].toUpperCase() || "UNKNOWN";
+}
+
+function recentJobMatchesFilters(job: Job, filters: RecentJobFilters) {
+  const name = filters.name.trim().toLowerCase();
+  if (name) {
+    const haystack = [
+      job.job_id,
+      job.job_name,
+      job.variant ?? "",
+      job.cluster,
+      job.partition,
+      job.nodelist,
+    ].join(" ").toLowerCase();
+    if (!haystack.includes(name)) return false;
+  }
+  const phase = normalizeJobPhase(job.phase) ?? jobPhase(job.job_name);
+  if (filters.phase !== "all" && phase !== filters.phase) return false;
+  if (filters.state !== "all" && normalizeStateFilterValue(job.state) !== filters.state) return false;
+  return true;
+}
 
 function defaultHistoryRange(): HistoryRange {
   const end = new Date();

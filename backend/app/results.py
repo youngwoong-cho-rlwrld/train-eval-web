@@ -62,11 +62,14 @@ class ResultsResponse(BaseModel):
 
 
 async def list_results(cluster: str | None = None) -> ResultsResponse:
-    target_clusters = [cluster] if cluster else [c for c in list_clusters() if c != "mlxp"]
+    target_clusters = [cluster] if cluster else list_clusters()
     payload = await _variant_payload()
 
     async def _one(c: str) -> tuple[list[ResultVariant], ClusterResultError | None]:
         try:
+            if c == "mlxp":
+                raw = await _read_mlxp_results(payload)
+                return [ResultVariant.model_validate(x) for x in raw], None
             env = await load_cluster(c)
             raw = await _read_cluster_results(env.ssh_alias, c, payload)
             return [ResultVariant.model_validate(x) for x in raw], None
@@ -168,6 +171,40 @@ async def _read_cluster_results(host: str, cluster: str, payload: list[dict[str,
         raise RuntimeError(f"could not parse results from {cluster}: {e}: {r.stdout[:500]}")
 
 
+async def _read_mlxp_results(payload: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    from .mlxp_config import get_settings
+    from .mlxp_data_pod import ensure_listing_pod
+
+    settings = get_settings()
+    pod = await ensure_listing_pod()
+    payload_b64 = base64.b64encode(json.dumps(payload).encode()).decode()
+    cmd = (
+        f"RESULTS_PAYLOAD_B64={shlex.quote(payload_b64)} "
+        "RESULTS_CLUSTER=mlxp "
+        f"RESULTS_EXPERIMENTS_ROOT={shlex.quote(settings.experiments_dir)} "
+        "python3 - <<'PY'\n"
+        + _REMOTE_SCRIPT
+        + "\nPY"
+    )
+    proc = await asyncio.create_subprocess_exec(
+        "kubectl", "exec", "-n", settings.namespace, pod, "--", "bash", "-lc", cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=45.0)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            stderr.decode(errors="replace").strip()
+            or stdout.decode(errors="replace").strip()
+            or "kubectl exec failed on mlxp"
+        )
+    out = stdout.decode(errors="replace")
+    try:
+        return json.loads(out or "[]")
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"could not parse results from mlxp: {e}: {out[:500]}")
+
+
 _REMOTE_SCRIPT = r'''
 import base64
 import json
@@ -179,7 +216,7 @@ from pathlib import Path
 payload = json.loads(base64.b64decode(os.environ["RESULTS_PAYLOAD_B64"]).decode())
 cluster = os.environ["RESULTS_CLUSTER"]
 staging_rel = os.environ.get("RESULTS_STAGING_REL", ".train-eval-web")
-experiments_root = Path.home() / staging_rel / "experiments"
+experiments_root = Path(os.environ["RESULTS_EXPERIMENTS_ROOT"]) if os.environ.get("RESULTS_EXPERIMENTS_ROOT") else Path.home() / staging_rel / "experiments"
 
 
 def int_or_none(value):

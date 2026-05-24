@@ -3,7 +3,6 @@
 import { useState } from "react";
 import { Plus, Settings, X } from "lucide-react";
 import type { Variant, Dataset } from "@/lib/api";
-import { MLXP_DATASETS_DIR } from "@/lib/mlxp-config";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -173,7 +172,7 @@ function DatasetDirControl({
           <Input
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
-            placeholder={MLXP_DATASETS_DIR}
+            placeholder={datasetDir}
             className="font-mono text-xs"
             autoFocus
           />

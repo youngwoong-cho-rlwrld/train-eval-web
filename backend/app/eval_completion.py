@@ -44,7 +44,7 @@ async def eval_job_completed(
         return False
 
     stdout_q = shlex.quote(stdout_path)
-    eval_dir_q = _remote_path_expr(eval_dir)
+    eval_dir_q = remote_path_expr(eval_dir)
     cmd = (
         f"stdout_path={stdout_q}; eval_dir={eval_dir_q}; expected={expected}; "
         "saved=$(grep -h '^Results saved to:' \"$stdout_path\" 2>/dev/null | wc -l); "
@@ -71,7 +71,7 @@ async def eval_job_completed_from_log_dir(
     log_dir_q = shlex.quote(log_dir)
     job_id_q = shlex.quote(job_id)
     eval_dirs = " ".join(
-        _remote_path_expr(f"$HOME/{rel}/eval_results")
+        remote_path_expr(f"$HOME/{rel}/eval_results")
         for rel in exp_dir_rel_candidates(variant)
     )
     cmd = (
@@ -107,7 +107,7 @@ def _parse_completion_probe(stdout: str, expected: int) -> bool:
     return stdout_complete and files_complete
 
 
-def _remote_path_expr(path: str) -> str:
+def remote_path_expr(path: str) -> str:
     return path if path.startswith("$HOME/") else shlex.quote(path)
 
 

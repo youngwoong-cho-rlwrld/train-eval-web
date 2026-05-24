@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { MLXP_DEFAULT_NODE } from "@/lib/mlxp-config";
 
 const KEY = "mlxpNode";
 const EVENT = "mlxp-node-change";
@@ -9,11 +8,16 @@ const EVENT = "mlxp-node-change";
 /** localStorage-backed value for "my MLXP node", reactive within a single
  *  tab via a custom event so multiple components on the page update together
  *  when one of them writes a new value. */
-export function useMyMlxpNode(): [string, (v: string) => void] {
+export function useMyMlxpNode(defaultNode = ""): [string, (v: string) => void] {
   const [node, setLocal] = useState<string>(() => {
-    if (typeof window === "undefined") return MLXP_DEFAULT_NODE;
-    return localStorage.getItem(KEY) || MLXP_DEFAULT_NODE;
+    if (typeof window === "undefined") return defaultNode;
+    return localStorage.getItem(KEY) || defaultNode;
   });
+
+  useEffect(() => {
+    if (!defaultNode || typeof window === "undefined") return;
+    if (!localStorage.getItem(KEY)) setLocal(defaultNode);
+  }, [defaultNode]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;

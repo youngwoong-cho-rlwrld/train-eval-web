@@ -22,7 +22,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from .clusters import load_cluster
-from .mlxp_config import DATASETS_DIR as MLXP_DEFAULT_DIR, NAMESPACE as MLXP_NS
+from .mlxp_config import get_settings
 from .mlxp_data_pod import ensure_listing_pod
 from .ssh import ssh_run
 
@@ -100,7 +100,8 @@ def _parse_lines(text: str) -> list[DatasetInfo]:
 
 async def list_datasets(cluster: str, path: str | None = None) -> list[DatasetInfo]:
     if cluster == "mlxp":
-        return await _list_datasets_mlxp(path or MLXP_DEFAULT_DIR)
+        settings = get_settings()
+        return await _list_datasets_mlxp(path or settings.datasets_dir)
     return await _list_datasets_slurm(cluster, path or SLURM_DEFAULT_DIR)
 
 
@@ -122,10 +123,11 @@ async def _list_datasets_mlxp(dir_path: str) -> list[DatasetInfo]:
     take ~30-90s while the pod schedules.
     """
     pod = await ensure_listing_pod()
+    settings = get_settings()
 
     script = _list_py(dir_path)
     proc = await asyncio.create_subprocess_exec(
-        "kubectl", "exec", "-n", MLXP_NS, pod, "--",
+        "kubectl", "exec", "-n", settings.namespace, pod, "--",
         "python3", "-c", script,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

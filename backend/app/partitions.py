@@ -14,6 +14,7 @@ from .ssh import ssh_run
 
 
 _GPU_PER_NODE_RE = re.compile(r"gpu(?::[A-Za-z0-9_-]+)?:(\d+)")
+_GPU_TYPE_RE = re.compile(r"gpu:([A-Za-z0-9_-]+):\d+")
 
 
 class PartitionInfo(BaseModel):
@@ -24,6 +25,7 @@ class PartitionInfo(BaseModel):
     idle_nodes: int
     gpu_total: int
     gpu_idle: int
+    gpu_type: str | None = None
     states: dict[str, int]       # e.g. {"idle": 1, "mix": 5}
 
 
@@ -35,6 +37,11 @@ def _is_idle(state: str) -> bool:
 def _gpus_per_node(gres: str) -> int:
     m = _GPU_PER_NODE_RE.search(gres)
     return int(m.group(1)) if m else 0
+
+
+def _gpu_type(gres: str) -> str | None:
+    m = _GPU_TYPE_RE.search(gres)
+    return m.group(1).upper() if m else None
 
 
 def _strip_state(s: str) -> str:
@@ -69,11 +76,14 @@ async def list_partitions(cluster: str) -> list[PartitionInfo]:
     per_part: dict[str, dict] = defaultdict(lambda: {
         "states": defaultdict(int),
         "total_nodes": 0, "idle_nodes": 0,
-        "gpu_total": 0, "gpu_idle": 0,
+        "gpu_total": 0, "gpu_idle": 0, "gpu_type": None,
     })
     for name, state, count, gres in rows:
         gpn = _gpus_per_node(gres)
+        gpu_type = _gpu_type(gres)
         d = per_part[name]
+        if gpu_type and not d["gpu_type"]:
+            d["gpu_type"] = gpu_type
         st_key = _strip_state(state)
         d["states"][st_key] += count
         d["total_nodes"] += count
@@ -96,6 +106,7 @@ async def list_partitions(cluster: str) -> list[PartitionInfo]:
             idle_nodes=d["idle_nodes"],
             gpu_total=d["gpu_total"],
             gpu_idle=d["gpu_idle"],
+            gpu_type=d["gpu_type"],
             states=dict(d["states"]),
         ))
     return out

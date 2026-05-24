@@ -15,7 +15,11 @@ from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 from pydantic import BaseModel, Field
 
 from .clusters import load_cluster
-from .eval_completion import eval_job_completed, eval_shape
+from .eval_completion import (
+    eval_job_completed,
+    eval_shape,
+    exp_dir_rel_candidates,
+)
 from .job_identity import (
     parse_comment_metadata,
     parse_phase_and_variant,
@@ -23,9 +27,10 @@ from .job_identity import (
     resolve_phase_and_variant,
 )
 from .jobs import get_job
-from .mlxp_config import EXPERIMENTS_DIR as MLXP_EXPERIMENTS_DIR, NAMESPACE as MLXP_NAMESPACE
+from .mlxp_config import get_settings
 from .paths import CLUSTER_STAGING_REL
 from .ssh import ssh_run
+from .slurm_meta import read_slurm_meta
 from .variants import load_variant
 
 
@@ -140,25 +145,6 @@ def _snapshot_wandb_project(text: str | None) -> str | None:
     except ValueError:
         pass
     return raw.strip("'\"") or None
-
-
-async def _read_slurm_meta(host: str, job_id: str) -> dict[str, str]:
-    """Read the sidecar written at submit time.
-
-    `~/.train-eval-web/jobs/<job_id>.meta` shape: lines `key=value`."""
-    r = await ssh_run(
-        host,
-        f"cat $HOME/.train-eval-web/jobs/{job_id}.meta 2>/dev/null",
-        timeout=10.0,
-    )
-    if r.returncode != 0 or not r.stdout.strip():
-        return {}
-    fields: dict[str, str] = {}
-    for line in r.stdout.splitlines():
-        if "=" in line:
-            k, v = line.split("=", 1)
-            fields[k.strip()] = v.strip()
-    return fields
 
 
 async def _read_slurm_scontrol_comment(host: str, job_id: str) -> str | None:
@@ -280,16 +266,16 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
             if p and v:
                 phase, variant = p, v
     if not variant:
-        slurm_meta = await _read_slurm_meta(env.ssh_alias, job_id)
+        slurm_meta = await read_slurm_meta(env.ssh_alias, job_id)
         p, v = phase_variant_from_meta(slurm_meta)
         if p and v:
             phase, variant = p, v
     elif phase == "eval":
         # Eval details may need checkpoint_path even when phase/variant were
         # already recovered from the job name or sacct comment.
-        slurm_meta = await _read_slurm_meta(env.ssh_alias, job_id)
+        slurm_meta = await read_slurm_meta(env.ssh_alias, job_id)
     elif phase in ("train", "resume"):
-        slurm_meta = await _read_slurm_meta(env.ssh_alias, job_id)
+        slurm_meta = await read_slurm_meta(env.ssh_alias, job_id)
     log_dir = env.vars["LOG_DIR"]
     stdout_path, stderr_path, log_job_name = await _resolve_slurm_log_paths(
         env.ssh_alias,
@@ -395,17 +381,22 @@ async def _mlxp_details(
     job_comment: str | None = None,
 ) -> JobDetails:
     """MLXP runs train via `kubectl apply` on a pod. All paths live on DDN."""
-    exp_dir = f"{MLXP_EXPERIMENTS_DIR}/{variant}" if variant else MLXP_EXPERIMENTS_DIR
+    settings = get_settings()
+    exp_dir = f"{settings.experiments_dir}/{variant}" if variant else settings.experiments_dir
     ckpt_dir = f"{exp_dir}/checkpoints/{job_name}" if phase in ("train", "resume") else None
+    eval_dir = f"{exp_dir}/eval_results" if phase == "eval" else None
     paths = Paths(
-        stdout=f"kubectl logs -n {MLXP_NAMESPACE} -l job-name={job_id}",
-        stderr=f"kubectl logs -n {MLXP_NAMESPACE} -l job-name={job_id}  (k8s merges stdout+stderr)",
+        stdout=f"kubectl logs -n {settings.namespace} -l job-name={job_id}",
+        stderr=f"kubectl logs -n {settings.namespace} -l job-name={job_id}  (k8s merges stdout+stderr)",
         exp_dir=exp_dir,
         ckpt_dir=ckpt_dir,
-        eval_dir=None,
-        isaac_logs_glob=None,
+        eval_checkpoint=None,
+        eval_dir=eval_dir,
+        isaac_logs_glob=f"{exp_dir}/logs/{job_id}/server_*.log" if phase == "eval" else None,
     )
     metadata = _metadata_fields(job_comment)
+    if phase == "eval":
+        paths.eval_checkpoint = metadata.get("checkpoint_path") or None
     config_snapshot = await _mlxp_config_snapshot(metadata)
     job_wandb_project = (
         metadata.get("wandb_project")
@@ -415,7 +406,11 @@ async def _mlxp_details(
     # mlxp body pins WANDB_RUN_ID = job_name (resolved from the Job's
     # display-name annotation by get_job). The k8s job_id has no wandb
     # run behind it.
-    wandb_url = await _wandb_url(job_name, project=job_wandb_project)
+    wandb_url = (
+        await _wandb_url(job_name, project=job_wandb_project)
+        if phase in ("train", "resume")
+        else None
+    )
     progress = await _mlxp_progress(job_name, variant, phase, metadata, project=job_wandb_project)
     gpu = await _mlxp_gpu_usage(pod_name, node, state) if include_gpu else None
 
@@ -486,6 +481,7 @@ async def _mlxp_config_snapshot(meta: dict[str, str]) -> ConfigSnapshot | None:
     import shutil
     from .mlxp_data_pod import ensure_listing_pod
 
+    settings = get_settings()
     text: str | None = None
     error: str | None = None
     if shutil.which("kubectl") is None:
@@ -497,7 +493,7 @@ async def _mlxp_config_snapshot(meta: dict[str, str]) -> ConfigSnapshot | None:
                 "kubectl",
                 "exec",
                 "-n",
-                MLXP_NAMESPACE,
+                settings.namespace,
                 pod,
                 "--",
                 "cat",
@@ -685,6 +681,7 @@ async def _mlxp_gpu_usage(
         return GpuUsage(node=fallback_node, error="MLXP pod is not available yet")
     if shutil.which("kubectl") is None:
         return GpuUsage(node=fallback_node, error="kubectl not found on PATH")
+    settings = get_settings()
 
     proc = None
     try:
@@ -692,7 +689,7 @@ async def _mlxp_gpu_usage(
             "kubectl",
             "exec",
             "-n",
-            MLXP_NAMESPACE,
+            settings.namespace,
             pod_name,
             "--",
             "bash",
@@ -749,6 +746,9 @@ async def _mlxp_progress(
         return progress
 
     metadata = metadata or {}
+    if phase == "eval":
+        return await _mlxp_eval_progress(variant, metadata, progress)
+
     try:
         if metadata.get("train_max_steps"):
             progress.max_steps = int(metadata["train_max_steps"])
@@ -777,7 +777,8 @@ async def _mlxp_progress(
     import shutil
     if shutil.which("kubectl") is None:
         return progress
-    ckpt_root = f"{MLXP_EXPERIMENTS_DIR}/{variant}/checkpoints"
+    settings = get_settings()
+    ckpt_root = f"{settings.experiments_dir}/{variant}/checkpoints"
     ckpt_dirs = [f"{ckpt_root}/{run_id}", f"{ckpt_root}/{run_id}/{run_id}", ckpt_root]
     from .mlxp_data_pod import ensure_listing_pod
     try:
@@ -794,7 +795,7 @@ async def _mlxp_progress(
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
-            "kubectl", "exec", "-n", MLXP_NAMESPACE, pod, "--", "bash", "-c", cmd,
+            "kubectl", "exec", "-n", settings.namespace, pod, "--", "bash", "-c", cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -815,6 +816,65 @@ async def _mlxp_progress(
         progress.current_label = f"step {cur:,}/{progress.max_steps:,}"
     else:
         progress.current_label = f"step {cur:,}"
+    return progress
+
+
+async def _mlxp_eval_progress(
+    variant: str,
+    metadata: dict[str, str],
+    progress: Progress,
+) -> Progress:
+    import asyncio
+    import shutil
+
+    try:
+        v = await load_variant(variant)
+        eval_sets, n_runs, n_eps, tasks = eval_shape(v, metadata)
+    except Exception:
+        return progress
+    total = max(len(tasks) * len(eval_sets) * n_runs, 0)
+    progress.total_runs = total or None
+    if total <= 0:
+        return progress
+    if n_eps > 0:
+        progress.max_steps = total * n_eps
+
+    if shutil.which("kubectl") is None:
+        return progress
+    settings = get_settings()
+    eval_dir = f"{settings.experiments_dir}/{variant}/eval_results"
+    from .mlxp_data_pod import ensure_listing_pod
+    try:
+        pod = await ensure_listing_pod()
+    except Exception:
+        return progress
+
+    cmd = f"find {shlex.quote(eval_dir)} -type f -name results.json 2>/dev/null | wc -l"
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "kubectl", "exec", "-n", settings.namespace, pod, "--", "bash", "-c", cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+    except Exception:
+        if proc is not None and proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        return progress
+    try:
+        completed = int(stdout.decode(errors="replace").strip())
+    except ValueError:
+        completed = 0
+    progress.completed_runs = completed
+    if n_eps > 0 and progress.max_steps:
+        progress.current_step = min(completed * n_eps, progress.max_steps)
+        progress.percent = round(100.0 * progress.current_step / progress.max_steps, 1)
+        progress.current_label = f"{completed}/{total} runs · {progress.current_step}/{progress.max_steps} episodes"
+    else:
+        progress.percent = round(100.0 * completed / total, 1)
+        progress.current_label = f"{completed}/{total} runs"
     return progress
 
 
@@ -946,14 +1006,6 @@ async def _wandb_step(run_id: str, project: str | None = None) -> int | None:
 _BODY_SUFFIX_RE = re.compile(r"/lib/(train|eval)_body(?:_n16)?\.sh$")
 
 
-def _exp_dir_rel_candidates(variant: str) -> list[str]:
-    """Experiment roots relative to $HOME, in preferred fallback order."""
-    return [
-        f"{CLUSTER_STAGING_REL}/experiments/{variant}",
-        f"train-eval-scripts/experiments/{variant}",
-    ]
-
-
 def _latest_logs_dir_script(variant: str) -> str:
     """Shell snippet that prints the candidate exp dir with newest logs/.
 
@@ -961,7 +1013,7 @@ def _latest_logs_dir_script(variant: str) -> str:
     grouping, only the last command is piped, which can return
     "<mtime> <path>" instead of just the path when the first candidate wins.
     """
-    rels = " ".join(shlex.quote(rel) for rel in _exp_dir_rel_candidates(variant))
+    rels = " ".join(shlex.quote(rel) for rel in exp_dir_rel_candidates(variant))
     return (
         "best_mtime=-1; best_path=''; "
         f"for rel in {rels}; do "
@@ -980,19 +1032,13 @@ def _latest_logs_dir_script(variant: str) -> str:
 
 def _existing_exp_dirs_script(variant: str) -> str:
     """Shell snippet that prints existing candidate exp dirs, in order."""
-    rels = " ".join(shlex.quote(rel) for rel in _exp_dir_rel_candidates(variant))
+    rels = " ".join(shlex.quote(rel) for rel in exp_dir_rel_candidates(variant))
     return (
         f"for rel in {rels}; do "
         'c="$HOME/$rel"; '
         'if [ -d "$c" ]; then printf "%s\\n" "$c"; fi; '
         "done"
     )
-
-
-def _remote_path_expr(path: str) -> str:
-    """Quote a remote path for shell use while preserving a leading $HOME."""
-    return path if path.startswith("$HOME/") else shlex.quote(path)
-
 
 async def _resolve_eval_checkpoint(
     host: str,
@@ -1063,7 +1109,7 @@ async def _resolve_exp_dir(host: str, job_id: str, variant: str) -> str:
     lines = r.stdout.strip().splitlines()
     if lines:
         return lines[0]
-    return f"$HOME/{_exp_dir_rel_candidates(variant)[0]}"
+    return f"$HOME/{exp_dir_rel_candidates(variant)[0]}"
 
 
 _TQDM_STEP_RE = re.compile(r"(\d+)/(\d+)\s*\[")

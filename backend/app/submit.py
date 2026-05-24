@@ -10,6 +10,7 @@ Flow:
 import re
 import shlex
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -26,6 +27,7 @@ from .submission_snapshot import (
     render_training_config_snapshot,
     snapshot_metadata,
     snapshot_suffix,
+    shell_array_assignment,
     slurm_training_repo_path,
     training_repo_label,
 )
@@ -51,8 +53,8 @@ class SubmitRequest(BaseModel):
     # Slurm-only: partition name (None → fall back to cluster.env default).
     partition: str | None = None
     # MLXP-only: which k8s node to pin via nodeAffinity (each rlwrld team
-    # member is assigned a specific h200-03-w-XXXX in the GPU Resource
-    # Schedule sheet). None falls back to mlxp_submit.DEFAULT_NODE.
+    # member is assigned a specific GPU node in the GPU Resource Schedule
+    # sheet). None falls back to the saved MLXP settings default.
     node: str | None = None
     # Per-submit dataset override. Two shapes accepted:
     #   - single string  → replaces DATASET_NAME in single-task variants
@@ -133,6 +135,48 @@ def require_eval_checkpoint_path(req: SubmitRequest) -> str:
     return path
 
 
+@dataclass(frozen=True)
+class TrainSettings:
+    num_gpus: int
+    global_batch_size: int | None
+    max_steps: int
+    save_steps: int
+
+
+def resolve_train_settings(req: SubmitRequest, variant, model_family: str) -> TrainSettings:
+    """Resolve train-time override values exactly once for submit and preview."""
+    train_num_gpus = req.train_num_gpus or variant_int(variant, "TRAIN_NUM_GPUS", 2)
+    train_max_steps = req.train_max_steps or variant_int(variant, "MAX_STEPS", 30000)
+    train_save_steps = req.train_save_steps or variant_int(variant, "SAVE_STEPS", 1000)
+    train_global_batch_size = req.train_global_batch_size
+
+    if train_global_batch_size is None:
+        for key in ("TRAIN_GLOBAL_BATCH_SIZE", "GLOBAL_BATCH_SIZE"):
+            raw = variant.vars.get(key)
+            if raw:
+                try:
+                    train_global_batch_size = int(raw)
+                    break
+                except ValueError:
+                    pass
+        if train_global_batch_size is None:
+            train_global_batch_size = variant_int(variant, "TRAIN_BATCH_SIZE", 64) * train_num_gpus
+
+    if (
+        req.train_global_batch_size is not None
+        and model_family == "n1.5"
+        and req.train_global_batch_size % train_num_gpus != 0
+    ):
+        raise ValueError("train_global_batch_size must be divisible by train_num_gpus for n1.5 training")
+
+    return TrainSettings(
+        num_gpus=train_num_gpus,
+        global_batch_size=train_global_batch_size,
+        max_steps=train_max_steps,
+        save_steps=train_save_steps,
+    )
+
+
 class SubmitResponse(BaseModel):
     job_id: str
     job_name: str
@@ -205,25 +249,8 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     if exclude_nodes:
         sbatch_flags.append(f"--exclude={shlex.quote(exclude_nodes)}")
 
-    train_num_gpus = req.train_num_gpus or variant_int(variant, "TRAIN_NUM_GPUS", 2)
-    train_max_steps = req.train_max_steps or variant_int(variant, "MAX_STEPS", 30000)
-    train_save_steps = req.train_save_steps or variant_int(variant, "SAVE_STEPS", 1000)
-    effective_train_global_batch_size = req.train_global_batch_size
-    if req.phase == "train" and effective_train_global_batch_size is None:
-        for key in ("TRAIN_GLOBAL_BATCH_SIZE", "GLOBAL_BATCH_SIZE"):
-            raw = variant.vars.get(key)
-            if raw:
-                try:
-                    effective_train_global_batch_size = int(raw)
-                    break
-                except ValueError:
-                    pass
-        if effective_train_global_batch_size is None:
-            effective_train_global_batch_size = variant_int(variant, "TRAIN_BATCH_SIZE", 64) * train_num_gpus
-    if req.phase == "train" and req.train_global_batch_size is not None and model.family == "n1.5":
-        if req.train_global_batch_size % train_num_gpus != 0:
-            raise ValueError("train_global_batch_size must be divisible by train_num_gpus for n1.5 training")
-    gpus = str(train_num_gpus)
+    train_settings = resolve_train_settings(req, variant, model.family)
+    gpus = str(train_settings.num_gpus)
 
     # Unified shape across slurm + MLXP. The cluster/partition are shown in
     # table columns; the job name carries phase, variant, and timestamp.
@@ -238,6 +265,9 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     snapshot_meta_path: str | None = None
     snapshot_text: str | None = None
     snapshot_meta_text: str | None = None
+    submit_extra_args_rel: str | None = None
+    submit_extra_args_path: str | None = None
+    submit_extra_args_text: str | None = None
     if req.phase == "train":
         submit_git = await prepare_slurm_training_git(
             host=host,
@@ -252,6 +282,15 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         snapshot_meta_rel = f"{CLUSTER_STAGING_REL}/experiments/{req.variant}/config_{suffix}.meta.json"
         snapshot_path = f"$HOME/{snapshot_rel}"
         snapshot_meta_path = f"$HOME/{snapshot_meta_rel}"
+        if req.extra_args:
+            safe_job_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", job_name).strip("_") or suffix
+            submit_extra_args_rel = f"{CLUSTER_STAGING_REL}/jobs/{safe_job_name}.extra_args.sh"
+            submit_extra_args_path = f"$HOME/{submit_extra_args_rel}"
+            submit_extra_args_text = (
+                "# Generated by train-eval-web for this submission.\n"
+                + shell_array_assignment("SUBMIT_EXTRA_ARGS", req.extra_args)
+                + "\n"
+            )
         snapshot_text = render_training_config_snapshot(
             base_config=variant.raw,
             variant=req.variant,
@@ -261,10 +300,10 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             partition=partition,
             dataset_override=req.dataset_override,
             extra_args=req.extra_args,
-            train_num_gpus=train_num_gpus,
-            train_global_batch_size=effective_train_global_batch_size,
-            train_max_steps=train_max_steps,
-            train_save_steps=train_save_steps,
+            train_num_gpus=train_settings.num_gpus,
+            train_global_batch_size=train_settings.global_batch_size,
+            train_max_steps=train_settings.max_steps,
+            train_save_steps=train_settings.save_steps,
             wandb_project=submitted_wandb_project,
             git=submit_git,
         )
@@ -277,10 +316,10 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             partition=partition,
             dataset_override=req.dataset_override,
             extra_args=req.extra_args,
-            train_num_gpus=train_num_gpus,
-            train_global_batch_size=effective_train_global_batch_size,
-            train_max_steps=train_max_steps,
-            train_save_steps=train_save_steps,
+            train_num_gpus=train_settings.num_gpus,
+            train_global_batch_size=train_settings.global_batch_size,
+            train_max_steps=train_settings.max_steps,
+            train_save_steps=train_settings.save_steps,
             wandb_project=submitted_wandb_project,
             git=submit_git,
         ))
@@ -290,7 +329,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     # root, so flatten configs/ on the way out: configs/clusters → clusters/,
     # configs/experiments → experiments/.
     staging = f"$HOME/{CLUSTER_STAGING_REL}"
-    mkdir_result = await ssh_run(host, f"mkdir -p {staging}/clusters {staging}/experiments {staging}/models {staging}/lib")
+    mkdir_result = await ssh_run(host, f"mkdir -p {staging}/clusters {staging}/experiments {staging}/models {staging}/lib {staging}/jobs")
     if mkdir_result.returncode != 0:
         raise RuntimeError(f"mkdir on cluster failed: {mkdir_result.stderr}")
 
@@ -335,6 +374,8 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     if snapshot_rel and snapshot_text and snapshot_meta_rel and snapshot_meta_text:
         await _rsync_text(host, snapshot_text, snapshot_rel)
         await _rsync_text(host, snapshot_meta_text, snapshot_meta_rel)
+    if submit_extra_args_rel and submit_extra_args_text:
+        await _rsync_text(host, submit_extra_args_text, submit_extra_args_rel)
 
     if req.phase == "eval" and req.seed_eval_results_from:
         dst_rel = f"{CLUSTER_STAGING_REL}/experiments/{req.variant}/eval_results"
@@ -375,9 +416,9 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     )
     if req.phase == "train":
         comment += (
-            f";train_num_gpus={train_num_gpus}"
-            f";train_max_steps={train_max_steps}"
-            f";train_save_steps={train_save_steps}"
+            f";train_num_gpus={train_settings.num_gpus}"
+            f";train_max_steps={train_settings.max_steps}"
+            f";train_save_steps={train_settings.save_steps}"
         )
         if req.train_global_batch_size is not None:
             comment += f";train_global_batch_size={req.train_global_batch_size}"
@@ -412,14 +453,18 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         # and matches MLXP's run-id format.
         f"WANDB_RUN_ID={shlex.quote(job_name)}"
         + (
-            f",SUBMIT_TRAIN_NUM_GPUS={train_num_gpus},"
-            f"SUBMIT_TRAIN_MAX_STEPS={train_max_steps},"
-            f"SUBMIT_TRAIN_SAVE_STEPS={train_save_steps}"
+            f",SUBMIT_TRAIN_NUM_GPUS={train_settings.num_gpus},"
+            f"SUBMIT_TRAIN_MAX_STEPS={train_settings.max_steps},"
+            f"SUBMIT_TRAIN_SAVE_STEPS={train_settings.save_steps}"
             if req.phase == "train" else ""
         )
         + (
             f",SUBMIT_TRAIN_GLOBAL_BATCH_SIZE={req.train_global_batch_size}"
             if req.phase == "train" and req.train_global_batch_size is not None else ""
+        )
+        + (
+            f",SUBMIT_EXTRA_ARGS_FILE={submit_extra_args_path}"
+            if req.phase == "train" and submit_extra_args_path else ""
         )
         + (
             f",SUBMIT_EVAL_NUM_ENVS_PER_GPU={eval_num_envs_per_gpu}"
@@ -446,7 +491,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             if req.phase == "eval" and eval_checkpoint else ""
         ),
         *sbatch_flags,
-        *[shlex.quote(a) for a in req.extra_args],
+        *([] if req.phase == "train" else [shlex.quote(a) for a in req.extra_args]),
         body_path,
     ]
     # Fallback to which-sbatch if /opt/slurm/bin/sbatch missing:
@@ -489,9 +534,9 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             else ""
         )
         + (
-            f"train_num_gpus={train_num_gpus}\n"
-            f"train_max_steps={train_max_steps}\n"
-            f"train_save_steps={train_save_steps}\n"
+            f"train_num_gpus={train_settings.num_gpus}\n"
+            f"train_max_steps={train_settings.max_steps}\n"
+            f"train_save_steps={train_settings.save_steps}\n"
             if req.phase == "train"
             else ""
         )
@@ -506,6 +551,12 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             f"config_snapshot_meta_path={snapshot_meta_path}\n"
             f"config_snapshot_meta_rel={snapshot_meta_rel}\n"
             if req.phase == "train" and snapshot_path and snapshot_rel and snapshot_meta_path and snapshot_meta_rel
+            else ""
+        )
+        + (
+            f"submit_extra_args_path={submit_extra_args_path}\n"
+            f"submit_extra_args_rel={submit_extra_args_rel}\n"
+            if req.phase == "train" and submit_extra_args_path and submit_extra_args_rel
             else ""
         )
         + (

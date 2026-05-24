@@ -4,39 +4,33 @@ import asyncio
 import json
 import shutil
 
+from .kubectl_errors import is_kubectl_transport_error
 from .mlxp_config import (
-    DATA_POD_NAME,
-    DDN_MOUNT,
-    DDN_PVC,
-    DEFAULT_NODE,
-    IMAGE,
-    IMAGE_PULL_SECRET,
-    NAMESPACE,
-    OWNER_LABEL,
-    TOOL_LABEL,
-    ZONE,
+    MlxpSettings,
+    get_settings,
     owner_selector,
 )
 
-DATA_POD_YAML = f"""apiVersion: v1
+def _data_pod_yaml(settings: MlxpSettings) -> str:
+    return f"""apiVersion: v1
 kind: Pod
 metadata:
-  name: {DATA_POD_NAME}
-  namespace: {NAMESPACE}
+  name: {settings.data_pod_name}
+  namespace: {settings.namespace}
   annotations:
-    mlx.navercorp.com/zone: {ZONE}
+    mlx.navercorp.com/zone: {settings.zone}
     sidecar.istio.io/inject: "false"
   labels:
-    owner: {OWNER_LABEL}
-    tool: {TOOL_LABEL}
+    owner: {settings.owner_label}
+    tool: {settings.tool_label}
 spec:
   restartPolicy: Never
   imagePullSecrets:
-  - name: {IMAGE_PULL_SECRET}
+  - name: {settings.image_pull_secret}
   volumes:
   - name: ddn
     persistentVolumeClaim:
-      claimName: {DDN_PVC}
+      claimName: {settings.ddn_pvc}
   affinity:
     nodeAffinity:
       requiredDuringSchedulingIgnoredDuringExecution:
@@ -45,10 +39,10 @@ spec:
           - key: kubernetes.io/hostname
             operator: In
             values:
-            - {DEFAULT_NODE}
+            - {settings.default_node}
   containers:
   - name: main
-    image: {IMAGE}
+    image: {settings.image}
     command: ["sleep", "infinity"]
     env:
     - name: NVIDIA_VISIBLE_DEVICES
@@ -62,33 +56,13 @@ spec:
         memory: "16Gi"
     volumeMounts:
     - name: ddn
-      mountPath: {DDN_MOUNT}
+      mountPath: {settings.ddn_mount}
 """
 
 
 _CACHE_TTL = 5.0  # seconds
 _pods_cache: tuple[float, dict] | None = None
 _pods_lock = asyncio.Lock()
-
-
-def _transient_kubectl_error(message: str) -> bool:
-    lower = message.lower()
-    return any(
-        token in lower
-        for token in (
-            "failed calling webhook",
-            "failed to call webhook",
-            "admission-webhook",
-            "error sending request",
-            "cannot assign requested address",
-            "connection refused",
-            "i/o timeout",
-            "tls handshake timeout",
-            "context deadline exceeded",
-            "internal error occurred",
-            "no such host",
-        )
-    )
 
 
 def _label_matches(item: dict, label: str | None) -> bool:
@@ -117,13 +91,14 @@ async def _kubectl_get_pods_json(
     in flight against MLXP's sometimes-slow API.
     """
     global _pods_cache
+    settings = get_settings()
     async with _pods_lock:
         now = asyncio.get_event_loop().time()
         if not refresh and _pods_cache and now - _pods_cache[0] < _CACHE_TTL:
             data = _pods_cache[1]
         else:
             proc = await asyncio.create_subprocess_exec(
-                "kubectl", "get", "pods", "-n", NAMESPACE, "-o", "json",
+                "kubectl", "get", "pods", "-n", settings.namespace, "-o", "json",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -159,13 +134,14 @@ async def _kubectl_get_pods_json(
 
 async def _find_running_with_ddn(*, refresh: bool = False, strict: bool = False) -> str | None:
     """First Running owned pod that has the configured DDN PVC mounted."""
-    data = await _kubectl_get_pods_json(owner_selector(), refresh=refresh, strict=strict)
+    settings = get_settings()
+    data = await _kubectl_get_pods_json(owner_selector(settings), refresh=refresh, strict=strict)
     for item in data.get("items", []):
         if (item.get("status") or {}).get("phase") != "Running":
             continue
         vols = ((item.get("spec") or {}).get("volumes") or [])
         if any(
-            ((v.get("persistentVolumeClaim") or {}).get("claimName") == DDN_PVC)
+            ((v.get("persistentVolumeClaim") or {}).get("claimName") == settings.ddn_pvc)
             for v in vols
         ):
             return item["metadata"]["name"]
@@ -174,10 +150,11 @@ async def _find_running_with_ddn(*, refresh: bool = False, strict: bool = False)
 
 async def _apply_yaml(yaml_text: str) -> None:
     global _pods_cache
+    settings = get_settings()
     last_error = ""
     for attempt in range(1, 6):
         proc = await asyncio.create_subprocess_exec(
-            "kubectl", "create", "-f", "-", "--validate=false", "-n", NAMESPACE,
+            "kubectl", "create", "-f", "-", "--validate=false", "-n", settings.namespace,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -192,7 +169,7 @@ async def _apply_yaml(yaml_text: str) -> None:
         if "already exists" in last_error.lower():
             _pods_cache = None
             return
-        if not _transient_kubectl_error(last_error) or attempt == 5:
+        if not is_kubectl_transport_error(last_error) or attempt == 5:
             break
         await asyncio.sleep(1.5 * attempt)
     raise RuntimeError(f"kubectl apply (data-pod) failed: {last_error}")
@@ -232,49 +209,55 @@ async def ensure_listing_pod() -> str:
     """Return a Running pod usable for DDN listing, creating one if needed."""
     if shutil.which("kubectl") is None:
         raise RuntimeError("kubectl not found on PATH")
+    settings = get_settings()
+    data_pod_name = settings.data_pod_name
+    data_pod_yaml = _data_pod_yaml(settings)
 
     # Use the dedicated CPU-only data pod. Reusing arbitrary running training
     # pods makes data movement depend on unrelated job lifecycles.
     for attempt in range(1, 6):
         try:
-            pod = await _get_pod_by_name(DATA_POD_NAME, refresh=True, strict=True)
+            pod = await _get_pod_by_name(data_pod_name, refresh=True, strict=True)
         except RuntimeError as e:
-            if not _transient_kubectl_error(str(e)) or attempt == 5:
+            if not is_kubectl_transport_error(str(e)) or attempt == 5:
                 raise
             await asyncio.sleep(1.5 * attempt)
             continue
 
         if pod is None:
-            await _apply_yaml(DATA_POD_YAML)
-            await _wait_until_running(DATA_POD_NAME)
-            return DATA_POD_NAME
+            await _apply_yaml(data_pod_yaml)
+            await _wait_until_running(data_pod_name)
+            return data_pod_name
 
         phase = (pod.get("status") or {}).get("phase")
         if phase == "Running":
             vols = ((pod.get("spec") or {}).get("volumes") or [])
             if any(
-                ((v.get("persistentVolumeClaim") or {}).get("claimName") == DDN_PVC)
+                ((v.get("persistentVolumeClaim") or {}).get("claimName") == settings.ddn_pvc)
                 for v in vols
             ):
-                return DATA_POD_NAME
-            raise RuntimeError(f"data pod {DATA_POD_NAME} is running without DDN PVC {DDN_PVC}")
+                return data_pod_name
+            raise RuntimeError(
+                f"data pod {data_pod_name} is running without DDN PVC {settings.ddn_pvc}"
+            )
 
         if phase in ("Failed", "Succeeded"):
-            await _delete_pod(DATA_POD_NAME)
-            await _apply_yaml(DATA_POD_YAML)
-            await _wait_until_running(DATA_POD_NAME)
-            return DATA_POD_NAME
+            await _delete_pod(data_pod_name)
+            await _apply_yaml(data_pod_yaml)
+            await _wait_until_running(data_pod_name)
+            return data_pod_name
 
-        await _wait_until_running(DATA_POD_NAME)
-        return DATA_POD_NAME
+        await _wait_until_running(data_pod_name)
+        return data_pod_name
 
-    return DATA_POD_NAME
+    return data_pod_name
 
 
 async def _delete_pod(name: str) -> None:
     global _pods_cache
+    settings = get_settings()
     proc = await asyncio.create_subprocess_exec(
-        "kubectl", "delete", "pod", name, "-n", NAMESPACE,
+        "kubectl", "delete", "pod", name, "-n", settings.namespace,
         "--ignore-not-found=true", "--wait=true", "--timeout=60s",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

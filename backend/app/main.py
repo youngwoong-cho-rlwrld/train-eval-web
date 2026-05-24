@@ -7,10 +7,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from . import clusters, copy_checkpoint, data_interface, datasets, details, flags, job_resume, jobs, mlxp, mlxp_submit, partitions, results, submission_snapshot, submit, training_models, variants, wandb_auth
+from . import clusters, copy_checkpoint, data_interface, datasets, details, flags, job_resume, jobs, mlxp, mlxp_config, mlxp_submit, partitions, results, submission_snapshot, submit, training_models, variants, wandb_auth
 from .paths import CLUSTER_STAGING_REL
+from .slurm_meta import read_slurm_meta
 from .ssh import ssh_tail_lines
-from .variant_values import variant_int
 from .wandb_config import get_project as wandb_project
 
 
@@ -57,17 +57,58 @@ async def get_mlxp_gpus():
         raise HTTPException(503, str(e))
 
 
+@app.get("/api/mlxp/settings", response_model=mlxp_config.MlxpSettings)
+async def get_mlxp_settings():
+    return mlxp_config.get_settings()
+
+
+@app.post("/api/mlxp/settings", response_model=mlxp_config.MlxpSettings)
+async def post_mlxp_settings(req: mlxp_config.MlxpSettingsUpdate):
+    try:
+        from .mlxp_data_pod import invalidate_pods_cache
+
+        saved = mlxp_config.save_user(req.user.strip())
+        invalidate_pods_cache()
+        return saved
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 @app.get("/api/clusters/{name}/path-exists")
 async def get_path_exists(name: str, path: str):
     """Check whether `path` exists (file or dir) on the cluster.
 
     Used by the submit page to verify a user-typed eval checkpoint path
-    before launching. Slurm-only; mlxp eval isn't wired yet.
+    before launching.
     """
-    if name == "mlxp":
-        return {"exists": False, "kind": None}
     if not path or not path.strip():
         return {"exists": False, "kind": None}
+    if name == "mlxp":
+        try:
+            from .mlxp_data_pod import ensure_listing_pod
+            import asyncio
+            import shlex
+
+            settings = mlxp_config.get_settings()
+            pod = await ensure_listing_pod()
+            p = shlex.quote(path.strip())
+            proc = await asyncio.create_subprocess_exec(
+                "kubectl", "exec", "-n", settings.namespace, pod, "--", "bash", "-lc",
+                f'if [ -d {p} ]; then echo dir; elif [ -f {p} ]; then echo file; else echo none; fi',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+            if proc.returncode != 0:
+                raise RuntimeError(stderr.decode(errors="replace").strip())
+            kind = stdout.decode(errors="replace").strip()
+            if kind not in ("dir", "file"):
+                return {"exists": False, "kind": None}
+            return {"exists": True, "kind": kind}
+        except RuntimeError as e:
+            raise HTTPException(503, str(e))
+        except Exception as e:
+            raise HTTPException(500, str(e))
     try:
         env = await clusters.load_cluster(name)
     except FileNotFoundError:
@@ -229,7 +270,7 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
             except ValueError as e:
                 model_repo_error = str(e)
         elif not node:
-            node = mlxp_submit.DEFAULT_NODE
+            node = mlxp_config.get_settings().default_node
             try:
                 model_repo_path = mlxp_submit.mlxp_training_repo_path(model)
             except ValueError as e:
@@ -242,28 +283,11 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
 
         path: str | None = None
         if req.phase == "train":
-            train_num_gpus = req.train_num_gpus or variant_int(variant, "TRAIN_NUM_GPUS", 2)
-            train_max_steps = req.train_max_steps or variant_int(variant, "MAX_STEPS", 30000)
-            train_save_steps = req.train_save_steps or variant_int(variant, "SAVE_STEPS", 1000)
-            train_global_batch_size = req.train_global_batch_size
-            if train_global_batch_size is None:
-                for key in ("TRAIN_GLOBAL_BATCH_SIZE", "GLOBAL_BATCH_SIZE"):
-                    raw = variant.vars.get(key)
-                    if raw:
-                        try:
-                            train_global_batch_size = int(raw)
-                            break
-                        except ValueError:
-                            pass
-                if train_global_batch_size is None:
-                    train_global_batch_size = variant_int(variant, "TRAIN_BATCH_SIZE", 64) * train_num_gpus
-            if req.train_global_batch_size is not None and model.family == "n1.5":
-                if req.train_global_batch_size % train_num_gpus != 0:
-                    raise ValueError("train_global_batch_size must be divisible by train_num_gpus for n1.5 training")
+            train_settings = submit.resolve_train_settings(req, variant, model.family)
 
             suffix = submission_snapshot.snapshot_suffix(job_name)
             if req.cluster == "mlxp":
-                path = f"{mlxp_submit.MLXP_EXPERIMENTS_DIR}/{req.variant}/config_{suffix}.sh"
+                path = f"{mlxp_config.get_settings().experiments_dir}/{req.variant}/config_{suffix}.sh"
             else:
                 path = f"$HOME/{CLUSTER_STAGING_REL}/experiments/{req.variant}/config_{suffix}.sh"
             text = submission_snapshot.render_training_config_snapshot(
@@ -276,16 +300,19 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
                 node=node,
                 dataset_override=req.dataset_override,
                 extra_args=req.extra_args,
-                train_num_gpus=train_num_gpus,
-                train_global_batch_size=train_global_batch_size,
-                train_max_steps=train_max_steps,
-                train_save_steps=train_save_steps,
+                train_num_gpus=train_settings.num_gpus,
+                train_global_batch_size=train_settings.global_batch_size,
+                train_max_steps=train_settings.max_steps,
+                train_save_steps=train_settings.save_steps,
                 wandb_project=wandb_project(),
                 git=None,
             )
         elif req.phase == "eval":
             checkpoint_path = submit.require_eval_checkpoint_path(req)
             eval_sets = submit._normalize_eval_sets(req.eval_sets)
+            if req.cluster == "mlxp":
+                suffix = submission_snapshot.snapshot_suffix(job_name)
+                path = f"{mlxp_config.get_settings().experiments_dir}/{req.variant}/config_{suffix}.sh"
             text = submission_snapshot.render_eval_config_preview(
                 base_config=variant.raw,
                 variant=req.variant,
@@ -300,6 +327,7 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
                 eval_overwrite_results=req.eval_overwrite_results,
                 checkpoint_path=checkpoint_path,
                 extra_args=req.extra_args,
+                data_dir=mlxp_config.get_settings().datasets_dir if req.cluster == "mlxp" else None,
             )
         else:
             raise ValueError(f"unsupported phase: {req.phase}")
@@ -332,8 +360,6 @@ async def post_submit(req: submit.SubmitRequest):
     """
     try:
         if req.cluster == "mlxp":
-            if req.phase != "train":
-                raise ValueError("MLXP currently supports phase=train only")
             # GPU count defaults to TRAIN_NUM_GPUS; submit-time overrides use
             # the same request fields as Slurm and then map to MLXP CPU/RAM.
             v = await variants.load_variant(req.variant)
@@ -345,13 +371,20 @@ async def post_submit(req: submit.SubmitRequest):
                 )
             mlxp_req = mlxp_submit.MlxpSubmitRequest(
                 variant=req.variant,
+                phase=req.phase,
                 num_gpus=num_gpus,
-                global_batch_size=req.train_global_batch_size,
-                max_steps=req.train_max_steps,
-                save_steps=req.train_save_steps,
+                global_batch_size=req.train_global_batch_size if req.phase == "train" else None,
+                max_steps=req.train_max_steps if req.phase == "train" else None,
+                save_steps=req.train_save_steps if req.phase == "train" else None,
                 node=req.node,
                 dataset_override=req.dataset_override,
                 extra_args=req.extra_args,
+                eval_num_envs_per_gpu=req.eval_num_envs_per_gpu or req.eval_parallel_sims_per_gpu,
+                eval_n_episodes=req.eval_n_episodes,
+                eval_n_runs=req.eval_n_runs,
+                eval_sets=req.eval_sets,
+                eval_overwrite_results=req.eval_overwrite_results,
+                checkpoint_path=req.checkpoint_path,
                 job_name=req.job_name,
                 commit_dirty_changes=req.commit_dirty_changes,
             )
@@ -548,7 +581,7 @@ async def get_job_flags(cluster: str, job_id: str):
     out = flags.flags_for(v, cluster, det.phase)
     if cluster != "mlxp" and det.phase == "eval":
         env = await clusters.load_cluster(cluster)
-        meta = await details._read_slurm_meta(env.ssh_alias, job_id)
+        meta = await read_slurm_meta(env.ssh_alias, job_id)
         envs_override = (
             meta.get("eval_num_envs_per_gpu")
             or meta.get("eval_parallel_sims_per_gpu")

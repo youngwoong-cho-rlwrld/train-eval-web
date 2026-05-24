@@ -1,36 +1,39 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { MLXP_DATASETS_DIR } from "@/lib/mlxp-config";
 
 const PREFIX = "datasetDir";
 const EVENT = "dataset-dir-change";
 
-const DEFAULTS: Record<string, string> = {
-  mlxp: MLXP_DATASETS_DIR,
-};
 const SLURM_DEFAULT = "~/datasets";
 
 function keyFor(cluster: string) {
   return `${PREFIX}:${cluster}`;
 }
 
-function defaultFor(cluster: string) {
-  return DEFAULTS[cluster] ?? SLURM_DEFAULT;
+function defaultFor(cluster: string, defaultDir?: string) {
+  return defaultDir || SLURM_DEFAULT;
 }
 
-function storedFor(cluster: string) {
-  if (typeof window === "undefined") return defaultFor(cluster);
-  return localStorage.getItem(keyFor(cluster)) || defaultFor(cluster);
+function storedFor(cluster: string, defaultDir?: string) {
+  if (typeof window === "undefined") return defaultFor(cluster, defaultDir);
+  return localStorage.getItem(keyFor(cluster)) || defaultFor(cluster, defaultDir);
 }
 
 /** localStorage-backed value for "where should the dataset picker look on
  *  this cluster?", reactive within a single tab via a custom event so
  *  multiple components on the page update together when one writes. Stored
  *  per-cluster under `datasetDir:<cluster>`. */
-export function useDatasetDir(cluster: string): [string, (v: string) => void] {
+export function useDatasetDir(cluster: string, defaultDir?: string): [string, (v: string) => void] {
   const [local, setLocal] = useState<Record<string, string>>({});
-  const dir = local[cluster] ?? storedFor(cluster);
+  const dir = local[cluster] ?? storedFor(cluster, defaultDir);
+
+  useEffect(() => {
+    if (!defaultDir || typeof window === "undefined") return;
+    if (!localStorage.getItem(keyFor(cluster))) {
+      setLocal((prev) => ({ ...prev, [cluster]: defaultDir }));
+    }
+  }, [cluster, defaultDir]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -42,7 +45,7 @@ export function useDatasetDir(cluster: string): [string, (v: string) => void] {
     };
     const onStorage = (e: StorageEvent) => {
       if (e.key === keyFor(cluster) && e.newValue) {
-        setLocal((prev) => ({ ...prev, [cluster]: e.newValue ?? defaultFor(cluster) }));
+        setLocal((prev) => ({ ...prev, [cluster]: e.newValue ?? defaultFor(cluster, defaultDir) }));
       }
     };
     window.addEventListener(EVENT, onCustom);
@@ -51,7 +54,7 @@ export function useDatasetDir(cluster: string): [string, (v: string) => void] {
       window.removeEventListener(EVENT, onCustom);
       window.removeEventListener("storage", onStorage);
     };
-  }, [cluster]);
+  }, [cluster, defaultDir]);
 
   const set = (v: string) => {
     setLocal((prev) => ({ ...prev, [cluster]: v }));

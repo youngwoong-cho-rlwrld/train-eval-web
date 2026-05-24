@@ -17,6 +17,7 @@ import {
   type Partition,
   type Dataset,
   type MlxpNode,
+  type MlxpSettings,
   type GitStatus,
 } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -94,8 +95,12 @@ export default function SubmitPage() {
   const [variantName, setVariantName] = useState<string>("");
   const [phase, setPhase] = useState<Phase>("train");
   const [partition, setPartition] = useState<string>("");
+  const mlxpSettings = useQuery({
+    queryKey: ["mlxp-settings"],
+    queryFn: () => api<MlxpSettings>("/api/mlxp/settings"),
+  });
   // Persisted across sessions + synced across pages via useMyMlxpNode.
-  const [mlxpNode, setMlxpNode] = useMyMlxpNode();
+  const [mlxpNode, setMlxpNode] = useMyMlxpNode(mlxpSettings.data?.default_node ?? "");
   const [extraArgs, setExtraArgs] = useState<string>("");
   const [evalOverwriteResults, setEvalOverwriteResults] = useState<boolean>(false);
   const [evalConfigEdit, setEvalConfigEdit] = useState<EvalConfigEdit | null>(null);
@@ -159,12 +164,13 @@ export default function SubmitPage() {
     enabled: !!cluster && cluster !== "mlxp",
   });
   const isSlurm = cluster !== "mlxp";
-  const submitPhase: Phase = isSlurm ? phase : "train";
+  const submitPhase: Phase = phase;
   const checkpointScope = `${cluster}:${variantName}:${submitPhase}`;
   const evalConfigScope = `${checkpointScope}:eval-config`;
   const trainConfigScope = `${checkpointScope}:train-config`;
 
-  const [datasetDir, setDatasetDir] = useDatasetDir(cluster);
+  const defaultDatasetDir = cluster === "mlxp" ? mlxpSettings.data?.datasets_dir : undefined;
+  const [datasetDir, setDatasetDir] = useDatasetDir(cluster, defaultDatasetDir);
   const datasets = useQuery({
     queryKey: ["datasets", cluster, datasetDir],
     queryFn: () =>
@@ -181,7 +187,7 @@ export default function SubmitPage() {
     retry: false,
     enabled: !isSlurm,
   });
-  const wantsCheckpoint = phase === "eval" && isSlurm && !!variantName;
+  const wantsCheckpoint = phase === "eval" && !!variantName;
   const activeCheckpointEdit =
     checkpointEdit?.scope === checkpointScope ? checkpointEdit : null;
   const checkpointPath = activeCheckpointEdit ? activeCheckpointEdit.value : "";
@@ -383,33 +389,32 @@ export default function SubmitPage() {
       : null;
 
   const buildSubmitBody = (commitDirtyChanges: boolean) => {
-      let dataset_override: string | string[] | null = null;
-      if (datasetTouched) {
-        if (variant.data?.arrays.TRAIN_DATASET_NAMES) dataset_override = multiDatasets;
-        else if (variant.data?.arrays.DATASETS) dataset_override = multiDatasets;
-        else if (variant.data?.vars.DATASET_NAME) dataset_override = singleDataset;
-      }
-      return {
-        cluster,
-        variant: variantName,
-        phase: submitPhase,
-        partition: isSlurm ? selectedPartitionName : null,
-        node: isSlurm ? null : mlxpNode,
-        dataset_override,
-        extra_args: extraArgs.split(/\s+/).filter(Boolean),
-        train_num_gpus: submitPhase === "train" ? trainNumGpusParsed : null,
-        train_global_batch_size: submittedTrainGlobalBatchSize,
-        train_max_steps: submitPhase === "train" ? trainMaxStepsParsed : null,
-        train_save_steps: submitPhase === "train" ? trainSaveStepsParsed : null,
-        eval_num_envs_per_gpu: null,
-        eval_n_episodes: wantsCheckpoint ? evalNEpisodesParsed : null,
-        eval_n_runs: wantsCheckpoint ? evalNRunsParsed : null,
-        eval_sets: wantsCheckpoint ? evalSetValues : null,
-        eval_overwrite_results: wantsCheckpoint ? evalOverwriteResults : false,
-        checkpoint_path: wantsCheckpoint ? trimmedCkpt : null,
-        job_name: shownJobName.trim() || null,
-        commit_dirty_changes: commitDirtyChanges,
-      };
+    return {
+      cluster,
+      variant: variantName,
+      phase: submitPhase,
+      partition: isSlurm ? selectedPartitionName : null,
+      node: isSlurm ? null : mlxpNode,
+      dataset_override: resolveDatasetOverride({
+        touched: datasetTouched,
+        variant: variant.data,
+        singleDataset,
+        multiDatasets,
+      }),
+      extra_args: submitPhase === "eval" && !isSlurm ? [] : splitArgs(extraArgs),
+      train_num_gpus: submitPhase === "train" ? trainNumGpusParsed : null,
+      train_global_batch_size: submittedTrainGlobalBatchSize,
+      train_max_steps: submitPhase === "train" ? trainMaxStepsParsed : null,
+      train_save_steps: submitPhase === "train" ? trainSaveStepsParsed : null,
+      eval_num_envs_per_gpu: null,
+      eval_n_episodes: wantsCheckpoint ? evalNEpisodesParsed : null,
+      eval_n_runs: wantsCheckpoint ? evalNRunsParsed : null,
+      eval_sets: wantsCheckpoint ? evalSetValues : null,
+      eval_overwrite_results: wantsCheckpoint ? evalOverwriteResults : false,
+      checkpoint_path: wantsCheckpoint ? trimmedCkpt : null,
+      job_name: shownJobName.trim() || null,
+      commit_dirty_changes: commitDirtyChanges,
+    };
   };
 
   const configPreviewEnabled =
@@ -776,33 +781,39 @@ export default function SubmitPage() {
       ),
     });
   }
-  extraFlagRows.push({
-    key: "extra-sbatch-args",
-    flag: "extra sbatch args",
-    value: extraArgs.trim() || "(none)",
-    editor: {
-      wide: true,
-      content: (
-        <Input
-          placeholder={
-            isSlurm
-              ? "--exclusive --nice=100"
-              : "--exclude=rlwrld-gpu-260504-260803-st-p5en-48xl-3"
-          }
-          value={extraArgs}
-          onChange={(e) => setExtraArgs(e.target.value)}
-        />
-      ),
-    },
-  });
+  if (phase === "train" || isSlurm) {
+    extraFlagRows.push({
+      key: "extra-args",
+      flag: phase === "train" ? "extra train args" : "extra sbatch args",
+      value: extraArgs.trim() || "(none)",
+      editor: {
+        wide: true,
+        content: (
+          <Input
+            placeholder={
+              phase === "train"
+                ? "--state-part-mode random_balanced --state-part-token-count 7"
+                : "--exclusive --nice=100"
+            }
+            value={extraArgs}
+            onChange={(e) => setExtraArgs(e.target.value)}
+          />
+        ),
+      },
+    });
+  }
   const selectedVariantName = variant.data?.name ?? variantName;
   const canReviewConfig = !!variantName;
+  const selectedMlxpGpuType =
+    mlxp.data?.find((n) => n.name === mlxpNode)?.gpu_type ||
+    mlxpSettings.data?.gpu_type ||
+    "GPU";
   const submitButtonLabel =
     submit.isPending || preflightPending
       ? "Submitting..."
       : isSlurm
         ? `Submit ${phase} -> ${cluster}/${selectedPartitionName || "?"}`
-        : `Submit train -> mlxp/${mlxpNode}/${trainNumGpus || "?"}xH200`;
+        : `Submit ${phase} -> mlxp/${mlxpNode}/${trainNumGpus || "?"}x${selectedMlxpGpuType}`;
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8 lg:py-12">
@@ -903,7 +914,7 @@ export default function SubmitPage() {
                                 </Badge>
                               )}
                               <span className="ml-2 text-xs text-slate-500">
-                                {p.gpu_idle}/{p.gpu_total} GPU
+                                {p.gpu_idle}/{p.gpu_total} {p.gpu_type ?? "GPU"}
                               </span>
                             </span>
                           </SelectItem>
@@ -921,46 +932,22 @@ export default function SubmitPage() {
                     {partitions.error && <ErrorState message={(partitions.error as Error).message} />}
                   </Field>
 
-                  <Field
-                    label={
-                      <span className="flex items-center gap-2">
-                        Job name
-                        <span className="font-mono text-xs font-normal text-slate-500">
-                          {shownJobName.length}
-                        </span>
-                      </span>
+                  <JobNameField
+                    value={shownJobName}
+                    defaultValue={defaultJobName}
+                    variantName={variantName}
+                    touched={jobNameTouched}
+                    description={
+                      <>
+                        Used as <code>--job-name</code> and the wandb run id.
+                      </>
                     }
-                  >
-                    <div className="flex gap-2">
-                      <Input
-                        value={shownJobName}
-                        onChange={(e) => {
-                          setJobName(e.target.value);
-                          setJobNameTouched(true);
-                        }}
-                        placeholder={
-                          variantName
-                            ? defaultJobName
-                            : "pick an experiment first"
-                        }
-                        className="flex-1 font-mono text-xs"
-                      />
-                      {jobNameTouched && (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => {
-                            setJobNameTouched(false);
-                          }}
-                        >
-                          Reset to default
-                        </Button>
-                      )}
-                    </div>
-                    <p className="text-xs text-slate-500">
-                      Used as <code>--job-name</code> and the wandb run id.
-                    </p>
-                  </Field>
+                    onChange={(value) => {
+                      setJobName(value);
+                      setJobNameTouched(true);
+                    }}
+                    onReset={() => setJobNameTouched(false)}
+                  />
 
                 </>
               )}
@@ -968,17 +955,18 @@ export default function SubmitPage() {
               {!isSlurm && (
                 <>
                   <Field label="Phase">
-                    <Select value="train" onValueChange={() => {}}>
+                    <Select
+                      value={phase}
+                      onValueChange={(v) => changePhase(v as Phase)}
+                    >
                       <SelectTrigger>
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
                         <SelectItem value="train">train</SelectItem>
+                        <SelectItem value="eval">eval</SelectItem>
                       </SelectContent>
                     </Select>
-                    <p className="text-xs text-slate-500">
-                      MLXP currently supports <code>train</code> only.
-                    </p>
                   </Field>
 
                   <Field label="Node">
@@ -1009,47 +997,23 @@ export default function SubmitPage() {
                     </p>
                   </Field>
 
-                  <Field
-                    label={
-                      <span className="flex items-center gap-2">
-                        Job name
-                        <span className="font-mono text-xs font-normal text-slate-500">
-                          {shownJobName.length}
-                        </span>
-                      </span>
+                  <JobNameField
+                    value={shownJobName}
+                    defaultValue={defaultJobName}
+                    variantName={variantName}
+                    touched={jobNameTouched}
+                    description={
+                      <>
+                        Carried as the MLXP <code>display-name</code>{" "}
+                        annotation and the wandb run id.
+                      </>
                     }
-                  >
-                    <div className="flex gap-2">
-                      <Input
-                        value={shownJobName}
-                        onChange={(e) => {
-                          setJobName(e.target.value);
-                          setJobNameTouched(true);
-                        }}
-                        placeholder={
-                          variantName
-                            ? defaultJobName
-                            : "pick an experiment first"
-                        }
-                        className="flex-1 font-mono text-xs"
-                      />
-                      {jobNameTouched && (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => {
-                            setJobNameTouched(false);
-                          }}
-                        >
-                          Reset to default
-                        </Button>
-                      )}
-                    </div>
-                    <p className="text-xs text-slate-500">
-                      Carried as the MLXP <code>display-name</code> annotation
-                      and the wandb run id.
-                    </p>
-                  </Field>
+                    onChange={(value) => {
+                      setJobName(value);
+                      setJobNameTouched(true);
+                    }}
+                    onReset={() => setJobNameTouched(false)}
+                  />
 
                 </>
               )}
@@ -1329,6 +1293,52 @@ function Field({
   );
 }
 
+function JobNameField({
+  value,
+  defaultValue,
+  variantName,
+  touched,
+  description,
+  onChange,
+  onReset,
+}: {
+  value: string;
+  defaultValue: string;
+  variantName: string;
+  touched: boolean;
+  description: React.ReactNode;
+  onChange: (value: string) => void;
+  onReset: () => void;
+}) {
+  return (
+    <Field
+      label={
+        <span className="flex items-center gap-2">
+          Job name
+          <span className="font-mono text-xs font-normal text-slate-500">
+            {value.length}
+          </span>
+        </span>
+      }
+    >
+      <div className="flex gap-2">
+        <Input
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={variantName ? defaultValue : "pick an experiment first"}
+          className="flex-1 font-mono text-xs"
+        />
+        {touched && (
+          <Button variant="outline" size="sm" onClick={onReset}>
+            Reset to default
+          </Button>
+        )}
+      </div>
+      <p className="text-xs text-slate-500">{description}</p>
+    </Field>
+  );
+}
+
 function NumberCellEditor({
   value,
   onChange,
@@ -1374,6 +1384,31 @@ function parseEvalSetsInput(value: string): string[] {
     out.push(item);
   }
   return out;
+}
+
+function resolveDatasetOverride({
+  touched,
+  variant,
+  singleDataset,
+  multiDatasets,
+}: {
+  touched: boolean;
+  variant?: Variant | null;
+  singleDataset: string;
+  multiDatasets: string[];
+}): string | string[] | null {
+  if (!touched || !variant) return null;
+  if (variant.arrays.TRAIN_DATASET_NAMES || variant.arrays.DATASETS) {
+    return multiDatasets;
+  }
+  if (variant.vars.DATASET_NAME) {
+    return singleDataset;
+  }
+  return null;
+}
+
+function splitArgs(value: string): string[] {
+  return value.split(/\s+/).filter(Boolean);
 }
 
 function formatEvalSetsInput(values: string[]): string {

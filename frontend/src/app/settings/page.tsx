@@ -4,7 +4,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ExternalLink } from "lucide-react";
-import { api } from "@/lib/api";
+import { api, type MlxpSettings } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -22,8 +22,78 @@ export default function SettingsPage() {
   return (
     <div className="mx-auto max-w-7xl px-8 py-12">
       <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
+      <MlxpSettingsCard />
       <WandbCard />
     </div>
+  );
+}
+
+function MlxpSettingsCard() {
+  const qc = useQueryClient();
+  const [draftUser, setDraftUser] = useState<string | null>(null);
+
+  const settings = useQuery({
+    queryKey: ["mlxp-settings"],
+    queryFn: () => api<MlxpSettings>("/api/mlxp/settings"),
+  });
+  const savedUser = settings.data?.user ?? "";
+  const currentUser = draftUser ?? savedUser;
+
+  const save = useMutation({
+    mutationFn: (user: string) =>
+      api<MlxpSettings>("/api/mlxp/settings", {
+        method: "POST",
+        body: JSON.stringify({ user: user.trim() }),
+      }),
+    onSuccess: (res) => {
+      toast.success("MLXP settings saved");
+      setDraftUser(null);
+      qc.setQueryData(["mlxp-settings"], res);
+      qc.invalidateQueries({ queryKey: ["mlxp-gpus"] });
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+
+  const dirty = draftUser !== null && draftUser.trim() !== savedUser;
+
+  return (
+    <Card className="mt-8">
+      <CardHeader>
+        <CardTitle>MLXP</CardTitle>
+        <p className="text-sm text-slate-500">
+          Used to derive /data/&lt;user&gt; paths, owner labels, data pod, and W&amp;B secret.
+        </p>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {settings.isLoading && <p className="text-sm text-slate-500">Loading MLXP settings...</p>}
+        {settings.error && (
+          <p className="text-sm text-red-600 dark:text-red-400">
+            {(settings.error as Error).message}
+          </p>
+        )}
+        {settings.data && (
+          <>
+            <div className="space-y-2">
+              <Label>User</Label>
+              <Input
+                value={currentUser}
+                onChange={(e) => setDraftUser(e.target.value)}
+                className="font-mono text-xs"
+                autoComplete="off"
+              />
+            </div>
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={() => setDraftUser(null)} disabled={!dirty || save.isPending}>
+                Reset
+              </Button>
+              <Button onClick={() => save.mutate(currentUser)} disabled={!dirty || save.isPending || !currentUser.trim()}>
+                {save.isPending ? "Saving..." : "Save"}
+              </Button>
+            </div>
+          </>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 

@@ -19,6 +19,7 @@ from typing import Any, Awaitable, Callable
 
 from pydantic import BaseModel, Field
 
+from .kubectl_errors import is_kubectl_exec_transport_error
 from .ssh import ssh_run
 from .training_models import (
     TrainingModel,
@@ -233,11 +234,12 @@ async def prepare_slurm_training_git(
 async def _mlxp_git_run(cmd: str, timeout: float) -> tuple[int, str, str]:
     import shutil
 
-    from .mlxp_config import NAMESPACE
+    from .mlxp_config import get_settings
     from .mlxp_data_pod import ensure_listing_pod
 
     if shutil.which("kubectl") is None:
         raise RuntimeError("kubectl not found on PATH")
+    settings = get_settings()
 
     try:
         pod = await ensure_listing_pod()
@@ -245,7 +247,7 @@ async def _mlxp_git_run(cmd: str, timeout: float) -> tuple[int, str, str]:
             "kubectl",
             "exec",
             "-n",
-            NAMESPACE,
+            settings.namespace,
             pod,
             "--",
             "bash",
@@ -260,43 +262,19 @@ async def _mlxp_git_run(cmd: str, timeout: float) -> tuple[int, str, str]:
         await proc.wait()
         return await _mlxp_git_run_with_pod(cmd, timeout)
     except RuntimeError as e:
-        if _is_mlxp_exec_transport_error(str(e)):
+        if is_kubectl_exec_transport_error(str(e)):
             return await _mlxp_git_run_with_pod(cmd, timeout)
         raise
 
     out = stdout.decode(errors="replace")
     err = stderr.decode(errors="replace")
-    if (proc.returncode or 0) != 0 and _is_mlxp_exec_transport_error(err or out):
+    if (proc.returncode or 0) != 0 and is_kubectl_exec_transport_error(err or out):
         return await _mlxp_git_run_with_pod(cmd, timeout)
     return proc.returncode or 0, out, err
 
 
-def _is_mlxp_exec_transport_error(message: str) -> bool:
-    lower = message.lower()
-    return any(
-        token in lower
-        for token in (
-            "internal error occurred",
-            "error sending request",
-            "cannot assign requested address",
-            "connection refused",
-            "i/o timeout",
-            "tls handshake timeout",
-            "context deadline exceeded",
-            "unexpected eof",
-            "error reading from error stream",
-            "copying stderr failed",
-            "copying stdout failed",
-            "waiting for server to close stdin failed",
-            "cannot exec into a container in a completed pod",
-            "current phase is succeeded",
-            "current phase is failed",
-        )
-    )
-
-
 def is_mlxp_transport_error(message: str) -> bool:
-    return _is_mlxp_exec_transport_error(message)
+    return is_kubectl_exec_transport_error(message)
 
 
 async def _mlxp_git_run_with_pod(cmd: str, timeout: float) -> tuple[int, str, str]:
@@ -306,18 +284,9 @@ async def _mlxp_git_run_with_pod(cmd: str, timeout: float) -> tuple[int, str, st
     while pod creation and logs still work. A short-lived pod gives the submit
     preflight the same filesystem view without depending on exec.
     """
-    from .mlxp_config import (
-        DDN_MOUNT,
-        DDN_PVC,
-        DEFAULT_NODE,
-        IMAGE,
-        IMAGE_PULL_SECRET,
-        NAMESPACE,
-        OWNER_LABEL,
-        TOOL_LABEL,
-        ZONE,
-    )
+    from .mlxp_config import get_settings
 
+    settings = get_settings()
     pod_name = f"tew-git-{uuid.uuid4().hex[:10]}"
     marker = f"__TRAIN_EVAL_WEB_RC_{uuid.uuid4().hex}__"
     wrapped_cmd = (
@@ -366,23 +335,23 @@ async def _mlxp_git_run_with_pod(cmd: str, timeout: float) -> tuple[int, str, st
         "kind": "Pod",
         "metadata": {
             "name": pod_name,
-            "namespace": NAMESPACE,
+            "namespace": settings.namespace,
             "annotations": {
-                "mlx.navercorp.com/zone": ZONE,
+                "mlx.navercorp.com/zone": settings.zone,
                 "sidecar.istio.io/inject": "false",
             },
             "labels": {
-                "owner": OWNER_LABEL,
-                "tool": TOOL_LABEL,
+                "owner": settings.owner_label,
+                "tool": settings.tool_label,
             },
         },
         "spec": {
             "restartPolicy": "Never",
-            "imagePullSecrets": [{"name": IMAGE_PULL_SECRET}],
+            "imagePullSecrets": [{"name": settings.image_pull_secret}],
             "volumes": [
                 {
                     "name": "ddn",
-                    "persistentVolumeClaim": {"claimName": DDN_PVC},
+                    "persistentVolumeClaim": {"claimName": settings.ddn_pvc},
                 }
             ],
             "affinity": {
@@ -394,7 +363,7 @@ async def _mlxp_git_run_with_pod(cmd: str, timeout: float) -> tuple[int, str, st
                                     {
                                         "key": "kubernetes.io/hostname",
                                         "operator": "In",
-                                        "values": [DEFAULT_NODE],
+                                        "values": [settings.default_node],
                                     }
                                 ]
                             }
@@ -405,7 +374,7 @@ async def _mlxp_git_run_with_pod(cmd: str, timeout: float) -> tuple[int, str, st
             "containers": [
                 {
                     "name": "main",
-                    "image": IMAGE,
+                    "image": settings.image,
                     "command": ["bash", "-lc"],
                     "args": [wrapped_cmd],
                     "terminationMessagePath": "/dev/termination-log",
@@ -417,7 +386,7 @@ async def _mlxp_git_run_with_pod(cmd: str, timeout: float) -> tuple[int, str, st
                         "requests": {"cpu": "10m", "memory": "128Mi"},
                         "limits": {"cpu": "1", "memory": "512Mi"},
                     },
-                    "volumeMounts": [{"name": "ddn", "mountPath": DDN_MOUNT}],
+                    "volumeMounts": [{"name": "ddn", "mountPath": settings.ddn_mount}],
                 }
             ],
         },
@@ -453,13 +422,13 @@ async def _mlxp_git_run_with_pod(cmd: str, timeout: float) -> tuple[int, str, st
                 "-",
                 "--validate=false",
                 "-n",
-                NAMESPACE,
+                settings.namespace,
                 stdin=json.dumps(spec).encode(),
                 deadline=30.0,
             )
             if create_rc == 0:
                 break
-            if not _is_mlxp_exec_transport_error(create_err) or attempt == 3:
+            if not is_kubectl_exec_transport_error(create_err) or attempt == 3:
                 return create_rc, "", create_err.strip() or "kubectl create git pod failed"
             await asyncio.sleep(1.5 * (attempt + 1))
 
@@ -468,7 +437,9 @@ async def _mlxp_git_run_with_pod(cmd: str, timeout: float) -> tuple[int, str, st
         exit_code: int | None = None
         termination_message = ""
         while asyncio.get_event_loop().time() < deadline_at:
-            rc, out, err = await kubectl("get", "pod", pod_name, "-n", NAMESPACE, "-o", "json", deadline=15.0)
+            rc, out, err = await kubectl(
+                "get", "pod", pod_name, "-n", settings.namespace, "-o", "json", deadline=15.0
+            )
             if rc != 0:
                 return rc, "", err.strip() or out.strip() or "kubectl get git pod failed"
             try:
@@ -497,7 +468,9 @@ async def _mlxp_git_run_with_pod(cmd: str, timeout: float) -> tuple[int, str, st
             if parsed is not None:
                 return parsed
 
-        logs_rc, logs, logs_err = await kubectl("logs", pod_name, "-n", NAMESPACE, deadline=30.0)
+        logs_rc, logs, logs_err = await kubectl(
+            "logs", pod_name, "-n", settings.namespace, deadline=30.0
+        )
         if logs_rc != 0:
             return logs_rc, "", logs_err.strip() or "kubectl logs git pod failed"
         parsed_rc = exit_code if exit_code is not None else (0 if phase == "Succeeded" else 1)
@@ -510,7 +483,9 @@ async def _mlxp_git_run_with_pod(cmd: str, timeout: float) -> tuple[int, str, st
                 output += "\n"
         return parsed_rc, output, ""
     finally:
-        await kubectl("delete", "pod", pod_name, "-n", NAMESPACE, "--wait=false", deadline=15.0)
+        await kubectl(
+            "delete", "pod", pod_name, "-n", settings.namespace, "--wait=false", deadline=15.0
+        )
 
 
 def _parse_mlxp_git_termination_message(message: str) -> tuple[int, str, str] | None:
@@ -614,7 +589,7 @@ def _set_scalar(config_text: str, name: str, value: int | str) -> str:
     return f"{config_text}{suffix}{rendered}\n"
 
 
-def _array_assignment(name: str, values: list[str]) -> str:
+def shell_array_assignment(name: str, values: list[str]) -> str:
     lines = [f"{name}=("]
     lines.extend(f"    {shlex.quote(v)}" for v in values)
     lines.append(")")
@@ -622,7 +597,7 @@ def _array_assignment(name: str, values: list[str]) -> str:
 
 
 def _set_array(config_text: str, name: str, values: list[str]) -> str:
-    rendered = _array_assignment(name, values)
+    rendered = shell_array_assignment(name, values)
     pattern = rf"^{re.escape(name)}=\(.*?^\)\s*$"
     if re.search(pattern, config_text, flags=re.MULTILINE | re.DOTALL):
         return re.sub(
@@ -694,7 +669,7 @@ def render_training_config_snapshot(
             + shlex.quote(json.dumps(dataset_override, ensure_ascii=True))
         )
     if extra_args:
-        footer.append(_array_assignment("SUBMIT_EXTRA_ARGS", extra_args))
+        footer.append(shell_array_assignment("SUBMIT_EXTRA_ARGS", extra_args))
     footer.append("# -------------------------------------------")
 
     suffix = "" if text.endswith("\n") else "\n"
@@ -716,10 +691,13 @@ def render_eval_config_preview(
     eval_overwrite_results: bool = False,
     checkpoint_path: str | None = None,
     extra_args: list[str] | None = None,
+    data_dir: str | None = None,
 ) -> str:
     text = base_config
     if dataset_override is not None:
         text = apply_dataset_override(text, dataset_override)
+    if data_dir:
+        text = _set_scalar(text, "DATA_DIR", data_dir)
     if eval_n_episodes is not None:
         text = _set_scalar(text, "N_EPISODES", eval_n_episodes)
     if eval_n_runs is not None:
@@ -743,7 +721,7 @@ def render_eval_config_preview(
     if eval_overwrite_results:
         footer.append("SUBMIT_EVAL_OVERWRITE_RESULTS=1")
     if extra_args:
-        footer.append(_array_assignment("SUBMIT_EXTRA_ARGS", extra_args))
+        footer.append(shell_array_assignment("SUBMIT_EXTRA_ARGS", extra_args))
     footer.append("# -------------------------------------------------")
 
     suffix = "" if text.endswith("\n") else "\n"

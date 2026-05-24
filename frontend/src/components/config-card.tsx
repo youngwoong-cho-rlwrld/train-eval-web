@@ -87,7 +87,7 @@ export function ConfigCard({
     enabled: !!variantName && !loading && !error,
   });
   const wantsCheckpoint =
-    !!variantName && phase === "eval" && !!cluster && cluster !== "mlxp";
+    !!variantName && phase === "eval" && !!cluster;
   const overridePath = checkpointOverride?.trim() || null;
   const overrideMissing = overridePath && checkpointOverrideExists === false;
   const overrideChecking = overridePath && checkpointOverrideExists === null;

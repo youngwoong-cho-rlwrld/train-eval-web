@@ -10,6 +10,7 @@ from .eval_completion import eval_job_completed_from_log_dir
 from .job_identity import phase_variant_from_meta, resolve_phase_and_variant
 from .slurm_meta import read_slurm_meta
 from .ssh import ssh_run
+from .time_utils import scheduler_timezone, to_kst_iso
 
 
 class Job(BaseModel):
@@ -60,6 +61,7 @@ async def list_jobs(
         except FileNotFoundError:
             return []
         host = env.ssh_alias
+        source_tz_task = asyncio.create_task(scheduler_timezone(host))
 
         async def _squeue() -> str | None:
             try:
@@ -85,7 +87,7 @@ async def list_jobs(
                 return None
             return r.stdout if r.returncode == 0 else None
 
-        sq_out, sa_out = await asyncio.gather(_squeue(), _sacct())
+        sq_out, sa_out, source_tz = await asyncio.gather(_squeue(), _sacct(), source_tz_task)
 
         local: list[Job] = []
         seen: set[str] = set()
@@ -96,7 +98,7 @@ async def list_jobs(
                     continue
                 seen.add(parts[0])
                 time_left = parts[6] if parts[6] not in ("", "N/A") else None
-                job_start = parts[7] if parts[7] not in ("", "N/A", "Unknown") else None
+                job_start = to_kst_iso(parts[7], source_tz)
                 local.append(Job(
                     cluster=c, job_id=parts[0], job_name=parts[1], partition=parts[2],
                     state=parts[3], elapsed=parts[4], nodelist=parts[5],
@@ -112,8 +114,8 @@ async def list_jobs(
                     continue
                 # Truncate sacct's CANCELLED+by labels for cleaner display.
                 state = parts[3].split(" ")[0]
-                job_start = parts[5] if parts[5] not in ("", "Unknown") else None
-                job_end = parts[6] if parts[6] not in ("", "Unknown") else None
+                job_start = to_kst_iso(parts[5], source_tz)
+                job_end = to_kst_iso(parts[6], source_tz)
                 local.append(Job(
                     cluster=c, job_id=jid, job_name=parts[1], partition=parts[2],
                     state=state, elapsed=parts[4], nodelist=parts[7],
@@ -152,6 +154,7 @@ async def get_job(cluster: str, job_id: str) -> dict:
         from . import mlxp_jobs
         return await mlxp_jobs.get_job(job_id)
     env = await load_cluster(cluster)
+    source_tz = await scheduler_timezone(env.ssh_alias)
     r = await ssh_run(env.ssh_alias,
                       f'sacct -j {job_id} -X --parsable2 --format={_SACCT_FMT}',
                       timeout=15.0)
@@ -161,6 +164,8 @@ async def get_job(cluster: str, job_id: str) -> dict:
             header = lines[0].split("|")
             row = lines[1].split("|")
             d = {**dict(zip(header, row)), "cluster": cluster}
+            d["Start"] = to_kst_iso(d.get("Start"), source_tz) or ""
+            d["End"] = to_kst_iso(d.get("End"), source_tz) or ""
             await _normalize_completed_eval_record(env.ssh_alias, env.vars["LOG_DIR"], d)
             return d
 
@@ -174,6 +179,8 @@ async def get_job(cluster: str, job_id: str) -> dict:
         keys = ["JobID", "JobName", "Partition", "State", "Submit", "Start", "Elapsed", "Reason"]
         d = dict(zip(keys, parts))
         d["cluster"] = cluster
+        d["Submit"] = to_kst_iso(d.get("Submit"), source_tz) or ""
+        d["Start"] = to_kst_iso(d.get("Start"), source_tz) or ""
         d.setdefault("ExitCode", "")
         d.setdefault("End", "")
         d.setdefault("NodeList", parts[7] if len(parts) > 7 else "")

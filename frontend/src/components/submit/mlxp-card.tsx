@@ -47,7 +47,7 @@ export function MlxpCard({
           </span>
         </div>
         <CardDescription>
-          h200 nodes (8 GPU each) · your node: <code>{yoursNode || "—"}</code>
+          {nodes[0]?.gpu_type ?? "GPU"} nodes · your node: <code>{yoursNode || "—"}</code>
         </CardDescription>
       </CardHeader>
       {open && (

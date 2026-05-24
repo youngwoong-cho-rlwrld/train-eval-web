@@ -8,6 +8,8 @@ import { api, type ResultCell, type ResultsResponse, type ResultTask, type Resul
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { RefreshButton } from "@/components/refresh-button";
 import { LoadingState } from "@/components/loading-state";
@@ -20,6 +22,7 @@ const AVERAGE_HELP =
 export default function ResultsPage() {
   const qc = useQueryClient();
   const [cluster, setCluster] = useState("all");
+  const [nameFilter, setNameFilter] = useState("");
 
   const clustersQuery = useQuery({
     queryKey: ["clusters"],
@@ -42,7 +45,11 @@ export default function ResultsPage() {
       predicate: (q) => q.queryKey[0] === "results" || q.queryKey[0] === "clusters",
     }) > 0;
 
-  const variants = useMemo(() => resultsQuery.data?.variants ?? [], [resultsQuery.data?.variants]);
+  const allVariants = useMemo(() => resultsQuery.data?.variants ?? [], [resultsQuery.data?.variants]);
+  const variants = useMemo(
+    () => allVariants.filter((variant) => resultVariantMatchesName(variant, nameFilter)),
+    [allVariants, nameFilter],
+  );
   const { singleTask, multiTask, taskCount, evalCellCount } = useMemo(() => {
     const singleTask = variants.filter((v) => v.tasks.length <= 1);
     const multiTask = variants.filter((v) => v.tasks.length > 1);
@@ -75,7 +82,17 @@ export default function ResultsPage() {
             <span>{evalCellCount} eval-set summaries</span>
           </div>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-end justify-end gap-3">
+          <div className="space-y-1">
+            <Label htmlFor="result-name" className="text-xs text-slate-500">Name</Label>
+            <Input
+              id="result-name"
+              value={nameFilter}
+              onChange={(e) => setNameFilter(e.target.value)}
+              placeholder="experiment"
+              className="h-8 w-[220px] font-mono text-xs"
+            />
+          </div>
           <Select value={cluster} onValueChange={setCluster}>
             <SelectTrigger className="h-8 w-[150px]">
               <SelectValue />
@@ -108,11 +125,20 @@ export default function ResultsPage() {
         </Card>
       )}
 
-      {!resultsQuery.isLoading && variants.length === 0 && !resultsQuery.error && (
+      {!resultsQuery.isLoading && allVariants.length === 0 && !resultsQuery.error && (
         <Card className="mt-8">
           <CardContent className="flex items-center gap-3 py-8 text-sm text-slate-500">
             <Database className="h-4 w-4" />
             No eval result artifacts found for the selected cluster.
+          </CardContent>
+        </Card>
+      )}
+
+      {!resultsQuery.isLoading && allVariants.length > 0 && variants.length === 0 && !resultsQuery.error && (
+        <Card className="mt-8">
+          <CardContent className="flex items-center gap-3 py-8 text-sm text-slate-500">
+            <Database className="h-4 w-4" />
+            No results match this name filter.
           </CardContent>
         </Card>
       )}
@@ -134,6 +160,18 @@ function ErrorBanner({ message }: { message: string }) {
       <span>{message}</span>
     </div>
   );
+}
+
+function resultVariantMatchesName(variant: ResultVariant, filter: string) {
+  const needle = filter.trim().toLowerCase();
+  if (!needle) return true;
+  return [
+    variant.variant,
+    variant.experiment ?? "",
+    variant.note ?? "",
+    variant.checkpoint ?? "",
+    variant.source ?? "",
+  ].join(" ").toLowerCase().includes(needle);
 }
 
 function ResultSection({ title, variants }: { title: string; variants: ResultVariant[] }) {

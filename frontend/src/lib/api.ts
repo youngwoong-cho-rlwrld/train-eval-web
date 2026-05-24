@@ -178,6 +178,31 @@ export type MlxpNode = {
   gpu_used: number;
   gpu_total: number;
   gpu_free: number;
+  gpu_type: string | null;
+};
+
+export type MlxpSettings = {
+  user: string;
+  namespace: string;
+  owner_label: string;
+  tool_label: string;
+  default_node: string;
+  gpu_node_prefix: string;
+  gpu_type: string;
+  gpus_per_node: number;
+  ddn_mount: string;
+  ddn_user_home: string;
+  datasets_dir: string;
+  experiments_dir: string;
+  hf_home: string;
+  workspace_dir: string;
+  isaac_dir: string;
+  data_pod_name: string;
+  ddn_pvc: string;
+  image: string;
+  image_pull_secret: string;
+  zone: string;
+  wandb_secret: string;
 };
 
 export type Partition = {
@@ -188,6 +213,7 @@ export type Partition = {
   idle_nodes: number;
   gpu_total: number;
   gpu_idle: number;
+  gpu_type: string | null;
   states: Record<string, number>;
 };
 

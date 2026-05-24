@@ -20,10 +20,8 @@ from typing import Any
 
 from .jobs import Job
 from .kubectl_errors import is_kubectl_transport_error
-from .mlxp_config import EXPERIMENTS_DIR as MLXP_EXPERIMENTS_DIR, NAMESPACE, owner_selector
-
-
-_NS = NAMESPACE
+from .mlxp_config import get_settings, owner_selector
+from .time_utils import to_kst_iso
 
 
 async def _kubectl_json(*args: str, timeout: float = 20.0) -> dict[str, Any]:
@@ -188,15 +186,20 @@ def _job_in_range(job: Job, start: str | None, end: str | None) -> bool:
 async def _list_live_jobs() -> list[Job]:
     from .job_identity import parse_comment_metadata, parse_phase_and_variant
 
+    settings = get_settings()
     try:
-        data = await _kubectl_json("get", "jobs", "-n", _NS, "-l", owner_selector())
+        data = await _kubectl_json(
+            "get", "jobs", "-n", settings.namespace, "-l", owner_selector(settings)
+        )
     except RuntimeError:
         return []
 
     # We need pod-level info too (nodeName + start time of the actual pod, not the Job).
     pods_by_job: dict[str, dict] = {}
     try:
-        pod_data = await _kubectl_json("get", "pods", "-n", _NS, "-l", owner_selector())
+        pod_data = await _kubectl_json(
+            "get", "pods", "-n", settings.namespace, "-l", owner_selector(settings)
+        )
         for p in pod_data.get("items", []):
             labels = p.get("metadata", {}).get("labels", {})
             jn = labels.get("job-name") or labels.get("batch.kubernetes.io/job-name")
@@ -217,8 +220,8 @@ async def _list_live_jobs() -> list[Job]:
         status = j.get("status", {}) or {}
         pod = pods_by_job.get(job_id)
         state = _state_from_pod_and_job(status, pod)
-        start = status.get("startTime")
-        end = _end_time(status, pod)
+        start = to_kst_iso(status.get("startTime"))
+        end = to_kst_iso(_end_time(status, pod))
         elapsed = _elapsed(start, end)
 
         nodelist = (pod or {}).get("spec", {}).get("nodeName") or "(unscheduled)"
@@ -247,7 +250,8 @@ async def _list_archived_jobs(seen: set[str]) -> list[Job]:
     # NOTE: array glob with nullglob, not `ls $glob` — `ls` with zero-arg
     # falls back to listing `.` which used to slip past the empty check and
     # produced fake rows (`experiment_cfg`, `logs`, `runs`) in the table.
-    experiments_root = shlex.quote(MLXP_EXPERIMENTS_DIR)
+    settings = get_settings()
+    experiments_root = shlex.quote(settings.experiments_dir)
     script = r"""
 shopt -s nullglob
 for d in __EXPERIMENTS_ROOT__/*/checkpoints/ __EXPERIMENTS_ROOT__/*/checkpoints/*/ __EXPERIMENTS_ROOT__/*/checkpoints/*/*/; do
@@ -265,7 +269,7 @@ done
 """.replace("__EXPERIMENTS_ROOT__", experiments_root)
     try:
         proc = await asyncio.create_subprocess_exec(
-            "kubectl", "exec", "-n", _NS, pod, "--", "bash", "-c", script,
+            "kubectl", "exec", "-n", settings.namespace, pod, "--", "bash", "-c", script,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -291,8 +295,8 @@ done
             end_i = int(end_e)
             if end_i < start_i:
                 start_i, end_i = end_i, start_i
-            start_iso = datetime.fromtimestamp(start_i, tz=timezone.utc).isoformat()
-            end_iso = datetime.fromtimestamp(end_i, tz=timezone.utc).isoformat()
+            start_iso = to_kst_iso(datetime.fromtimestamp(start_i, tz=timezone.utc).isoformat())
+            end_iso = to_kst_iso(datetime.fromtimestamp(end_i, tz=timezone.utc).isoformat())
         except ValueError:
             continue
         elapsed = _elapsed(start_iso, end_iso)
@@ -310,23 +314,24 @@ async def get_job(name: str) -> dict[str, Any]:
     Falls back to the archived-on-DDN view when the k8s Job is gone
     (TTL'd), so the job-detail page works for completed runs too.
     """
+    settings = get_settings()
     try:
-        job_data = await _kubectl_json("get", "job", name, "-n", _NS)
+        job_data = await _kubectl_json("get", "job", name, "-n", settings.namespace)
     except RuntimeError:
         archived = await _archived_record(name)
         if archived:
             return archived
         raise FileNotFoundError(f"mlxp job not found: {name}")
     status = job_data.get("status", {}) or {}
-    start = status.get("startTime") or ""
-    pod_data = await _kubectl_json("get", "pods", "-n", _NS, "-l", f"job-name={name}")
+    start = to_kst_iso(status.get("startTime")) or ""
+    pod_data = await _kubectl_json("get", "pods", "-n", settings.namespace, "-l", f"job-name={name}")
     pods = pod_data.get("items", [])
     pod = pods[0] if pods else {}
     pod_status = pod.get("status", {}) or {}
     pod_name = pod.get("metadata", {}).get("name", "")
     node = pod.get("spec", {}).get("nodeName", "") or ""
     state = _state_from_pod_and_job(status, pod if pods else None)
-    end = _end_time(status, pod if pods else None) or ""
+    end = to_kst_iso(_end_time(status, pod if pods else None)) or ""
 
     # Per-container exit code if available
     exit_code = ""
@@ -375,7 +380,7 @@ async def cancel_job(name: str) -> None:
             "job",
             name,
             "-n",
-            _NS,
+            settings.namespace,
             "--wait=false",
             "--ignore-not-found=true",
             stdout=asyncio.subprocess.PIPE,
@@ -407,8 +412,9 @@ def _kubectl_not_found(message: str) -> bool:
 
 
 async def _job_deleted(name: str) -> bool:
+    settings = get_settings()
     try:
-        await _kubectl_json("get", "job", name, "-n", _NS, timeout=10.0)
+        await _kubectl_json("get", "job", name, "-n", settings.namespace, timeout=10.0)
     except RuntimeError as e:
         message = str(e)
         if _kubectl_not_found(message):
@@ -428,7 +434,8 @@ async def tail_logs(job_name: str, follow: bool = True, start_line: int = 1):
     """
     if shutil.which("kubectl") is None:
         raise RuntimeError("kubectl not found on PATH")
-    pod_data = await _kubectl_json("get", "pods", "-n", _NS, "-l", f"job-name={job_name}")
+    settings = get_settings()
+    pod_data = await _kubectl_json("get", "pods", "-n", settings.namespace, "-l", f"job-name={job_name}")
     pods = pod_data.get("items", [])
     if not pods:
         async for line in _tail_archived_log(job_name, start_line=start_line):
@@ -438,7 +445,7 @@ async def tail_logs(job_name: str, follow: bool = True, start_line: int = 1):
 
     # No --tail: stream the full log from the start. Frontend handles the
     # scrollback; backend just delivers everything kubectl will emit.
-    args = ["kubectl", "logs", "-n", _NS, pod_name]
+    args = ["kubectl", "logs", "-n", settings.namespace, pod_name]
     if follow:
         args.append("-f")
     # 1MB stream limit: tqdm progress lines use \r instead of \n, and at
@@ -476,9 +483,11 @@ async def _tail_archived_log(job_name: str, start_line: int = 1):
         _, variant = parse_phase_and_variant(job_name)
     if not variant:
         return
+    settings = get_settings()
     log_paths = [
-        f"{MLXP_EXPERIMENTS_DIR}/{variant}/checkpoints/{job_name}/logs/training.log",
-        f"{MLXP_EXPERIMENTS_DIR}/{variant}/checkpoints/logs/training_rank0.log",
+        f"{settings.experiments_dir}/{variant}/checkpoints/{job_name}/logs/training.log",
+        f"{settings.experiments_dir}/{variant}/checkpoints/logs/training_rank0.log",
+        f"{settings.experiments_dir}/{variant}/logs/{job_name}/eval.log",
     ]
     try:
         pod = await ensure_listing_pod()
@@ -494,7 +503,7 @@ async def _tail_archived_log(job_name: str, start_line: int = 1):
         "sleep 86400"
     )
     proc = await asyncio.create_subprocess_exec(
-        "kubectl", "exec", "-n", _NS, pod, "--", "bash", "-c", cmd,
+        "kubectl", "exec", "-n", settings.namespace, pod, "--", "bash", "-c", cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         limit=1 << 20,
@@ -547,7 +556,8 @@ async def _archived_record(name: str) -> dict[str, Any] | None:
     except Exception:
         return None
 
-    experiments_root = shlex.quote(MLXP_EXPERIMENTS_DIR)
+    settings = get_settings()
+    experiments_root = shlex.quote(settings.experiments_dir)
     quoted_name = shlex.quote(name)
     script = r"""
 shopt -s nullglob
@@ -566,7 +576,7 @@ done
 """.replace("__EXPERIMENTS_ROOT__", experiments_root).replace("__JOB_NAME__", quoted_name)
     try:
         proc = await asyncio.create_subprocess_exec(
-            "kubectl", "exec", "-n", _NS, pod, "--", "bash", "-c", script,
+            "kubectl", "exec", "-n", settings.namespace, pod, "--", "bash", "-c", script,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -588,8 +598,8 @@ done
         end_i = int(end_e)
         if end_i < start_i:
             start_i, end_i = end_i, start_i
-        start_iso = datetime.fromtimestamp(start_i, tz=timezone.utc).isoformat()
-        end_iso = datetime.fromtimestamp(end_i, tz=timezone.utc).isoformat()
+        start_iso = to_kst_iso(datetime.fromtimestamp(start_i, tz=timezone.utc).isoformat())
+        end_iso = to_kst_iso(datetime.fromtimestamp(end_i, tz=timezone.utc).isoformat())
     except ValueError:
         return None
     elapsed = _elapsed(start_iso, end_iso)
@@ -607,4 +617,3 @@ done
         "Reason": "(archived; k8s record GC'd)",
         "cluster": "mlxp",
     }
-    return None
