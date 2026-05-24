@@ -44,6 +44,8 @@ export type Job = {
   time_left?: string | null;
   start?: string | null;
   end?: string | null;
+  phase?: string | null;
+  variant?: string | null;
 };
 
 export type SubmitResponse = {

@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .jobs import Job
+from .kubectl_errors import is_kubectl_transport_error
 from .mlxp_config import EXPERIMENTS_DIR as MLXP_EXPERIMENTS_DIR, NAMESPACE, owner_selector
 
 
@@ -185,6 +186,8 @@ def _job_in_range(job: Job, start: str | None, end: str | None) -> bool:
 
 
 async def _list_live_jobs() -> list[Job]:
+    from .job_identity import parse_comment_metadata, parse_phase_and_variant
+
     try:
         data = await _kubectl_json("get", "jobs", "-n", _NS, "-l", owner_selector())
     except RuntimeError:
@@ -207,6 +210,10 @@ async def _list_live_jobs() -> list[Job]:
         job_id = j["metadata"]["name"]
         annotations = (j["metadata"].get("annotations") or {})
         job_name = annotations.get("train-eval-web/display-name") or job_id
+        comment = annotations.get("train-eval-web/comment") or ""
+        phase, variant = parse_comment_metadata(comment)
+        if not phase or not variant:
+            phase, variant = parse_phase_and_variant(job_name)
         status = j.get("status", {}) or {}
         pod = pods_by_job.get(job_id)
         state = _state_from_pod_and_job(status, pod)
@@ -220,6 +227,8 @@ async def _list_live_jobs() -> list[Job]:
             cluster="mlxp", job_id=job_id, job_name=job_name, partition="mlxp",
             state=state, elapsed=elapsed, nodelist=nodelist,
             start=start, end=end,
+            phase=None if phase == "unknown" else phase,
+            variant=variant,
         ))
     return out
 
@@ -290,7 +299,7 @@ done
         out.append(Job(
             cluster="mlxp", job_id=job_name, job_name=job_name, partition="mlxp",
             state="COMPLETED", elapsed=elapsed, nodelist="(archived)",
-            start=start_iso, end=end_iso,
+            start=start_iso, end=end_iso, phase="train", variant=variant,
         ))
     return out
 
@@ -380,34 +389,16 @@ async def cancel_job(name: str) -> None:
         last_error = err or out or "kubectl delete failed"
         if _kubectl_not_found(last_error) or await _job_deleted(name):
             return
-        if not _kubectl_transport_error(last_error) or attempt == 4:
+        if not is_kubectl_transport_error(last_error) or attempt == 4:
             break
         await asyncio.sleep(1.5 * (attempt + 1))
 
-    if _kubectl_transport_error(last_error):
+    if is_kubectl_transport_error(last_error):
         raise RuntimeError(
             "transient Kubernetes transport failure while deleting job after retries: "
             f"{last_error}"
         )
     raise RuntimeError(f"kubectl delete failed: {last_error}")
-
-
-def _kubectl_transport_error(message: str) -> bool:
-    lower = message.lower()
-    return any(
-        token in lower
-        for token in (
-            "failed calling webhook",
-            "failed to call webhook",
-            "error sending request",
-            "cannot assign requested address",
-            "connection refused",
-            "i/o timeout",
-            "tls handshake timeout",
-            "context deadline exceeded",
-            "internal error occurred",
-        )
-    )
 
 
 def _kubectl_not_found(message: str) -> bool:

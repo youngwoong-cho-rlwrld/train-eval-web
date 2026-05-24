@@ -5,9 +5,10 @@ import shlex
 
 from pydantic import BaseModel
 
-from .clusters import ClusterEnv, load_cluster, list_clusters
+from .clusters import load_cluster, list_clusters
 from .eval_completion import eval_job_completed_from_log_dir
 from .job_identity import phase_variant_from_meta, resolve_phase_and_variant
+from .slurm_meta import read_slurm_meta
 from .ssh import ssh_run
 
 
@@ -23,6 +24,8 @@ class Job(BaseModel):
     time_left: str | None = None     # `squeue %L`; None for sacct-only rows
     start: str | None = None         # ISO timestamp, or None / "Unknown"
     end: str | None = None           # ISO timestamp, or None / "Unknown"
+    phase: str | None = None
+    variant: str | None = None
 
 
 _SQUEUE_FMT = "%i|%j|%P|%T|%M|%R|%L|%S"
@@ -116,6 +119,7 @@ async def list_jobs(
                     state=state, elapsed=parts[4], nodelist=parts[7],
                     start=job_start, end=job_end,
                 ))
+        await _attach_phase_metadata(host, local)
         await _normalize_completed_eval_jobs(host, env.vars["LOG_DIR"], local)
         return local
 
@@ -124,6 +128,18 @@ async def list_jobs(
     for group in per_cluster:
         out.extend(group)
     return out
+
+
+async def _attach_phase_metadata(host: str, rows: list[Job]) -> None:
+    async def _one(job: Job) -> None:
+        meta = await read_slurm_meta(host, job.job_id)
+        phase, variant = phase_variant_from_meta(meta)
+        if not phase or not variant:
+            phase, variant = resolve_phase_and_variant(job.job_name)
+        job.phase = None if phase == "unknown" else phase
+        job.variant = variant
+
+    await asyncio.gather(*(_one(j) for j in rows))
 
 
 _SACCT_FMT = "JobID,JobName,Partition,State,ExitCode,Start,End,Elapsed,NodeList,Reason"
@@ -199,12 +215,12 @@ async def _normalize_completed_eval_jobs(host: str, log_dir: str, rows: list[Job
         meta: dict[str, str] = {}
         phase, variant = resolve_phase_and_variant(job.job_name)
         if phase != "eval" or not variant:
-            meta = await _read_slurm_meta(host, job.job_id)
+            meta = await read_slurm_meta(host, job.job_id)
             p, v = phase_variant_from_meta(meta)
             if p and v:
                 phase, variant = p, v
         elif phase == "eval":
-            meta = await _read_slurm_meta(host, job.job_id)
+            meta = await read_slurm_meta(host, job.job_id)
         if phase != "eval" or not variant:
             return
         try:
@@ -221,7 +237,7 @@ async def _normalize_completed_eval_record(host: str, log_dir: str, record: dict
     state = str(record.get("State") or "")
     if not _terminal_non_completed(state):
         return
-    meta = await _read_slurm_meta(host, str(record.get("JobID") or ""))
+    meta = await read_slurm_meta(host, str(record.get("JobID") or ""))
     phase, variant = resolve_phase_and_variant(str(record.get("JobName") or ""), record)
     if phase != "eval" or not variant:
         p, v = phase_variant_from_meta(meta)
@@ -245,19 +261,3 @@ async def _normalize_completed_eval_record(host: str, log_dir: str, record: dict
     record["State"] = "COMPLETED"
     if not record.get("Reason") or record.get("Reason") == "None":
         record["Reason"] = "Slurm exited nonzero after eval artifacts completed"
-
-
-async def _read_slurm_meta(host: str, job_id: str) -> dict[str, str]:
-    r = await ssh_run(
-        host,
-        f"cat $HOME/.train-eval-web/jobs/{job_id}.meta 2>/dev/null",
-        timeout=10.0,
-    )
-    if r.returncode != 0 or not r.stdout.strip():
-        return {}
-    fields: dict[str, str] = {}
-    for line in r.stdout.splitlines():
-        if "=" in line:
-            k, v = line.split("=", 1)
-            fields[k.strip()] = v.strip()
-    return fields

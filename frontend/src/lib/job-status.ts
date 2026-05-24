@@ -13,6 +13,11 @@ export function jobPhase(jobName?: string | null): JobPhase {
   return (match?.[1] as JobPhase | undefined) ?? "other";
 }
 
+export function normalizeJobPhase(phase?: string | null): JobPhase | null {
+  if (phase === "train" || phase === "resume" || phase === "eval") return phase;
+  return null;
+}
+
 export function isTrainJobPhase(phase?: string | null): boolean {
   return phase === "train" || phase === "resume";
 }

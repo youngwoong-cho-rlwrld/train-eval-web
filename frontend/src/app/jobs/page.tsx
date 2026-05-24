@@ -24,6 +24,7 @@ import {
   isTimeoutJobState,
   isTrainJobPhase,
   jobPhase,
+  normalizeJobPhase,
   type JobPhase,
 } from "@/lib/job-status";
 
@@ -254,7 +255,7 @@ function JobTable({
         </thead>
         <tbody>
           {rows.map((j) => {
-            const phase = jobPhase(j.job_name);
+            const phase = normalizeJobPhase(j.phase) ?? jobPhase(j.job_name);
             return (
               <tr key={`${j.cluster}-${j.job_id}`} className="border-b border-slate-100 last:border-0 hover:bg-slate-50 dark:border-slate-900 dark:hover:bg-slate-900/40">
                 <td className="py-2 pr-4 font-mono">
