@@ -141,7 +141,7 @@ def _end_time(job_status: dict, pod: dict | None = None) -> str | None:
     return _latest_k8s_time(candidates)
 
 
-async def list_jobs() -> list[Job]:
+async def list_jobs(start: str | None = None, end: str | None = None) -> list[Job]:
     """All MLXP jobs we know about: live k8s Jobs + archived runs derived
     from DDN checkpoint directories.
 
@@ -152,7 +152,36 @@ async def list_jobs() -> list[Job]:
     """
     live = await _list_live_jobs()
     archived = await _list_archived_jobs(seen={j.job_name for j in live})
-    return live + archived
+    rows = live + archived
+    if not start and not end:
+        return rows
+    return [j for j in rows if _is_active_state(j.state) or _job_in_range(j, start, end)]
+
+
+def _is_active_state(state: str) -> bool:
+    return state.upper() in {"RUNNING", "PENDING", "COMPLETING", "CONFIGURING", "SUSPENDED"}
+
+
+def _time_bound(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _job_in_range(job: Job, start: str | None, end: str | None) -> bool:
+    start_ts = _time_bound(start)
+    end_ts = _time_bound(end)
+    job_ts = _time_bound(job.end) or _time_bound(job.start)
+    if job_ts is None:
+        return False
+    if start_ts is not None and job_ts < start_ts:
+        return False
+    if end_ts is not None and job_ts > end_ts:
+        return False
+    return True
 
 
 async def _list_live_jobs() -> list[Job]:

@@ -7,7 +7,8 @@ import { api, type Job, type JobDetails } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { CopyButton } from "@/components/copy-button";
 import { CopyCheckpointDialog } from "@/components/copy-checkpoint-dialog";
 import { ResumeJobButton } from "@/components/resume-job-button";
@@ -30,12 +31,20 @@ const REFRESH_MS = 60_000;
 
 export default function JobsPage() {
   const qc = useQueryClient();
-  const [hours, setHours] = useState<string>("24");
+  const [draftHistoryRange, setDraftHistoryRange] = useState(() => defaultHistoryRange());
+  const [appliedHistoryRange, setAppliedHistoryRange] = useState(() => defaultHistoryRange());
+  const historyQuery = useMemo(
+    () => historyRangeQuery(appliedHistoryRange),
+    [appliedHistoryRange],
+  );
+  const hasHistoryRangeChanges =
+    draftHistoryRange.startDate !== appliedHistoryRange.startDate ||
+    draftHistoryRange.endDate !== appliedHistoryRange.endDate;
 
   const { data, isLoading, error } = useQuery({
-    queryKey: ["jobs", hours],
+    queryKey: ["jobs", historyQuery],
     queryFn: () =>
-      api<{ jobs: Job[] }>(`/api/jobs?hours=${hours}`).then((d) => d.jobs),
+      api<{ jobs: Job[] }>(`/api/jobs?${historyQuery}`).then((d) => d.jobs),
     refetchInterval: REFRESH_MS,
   });
 
@@ -93,19 +102,51 @@ export default function JobsPage() {
         <CardHeader className="flex flex-row items-start justify-between gap-4">
           <div>
             <CardTitle>Recent</CardTitle>
-            <CardDescription>{finished.length} finished {finished.length === 1 ? "job" : "jobs"} in the last {hours}h.</CardDescription>
+            <CardDescription>
+              {finished.length} finished {finished.length === 1 ? "job" : "jobs"} from{" "}
+              {formatDateRange(appliedHistoryRange)}.
+            </CardDescription>
           </div>
-          <div className="flex items-center gap-2 text-sm">
-            <span className="text-slate-500">history window:</span>
-            <Select value={hours} onValueChange={setHours}>
-              <SelectTrigger className="h-8 w-[120px]"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="6">6 hours</SelectItem>
-                <SelectItem value="24">24 hours</SelectItem>
-                <SelectItem value="72">3 days</SelectItem>
-                <SelectItem value="168">1 week</SelectItem>
-              </SelectContent>
-            </Select>
+          <div className="flex items-end gap-3">
+            <div className="space-y-1">
+              <Label htmlFor="recent-start" className="text-xs text-slate-500">From</Label>
+              <Input
+                id="recent-start"
+                type="date"
+                value={draftHistoryRange.startDate}
+                onChange={(e) =>
+                  setDraftHistoryRange((current) => ({
+                    ...current,
+                    startDate: e.target.value,
+                  }))
+                }
+                className="h-8 w-[150px]"
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="recent-end" className="text-xs text-slate-500">To</Label>
+              <Input
+                id="recent-end"
+                type="date"
+                value={draftHistoryRange.endDate}
+                onChange={(e) =>
+                  setDraftHistoryRange((current) => ({
+                    ...current,
+                    endDate: e.target.value,
+                  }))
+                }
+                className="h-8 w-[150px]"
+              />
+            </div>
+            <Button
+              type="button"
+              size="sm"
+              onClick={() => setAppliedHistoryRange(draftHistoryRange)}
+              disabled={!hasHistoryRangeChanges}
+              className="h-8"
+            >
+              Apply
+            </Button>
           </div>
         </CardHeader>
         <CardContent>
@@ -119,6 +160,67 @@ export default function JobsPage() {
       </Card>
     </div>
   );
+}
+
+type HistoryRange = {
+  startDate: string;
+  endDate: string;
+};
+
+function defaultHistoryRange(): HistoryRange {
+  const end = new Date();
+  const start = new Date(end);
+  start.setDate(start.getDate() - 1);
+  return {
+    startDate: dateInputValue(start),
+    endDate: dateInputValue(end),
+  };
+}
+
+function dateInputValue(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function orderedDateRange(range: HistoryRange): HistoryRange {
+  if (!range.startDate || !range.endDate || range.startDate <= range.endDate) {
+    return range;
+  }
+  return {
+    startDate: range.endDate,
+    endDate: range.startDate,
+  };
+}
+
+function historyRangeQuery(range: HistoryRange): string {
+  const ordered = orderedDateRange(range);
+  const params = new URLSearchParams();
+  if (ordered.startDate) {
+    params.set("start", `${ordered.startDate}T00:00:00`);
+  }
+  if (ordered.endDate) {
+    params.set("end", `${ordered.endDate}T23:59:59`);
+  }
+  if (!params.has("start") && !params.has("end")) {
+    params.set("hours", "24");
+  }
+  return params.toString();
+}
+
+function formatDateRange(range: HistoryRange): string {
+  const ordered = orderedDateRange(range);
+  if (ordered.startDate && ordered.endDate) {
+    return `${ordered.startDate} to ${ordered.endDate}`;
+  }
+  if (ordered.startDate) {
+    return `${ordered.startDate} onward`;
+  }
+  if (ordered.endDate) {
+    return `before ${ordered.endDate}`;
+  }
+  return "the last 24h";
 }
 
 function JobTable({

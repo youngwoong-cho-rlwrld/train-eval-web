@@ -1,6 +1,7 @@
 """Slurm job listing + status + cancel."""
 
 import asyncio
+import shlex
 
 from pydantic import BaseModel
 
@@ -29,8 +30,13 @@ _SACCT_LIST_FMT = "JobID,JobName,Partition,State,Elapsed,Start,End,NodeList"
 _ACTIVE_STATES = {"RUNNING", "PENDING", "COMPLETING", "CONFIGURING", "SUSPENDED"}
 
 
-async def list_jobs(clusters: list[str] | None = None, hours: int = 24) -> list[Job]:
-    """Active jobs from `squeue` + recent finished from `sacct` (last `hours`).
+async def list_jobs(
+    clusters: list[str] | None = None,
+    hours: int = 24,
+    start: str | None = None,
+    end: str | None = None,
+) -> list[Job]:
+    """Active jobs from `squeue` + finished jobs from `sacct`.
 
     Fans out across clusters (and across squeue/sacct within each cluster)
     so latency is roughly the slowest single SSH call, not their sum.
@@ -43,7 +49,7 @@ async def list_jobs(clusters: list[str] | None = None, hours: int = 24) -> list[
     async def _for_cluster(c: str) -> list[Job]:
         if c == "mlxp":
             try:
-                return await mlxp_jobs.list_jobs()
+                return await mlxp_jobs.list_jobs(start=start, end=end)
             except Exception:
                 return []
         try:
@@ -60,10 +66,16 @@ async def list_jobs(clusters: list[str] | None = None, hours: int = 24) -> list[
             return r.stdout if r.returncode == 0 else None
 
         async def _sacct() -> str | None:
+            if start or end:
+                start_arg = shlex.quote(start or f"now-{hours}hours")
+                end_arg = f" -E {shlex.quote(end)}" if end else ""
+                window = f"-S {start_arg}{end_arg}"
+            else:
+                window = f"-S now-{hours}hours"
             try:
                 r = await ssh_run(
                     host,
-                    f'sacct -X -u "$USER" -S now-{hours}hours -P -n -o {_SACCT_LIST_FMT}',
+                    f'sacct -X -u "$USER" {window} -P -n -o {_SACCT_LIST_FMT}',
                     timeout=30.0,
                 )
             except Exception:
@@ -81,11 +93,11 @@ async def list_jobs(clusters: list[str] | None = None, hours: int = 24) -> list[
                     continue
                 seen.add(parts[0])
                 time_left = parts[6] if parts[6] not in ("", "N/A") else None
-                start = parts[7] if parts[7] not in ("", "N/A", "Unknown") else None
+                job_start = parts[7] if parts[7] not in ("", "N/A", "Unknown") else None
                 local.append(Job(
                     cluster=c, job_id=parts[0], job_name=parts[1], partition=parts[2],
                     state=parts[3], elapsed=parts[4], nodelist=parts[5],
-                    time_left=time_left, start=start,
+                    time_left=time_left, start=job_start,
                 ))
         if sa_out is not None:
             for line in sa_out.strip().splitlines():
@@ -97,12 +109,12 @@ async def list_jobs(clusters: list[str] | None = None, hours: int = 24) -> list[
                     continue
                 # Truncate sacct's CANCELLED+by labels for cleaner display.
                 state = parts[3].split(" ")[0]
-                start = parts[5] if parts[5] not in ("", "Unknown") else None
-                end = parts[6] if parts[6] not in ("", "Unknown") else None
+                job_start = parts[5] if parts[5] not in ("", "Unknown") else None
+                job_end = parts[6] if parts[6] not in ("", "Unknown") else None
                 local.append(Job(
                     cluster=c, job_id=jid, job_name=parts[1], partition=parts[2],
                     state=state, elapsed=parts[4], nodelist=parts[7],
-                    start=start, end=end,
+                    start=job_start, end=job_end,
                 ))
         await _normalize_completed_eval_jobs(host, env.vars["LOG_DIR"], local)
         return local

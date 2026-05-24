@@ -374,9 +374,14 @@ async def post_submit(req: submit.SubmitRequest):
 # ── jobs ──
 
 @app.get("/api/jobs")
-async def get_jobs(cluster: str | None = None, hours: int = 24):
+async def get_jobs(
+    cluster: str | None = None,
+    hours: int = 24,
+    start: str | None = None,
+    end: str | None = None,
+):
     target = [cluster] if cluster else None
-    js = await jobs.list_jobs(target, hours=hours)
+    js = await jobs.list_jobs(target, hours=hours, start=start, end=end)
     return {"jobs": [j.model_dump() for j in js]}
 
 
