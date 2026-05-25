@@ -60,9 +60,15 @@ log "Modality config: $MODALITY_CONFIG_FILE"
 
 # ── Per-device → global batch size (default: keep TRAIN_BATCH_SIZE per-device) ──
 GLOBAL_BATCH_SIZE="${SUBMIT_TRAIN_GLOBAL_BATCH_SIZE:-$((TRAIN_NUM_GPUS * TRAIN_BATCH_SIZE))}"
+TRAIN_ACTION_HORIZON="${SUBMIT_TRAIN_ACTION_HORIZON:-${TRAIN_ACTION_HORIZON:-}}"
+ACTION_HORIZON_ARGS=()
+if [[ -n "$TRAIN_ACTION_HORIZON" ]]; then
+    ACTION_HORIZON_ARGS=(--action-horizon "$TRAIN_ACTION_HORIZON")
+fi
 log "Global batch: $GLOBAL_BATCH_SIZE"
 log "Train GPUs: $TRAIN_NUM_GPUS"
 log "Save steps: $SAVE_STEPS"
+log "Action horizon: ${TRAIN_ACTION_HORIZON:-default}"
 
 if [[ "${RESUME_EXPECTED:-0}" == "1" ]]; then
     if compgen -G "$RUN_CKPT_DIR/checkpoint-*" > /dev/null; then
@@ -111,6 +117,7 @@ uv run torchrun --nproc_per_node="$TRAIN_NUM_GPUS" --master-port "$MASTER_PORT" 
     --use-wandb \
     --wandb-project "$WANDB_PROJECT" \
     --color-jitter-params brightness 0.2 contrast 0.2 saturation 0.2 hue 0.1 \
+    "${ACTION_HORIZON_ARGS[@]}" \
     "${TRAIN_EXTRA_ARGS[@]}"
 
 log "Training completed."

@@ -503,13 +503,13 @@ for task_entry in "${TASKS[@]}"; do
     for EVAL_SET in "${EVAL_SETS[@]}"; do
         for i in $(seq 1 ${N_RUNS}); do
             RUN_DIR="${TASK_EVAL_DIR}/${EVAL_SET}/run_${i}"
+            RUN_SEED=$((EVAL_BASE_SEED + TASK_IDX * EVAL_SEED_TASK_STRIDE + EVAL_SET_IDX * EVAL_SEED_SET_STRIDE + (i - 1) * EVAL_SEED_RUN_STRIDE))
             if [ "$EVAL_OVERWRITE_RESULTS" != "1" ] && [ -f "${RUN_DIR}/results.json" ]; then
                 log ""
-                log "  eval_set: ${EVAL_SET} / Run ${i}/${N_RUNS}"
+                log "  eval_set: ${EVAL_SET} / Run ${i}/${N_RUNS} / seed ${RUN_SEED}"
                 log "  SKIP (results.json already exists): ${RUN_DIR}"
                 continue
             fi
-            RUN_SEED=$((EVAL_BASE_SEED + TASK_IDX * EVAL_SEED_TASK_STRIDE + EVAL_SET_IDX * EVAL_SEED_SET_STRIDE + (i - 1) * EVAL_SEED_RUN_STRIDE))
             wait_for_slot
             GPU_SLOT="$LAUNCH_IDX"
             START_SLOT="$((LAUNCH_IDX % EVAL_PARALLEL_WORKERS))"

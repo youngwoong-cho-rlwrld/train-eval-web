@@ -47,6 +47,7 @@ from .training_models import (
     mlxp_repo_path,
     resolve_training_model,
 )
+from .train_overrides import resolve_train_action_horizon
 from .variant_values import variant_int
 from .wandb_config import get_project as _wandb_project
 from .variants import load_variant
@@ -90,6 +91,7 @@ class MlxpSubmitRequest(BaseModel):
     global_batch_size: int | None = None
     max_steps: int | None = None
     save_steps: int | None = None
+    action_horizon: int | None = Field(default=None, ge=1)
     # The k8s node to pin via nodeAffinity. Leave None to fall back to the
     # configured default node.
     node: str | None = None
@@ -141,6 +143,7 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
         req.global_batch_size is not None,
         req.max_steps is not None,
         req.save_steps is not None,
+        req.action_horizon is not None,
     )):
         raise ValueError("train overrides are only valid for phase=train")
 
@@ -148,6 +151,12 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
     settings = get_settings()
     cpu, mem = _GPU_RESOURCES[req.num_gpus]
     model = resolve_training_model(variant)
+    if req.phase == "train" and model.family == "n1.6":
+        req.action_horizon = resolve_train_action_horizon(
+            variant=variant,
+            model_family=model.family,
+            requested=req.action_horizon,
+        )
     if (
         req.phase == "train"
         and req.global_batch_size is not None
@@ -256,6 +265,7 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
         train_global_batch_size=train_global_batch_size,
         train_max_steps=train_max_steps,
         train_save_steps=train_save_steps,
+        train_action_horizon=req.action_horizon,
         wandb_project=_wandb_project(),
         git=submit_git,
     )
@@ -273,6 +283,7 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
         train_global_batch_size=train_global_batch_size,
         train_max_steps=train_max_steps,
         train_save_steps=train_save_steps,
+        train_action_horizon=req.action_horizon,
         wandb_project=_wandb_project(),
         git=submit_git,
     )
@@ -713,6 +724,11 @@ def _render_body_n16(*, variant, req: MlxpSubmitRequest, job_name: str,
     wandb_project = shlex.quote(_wandb_project())
     uv_userbase = shlex.quote(f"{settings.ddn_user_home}/.local")
     uv_bin_dir = shlex.quote(f"{settings.ddn_user_home}/.local/bin")
+    action_horizon_arg = (
+        f" --action-horizon {req.action_horizon}"
+        if req.action_horizon is not None
+        else ""
+    )
 
     return f"""\
 set -euo pipefail
@@ -768,7 +784,7 @@ uv run $UV_RUN_ARGS torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/la
     --experiment-name "{job_name}" \\
     --use-wandb \\
     --wandb-project {wandb_project} \\
-    $RESUME_FLAG {train_extra} {user_extra}
+    $RESUME_FLAG{action_horizon_arg} {train_extra} {user_extra}
 """
 
 
@@ -784,10 +800,14 @@ def _render_eval_body_script(
     """Render MLXP eval by staging the same eval body script used on Slurm."""
     eval_body_path = LIB_DIR / model.eval_body_script
     common_path = LIB_DIR / "_common.sh"
+    isaac_runner_path = LIB_DIR / "isaac_server_runner.py"
     if not eval_body_path.is_file():
         raise FileNotFoundError(f"eval body script not found: {eval_body_path}")
+    if not isaac_runner_path.is_file():
+        raise FileNotFoundError(f"Isaac server runner not found: {isaac_runner_path}")
     common_text = _ensure_trailing_newline(common_path.read_text())
     eval_body_text = _ensure_trailing_newline(eval_body_path.read_text())
+    isaac_runner_text = _ensure_trailing_newline(isaac_runner_path.read_text())
 
     exp_dir = f"{settings.experiments_dir}/{variant.name}"
     runtime_root = f"{settings.experiments_dir}/.runtime/{snapshot['job_id']}"
@@ -870,6 +890,9 @@ cat > {shlex.quote(runtime_root)}/lib/_common.sh <<'TEW_COMMON_EOF'
 cat > {shlex.quote(runtime_root)}/lib/{model.eval_body_script} <<'TEW_EVAL_BODY_EOF'
 {eval_body_text}TEW_EVAL_BODY_EOF
 chmod +x {shlex.quote(runtime_root)}/lib/{model.eval_body_script}
+cat > {shlex.quote(runtime_root)}/lib/isaac_server_runner.py <<'TEW_ISAAC_RUNNER_EOF'
+{isaac_runner_text}TEW_ISAAC_RUNNER_EOF
+chmod +x {shlex.quote(runtime_root)}/lib/isaac_server_runner.py
 {modality_block}
 export SUBMIT_TRAIN_REPO_DIR="$TRAIN_REPO_WORKTREE"
 {chr(10).join(eval_exports)}
@@ -892,6 +915,8 @@ def _job_comment(req: MlxpSubmitRequest, variant, snapshot: dict) -> str:
         )
         if req.global_batch_size is not None:
             comment += f";train_global_batch_size={req.global_batch_size}"
+        if req.action_horizon is not None:
+            comment += f";train_action_horizon={req.action_horizon}"
     else:
         if req.eval_num_envs_per_gpu is not None:
             comment += f";eval_num_envs_per_gpu={req.eval_num_envs_per_gpu}"

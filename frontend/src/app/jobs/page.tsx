@@ -119,15 +119,15 @@ export default function JobsPage() {
       </Card>
 
       <Card className="mt-6">
-        <CardHeader className="flex flex-row items-start justify-between gap-4">
-          <div>
-            <CardTitle>Recent</CardTitle>
-            <CardDescription>
-              {filteredFinished.length} of {finished.length} finished {finished.length === 1 ? "job" : "jobs"} from{" "}
-              {formatDateRange(appliedHistoryRange)}.
-            </CardDescription>
-          </div>
-          <div className="flex flex-wrap items-end justify-end gap-3">
+        <CardHeader>
+          <CardTitle>Recent</CardTitle>
+          <CardDescription>
+            {filteredFinished.length} of {finished.length} finished {finished.length === 1 ? "job" : "jobs"} from{" "}
+            {formatDateRange(appliedHistoryRange)}.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="mb-5 flex flex-wrap items-end gap-3">
             <div className="space-y-1">
               <Label htmlFor="recent-name" className="text-xs text-slate-500">Name</Label>
               <Input
@@ -209,8 +209,6 @@ export default function JobsPage() {
               Apply
             </Button>
           </div>
-        </CardHeader>
-        <CardContent>
           {isLoading && <LoadingState label="Loading recent jobs..." rows={4} />}
           {error && <ErrorState message={(error as Error).message} />}
           {!isLoading && !error && finished.length === 0 && (

@@ -88,6 +88,8 @@ def _train_n16(v: Variant, cluster: str) -> list[tuple[str, str]]:
         ("--use-wandb", ""),
         ("--color-jitter-params", "brightness 0.2 contrast 0.2 saturation 0.2 hue 0.1"),
     ]
+    if v.vars.get("TRAIN_ACTION_HORIZON"):
+        out.append(("--action-horizon", v.vars.get("TRAIN_ACTION_HORIZON", "")))
     out.append(("--wandb-project", get_project()))
     out.extend((a, "") for a in (v.arrays.get("TRAIN_EXTRA_ARGS") or []))
     return out

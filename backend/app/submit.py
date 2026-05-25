@@ -32,6 +32,7 @@ from .submission_snapshot import (
     training_repo_label,
 )
 from .training_models import resolve_training_model
+from .train_overrides import resolve_train_action_horizon as resolve_action_horizon_override
 from .variants import load_variant
 from .variant_values import variant_int
 from .wandb_config import get_project as wandb_project
@@ -67,6 +68,7 @@ class SubmitRequest(BaseModel):
     train_global_batch_size: int | None = Field(default=None, ge=1)
     train_max_steps: int | None = Field(default=None, ge=1)
     train_save_steps: int | None = Field(default=None, ge=1)
+    train_action_horizon: int | None = Field(default=None, ge=1)
     # Eval-only: override Isaac's native vectorized env count per GPU.
     eval_num_envs_per_gpu: int | None = Field(default=None, ge=1)
     # Legacy request field accepted from older frontends/resume metadata.
@@ -177,6 +179,14 @@ def resolve_train_settings(req: SubmitRequest, variant, model_family: str) -> Tr
     )
 
 
+def resolve_train_action_horizon(req: SubmitRequest, variant, model_family: str) -> int | None:
+    return resolve_action_horizon_override(
+        variant=variant,
+        model_family=model_family,
+        requested=req.train_action_horizon,
+    )
+
+
 class SubmitResponse(BaseModel):
     job_id: str
     job_name: str
@@ -194,6 +204,11 @@ async def _rsync_text(host: str, text: str, remote_rel: str) -> None:
         fp.write(text)
         tmp_path = fp.name
     try:
+        parent = str(Path(remote_rel).parent)
+        if parent and parent != ".":
+            mkdir = await ssh_run(host, f"mkdir -p $HOME/{shlex.quote(parent)}", timeout=10.0)
+            if mkdir.returncode != 0:
+                raise RuntimeError(f"mkdir for snapshot failed: {mkdir.stderr or mkdir.stdout}")
         r = await rsync_to(host, tmp_path, remote_rel)
         if r.returncode != 0:
             raise RuntimeError(f"rsync snapshot failed: {r.stderr}")
@@ -221,6 +236,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         req.train_global_batch_size is not None,
         req.train_max_steps is not None,
         req.train_save_steps is not None,
+        req.train_action_horizon is not None,
     )):
         raise ValueError("train overrides are only valid for phase=train")
     if (
@@ -250,6 +266,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         sbatch_flags.append(f"--exclude={shlex.quote(exclude_nodes)}")
 
     train_settings = resolve_train_settings(req, variant, model.family)
+    train_action_horizon = resolve_train_action_horizon(req, variant, model.family) if req.phase == "train" else None
     gpus = str(train_settings.num_gpus)
 
     # Unified shape across slurm + MLXP. The cluster/partition are shown in
@@ -304,6 +321,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             train_global_batch_size=train_settings.global_batch_size,
             train_max_steps=train_settings.max_steps,
             train_save_steps=train_settings.save_steps,
+            train_action_horizon=train_action_horizon,
             wandb_project=submitted_wandb_project,
             git=submit_git,
         )
@@ -320,6 +338,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             train_global_batch_size=train_settings.global_batch_size,
             train_max_steps=train_settings.max_steps,
             train_save_steps=train_settings.save_steps,
+            train_action_horizon=train_action_horizon,
             wandb_project=submitted_wandb_project,
             git=submit_git,
         ))
@@ -344,7 +363,15 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     for local, remote_name in sync_targets:
         remote = f"{CLUSTER_STAGING_REL}/{remote_name}"
         excludes = (
-            ["checkpoints/", "eval_results/", "logs/", "results.json"]
+            [
+                "checkpoints/",
+                "eval_results/",
+                "logs/",
+                "results.json",
+                "config_*.sh",
+                "config_*.meta.json",
+                "extra_args_*.sh",
+            ]
             if remote_name == "experiments"
             else None
         )
@@ -420,6 +447,8 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             f";train_max_steps={train_settings.max_steps}"
             f";train_save_steps={train_settings.save_steps}"
         )
+        if train_action_horizon is not None:
+            comment += f";train_action_horizon={train_action_horizon}"
         if req.train_global_batch_size is not None:
             comment += f";train_global_batch_size={req.train_global_batch_size}"
         if snapshot_path:
@@ -461,6 +490,10 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         + (
             f",SUBMIT_TRAIN_GLOBAL_BATCH_SIZE={req.train_global_batch_size}"
             if req.phase == "train" and req.train_global_batch_size is not None else ""
+        )
+        + (
+            f",SUBMIT_TRAIN_ACTION_HORIZON={train_action_horizon}"
+            if req.phase == "train" and train_action_horizon is not None else ""
         )
         + (
             f",SUBMIT_EXTRA_ARGS_FILE={submit_extra_args_path}"
@@ -538,6 +571,11 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             f"train_max_steps={train_settings.max_steps}\n"
             f"train_save_steps={train_settings.save_steps}\n"
             if req.phase == "train"
+            else ""
+        )
+        + (
+            f"train_action_horizon={train_action_horizon}\n"
+            if req.phase == "train" and train_action_horizon is not None
             else ""
         )
         + (

@@ -154,6 +154,8 @@ export type ConfigSnapshot = {
   path: string | null;
   meta_path: string | null;
   text: string | null;
+  extra_args_path: string | null;
+  extra_args: string[];
   wandb_project: string | null;
   git_repo_path: string | null;
   git_repo_label: string | null;
@@ -162,6 +164,17 @@ export type ConfigSnapshot = {
   git_dirty_at_submit: boolean | null;
   git_committed_dirty: boolean | null;
   error: string | null;
+};
+
+export type EvalRun = {
+  task: string | null;
+  eval_set: string;
+  run: string;
+  seed: number | null;
+  success_count: number | null;
+  total_episodes: number | null;
+  success_rate: number | null;
+  path: string;
 };
 
 export type Dataset = {
@@ -231,6 +244,7 @@ export type JobDetails = {
   progress: Progress;
   gpu: GpuUsage | null;
   config_snapshot: ConfigSnapshot | null;
+  eval_runs: EvalRun[];
 };
 
 export type GitStatus = {

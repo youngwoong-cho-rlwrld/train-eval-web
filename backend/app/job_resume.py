@@ -57,6 +57,7 @@ async def resume_timed_out_job(cluster: str, job_id: str) -> submit.SubmitRespon
                 train_global_batch_size=int_meta("train_global_batch_size"),
                 train_max_steps=int_meta("train_max_steps"),
                 train_save_steps=int_meta("train_save_steps"),
+                train_action_horizon=int_meta("train_action_horizon"),
                 job_name=job_name,
                 resume=True,
                 resume_of=job_id,

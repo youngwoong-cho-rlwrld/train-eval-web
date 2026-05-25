@@ -14,6 +14,7 @@ import {
   type Variant,
   type SubmitResponse,
   type SubmitConfigPreview,
+  type DataInterfaceSummary,
   type Partition,
   type Dataset,
   type MlxpNode,
@@ -74,6 +75,7 @@ type TrainConfigEdit = {
   batchSize: string;
   maxSteps: string;
   saveSteps: string;
+  actionHorizon: string;
 };
 type SubmitStep = "job" | "config" | "modality";
 
@@ -155,6 +157,12 @@ export default function SubmitPage() {
     queryKey: ["variant", variantName],
     queryFn: () =>
       variantName ? api<Variant>(`/api/variants/${variantName}`) : null,
+    enabled: !!variantName,
+  });
+  const dataInterface = useQuery({
+    queryKey: ["variant-data-interface", variantName],
+    queryFn: () =>
+      api<DataInterfaceSummary>(`/api/variants/${variantName}/data-interface`),
     enabled: !!variantName,
   });
   const partitions = useQuery({
@@ -294,8 +302,13 @@ export default function SubmitPage() {
       batchSize,
       maxSteps: vars?.MAX_STEPS ?? "",
       saveSteps: vars?.SAVE_STEPS ?? "",
+      actionHorizon:
+        vars?.TRAIN_ACTION_HORIZON ??
+        (dataInterface.data?.action_horizon != null
+          ? String(dataInterface.data.action_horizon)
+          : ""),
     };
-  }, [variant.data]);
+  }, [variant.data, dataInterface.data?.action_horizon]);
   const activeTrainConfigEdit =
     trainConfigEdit?.scope === trainConfigScope ? trainConfigEdit : null;
   const trainNumGpus = activeTrainConfigEdit
@@ -310,6 +323,9 @@ export default function SubmitPage() {
   const trainSaveSteps = activeTrainConfigEdit
     ? activeTrainConfigEdit.saveSteps
     : trainConfigDefaults.saveSteps;
+  const trainActionHorizon = activeTrainConfigEdit
+    ? activeTrainConfigEdit.actionHorizon
+    : trainConfigDefaults.actionHorizon;
   const trainNumGpusParsed = Number.parseInt(trainNumGpus.trim(), 10);
   const trainBatchSizeParsed = Number.parseInt(
     trainBatchSize.trim(),
@@ -317,9 +333,15 @@ export default function SubmitPage() {
   );
   const trainMaxStepsParsed = Number.parseInt(trainMaxSteps.trim(), 10);
   const trainSaveStepsParsed = Number.parseInt(trainSaveSteps.trim(), 10);
+  const trainActionHorizonParsed = Number.parseInt(
+    trainActionHorizon.trim(),
+    10,
+  );
   const isPositiveInteger = (value: string) => /^[1-9]\d*$/.test(value.trim());
   const trainModel = variant.data?.vars.MODEL_VERSION ?? "n1.5";
   const wantsTrainConfig = submitPhase === "train" && !!variantName;
+  const trainActionHorizonEnabled = wantsTrainConfig && trainModel === "n1.6";
+  const modalityActionHorizon = dataInterface.data?.action_horizon ?? null;
   const trainNumGpusValid =
     !wantsTrainConfig ||
     (isPositiveInteger(trainNumGpus) &&
@@ -330,11 +352,17 @@ export default function SubmitPage() {
     !wantsTrainConfig || isPositiveInteger(trainMaxSteps);
   const trainSaveStepsValid =
     !wantsTrainConfig || isPositiveInteger(trainSaveSteps);
+  const trainActionHorizonValid =
+    !trainActionHorizonEnabled ||
+    (isPositiveInteger(trainActionHorizon) &&
+      (modalityActionHorizon == null ||
+        trainActionHorizonParsed === modalityActionHorizon));
   const trainConfigValid =
     trainNumGpusValid &&
     trainBatchSizeValid &&
     trainMaxStepsValid &&
-    trainSaveStepsValid;
+    trainSaveStepsValid &&
+    trainActionHorizonValid;
   const updateTrainConfig = (
     patch: Partial<Omit<TrainConfigEdit, "scope">>,
   ) => {
@@ -344,6 +372,7 @@ export default function SubmitPage() {
       batchSize: trainConfigDefaults.batchSize,
       maxSteps: trainConfigDefaults.maxSteps,
       saveSteps: trainConfigDefaults.saveSteps,
+      actionHorizon: trainConfigDefaults.actionHorizon,
     };
     setTrainConfigEdit({ ...base, ...patch, scope: trainConfigScope });
   };
@@ -387,6 +416,8 @@ export default function SubmitPage() {
         ? trainBatchSizeParsed * trainNumGpusParsed
         : trainBatchSizeParsed
       : null;
+  const submittedTrainActionHorizon =
+    trainActionHorizonEnabled ? trainActionHorizonParsed : null;
 
   const buildSubmitBody = (commitDirtyChanges: boolean) => {
     return {
@@ -406,6 +437,7 @@ export default function SubmitPage() {
       train_global_batch_size: submittedTrainGlobalBatchSize,
       train_max_steps: submitPhase === "train" ? trainMaxStepsParsed : null,
       train_save_steps: submitPhase === "train" ? trainSaveStepsParsed : null,
+      train_action_horizon: submittedTrainActionHorizon,
       eval_num_envs_per_gpu: null,
       eval_n_episodes: wantsCheckpoint ? evalNEpisodesParsed : null,
       eval_n_runs: wantsCheckpoint ? evalNRunsParsed : null,
@@ -444,6 +476,7 @@ export default function SubmitPage() {
       trainBatchSize,
       trainMaxSteps,
       trainSaveSteps,
+      trainActionHorizon,
       evalNEpisodes,
       evalNRuns,
       evalSetValues,
@@ -723,6 +756,20 @@ export default function SubmitPage() {
         invalidMessage="Positive integer."
       />
     );
+    if (trainActionHorizonEnabled) {
+      flagEditors["--action-horizon"] = (
+        <NumberCellEditor
+          value={trainActionHorizon}
+          onChange={(value) => updateTrainConfig({ actionHorizon: value })}
+          valid={trainActionHorizonValid}
+          invalidMessage={
+            modalityActionHorizon == null
+              ? "Positive integer."
+              : `Must match modality horizon ${modalityActionHorizon}.`
+          }
+        />
+      );
+    }
   }
   if (wantsCheckpoint) {
     flagEditors["--n-episodes"] = (

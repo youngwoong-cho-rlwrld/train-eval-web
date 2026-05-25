@@ -626,6 +626,7 @@ def render_training_config_snapshot(
     train_global_batch_size: int | None,
     train_max_steps: int,
     train_save_steps: int,
+    train_action_horizon: int | None = None,
     wandb_project: str | None = None,
     git: SubmitGitInfo | None = None,
 ) -> str:
@@ -636,6 +637,8 @@ def render_training_config_snapshot(
     text = _set_scalar(text, "TRAIN_NUM_GPUS", train_num_gpus)
     text = _set_scalar(text, "MAX_STEPS", train_max_steps)
     text = _set_scalar(text, "SAVE_STEPS", train_save_steps)
+    if train_action_horizon is not None:
+        text = _set_scalar(text, "TRAIN_ACTION_HORIZON", train_action_horizon)
     if train_global_batch_size is not None:
         text = _set_scalar(text, "TRAIN_GLOBAL_BATCH_SIZE", train_global_batch_size)
         if model == "n1.5" and train_num_gpus > 0:
@@ -654,6 +657,8 @@ def render_training_config_snapshot(
         footer.append(f"SUBMIT_PARTITION={shlex.quote(partition)}")
     if node:
         footer.append(f"SUBMIT_NODE={shlex.quote(node)}")
+    if train_action_horizon is not None:
+        footer.append(f"SUBMIT_TRAIN_ACTION_HORIZON={train_action_horizon}")
     if git:
         footer.append(f"SUBMIT_GIT_REPO_LABEL={shlex.quote(git.repo_label)}")
         footer.append(f"SUBMIT_GIT_REPO_PATH={shlex.quote(git.repo_path)}")
@@ -745,6 +750,7 @@ def snapshot_metadata(
     train_global_batch_size: int | None = None,
     train_max_steps: int | None = None,
     train_save_steps: int | None = None,
+    train_action_horizon: int | None = None,
     wandb_project: str | None = None,
     git: SubmitGitInfo | None = None,
 ) -> dict[str, Any]:
@@ -764,6 +770,7 @@ def snapshot_metadata(
             "global_batch_size": train_global_batch_size,
             "max_steps": train_max_steps,
             "save_steps": train_save_steps,
+            "action_horizon": train_action_horizon,
             "wandb_project": wandb_project,
         },
         "dataset_override": dataset_override,

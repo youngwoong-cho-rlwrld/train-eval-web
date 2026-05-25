@@ -6,6 +6,7 @@ the cluster a few small questions over SSH (slurm) or kubectl (mlxp) to
 compute progress.
 """
 
+import json
 import os
 import re
 import shlex
@@ -29,8 +30,11 @@ from .job_identity import (
 from .jobs import get_job
 from .mlxp_config import get_settings
 from .paths import CLUSTER_STAGING_REL
+from .submission_snapshot import SubmitGitInfo, render_training_config_snapshot
 from .ssh import ssh_run
 from .slurm_meta import read_slurm_meta
+from .training_models import resolve_training_model
+from .variant_values import variant_int
 from .variants import load_variant
 
 
@@ -92,6 +96,8 @@ class ConfigSnapshot(BaseModel):
     path: str | None = None
     meta_path: str | None = None
     text: str | None = None
+    extra_args_path: str | None = None
+    extra_args: list[str] = Field(default_factory=list)
     wandb_project: str | None = None
     git_repo_path: str | None = None
     git_repo_label: str | None = None
@@ -100,6 +106,17 @@ class ConfigSnapshot(BaseModel):
     git_dirty_at_submit: bool | None = None
     git_committed_dirty: bool | None = None
     error: str | None = None
+
+
+class EvalRun(BaseModel):
+    task: str | None = None
+    eval_set: str
+    run: str
+    seed: int | None = None
+    success_count: int | None = None
+    total_episodes: int | None = None
+    success_rate: float | None = None
+    path: str
 
 
 class JobDetails(BaseModel):
@@ -116,6 +133,7 @@ class JobDetails(BaseModel):
     progress: Progress
     gpu: GpuUsage | None = None
     config_snapshot: ConfigSnapshot | None = None
+    eval_runs: list[EvalRun] = Field(default_factory=list)
 
 
 def _metadata_fields(text: str | None) -> dict[str, str]:
@@ -254,7 +272,10 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
         )
 
     env = await load_cluster(cluster)
-    slurm_meta: dict[str, str] = {}
+    slurm_meta: dict[str, str] = await read_slurm_meta(env.ssh_alias, job_id)
+    meta_phase, meta_variant = phase_variant_from_meta(slurm_meta)
+    if meta_phase and meta_variant:
+        phase, variant = meta_phase, meta_variant
 
     # Slurm: if sacct didn't return Comment (slurmdbd doesn't archive it on
     # this cluster), check scontrol (works for jobs still in the
@@ -265,17 +286,6 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
             p, v = parse_comment_metadata(scontrol_comment)
             if p and v:
                 phase, variant = p, v
-    if not variant:
-        slurm_meta = await read_slurm_meta(env.ssh_alias, job_id)
-        p, v = phase_variant_from_meta(slurm_meta)
-        if p and v:
-            phase, variant = p, v
-    elif phase == "eval":
-        # Eval details may need checkpoint_path even when phase/variant were
-        # already recovered from the job name or sacct comment.
-        slurm_meta = await read_slurm_meta(env.ssh_alias, job_id)
-    elif phase in ("train", "resume"):
-        slurm_meta = await read_slurm_meta(env.ssh_alias, job_id)
     log_dir = env.vars["LOG_DIR"]
     stdout_path, stderr_path, log_job_name = await _resolve_slurm_log_paths(
         env.ssh_alias,
@@ -318,7 +328,7 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
         eval_dir=eval_dir,
         isaac_logs_glob=isaac_logs_glob,
     )
-    config_snapshot = await _slurm_config_snapshot(env.ssh_alias, slurm_meta)
+    config_snapshot = await _slurm_config_snapshot(env.ssh_alias, slurm_meta, cluster=cluster)
     job_wandb_project = (
         slurm_meta.get("wandb_project")
         or slurm_meta.get("submit_wandb_project")
@@ -358,6 +368,7 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
         if include_gpu
         else None
     )
+    eval_runs = await _slurm_eval_runs(env.ssh_alias, eval_dir) if phase == "eval" and eval_dir else []
 
     return JobDetails(
         cluster=cluster, job_id=job_id, job_name=job_name,
@@ -365,6 +376,7 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
         wandb_project=job_wandb_project,
         wandb_url=wandb_url, paths=paths, progress=progress, gpu=gpu,
         config_snapshot=config_snapshot,
+        eval_runs=eval_runs,
     )
 
 
@@ -413,6 +425,7 @@ async def _mlxp_details(
     )
     progress = await _mlxp_progress(job_name, variant, phase, metadata, project=job_wandb_project)
     gpu = await _mlxp_gpu_usage(pod_name, node, state) if include_gpu else None
+    eval_runs = await _mlxp_eval_runs(paths.eval_dir) if phase == "eval" and paths.eval_dir else []
 
     return JobDetails(
         cluster="mlxp", job_id=job_id, job_name=job_name,
@@ -420,6 +433,7 @@ async def _mlxp_details(
         wandb_project=job_wandb_project,
         wandb_url=wandb_url, paths=paths, progress=progress, gpu=gpu,
         config_snapshot=config_snapshot,
+        eval_runs=eval_runs,
     )
 
 
@@ -429,35 +443,56 @@ def _meta_bool(value: str | None) -> bool | None:
     return value.strip().lower() in {"1", "true", "yes", "y"}
 
 
-async def _slurm_config_snapshot(host: str, meta: dict[str, str]) -> ConfigSnapshot | None:
+async def _slurm_config_snapshot(
+    host: str,
+    meta: dict[str, str],
+    *,
+    cluster: str | None = None,
+) -> ConfigSnapshot | None:
     path = meta.get("config_snapshot_path")
     meta_path = meta.get("config_snapshot_meta_path")
     rel = meta.get("config_snapshot_rel")
+    extra_args_path = meta.get("submit_extra_args_path")
+    extra_args_rel = meta.get("submit_extra_args_rel")
     if not path and rel:
         path = f"$HOME/{rel}"
-    if not path:
+    if not path and not extra_args_path and not extra_args_rel:
         return None
 
     text: str | None = None
     error: str | None = None
-    if rel:
-        cmd = f"cat $HOME/{shlex.quote(rel)} 2>/dev/null"
-    else:
-        cat_path = path
-        if cat_path.startswith("$HOME/"):
-            cmd = f"cat $HOME/{shlex.quote(cat_path[len('$HOME/'):])} 2>/dev/null"
+    if path:
+        if rel:
+            cmd = f"cat $HOME/{shlex.quote(rel)} 2>/dev/null"
         else:
-            cmd = f"cat {shlex.quote(cat_path)} 2>/dev/null"
-    r = await ssh_run(host, cmd, timeout=10.0)
-    if r.returncode == 0:
-        text = r.stdout
-    else:
-        error = (r.stderr or "config snapshot not found").strip()
+            cat_path = path
+            if cat_path.startswith("$HOME/"):
+                cmd = f"cat $HOME/{shlex.quote(cat_path[len('$HOME/'):])} 2>/dev/null"
+            else:
+                cmd = f"cat {shlex.quote(cat_path)} 2>/dev/null"
+        r = await ssh_run(host, cmd, timeout=10.0)
+        if r.returncode == 0:
+            text = r.stdout
+        else:
+            error = (r.stderr or "config snapshot not found").strip()
+
+    extra_args_text = await _slurm_optional_text(host, extra_args_path, extra_args_rel)
+    sidecar_extra_args = _snapshot_extra_args(extra_args_text)
+    if text is None and meta.get("phase") == "train":
+        recovered = await _recover_slurm_training_snapshot(meta, sidecar_extra_args, cluster=cluster)
+        if recovered:
+            text = recovered
+            error = None
+    extra_args = _snapshot_extra_args(text) or sidecar_extra_args
+    if extra_args_path is None and extra_args_rel:
+        extra_args_path = f"$HOME/{extra_args_rel}"
 
     return ConfigSnapshot(
         path=path,
         meta_path=meta_path,
         text=text,
+        extra_args_path=extra_args_path,
+        extra_args=extra_args,
         wandb_project=meta.get("wandb_project")
         or meta.get("submit_wandb_project")
         or _snapshot_wandb_project(text),
@@ -469,6 +504,122 @@ async def _slurm_config_snapshot(host: str, meta: dict[str, str]) -> ConfigSnaps
         git_committed_dirty=_meta_bool(meta.get("submit_git_committed_dirty")),
         error=error,
     )
+
+
+async def _recover_slurm_training_snapshot(
+    meta: dict[str, str],
+    extra_args: list[str],
+    *,
+    cluster: str | None = None,
+) -> str | None:
+    variant_name = meta.get("variant")
+    job_name = meta.get("job_name")
+    if not variant_name or not job_name:
+        return None
+    try:
+        variant = await load_variant(variant_name)
+        model = resolve_training_model(variant)
+        train_num_gpus = _meta_int(meta, "train_num_gpus") or variant_int(variant, "TRAIN_NUM_GPUS", 2)
+        train_max_steps = _meta_int(meta, "train_max_steps") or variant_int(variant, "MAX_STEPS", 30000)
+        train_save_steps = _meta_int(meta, "train_save_steps") or variant_int(variant, "SAVE_STEPS", 1000)
+        train_action_horizon = _meta_int(meta, "train_action_horizon")
+        train_global_batch_size = _meta_int(meta, "train_global_batch_size")
+        if train_global_batch_size is None:
+            for key in ("TRAIN_GLOBAL_BATCH_SIZE", "GLOBAL_BATCH_SIZE"):
+                raw = (variant.vars.get(key) or "").strip()
+                if raw:
+                    try:
+                        train_global_batch_size = int(raw)
+                        break
+                    except ValueError:
+                        pass
+        git = _snapshot_git_from_meta(meta)
+        text = render_training_config_snapshot(
+            base_config=variant.raw,
+            variant=variant_name,
+            model=model.family,
+            job_name=job_name,
+            cluster=cluster or meta.get("cluster") or "",
+            partition=meta.get("partition") or meta.get("submit_partition"),
+            node=meta.get("node") or meta.get("submit_node"),
+            extra_args=extra_args,
+            train_num_gpus=train_num_gpus,
+            train_global_batch_size=train_global_batch_size,
+            train_max_steps=train_max_steps,
+            train_save_steps=train_save_steps,
+            train_action_horizon=train_action_horizon,
+            wandb_project=meta.get("wandb_project") or meta.get("submit_wandb_project"),
+            git=git,
+        )
+    except Exception:
+        return None
+    warning = (
+        "# Recovered by train-eval-web because the original submission snapshot file is missing.\n"
+        "# Source: Slurm sidecar metadata plus the current local base variant config.\n"
+        "# If the original extra-args sidecar was deleted too, per-job extra args may be absent below.\n\n"
+    )
+    return warning + text
+
+
+def _snapshot_git_from_meta(meta: dict[str, str]) -> SubmitGitInfo | None:
+    repo_path = meta.get("submit_git_repo_path") or meta.get("submit_train_repo_dir")
+    repo_label = meta.get("submit_git_repo_label") or meta.get("model_label")
+    commit = meta.get("submit_git_commit")
+    if not (repo_path or repo_label or commit):
+        return None
+    return SubmitGitInfo(
+        repo_path=repo_path or "",
+        repo_label=repo_label or "",
+        commit=commit or None,
+        branch=meta.get("submit_git_branch") or None,
+        dirty_before=bool(_meta_bool(meta.get("submit_git_dirty_at_submit"))),
+        committed_dirty=bool(_meta_bool(meta.get("submit_git_committed_dirty"))),
+        dirty_files=[],
+    )
+
+
+def _meta_int(meta: dict[str, str], key: str) -> int | None:
+    raw = meta.get(key)
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+async def _slurm_optional_text(host: str, path: str | None, rel: str | None = None) -> str | None:
+    if not path and not rel:
+        return None
+    if rel:
+        cmd = f"cat $HOME/{shlex.quote(rel)} 2>/dev/null"
+    elif path and path.startswith("$HOME/"):
+        cmd = f"cat $HOME/{shlex.quote(path[len('$HOME/'):])} 2>/dev/null"
+    elif path:
+        cmd = f"cat {shlex.quote(path)} 2>/dev/null"
+    else:
+        return None
+    r = await ssh_run(host, cmd, timeout=10.0)
+    return r.stdout if r.returncode == 0 else None
+
+
+def _snapshot_extra_args(text: str | None) -> list[str]:
+    if not text:
+        return []
+    match = re.search(r"^SUBMIT_EXTRA_ARGS=\(\n([\s\S]*?)^\)$", text, flags=re.MULTILINE)
+    if not match:
+        return []
+    args: list[str] = []
+    for raw_line in match.group(1).splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            parts = shlex.split(line, comments=False, posix=True)
+        except ValueError:
+            parts = [line.strip("'\"")]
+        args.extend(parts)
+    return args
 
 
 async def _mlxp_config_snapshot(meta: dict[str, str]) -> ConfigSnapshot | None:
@@ -524,6 +675,131 @@ async def _mlxp_config_snapshot(meta: dict[str, str]) -> ConfigSnapshot | None:
         git_committed_dirty=_meta_bool(meta.get("submit_git_committed_dirty")),
         error=error,
     )
+
+
+_EVAL_RUNS_SCRIPT = r'''
+import json
+import os
+import re
+from pathlib import Path
+
+
+def int_or_none(value):
+    try:
+        if value is None or value == "":
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def float_or_none(value):
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def seed_from_run_label(label):
+    m = re.search(r"seed([0-9]+)", label)
+    return int(m.group(1)) if m else None
+
+
+root = Path(os.environ["EVAL_DIR"])
+rows = []
+if root.is_dir():
+    for path in sorted(root.glob("**/results.json"), key=lambda p: str(p)):
+        rel = path.relative_to(root).parts
+        if len(rel) < 3:
+            continue
+        run_label = rel[-2]
+        if not run_label.startswith("run_"):
+            continue
+        eval_set = rel[-3]
+        task = "/".join(rel[:-3]) or None
+        try:
+            data = json.load(open(path))
+        except Exception:
+            continue
+        config = data.get("config") or {}
+        summary = data.get("summary") or {}
+        seed = int_or_none(config.get("seed"))
+        if seed is None:
+            seed = seed_from_run_label(run_label)
+        rows.append({
+            "task": task,
+            "eval_set": eval_set,
+            "run": run_label,
+            "seed": seed,
+            "success_count": int_or_none(summary.get("success_count")),
+            "total_episodes": int_or_none(summary.get("total_episodes") or summary.get("episode_count")),
+            "success_rate": float_or_none(summary.get("success_rate")),
+            "path": str(path),
+        })
+print(json.dumps(rows))
+'''
+
+
+async def _slurm_eval_runs(host: str, eval_dir: str) -> list[EvalRun]:
+    cmd = (
+        f"EVAL_DIR={shlex.quote(eval_dir)} "
+        "python3 - <<'PY'\n"
+        + _EVAL_RUNS_SCRIPT
+        + "\nPY"
+    )
+    try:
+        r = await ssh_run(host, cmd, timeout=20.0)
+    except Exception:
+        return []
+    if r.returncode != 0:
+        return []
+    try:
+        raw = json.loads(r.stdout or "[]")
+    except json.JSONDecodeError:
+        return []
+    return [EvalRun.model_validate(item) for item in raw]
+
+
+async def _mlxp_eval_runs(eval_dir: str) -> list[EvalRun]:
+    import asyncio
+    import shutil
+    from .mlxp_data_pod import ensure_listing_pod
+
+    if shutil.which("kubectl") is None:
+        return []
+    settings = get_settings()
+    try:
+        pod = await ensure_listing_pod()
+    except Exception:
+        return []
+    cmd = (
+        f"EVAL_DIR={shlex.quote(eval_dir)} "
+        "python3 - <<'PY'\n"
+        + _EVAL_RUNS_SCRIPT
+        + "\nPY"
+    )
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "kubectl", "exec", "-n", settings.namespace, pod, "--", "bash", "-lc", cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20.0)
+    except Exception:
+        if proc is not None and proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        return []
+    if proc.returncode != 0:
+        return []
+    try:
+        raw = json.loads(stdout.decode(errors="replace") or "[]")
+    except json.JSONDecodeError:
+        return []
+    return [EvalRun.model_validate(item) for item in raw]
 
 
 def _parse_gpu_usage(stdout: str, node: str | None) -> GpuUsage | None:

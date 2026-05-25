@@ -284,6 +284,7 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
         path: str | None = None
         if req.phase == "train":
             train_settings = submit.resolve_train_settings(req, variant, model.family)
+            train_action_horizon = submit.resolve_train_action_horizon(req, variant, model.family)
 
             suffix = submission_snapshot.snapshot_suffix(job_name)
             if req.cluster == "mlxp":
@@ -304,6 +305,7 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
                 train_global_batch_size=train_settings.global_batch_size,
                 train_max_steps=train_settings.max_steps,
                 train_save_steps=train_settings.save_steps,
+                train_action_horizon=train_action_horizon,
                 wandb_project=wandb_project(),
                 git=None,
             )
@@ -376,6 +378,7 @@ async def post_submit(req: submit.SubmitRequest):
                 global_batch_size=req.train_global_batch_size if req.phase == "train" else None,
                 max_steps=req.train_max_steps if req.phase == "train" else None,
                 save_steps=req.train_save_steps if req.phase == "train" else None,
+                action_horizon=req.train_action_horizon if req.phase == "train" else None,
                 node=req.node,
                 dataset_override=req.dataset_override,
                 extra_args=req.extra_args,
@@ -579,6 +582,17 @@ async def get_job_flags(cluster: str, job_id: str):
     except FileNotFoundError:
         raise HTTPException(404, f"variant {det.variant} not found")
     out = flags.flags_for(v, cluster, det.phase)
+    submitted_extra_args = det.config_snapshot.extra_args if det.config_snapshot else []
+    if submitted_extra_args:
+        idx = 0
+        while idx < len(submitted_extra_args):
+            arg = submitted_extra_args[idx]
+            if arg.startswith("--") and idx + 1 < len(submitted_extra_args) and not submitted_extra_args[idx + 1].startswith("--"):
+                out.append((arg, submitted_extra_args[idx + 1]))
+                idx += 2
+            else:
+                out.append((arg, ""))
+                idx += 1
     if cluster != "mlxp" and det.phase == "eval":
         env = await clusters.load_cluster(cluster)
         meta = await read_slurm_meta(env.ssh_alias, job_id)

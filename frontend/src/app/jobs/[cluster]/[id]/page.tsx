@@ -10,7 +10,7 @@ import {
 } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ArrowLeft, ExternalLink } from "lucide-react";
-import { api, logStreamUrl, type JobDetails } from "@/lib/api";
+import { api, logStreamUrl, type EvalRun, type JobDetails } from "@/lib/api";
 import { formatDuration, parseSlurmDuration } from "@/lib/duration";
 import { formatJobTimestamp } from "@/lib/job-time";
 import {
@@ -108,6 +108,13 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
   const [copyOpen, setCopyOpen] = useState(false);
 
   const cancelLabel = cluster === "mlxp" ? "kubectl delete job" : "scancel";
+
+  useEffect(() => {
+    document.title = details.data?.job_name ?? `${cluster}/${id}`;
+    return () => {
+      document.title = "train-eval-web";
+    };
+  }, [cluster, details.data?.job_name, id]);
 
   return (
     <div className="mx-auto max-w-7xl px-8 py-12">
@@ -293,6 +300,14 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
         error={detailsError}
       />
 
+      {isEval && (
+        <EvalRunsCard
+          d={details.data}
+          isLoading={details.isLoading}
+          error={detailsError}
+        />
+      )}
+
       <Card className="mt-6">
         <CardHeader className="flex flex-row items-center justify-between">
           <CardTitle>Logs</CardTitle>
@@ -331,7 +346,9 @@ function SubmissionSnapshotCard({
   const snapshot = d?.config_snapshot;
   const isTrain = isTrainJobPhase(d?.phase);
   const wandbProject = snapshot?.wandb_project ?? d?.wandb_project ?? null;
-  const extraArgs = snapshotExtraArgs(snapshot?.text);
+  const extraArgs = snapshot?.extra_args?.length
+    ? snapshot.extra_args.join(" ")
+    : snapshotExtraArgs(snapshot?.text);
 
   return (
     <Card className="mt-6">
@@ -358,6 +375,9 @@ function SubmissionSnapshotCard({
               )}
               {snapshot?.meta_path && (
                 <SnapshotRow label="metadata" value={snapshot.meta_path} />
+              )}
+              {snapshot?.extra_args_path && (
+                <SnapshotRow label="extra args file" value={snapshot.extra_args_path} />
               )}
               {wandbProject && (
                 <SnapshotRow label="wandb project" value={wandbProject} />
@@ -656,6 +676,96 @@ function PathsCard({
       </CardContent>
     </Card>
   );
+}
+
+function EvalRunsCard({
+  d,
+  isLoading = false,
+  error,
+}: {
+  d?: JobDetails;
+  isLoading?: boolean;
+  error?: Error | null;
+}) {
+  const rows = d?.eval_runs ?? [];
+  const hasTask = rows.some((row) => row.task);
+
+  return (
+    <Card className="mt-6">
+      <CardHeader>
+        <CardTitle>Eval Runs</CardTitle>
+      </CardHeader>
+      <CardContent>
+        {isLoading && <LoadingState label="Loading eval runs..." />}
+        {!isLoading && error && <ErrorState message={error.message} />}
+        {!isLoading && !error && !d && <EmptyState message="Eval runs unavailable." />}
+        {!isLoading && !error && d && rows.length === 0 && (
+          <EmptyState message="No per-run result files found yet." />
+        )}
+        {!isLoading && !error && rows.length > 0 && (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="border-b border-slate-200 text-left text-xs uppercase tracking-wide text-slate-500 dark:border-slate-800">
+                <tr>
+                  {hasTask && <Th>Task</Th>}
+                  <Th>Set</Th>
+                  <Th>Run</Th>
+                  <Th>Seed</Th>
+                  <Th>Success</Th>
+                  <Th>Result file</Th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row) => (
+                  <EvalRunRow key={row.path} row={row} showTask={hasTask} />
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function EvalRunRow({ row, showTask }: { row: EvalRun; showTask: boolean }) {
+  return (
+    <tr className="border-b border-slate-100 last:border-0 dark:border-slate-900">
+      {showTask && (
+        <td className="py-2 pr-4 font-mono text-xs">
+          {row.task ?? <span className="text-slate-400">—</span>}
+        </td>
+      )}
+      <td className="py-2 pr-4 font-mono text-xs">{row.eval_set}</td>
+      <td className="py-2 pr-4 font-mono text-xs">{row.run}</td>
+      <td className="py-2 pr-4 font-mono text-xs">
+        {row.seed ?? <span className="text-slate-400">—</span>}
+      </td>
+      <td className="py-2 pr-4 font-mono text-xs">
+        {formatEvalRunSuccess(row)}
+      </td>
+      <td className="py-2 pr-4">
+        <div className="flex items-center gap-1">
+          <ImmediateTooltip content={row.path} className="max-w-[420px]">
+            <span className="truncate font-mono text-xs">{row.path}</span>
+          </ImmediateTooltip>
+          <CopyButton value={row.path} title="Copy result file" />
+        </div>
+      </td>
+    </tr>
+  );
+}
+
+function formatEvalRunSuccess(row: EvalRun) {
+  const rate = row.success_rate == null ? null : `${(row.success_rate * 100).toFixed(2)}%`;
+  if (row.success_count != null && row.total_episodes != null) {
+    return `${row.success_count}/${row.total_episodes}${rate ? ` (${rate})` : ""}`;
+  }
+  return rate ?? <span className="text-slate-400">—</span>;
+}
+
+function Th({ children }: { children: React.ReactNode }) {
+  return <th className="py-2 pr-4 font-medium whitespace-nowrap">{children}</th>;
 }
 
 function LogStream({
