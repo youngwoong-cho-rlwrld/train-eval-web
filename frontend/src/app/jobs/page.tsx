@@ -334,14 +334,15 @@ function JobTable({
             <Th>Phase</Th>
             <Th>State</Th>
             {showProgress && <Th>Progress</Th>}
-            <Th>Name</Th>
+            {showProgress && <Th>Experiment</Th>}
+            <Th>Job name</Th>
             {showActions && <Th>Actions</Th>}
             <Th>Cluster</Th>
             <Th>Partition</Th>
             <Th>Node</Th>
             {showProgress && <Th>Server remaining</Th>}
             <Th>Started</Th>
-            <Th>Ended</Th>
+            {!showProgress && <Th>Ended</Th>}
             <Th>Elapsed</Th>
           </tr>
         </thead>
@@ -362,6 +363,20 @@ function JobTable({
                 {showProgress && (
                   <Td className="min-w-[300px]">
                     <ActiveProgressCell job={j} />
+                  </Td>
+                )}
+                {showProgress && (
+                  <Td className="font-mono text-xs">
+                    {j.variant ? (
+                      <div className="flex items-center gap-1">
+                        <ImmediateTooltip content={j.variant} className="max-w-[220px]">
+                          <span className="truncate">{j.variant}</span>
+                        </ImmediateTooltip>
+                        <CopyButton value={j.variant} title="Copy experiment" />
+                      </div>
+                    ) : (
+                      <span className="text-slate-400">—</span>
+                    )}
                   </Td>
                 )}
                 <td className="py-2 pr-4 font-mono text-xs">
@@ -402,7 +417,9 @@ function JobTable({
                   </Td>
                 )}
                 <Td className="font-mono text-xs"><Timestamp iso={j.start} cluster={j.cluster} /></Td>
-                <Td className="font-mono text-xs"><Timestamp iso={j.end} cluster={j.cluster} /></Td>
+                {!showProgress && (
+                  <Td className="font-mono text-xs"><Timestamp iso={j.end} cluster={j.cluster} /></Td>
+                )}
                 <Td className="font-mono text-xs">{j.elapsed}</Td>
               </tr>
             );
