@@ -71,10 +71,10 @@ export function ResumeJobButton({
       </Button>
 
       <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent>
+        <DialogContent className="max-w-[min(92vw,32rem)]">
           <DialogHeader>
             <DialogTitle>Resume timed-out job?</DialogTitle>
-            <DialogDescription>
+            <DialogDescription className="[overflow-wrap:anywhere]">
               This submits a new {phaseLabel} job on{" "}
               <span className="font-mono">{cluster}</span> from timed-out job{" "}
               <span className="font-mono">{jobId}</span>
@@ -89,9 +89,11 @@ export function ResumeJobButton({
 
           <div className="space-y-2 text-sm text-slate-600 dark:text-slate-400">
             {jobName && (
-              <p>
-                Original job name:{" "}
-                <span className="font-mono text-xs">{jobName}</span>
+              <p className="grid gap-1">
+                <span>Original job name:</span>
+                <span className="min-w-0 break-all font-mono text-xs text-slate-700 dark:text-slate-300">
+                  {jobName}
+                </span>
               </p>
             )}
             {normalizedPhase === "train" ? (

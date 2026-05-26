@@ -27,10 +27,18 @@ TRAIN_REPO_DIR="${SUBMIT_TRAIN_REPO_DIR:-${TRAIN_REPO_DIR:-$GROOT_N16_DIR}}"
 
 GPU_INSTANCE="$(detect_gpu_instance)"
 EXP_NAME="${SLURM_JOB_NAME:-${VARIANT}_eval_${GPU_INSTANCE}_$(date +%Y%m%d%H%M%S)}"
+OUTPUT_NAMESPACE="${SUBMIT_OUTPUT_NAMESPACE:-}"
 
 CKPT_DIR="$EXP_DIR/checkpoints"
-EVAL_DIR="$EXP_DIR/eval_results"
-JOB_LOG_DIR="$EXP_DIR/logs/${SLURM_JOB_ID:-$EXP_NAME}"
+if [ -n "${SUBMIT_EVAL_DIR:-}" ]; then
+    EVAL_DIR="$SUBMIT_EVAL_DIR"
+elif [ -n "$OUTPUT_NAMESPACE" ]; then
+    EVAL_DIR="$EXP_DIR/eval_results/$OUTPUT_NAMESPACE"
+else
+    EVAL_DIR="$EXP_DIR/eval_results"
+fi
+RESULTS_PATH="${SUBMIT_RESULTS_PATH:-$EVAL_DIR/results.json}"
+JOB_LOG_DIR="$EXP_DIR/logs/${OUTPUT_NAMESPACE:-${SLURM_JOB_ID:-$EXP_NAME}}"
 mkdir -p "$JOB_LOG_DIR" "$LOG_DIR" "$EVAL_DIR"
 LOG_FILE="$JOB_LOG_DIR/eval.log"
 
@@ -38,6 +46,8 @@ log "========================================================"
 log "$EXP_NAME"
 log "  cluster=$CLUSTER  partition=${SUBMIT_PARTITION:-$PARTITION}  gpu=$GPU_INSTANCE  model=${MODEL_ID:-n1.6}"
 log "  train repo=$TRAIN_REPO_DIR"
+log "  run namespace=${OUTPUT_NAMESPACE:-legacy}"
+log "  eval results=$EVAL_DIR"
 log "========================================================"
 
 if [ -z "${EVAL_CHECKPOINT:-}" ]; then
@@ -108,7 +118,7 @@ if [ "$EVAL_OVERWRITE_RESULTS" != "0" ] && [ "$EVAL_OVERWRITE_RESULTS" != "1" ];
 fi
 if [ "$EVAL_OVERWRITE_RESULTS" = "1" ]; then
     log "Overwrite existing evaluation results: enabled"
-    rm -f "$EXP_DIR/results.json"
+    rm -f "$RESULTS_PATH"
 fi
 
 EVAL_BASE_SEED="${EVAL_BASE_SEED:-42}"
@@ -538,7 +548,7 @@ done
 if ! wait_for_all; then
     FAILED=1
 fi
-finish_eval_launch_phase "$EVAL_LAUNCHED" "$FAILED" "$EXP_DIR/results.json"
+finish_eval_launch_phase "$EVAL_LAUNCHED" "$FAILED" "$RESULTS_PATH"
 
 ###############################################################################
 # Phase 3: Aggregate
@@ -547,7 +557,7 @@ finish_eval_launch_phase "$EVAL_LAUNCHED" "$FAILED" "$EXP_DIR/results.json"
 log "Aggregating results..."
 
 # Dump TASKS as JSON so Python can iterate without bash quoting issues.
-TASKS_JSON="$EXP_DIR/.eval_tasks.json"
+TASKS_JSON="$EVAL_DIR/.eval_tasks.json"
 python3 - "$TASKS_JSON" "${TASKS[@]}" <<'PYDUMP'
 import json, sys
 out_path = sys.argv[1]
@@ -599,6 +609,7 @@ def aggregate_task(task_eval_dir):
 
 agg = {
     'experiment': '${EXP_NAME}',
+    'output_namespace': '${OUTPUT_NAMESPACE}',
     'cluster': '${CLUSTER}',
     'gpu': '${GPU_INSTANCE}',
     'model_version': '${MODEL_ID:-n1.6}',
@@ -634,10 +645,11 @@ else:
     agg['task_name'] = tasks[0]['task_name']
     agg['eval_sets'] = aggregate_task(base)
 
-out = Path('${EXP_DIR}') / 'results.json'
+out = Path('${RESULTS_PATH}')
+out.parent.mkdir(parents=True, exist_ok=True)
 with open(out, 'w') as f:
     json.dump(agg, f, indent=2)
 print(f'Saved to {out}')
 PYEOF
 
-log "DONE  $EXP_DIR/results.json"
+log "DONE  $RESULTS_PATH"

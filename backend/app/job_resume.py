@@ -59,6 +59,7 @@ async def resume_timed_out_job(cluster: str, job_id: str) -> submit.SubmitRespon
                 train_save_steps=int_meta("train_save_steps"),
                 train_action_horizon=int_meta("train_action_horizon"),
                 job_name=job_name,
+                output_namespace=(meta.get("output_namespace") or "").strip() or None,
                 resume=True,
                 resume_of=job_id,
             )
@@ -109,6 +110,7 @@ async def resume_timed_out_job(cluster: str, job_id: str) -> submit.SubmitRespon
             checkpoint_path=checkpoint,
             seed_eval_results_from=seed_eval_dirs,
             job_name=job_name,
+            output_namespace=(meta.get("output_namespace") or "").strip() or None,
             resume_of=job_id,
         )
     )

@@ -185,7 +185,10 @@ function ResultSection({ title, variants }: { title: string; variants: ResultVar
       </div>
       <div className="space-y-5">
         {variants.map((variant) => (
-          <ResultCard key={`${variant.cluster}-${variant.variant}`} variant={variant} />
+          <ResultCard
+            key={`${variant.cluster}-${variant.variant}-${variant.experiment ?? variant.source ?? ""}`}
+            variant={variant}
+          />
         ))}
       </div>
     </section>
@@ -203,7 +206,7 @@ function ResultCard({ variant }: { variant: ResultVariant }) {
         <div className="min-w-0">
           <CardTitle className="truncate font-mono text-base">{variant.variant}</CardTitle>
           <CardDescription className="mt-1">
-            {variant.note || variant.experiment || "eval results"}
+            {[variant.note, variant.experiment].filter(Boolean).join(" / ") || "eval results"}
           </CardDescription>
         </div>
         <div className="flex shrink-0 flex-wrap justify-end gap-2">

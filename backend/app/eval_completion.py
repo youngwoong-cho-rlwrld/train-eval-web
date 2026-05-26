@@ -70,10 +70,13 @@ async def eval_job_completed_from_log_dir(
 
     log_dir_q = shlex.quote(log_dir)
     job_id_q = shlex.quote(job_id)
-    eval_dirs = " ".join(
-        remote_path_expr(f"$HOME/{rel}/eval_results")
-        for rel in exp_dir_rel_candidates(variant)
-    )
+    if overrides and overrides.get("eval_dir"):
+        eval_dirs = remote_path_expr(overrides["eval_dir"])
+    else:
+        eval_dirs = " ".join(
+            remote_path_expr(f"$HOME/{rel}/eval_results")
+            for rel in exp_dir_rel_candidates(variant)
+        )
     cmd = (
         f"stdout_path=$(ls -1 {log_dir_q}/*_{job_id_q}.out 2>/dev/null | head -1); "
         "if [ -z \"$stdout_path\" ]; then echo '0 0 0 0'; exit 0; fi; "

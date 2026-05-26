@@ -27,9 +27,10 @@ append_submit_extra_train_args
 GPU_INSTANCE="$(detect_gpu_instance)"
 # EXP_NAME mirrors the slurm job name when launched via submit; fallback for ad-hoc runs.
 EXP_NAME="${SLURM_JOB_NAME:-${VARIANT}_${GPU_INSTANCE}_$(date +%Y%m%d%H%M%S)}"
+OUTPUT_NAMESPACE="${SUBMIT_OUTPUT_NAMESPACE:-$EXP_NAME}"
 
 CKPT_DIR="$EXP_DIR/checkpoints"
-RUN_CKPT_DIR="$CKPT_DIR/$EXP_NAME"
+RUN_CKPT_DIR="$CKPT_DIR/$OUTPUT_NAMESPACE"
 mkdir -p "$EXP_DIR/logs" "$LOG_DIR" "$CKPT_DIR"
 LOG_FILE="$EXP_DIR/logs/train.log"
 
@@ -38,6 +39,7 @@ log "$EXP_NAME"
 log "  cluster=$CLUSTER  partition=${SUBMIT_PARTITION:-$PARTITION}  gpu=$GPU_INSTANCE  model=${MODEL_ID:-n1.6}"
 log "  train repo=$TRAIN_REPO_DIR"
 log "  variant note: $TRAIN_NOTE"
+log "  run namespace=$OUTPUT_NAMESPACE"
 log "  output=$RUN_CKPT_DIR"
 log "============================================="
 
@@ -113,7 +115,7 @@ uv run torchrun --nproc_per_node="$TRAIN_NUM_GPUS" --master-port "$MASTER_PORT" 
     --save-steps "$SAVE_STEPS" \
     --save-total-limit 5 \
     --dataloader-num-workers 8 \
-    --experiment-name "$EXP_NAME" \
+    --experiment-name "$OUTPUT_NAMESPACE" \
     --use-wandb \
     --wandb-project "$WANDB_PROJECT" \
     --color-jitter-params brightness 0.2 contrast 0.2 saturation 0.2 hue 0.1 \

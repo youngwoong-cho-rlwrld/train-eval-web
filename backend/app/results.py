@@ -385,16 +385,11 @@ def instruction_for(short, configured_tasks, fallback=None):
     return fallback
 
 
-def build_variant(meta):
+def build_variant_from_root(meta, exp_dir, eval_root, top_path):
     variant = meta["variant"]
-    exp_dir = experiments_root / variant
-    if not exp_dir.exists():
-        return None
-
     configured_tasks = meta.get("tasks") or []
     configured_eval_sets = meta.get("eval_sets") or []
     expected_runs = int_or_none(meta.get("n_runs"))
-    top_path = exp_dir / "results.json"
     top = None
     aggregate_tasks = []
     if top_path.exists():
@@ -414,7 +409,7 @@ def build_variant(meta):
         "n_runs": expected_runs,
         "num_envs_per_gpu": None,
         "total_num_envs": None,
-        "source": str(top_path) if top_path.exists() else str(exp_dir / "eval_results"),
+        "source": str(top_path) if top_path.exists() else str(eval_root),
         "tasks": [],
     }
     if top:
@@ -460,7 +455,6 @@ def build_variant(meta):
                     "eval_sets": cells,
                 })
 
-    eval_root = exp_dir / "eval_results"
     if not eval_root.exists():
         if aggregate_tasks:
             result["tasks"] = aggregate_tasks
@@ -501,10 +495,39 @@ def build_variant(meta):
     return None
 
 
+def build_variant(meta):
+    variant = meta["variant"]
+    exp_dir = experiments_root / variant
+    if not exp_dir.exists():
+        return []
+
+    eval_root = exp_dir / "eval_results"
+    rows = []
+
+    # New layout: one immutable output namespace per eval submission:
+    #   <variant>/eval_results/<output_namespace>/results.json
+    if eval_root.exists():
+        for run_root in sorted(p for p in eval_root.iterdir() if p.is_dir()):
+            top_path = run_root / "results.json"
+            if not top_path.exists():
+                continue
+            item = build_variant_from_root(meta, exp_dir, run_root, top_path)
+            if item:
+                rows.append(item)
+
+    # Legacy layout: all eval runs directly under <variant>/eval_results and
+    # aggregate at <variant>/results.json.
+    legacy_item = build_variant_from_root(meta, exp_dir, eval_root, exp_dir / "results.json")
+    if legacy_item:
+        legacy_source = legacy_item.get("source") or ""
+        duplicate_new_source = "/eval_results/" in legacy_source and legacy_source.endswith("/results.json")
+        if not duplicate_new_source:
+            rows.append(legacy_item)
+    return rows
+
+
 rows = []
 for meta in payload:
-    item = build_variant(meta)
-    if item:
-        rows.append(item)
+    rows.extend(build_variant(meta))
 print(json.dumps(rows))
 '''

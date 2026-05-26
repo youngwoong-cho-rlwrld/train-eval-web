@@ -34,8 +34,10 @@ fi
 GPU_INSTANCE="$(detect_gpu_instance)"
 # EXP_NAME mirrors the slurm job name when launched via submit; fallback for ad-hoc runs.
 EXP_NAME="${SLURM_JOB_NAME:-${VARIANT}_${GPU_INSTANCE}_$(date +%Y%m%d%H%M%S)}"
+OUTPUT_NAMESPACE="${SUBMIT_OUTPUT_NAMESPACE:-$EXP_NAME}"
 
-CKPT_DIR="$EXP_DIR/checkpoints"
+CKPT_ROOT="$EXP_DIR/checkpoints"
+CKPT_DIR="$CKPT_ROOT/$OUTPUT_NAMESPACE"
 mkdir -p "$EXP_DIR/logs" "$LOG_DIR" "$CKPT_DIR"
 LOG_FILE="$EXP_DIR/logs/train.log"
 
@@ -93,6 +95,7 @@ else
     fi
 fi
 log "Data config YAML: $DATA_CONFIG_YAML"
+log "Run namespace:  $OUTPUT_NAMESPACE"
 log "Output:         $CKPT_DIR"
 log "Max steps:      $MAX_STEPS"
 log "Save steps:     $SAVE_STEPS"

@@ -18,6 +18,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from .clusters import load_cluster
+from .output_namespace import make_output_namespace, validate_output_namespace
 from .paths import CLUSTER_STAGING_REL, CONFIGS_DIR, LIB_DIR
 from .ssh import rsync_to, ssh_run
 from .submission_snapshot import (
@@ -84,6 +85,9 @@ class SubmitRequest(BaseModel):
     # Internal eval resume: remote eval_results dir from the timed-out job.
     # Seed the staged eval_results before sbatch so completed runs are skipped.
     seed_eval_results_from: str | list[str] | None = None
+    # Internal resume/output control. New user submissions leave this unset;
+    # the submitter generates one immutable namespace for checkpoints/results.
+    output_namespace: str | None = None
     # Optional override for the auto-generated job_name. Must match
     # `{train|eval}_<anything>_<YYYYMMDD>_<HHMMSS>` so the parser
     # keeps working. None → server builds the default.
@@ -272,8 +276,26 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     # Unified shape across slurm + MLXP. The cluster/partition are shown in
     # table columns; the job name carries phase, variant, and timestamp.
     job_name = resolve_job_name(req.job_name, req.phase, req.variant)
+    output_namespace = (
+        validate_output_namespace(req.output_namespace)
+        if req.output_namespace
+        else (None if req.resume else make_output_namespace(job_name))
+    )
     host = cluster.ssh_alias
     submitted_wandb_project = wandb_project()
+    exp_dir_remote = f"$HOME/{CLUSTER_STAGING_REL}/experiments/{req.variant}"
+    checkpoint_dir = (
+        f"{exp_dir_remote}/checkpoints/{output_namespace}"
+        if req.phase == "train" and output_namespace
+        else None
+    )
+    eval_dir = (
+        f"{exp_dir_remote}/eval_results/{output_namespace}"
+        if req.phase == "eval" and output_namespace
+        else (f"{exp_dir_remote}/eval_results" if req.phase == "eval" else None)
+    )
+    results_path = f"{eval_dir}/results.json" if eval_dir else None
+    job_log_dir = f"{exp_dir_remote}/logs/{output_namespace}" if output_namespace else ""
 
     submit_git = None
     snapshot_rel: str | None = None
@@ -405,7 +427,11 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         await _rsync_text(host, submit_extra_args_text, submit_extra_args_rel)
 
     if req.phase == "eval" and req.seed_eval_results_from:
-        dst_rel = f"{CLUSTER_STAGING_REL}/experiments/{req.variant}/eval_results"
+        dst_rel = (
+            f"{CLUSTER_STAGING_REL}/experiments/{req.variant}/eval_results/{output_namespace}"
+            if output_namespace
+            else f"{CLUSTER_STAGING_REL}/experiments/{req.variant}/eval_results"
+        )
         seed_sources = (
             [req.seed_eval_results_from]
             if isinstance(req.seed_eval_results_from, str)
@@ -441,6 +467,8 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         f"model_id={model.id};submit_train_repo_dir={training_repo};"
         f"wandb_project={submitted_wandb_project}"
     )
+    if output_namespace:
+        comment += f";output_namespace={output_namespace}"
     if req.phase == "train":
         comment += (
             f";train_num_gpus={train_settings.num_gpus}"
@@ -453,6 +481,8 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             comment += f";train_global_batch_size={req.train_global_batch_size}"
         if snapshot_path:
             comment += f";config_snapshot_path={snapshot_path}"
+        if checkpoint_dir:
+            comment += f";checkpoint_dir={checkpoint_dir}"
         if submit_git:
             comment += (
                 f";submit_git_repo_path={submit_git.repo_path}"
@@ -462,6 +492,13 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
                 comment += f";submit_git_branch={submit_git.branch}"
         if submit_git and submit_git.commit:
             comment += f";submit_git_commit={submit_git.commit}"
+    else:
+        if eval_dir:
+            comment += f";eval_dir={eval_dir}"
+        if results_path:
+            comment += f";results_path={results_path}"
+        if eval_checkpoint:
+            comment += f";checkpoint_path={eval_checkpoint}"
 
     sbatch_parts = [
         "/opt/slurm/bin/sbatch",
@@ -477,10 +514,14 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         f"REPO_ROOT={repo_root_remote},RESUME_EXPECTED={resume_expected},"
         f"SUBMIT_PARTITION={shlex.quote(partition)},"
         f"SUBMIT_TRAIN_REPO_DIR={shlex.quote(training_repo)},"
-        f"SUBMIT_WANDB_PROJECT={shlex.quote(submitted_wandb_project)},"
+        f"SUBMIT_WANDB_PROJECT={shlex.quote(submitted_wandb_project)}"
+        + (
+            f",SUBMIT_OUTPUT_NAMESPACE={shlex.quote(output_namespace)}"
+            if output_namespace else ""
+        )
         # Pin wandb run id to the slurm display name so the URL is stable
         # and matches MLXP's run-id format.
-        f"WANDB_RUN_ID={shlex.quote(job_name)}"
+        + f",WANDB_RUN_ID={shlex.quote(job_name)}"
         + (
             f",SUBMIT_TRAIN_NUM_GPUS={train_settings.num_gpus},"
             f"SUBMIT_TRAIN_MAX_STEPS={train_settings.max_steps},"
@@ -556,6 +597,14 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         f"wandb_project={submitted_wandb_project}\n"
         f"job_name={job_name}\n"
         + (
+            f"output_namespace={output_namespace}\n"
+            if output_namespace else ""
+        )
+        + (
+            f"job_log_dir={job_log_dir}\n"
+            if job_log_dir else ""
+        )
+        + (
             f"resume_of={req.resume_of.strip()}\n"
             if req.resume_of and req.resume_of.strip()
             else ""
@@ -571,6 +620,11 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             f"train_max_steps={train_settings.max_steps}\n"
             f"train_save_steps={train_settings.save_steps}\n"
             if req.phase == "train"
+            else ""
+        )
+        + (
+            f"checkpoint_dir={checkpoint_dir}\n"
+            if req.phase == "train" and checkpoint_dir
             else ""
         )
         + (
@@ -635,6 +689,12 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         + (
             f"checkpoint_path={eval_checkpoint}\n"
             if req.phase == "eval" and eval_checkpoint
+            else ""
+        )
+        + (
+            f"eval_dir={eval_dir}\n"
+            f"results_path={results_path}\n"
+            if req.phase == "eval" and eval_dir and results_path
             else ""
         )
     )

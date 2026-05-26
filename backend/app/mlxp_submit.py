@@ -31,6 +31,7 @@ from .mlxp_config import (
     get_settings,
     labels,
 )
+from .output_namespace import make_output_namespace, validate_output_namespace
 from .paths import EXPERIMENTS_DIR, LIB_DIR
 from .submission_snapshot import (
     metadata_json,
@@ -107,6 +108,7 @@ class MlxpSubmitRequest(BaseModel):
     # Optional override for the auto-generated display job_name. Validated
     # against the unified regex in submit.resolve_job_name.
     job_name: str | None = None
+    output_namespace: str | None = None
     commit_dirty_changes: bool = False
 
 
@@ -170,6 +172,9 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
     from .submit import resolve_job_name
     job_id = "m" + uuid.uuid4().hex[:5]
     job_name = resolve_job_name(req.job_name, req.phase, req.variant)
+    req.output_namespace = validate_output_namespace(
+        req.output_namespace or make_output_namespace(job_name)
+    )
     repo_path = mlxp_training_repo_path(model)
     submit_git = await prepare_mlxp_training_git(
         repo_path=repo_path,
@@ -248,7 +253,7 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
     train_save_steps = req.save_steps or variant_int(variant, "SAVE_STEPS", 1000)
     per_gpu_batch = int(variant.vars.get("TRAIN_BATCH_SIZE", "64"))
     train_global_batch_size = req.global_batch_size or per_gpu_batch * train_num_gpus
-    suffix = f"{snapshot_suffix(job_name)}_{job_id}"
+    suffix = req.output_namespace or f"{snapshot_suffix(job_name)}_{job_id}"
     exp_dir = f"{settings.experiments_dir}/{variant.name}"
     path = f"{exp_dir}/config_{suffix}.sh"
     meta_path = f"{exp_dir}/config_{suffix}.meta.json"
@@ -287,9 +292,12 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
         wandb_project=_wandb_project(),
         git=submit_git,
     )
+    meta["output_namespace"] = req.output_namespace
+    meta["checkpoint_dir"] = f"{exp_dir}/checkpoints/{req.output_namespace}"
     return {
         "job_id": job_id,
         "job_name": job_name,
+        "output_namespace": req.output_namespace,
         "phase": "train",
         "path": path,
         "meta_path": meta_path,
@@ -310,7 +318,7 @@ def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str
     from .submit import _normalize_eval_sets
 
     eval_sets = _normalize_eval_sets(req.eval_sets)
-    suffix = f"{snapshot_suffix(job_name)}_{job_id}"
+    suffix = req.output_namespace or f"{snapshot_suffix(job_name)}_{job_id}"
     exp_dir = f"{settings.experiments_dir}/{variant.name}"
     path = f"{exp_dir}/config_{suffix}.sh"
     meta_path = f"{exp_dir}/config_{suffix}.meta.json"
@@ -344,6 +352,10 @@ def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str
         wandb_project=_wandb_project(),
         git=submit_git,
     )
+    meta["output_namespace"] = req.output_namespace
+    meta["eval_dir"] = f"{exp_dir}/eval_results/{req.output_namespace}"
+    meta["results_path"] = f"{exp_dir}/eval_results/{req.output_namespace}/results.json"
+    meta["job_log_dir"] = f"{exp_dir}/logs/{req.output_namespace}"
     meta["eval"] = {
         "checkpoint_path": checkpoint_path,
         "num_envs_per_gpu": req.eval_num_envs_per_gpu,
@@ -355,6 +367,7 @@ def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str
     return {
         "job_id": job_id,
         "job_name": job_name,
+        "output_namespace": req.output_namespace,
         "phase": "eval",
         "path": path,
         "meta_path": meta_path,
@@ -568,7 +581,8 @@ def _render_body_script(
     train_extra = " ".join(variant.arrays.get("TRAIN_EXTRA_ARGS") or [])
     user_extra = " ".join(req.extra_args)
 
-    ckpt_dir = f"{settings.experiments_dir}/{variant.name}/checkpoints/{job_name}"
+    output_namespace = req.output_namespace or _path_slug(job_name)
+    ckpt_dir = f"{settings.experiments_dir}/{variant.name}/checkpoints/{output_namespace}"
     run_log_dir = f"{ckpt_dir}/logs"
     wandb_project = shlex.quote(_wandb_project())
 
@@ -622,6 +636,7 @@ mkdir -p {ckpt_dir}
 RUN_LOG_DIR={shlex.quote(run_log_dir)}
 mkdir -p "$RUN_LOG_DIR"
 exec > >(tee -a "$RUN_LOG_DIR/training.log") 2>&1
+echo "[mlxp] run namespace: {output_namespace}"
 
 # Render data_config.yaml from variant config.
 cat > /tmp/data_config.yaml <<'YAML_EOF'
@@ -724,6 +739,8 @@ def _render_body_n16(*, variant, req: MlxpSubmitRequest, job_name: str,
     wandb_project = shlex.quote(_wandb_project())
     uv_userbase = shlex.quote(f"{settings.ddn_user_home}/.local")
     uv_bin_dir = shlex.quote(f"{settings.ddn_user_home}/.local/bin")
+    output_namespace = ckpt_dir.rstrip("/").rsplit("/", 1)[-1]
+    output_parent = ckpt_dir.rsplit("/", 1)[0]
     action_horizon_arg = (
         f" --action-horizon {req.action_horizon}"
         if req.action_horizon is not None
@@ -774,14 +791,14 @@ uv run $UV_RUN_ARGS torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/la
     --embodiment-tag NEW_EMBODIMENT \\
     --modality-config-path /tmp/modality_config.py \\
     --num-gpus {req.num_gpus} \\
-    --output-dir {ckpt_dir} \\
+    --output-dir {output_parent} \\
     --global-batch-size {global_batch} \\
     --learning-rate 1e-4 \\
     --max-steps {max_steps} \\
     --save-steps {save_steps} \\
     --save-total-limit 5 \\
     --dataloader-num-workers 8 \\
-    --experiment-name "{job_name}" \\
+    --experiment-name "{output_namespace}" \\
     --use-wandb \\
     --wandb-project {wandb_project} \\
     $RESUME_FLAG{action_horizon_arg} {train_extra} {user_extra}
@@ -810,6 +827,9 @@ def _render_eval_body_script(
     isaac_runner_text = _ensure_trailing_newline(isaac_runner_path.read_text())
 
     exp_dir = f"{settings.experiments_dir}/{variant.name}"
+    output_namespace = str(snapshot.get("output_namespace") or _path_slug(job_name))
+    eval_dir = f"{exp_dir}/eval_results/{output_namespace}"
+    results_path = f"{eval_dir}/results.json"
     runtime_root = f"{settings.experiments_dir}/.runtime/{snapshot['job_id']}"
     config_path = snapshot["path"]
     modality_block = ""
@@ -848,6 +868,9 @@ cat > {shlex.quote(modality_target)} <<'TEW_MODALITY_EOF'
         f"export SLURM_JOB_NAME={shlex.quote(job_name)}",
         f"export SUBMIT_PARTITION={shlex.quote(req.node or settings.default_node)}",
         f"export SUBMIT_EXP_DIR={shlex.quote(exp_dir)}",
+        f"export SUBMIT_OUTPUT_NAMESPACE={shlex.quote(output_namespace)}",
+        f"export SUBMIT_EVAL_DIR={shlex.quote(eval_dir)}",
+        f"export SUBMIT_RESULTS_PATH={shlex.quote(results_path)}",
         f"export SUBMIT_CONFIG_FILE={shlex.quote(config_path)}",
         f"export SUBMIT_DATA_DIR={shlex.quote(settings.datasets_dir)}",
         f"export EVAL_CHECKPOINT={shlex.quote((req.checkpoint_path or '').strip())}",
@@ -882,7 +905,7 @@ fi
 TRAIN_REPO_WORKTREE="$PWD"
 
 {_snapshot_preamble(snapshot)}
-mkdir -p {shlex.quote(runtime_root)}/clusters {shlex.quote(runtime_root)}/lib {shlex.quote(exp_dir)}/logs {shlex.quote(exp_dir)}/eval_results
+mkdir -p {shlex.quote(runtime_root)}/clusters {shlex.quote(runtime_root)}/lib {shlex.quote(exp_dir)}/logs {shlex.quote(eval_dir)}
 cat > {shlex.quote(runtime_root)}/clusters/mlxp.env <<'TEW_CLUSTER_ENV_EOF'
 {cluster_env}TEW_CLUSTER_ENV_EOF
 cat > {shlex.quote(runtime_root)}/lib/_common.sh <<'TEW_COMMON_EOF'
@@ -902,9 +925,12 @@ bash {shlex.quote(runtime_root)}/lib/{model.eval_body_script}
 
 
 def _job_comment(req: MlxpSubmitRequest, variant, snapshot: dict) -> str:
+    settings = get_settings()
+    output_namespace = str(snapshot.get("output_namespace") or req.output_namespace or _path_slug(snapshot.get("job_name") or "job"))
+    exp_dir = f"{settings.experiments_dir}/{variant.name}"
     comment = (
         f"phase={req.phase};variant={req.variant};model_id={variant.vars.get('MODEL_ID') or variant.vars.get('MODEL_VERSION') or ''};"
-        f"wandb_project={_wandb_project()}"
+        f"wandb_project={_wandb_project()};output_namespace={output_namespace}"
     )
     if req.phase == "train":
         max_steps = req.max_steps or variant_int(variant, "MAX_STEPS", 30000)
@@ -917,6 +943,7 @@ def _job_comment(req: MlxpSubmitRequest, variant, snapshot: dict) -> str:
             comment += f";train_global_batch_size={req.global_batch_size}"
         if req.action_horizon is not None:
             comment += f";train_action_horizon={req.action_horizon}"
+        comment += f";checkpoint_dir={exp_dir}/checkpoints/{output_namespace}"
     else:
         if req.eval_num_envs_per_gpu is not None:
             comment += f";eval_num_envs_per_gpu={req.eval_num_envs_per_gpu}"
@@ -930,6 +957,11 @@ def _job_comment(req: MlxpSubmitRequest, variant, snapshot: dict) -> str:
             comment += ";eval_overwrite_results=true"
         if req.checkpoint_path:
             comment += f";checkpoint_path={req.checkpoint_path.strip()}"
+        comment += (
+            f";eval_dir={exp_dir}/eval_results/{output_namespace}"
+            f";results_path={exp_dir}/eval_results/{output_namespace}/results.json"
+            f";job_log_dir={exp_dir}/logs/{output_namespace}"
+        )
     comment += (
         f";config_snapshot_path={snapshot['path']}"
         f";config_snapshot_meta_path={snapshot['meta_path']}"

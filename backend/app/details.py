@@ -242,7 +242,10 @@ async def _resolve_runtime_exp_dir(
         else:
             m = re.search(r"(?:DONE\s+|Saved to )(\S+)/results\.json", line)
             if m:
-                return m.group(1)
+                result_dir = m.group(1)
+                if "/eval_results/" in result_dir:
+                    return result_dir.split("/eval_results/", 1)[0]
+                return result_dir
             m = re.search(r"(/\S+?)/eval_results(?:/|\s|$)", line)
             if m:
                 return m.group(1)
@@ -306,8 +309,14 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
     runtime_exp_dir = await _resolve_runtime_exp_dir(env.ssh_alias, stdout_path, phase)
     if runtime_exp_dir:
         exp_dir_remote = runtime_exp_dir
-    ckpt_dir = f"{exp_dir_remote}/checkpoints" if phase in ("train", "resume") else None
-    eval_dir = f"{exp_dir_remote}/eval_results" if phase == "eval" else None
+    ckpt_dir = (
+        slurm_meta.get("checkpoint_dir")
+        or (f"{exp_dir_remote}/checkpoints" if phase in ("train", "resume") else None)
+    )
+    eval_dir = (
+        slurm_meta.get("eval_dir")
+        or (f"{exp_dir_remote}/eval_results" if phase == "eval" else None)
+    )
     eval_checkpoint = (
         await _resolve_eval_checkpoint(
             env.ssh_alias,
@@ -318,7 +327,11 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
         if phase == "eval" and variant
         else None
     )
-    isaac_logs_glob = f"{exp_dir_remote}/logs/{job_id}/server_*.log" if phase == "eval" else None
+    isaac_logs_glob = (
+        f"{slurm_meta.get('job_log_dir')}/server_*.log"
+        if phase == "eval" and slurm_meta.get("job_log_dir")
+        else (f"{exp_dir_remote}/logs/{job_id}/server_*.log" if phase == "eval" else None)
+    )
     paths = Paths(
         stdout=stdout_path,
         stderr=stderr_path,
@@ -395,8 +408,23 @@ async def _mlxp_details(
     """MLXP runs train via `kubectl apply` on a pod. All paths live on DDN."""
     settings = get_settings()
     exp_dir = f"{settings.experiments_dir}/{variant}" if variant else settings.experiments_dir
-    ckpt_dir = f"{exp_dir}/checkpoints/{job_name}" if phase in ("train", "resume") else None
-    eval_dir = f"{exp_dir}/eval_results" if phase == "eval" else None
+    metadata = _metadata_fields(job_comment)
+    output_namespace = metadata.get("output_namespace") or None
+    ckpt_dir = (
+        metadata.get("checkpoint_dir")
+        or (
+            f"{exp_dir}/checkpoints/{output_namespace or job_name}"
+            if phase in ("train", "resume") else None
+        )
+    )
+    eval_dir = (
+        metadata.get("eval_dir")
+        or (
+            f"{exp_dir}/eval_results/{output_namespace}"
+            if phase == "eval" and output_namespace else
+            (f"{exp_dir}/eval_results" if phase == "eval" else None)
+        )
+    )
     paths = Paths(
         stdout=f"kubectl logs -n {settings.namespace} -l job-name={job_id}",
         stderr=f"kubectl logs -n {settings.namespace} -l job-name={job_id}  (k8s merges stdout+stderr)",
@@ -404,9 +432,12 @@ async def _mlxp_details(
         ckpt_dir=ckpt_dir,
         eval_checkpoint=None,
         eval_dir=eval_dir,
-        isaac_logs_glob=f"{exp_dir}/logs/{job_id}/server_*.log" if phase == "eval" else None,
+        isaac_logs_glob=(
+            f"{metadata.get('job_log_dir')}/server_*.log"
+            if phase == "eval" and metadata.get("job_log_dir")
+            else (f"{exp_dir}/logs/{job_id}/server_*.log" if phase == "eval" else None)
+        ),
     )
-    metadata = _metadata_fields(job_comment)
     if phase == "eval":
         paths.eval_checkpoint = metadata.get("checkpoint_path") or None
     config_snapshot = await _mlxp_config_snapshot(metadata)
@@ -744,7 +775,7 @@ print(json.dumps(rows))
 
 async def _slurm_eval_runs(host: str, eval_dir: str) -> list[EvalRun]:
     cmd = (
-        f"EVAL_DIR={shlex.quote(eval_dir)} "
+        f"EVAL_DIR={_remote_path_expr(eval_dir)} "
         "python3 - <<'PY'\n"
         + _EVAL_RUNS_SCRIPT
         + "\nPY"
@@ -760,6 +791,10 @@ async def _slurm_eval_runs(host: str, eval_dir: str) -> list[EvalRun]:
     except json.JSONDecodeError:
         return []
     return [EvalRun.model_validate(item) for item in raw]
+
+
+def _remote_path_expr(path: str) -> str:
+    return path if path.startswith("$HOME/") else shlex.quote(path)
 
 
 async def _mlxp_eval_runs(eval_dir: str) -> list[EvalRun]:
@@ -1055,7 +1090,18 @@ async def _mlxp_progress(
         return progress
     settings = get_settings()
     ckpt_root = f"{settings.experiments_dir}/{variant}/checkpoints"
-    ckpt_dirs = [f"{ckpt_root}/{run_id}", f"{ckpt_root}/{run_id}/{run_id}", ckpt_root]
+    checkpoint_dir = metadata.get("checkpoint_dir")
+    output_namespace = metadata.get("output_namespace")
+    ckpt_dirs = [
+        d for d in [
+            checkpoint_dir,
+            f"{ckpt_root}/{output_namespace}" if output_namespace else None,
+            f"{ckpt_root}/{run_id}",
+            f"{ckpt_root}/{run_id}/{run_id}",
+            ckpt_root,
+        ]
+        if d
+    ]
     from .mlxp_data_pod import ensure_listing_pod
     try:
         pod = await ensure_listing_pod()
@@ -1118,7 +1164,7 @@ async def _mlxp_eval_progress(
     if shutil.which("kubectl") is None:
         return progress
     settings = get_settings()
-    eval_dir = f"{settings.experiments_dir}/{variant}/eval_results"
+    eval_dir = metadata.get("eval_dir") or f"{settings.experiments_dir}/{variant}/eval_results"
     from .mlxp_data_pod import ensure_listing_pod
     try:
         pod = await ensure_listing_pod()
@@ -1479,7 +1525,7 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
         active_eps = 0
         active_envs = 0
         job_completed_runs = 0
-        logs_dir = eval_dir.rsplit("/", 1)[0] + "/logs"
+        job_log_dir = (slurm_meta or {}).get("job_log_dir") if slurm_meta else None
         if n_eps > 0:
             env = await load_cluster(cluster)
             log_dir_q = shlex.quote(env.vars["LOG_DIR"])
@@ -1499,9 +1545,9 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
                 active_eps = 0
                 job_completed_runs = 0
 
-            logs_dir_q = shlex.quote(logs_dir)
+            job_logs_q = shlex.quote(job_log_dir or f"{eval_dir.rsplit('/', 1)[0]}/logs/{job_id}")
             ep_cmd = (
-                f"job_logs={logs_dir_q}/{job_id_q}; "
+                f"job_logs={job_logs_q}; "
                 "if [ -d \"$job_logs\" ]; then pattern=\"$job_logs/server_*.log\"; "
                 "else echo '0 0'; exit 0; fi; "
                 "total=0; envs_started=0; "

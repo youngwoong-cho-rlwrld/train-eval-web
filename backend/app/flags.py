@@ -41,7 +41,7 @@ def _train_n15(v: Variant, cluster: str) -> list[tuple[str, str]]:
         ("--num-gpus", v.vars.get("TRAIN_NUM_GPUS", "")),
         ("--batch-size", v.vars.get("TRAIN_BATCH_SIZE", "")),
         ("--learning_rate", "1e-4"),
-        ("--output-dir", "$EXP_DIR/checkpoints"),
+        ("--output-dir", "$EXP_DIR/checkpoints/$SUBMIT_OUTPUT_NAMESPACE"),
         ("--data-config", "$EXP_DIR/data_config.yaml"),
         ("--max-steps", v.vars.get("MAX_STEPS", "")),
         ("--save-steps", v.vars.get("SAVE_STEPS", "")),
@@ -84,7 +84,7 @@ def _train_n16(v: Variant, cluster: str) -> list[tuple[str, str]]:
         ("--save-steps", v.vars.get("SAVE_STEPS", "")),
         ("--save-total-limit", "5"),
         ("--dataloader-num-workers", "8"),
-        ("--experiment-name", "<job-name>"),
+        ("--experiment-name", "<output-namespace>"),
         ("--use-wandb", ""),
         ("--color-jitter-params", "brightness 0.2 contrast 0.2 saturation 0.2 hue 0.1"),
     ]
