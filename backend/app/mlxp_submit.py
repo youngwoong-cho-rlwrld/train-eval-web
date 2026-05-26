@@ -175,7 +175,7 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
     job_name = resolve_job_name(req.job_name, req.phase, req.variant)
     train_note = resolve_train_note(req.train_note, variant)
     req.output_namespace = validate_output_namespace(
-        req.output_namespace or make_output_namespace(job_name)
+        req.output_namespace or make_output_namespace(job_name, req.variant)
     )
     repo_path = mlxp_training_repo_path(model)
     submit_git = await prepare_mlxp_training_git(

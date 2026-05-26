@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from .clusters import load_cluster, list_clusters
 from .eval_completion import eval_job_completed_from_log_dir
 from .job_identity import phase_variant_from_meta, resolve_phase_and_variant
-from .slurm_meta import read_slurm_meta
+from .slurm_meta import read_slurm_meta, read_slurm_meta_many
 from .ssh import ssh_run
 from .time_utils import scheduler_timezone, to_kst_iso
 
@@ -121,8 +121,9 @@ async def list_jobs(
                     state=state, elapsed=parts[4], nodelist=parts[7],
                     start=job_start, end=job_end,
                 ))
-        await _attach_phase_metadata(host, local)
-        await _normalize_completed_eval_jobs(host, env.vars["LOG_DIR"], local)
+        meta_by_job_id = await read_slurm_meta_many(host, [j.job_id for j in local])
+        _attach_phase_metadata(local, meta_by_job_id)
+        await _normalize_completed_eval_jobs(host, env.vars["LOG_DIR"], local, meta_by_job_id)
         return local
 
     per_cluster = await asyncio.gather(*[_for_cluster(c) for c in target_clusters])
@@ -132,16 +133,14 @@ async def list_jobs(
     return out
 
 
-async def _attach_phase_metadata(host: str, rows: list[Job]) -> None:
-    async def _one(job: Job) -> None:
-        meta = await read_slurm_meta(host, job.job_id)
+def _attach_phase_metadata(rows: list[Job], meta_by_job_id: dict[str, dict[str, str]]) -> None:
+    for job in rows:
+        meta = meta_by_job_id.get(job.job_id, {})
         phase, variant = phase_variant_from_meta(meta)
         if not phase or not variant:
             phase, variant = resolve_phase_and_variant(job.job_name)
         job.phase = None if phase == "unknown" else phase
         job.variant = variant
-
-    await asyncio.gather(*(_one(j) for j in rows))
 
 
 _SACCT_FMT = "JobID,JobName,Partition,State,ExitCode,Start,End,Elapsed,NodeList,Reason"
@@ -215,19 +214,23 @@ def _terminal_non_completed(state: str) -> bool:
     ))
 
 
-async def _normalize_completed_eval_jobs(host: str, log_dir: str, rows: list[Job]) -> None:
+async def _normalize_completed_eval_jobs(
+    host: str,
+    log_dir: str,
+    rows: list[Job],
+    meta_by_job_id: dict[str, dict[str, str]],
+) -> None:
     async def _one(job: Job) -> None:
         if not _terminal_non_completed(job.state):
             return
-        meta: dict[str, str] = {}
-        phase, variant = resolve_phase_and_variant(job.job_name)
+        meta = meta_by_job_id.get(job.job_id, {})
+        phase, variant = job.phase, job.variant
         if phase != "eval" or not variant:
-            meta = await read_slurm_meta(host, job.job_id)
             p, v = phase_variant_from_meta(meta)
             if p and v:
                 phase, variant = p, v
-        elif phase == "eval":
-            meta = await read_slurm_meta(host, job.job_id)
+        if phase != "eval" or not variant:
+            phase, variant = resolve_phase_and_variant(job.job_name)
         if phase != "eval" or not variant:
             return
         try:
@@ -237,14 +240,17 @@ async def _normalize_completed_eval_jobs(host: str, log_dir: str, rows: list[Job
         except Exception:
             return
 
-    await asyncio.gather(*(_one(j) for j in rows))
+    await asyncio.gather(*(_one(j) for j in rows), return_exceptions=True)
 
 
 async def _normalize_completed_eval_record(host: str, log_dir: str, record: dict) -> None:
     state = str(record.get("State") or "")
     if not _terminal_non_completed(state):
         return
-    meta = await read_slurm_meta(host, str(record.get("JobID") or ""))
+    try:
+        meta = await read_slurm_meta(host, str(record.get("JobID") or ""))
+    except Exception:
+        meta = {}
     phase, variant = resolve_phase_and_variant(str(record.get("JobName") or ""), record)
     if phase != "eval" or not variant:
         p, v = phase_variant_from_meta(meta)

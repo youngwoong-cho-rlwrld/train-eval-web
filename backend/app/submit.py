@@ -317,7 +317,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     output_namespace = (
         validate_output_namespace(req.output_namespace)
         if req.output_namespace
-        else (None if req.resume else make_output_namespace(job_name))
+        else (None if req.resume else make_output_namespace(job_name, req.variant))
     )
     host = cluster.ssh_alias
     submitted_wandb_project = wandb_project()

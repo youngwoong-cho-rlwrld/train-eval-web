@@ -8,13 +8,22 @@ from datetime import datetime
 
 
 _SAFE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_UNSAFE_SEGMENT_CHARS_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
-def make_output_namespace(job_name: str) -> str:
+def _safe_segment(value: str | None) -> str:
+    if not value:
+        return ""
+    return _UNSAFE_SEGMENT_CHARS_RE.sub("_", value.strip()).strip("._-")
+
+
+def make_output_namespace(job_name: str, experiment: str | None = None) -> str:
     """Return a unique, path-safe namespace for one concrete submission."""
     matches = re.findall(r"\d{8}_\d{6}", job_name)
     stamp = matches[-1] if matches else datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"{stamp}_{uuid.uuid4().hex[:6]}"
+    suffix = f"{stamp}_{uuid.uuid4().hex[:6]}"
+    prefix = _safe_segment(experiment)
+    return f"{prefix}_{suffix}" if prefix else suffix
 
 
 def validate_output_namespace(value: str) -> str:
