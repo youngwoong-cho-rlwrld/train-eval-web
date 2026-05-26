@@ -1,8 +1,9 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import Link from "next/link";
 import { useIsFetching, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertCircle, Check, CircleHelp, Copy, Database, Trophy } from "lucide-react";
+import { AlertCircle, Check, CircleHelp, Copy, Database, ExternalLink, Trophy } from "lucide-react";
 import { toast } from "sonner";
 import { api, type ResultCell, type ResultsResponse, type ResultTask, type ResultVariant } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
@@ -204,7 +205,9 @@ function ResultCard({ variant }: { variant: ResultVariant }) {
     <Card>
       <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between sm:space-y-0">
         <div className="min-w-0">
-          <CardTitle className="truncate font-mono text-base">{variant.variant}</CardTitle>
+          <CardTitle className="truncate font-mono text-base">
+            <ResultTitle variant={variant} />
+          </CardTitle>
           <CardDescription className="mt-1">
             {[variant.note, variant.experiment].filter(Boolean).join(" / ") || "eval results"}
           </CardDescription>
@@ -262,6 +265,22 @@ function ResultCard({ variant }: { variant: ResultVariant }) {
         </div>
       </CardContent>
     </Card>
+  );
+}
+
+function ResultTitle({ variant }: { variant: ResultVariant }) {
+  if (!variant.job_id) return variant.variant;
+  return (
+    <Link
+      href={`/jobs/${encodeURIComponent(variant.cluster)}/${encodeURIComponent(variant.job_id)}`}
+      target="_blank"
+      rel="noreferrer"
+      className="inline-flex max-w-full items-center gap-1.5 text-blue-600 hover:underline dark:text-blue-400"
+      title={variant.job_name ? `Open ${variant.job_name}` : "Open job detail"}
+    >
+      <span className="truncate">{variant.variant}</span>
+      <ExternalLink className="h-3.5 w-3.5 shrink-0" />
+    </Link>
   );
 }
 

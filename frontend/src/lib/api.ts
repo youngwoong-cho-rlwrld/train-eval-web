@@ -279,6 +279,8 @@ export type ResultTask = {
 
 export type ResultVariant = {
   cluster: string;
+  job_id?: string | null;
+  job_name?: string | null;
   variant: string;
   experiment?: string | null;
   model_version?: string | null;

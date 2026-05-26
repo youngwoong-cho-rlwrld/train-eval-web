@@ -37,6 +37,8 @@ class ResultTask(BaseModel):
 
 class ResultVariant(BaseModel):
     cluster: str
+    job_id: str | None = None
+    job_name: str | None = None
     variant: str
     experiment: str | None = None
     model_version: str | None = None
@@ -364,6 +366,117 @@ def metadata_from_runs(task_roots):
     return {}
 
 
+def path_key(value):
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    home = str(Path.home())
+    if s.startswith("$HOME/"):
+        s = home + s[len("$HOME"):]
+    elif s == "$HOME":
+        s = home
+    elif s.startswith("~/"):
+        s = home + s[1:]
+    return s.rstrip("/")
+
+
+def add_job_index_entry(index, key, info):
+    key = path_key(key)
+    if not key:
+        return
+    index[key] = info
+    if key.endswith("/results.json"):
+        index[key[: -len("/results.json")]] = info
+
+
+def add_job_name_index(index, info):
+    job_name = (info.get("job_name") or "").strip()
+    if job_name:
+        index[job_name] = info
+
+
+def add_variant_job_index(index, variant, info):
+    variant = (variant or "").strip()
+    if variant:
+        index[variant] = info
+
+
+def parse_sidecar_meta(path):
+    out = {}
+    try:
+        for line in path.read_text().splitlines():
+            if "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip()
+    except Exception:
+        return {}
+    return out
+
+
+def load_result_job_index():
+    path_index = {}
+    name_index = {}
+    variant_index = {}
+
+    job_meta_root = Path.home() / staging_rel / "jobs"
+    job_meta_paths = sorted(job_meta_root.glob("*.meta")) if job_meta_root.exists() else []
+    for path in job_meta_paths:
+        meta = parse_sidecar_meta(path)
+        if meta.get("phase") != "eval":
+            continue
+        job_id = path.stem
+        info = {"job_id": job_id, "job_name": meta.get("job_name") or job_id}
+        add_job_name_index(name_index, info)
+        add_variant_job_index(variant_index, meta.get("variant"), info)
+        add_job_index_entry(path_index, meta.get("eval_dir"), info)
+        add_job_index_entry(path_index, meta.get("results_path"), info)
+        if meta.get("variant") and meta.get("output_namespace"):
+            add_job_index_entry(
+                path_index,
+                experiments_root / meta["variant"] / "eval_results" / meta["output_namespace"],
+                info,
+            )
+
+    snapshot_meta_paths = sorted(experiments_root.glob("*/config_*.meta.json")) if experiments_root.exists() else []
+    for path in snapshot_meta_paths:
+        try:
+            meta = read_json(path)
+        except Exception:
+            continue
+        if meta.get("phase") != "eval" or not meta.get("job_id"):
+            continue
+        info = {"job_id": str(meta["job_id"]), "job_name": meta.get("job_name") or str(meta["job_id"])}
+        add_job_name_index(name_index, info)
+        add_variant_job_index(variant_index, meta.get("variant"), info)
+        add_job_index_entry(path_index, meta.get("eval_dir"), info)
+        add_job_index_entry(path_index, meta.get("results_path"), info)
+        if meta.get("variant") and meta.get("output_namespace"):
+            add_job_index_entry(
+                path_index,
+                experiments_root / meta["variant"] / "eval_results" / meta["output_namespace"],
+                info,
+            )
+
+    return path_index, name_index, variant_index
+
+
+def result_job_info(eval_root, top_path, job_name=None, variant_name=None):
+    for candidate in (top_path, eval_root):
+        info = job_path_index.get(path_key(candidate))
+        if info:
+            return info
+    if job_name:
+        info = job_name_index.get(job_name)
+        if info:
+            return info
+    if variant_name:
+        return job_variant_index.get(variant_name)
+    return None
+
+
 def run_path_key(path):
     try:
         return (0, int(path.parent.name.rsplit("_", 1)[-1]))
@@ -400,6 +513,8 @@ def build_variant_from_root(meta, exp_dir, eval_root, top_path):
 
     result = {
         "cluster": cluster,
+        "job_id": None,
+        "job_name": None,
         "variant": variant,
         "experiment": None,
         "model_version": meta.get("model_version"),
@@ -412,6 +527,10 @@ def build_variant_from_root(meta, exp_dir, eval_root, top_path):
         "source": str(top_path) if top_path.exists() else str(eval_root),
         "tasks": [],
     }
+    job_info = result_job_info(eval_root, top_path, variant_name=variant)
+    if job_info:
+        result["job_id"] = job_info.get("job_id")
+        result["job_name"] = job_info.get("job_name")
     if top:
         result.update({
             "experiment": top.get("experiment") or top.get("experiment_name"),
@@ -424,6 +543,11 @@ def build_variant_from_root(meta, exp_dir, eval_root, top_path):
             "total_num_envs": int_or_none(top.get("total_num_envs")),
         })
         expected_runs = result["n_runs"]
+        if not result["job_id"]:
+            job_info = result_job_info(eval_root, top_path, result.get("experiment"), variant)
+            if job_info:
+                result["job_id"] = job_info.get("job_id")
+                result["job_name"] = job_info.get("job_name")
         if isinstance(top.get("tasks"), dict):
             for short, task_data in sorted(top["tasks"].items()):
                 cells = cells_from_aggregate(
@@ -527,6 +651,7 @@ def build_variant(meta):
 
 
 rows = []
+job_path_index, job_name_index, job_variant_index = load_result_job_index()
 for meta in payload:
     rows.extend(build_variant(meta))
 print(json.dumps(rows))
