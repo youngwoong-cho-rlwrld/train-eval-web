@@ -29,13 +29,6 @@ export function useDatasetDir(cluster: string, defaultDir?: string): [string, (v
   const dir = local[cluster] ?? storedFor(cluster, defaultDir);
 
   useEffect(() => {
-    if (!defaultDir || typeof window === "undefined") return;
-    if (!localStorage.getItem(keyFor(cluster))) {
-      setLocal((prev) => ({ ...prev, [cluster]: defaultDir }));
-    }
-  }, [cluster, defaultDir]);
-
-  useEffect(() => {
     if (typeof window === "undefined") return;
     const onCustom = (e: Event) => {
       const d = (e as CustomEvent<{ cluster: string; value: string }>).detail;

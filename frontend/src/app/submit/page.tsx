@@ -77,6 +77,10 @@ type TrainConfigEdit = {
   saveSteps: string;
   actionHorizon: string;
 };
+type TrainNoteEdit = {
+  scope: string;
+  value: string;
+};
 type SubmitStep = "job" | "config" | "modality";
 
 function buildDefaultJobName(phase: Phase, variant: string): string {
@@ -111,6 +115,7 @@ export default function SubmitPage() {
     scope: string;
     value: string;
   } | null>(null);
+  const [trainNoteEdit, setTrainNoteEdit] = useState<TrainNoteEdit | null>(null);
   const [jobName, setJobName] = useState<string>("");
   const [jobNameTouched, setJobNameTouched] = useState<boolean>(false);
   const [gitDialogOpen, setGitDialogOpen] = useState<boolean>(false);
@@ -174,6 +179,7 @@ export default function SubmitPage() {
   const isSlurm = cluster !== "mlxp";
   const submitPhase: Phase = phase;
   const checkpointScope = `${cluster}:${variantName}:${submitPhase}`;
+  const trainNoteScope = `${checkpointScope}:train-note`;
   const evalConfigScope = `${checkpointScope}:eval-config`;
   const trainConfigScope = `${checkpointScope}:train-config`;
 
@@ -219,6 +225,13 @@ export default function SubmitPage() {
     [submitPhase, variantName],
   );
   const shownJobName = jobNameTouched ? jobName : defaultJobName;
+  const trainNoteDefault = variant.data?.vars.TRAIN_NOTE ?? "";
+  const activeTrainNoteEdit =
+    trainNoteEdit?.scope === trainNoteScope ? trainNoteEdit : null;
+  const trainNote = activeTrainNoteEdit ? activeTrainNoteEdit.value : trainNoteDefault;
+  const submittedTrainNote = trainNote.trim() || null;
+  const effectiveTrainNote = submittedTrainNote ?? trainNoteDefault.trim();
+  const trainNoteValid = effectiveTrainNote.length > 0;
   const evalConfigDefaults = useMemo(
     () => ({
       nEpisodes: variant.data?.vars.N_EPISODES ?? "",
@@ -424,6 +437,7 @@ export default function SubmitPage() {
       cluster,
       variant: variantName,
       phase: submitPhase,
+      train_note: submittedTrainNote,
       partition: isSlurm ? selectedPartitionName : null,
       node: isSlurm ? null : mlxpNode,
       dataset_override: resolveDatasetOverride({
@@ -453,6 +467,7 @@ export default function SubmitPage() {
     !!variantName &&
     !variant.isLoading &&
     !variantError &&
+    trainNoteValid &&
     (submitPhase !== "train" || trainConfigValid) &&
     (!wantsCheckpoint ||
       (!!trimmedCkpt &&
@@ -472,6 +487,7 @@ export default function SubmitPage() {
       singleDataset,
       multiDatasets,
       extraArgs,
+      trainNote,
       trainNumGpus,
       trainBatchSize,
       trainMaxSteps,
@@ -566,6 +582,7 @@ export default function SubmitPage() {
 
   const canSubmit =
     !!variantName &&
+    trainNoteValid &&
     (isSlurm ? !!selectedPartitionName : !!mlxpNode) &&
     (!wantsCheckpoint ||
       (!!trimmedCkpt &&
@@ -850,7 +867,7 @@ export default function SubmitPage() {
     });
   }
   const selectedVariantName = variant.data?.name ?? variantName;
-  const canReviewConfig = !!variantName;
+  const canReviewConfig = !!variantName && trainNoteValid;
   const selectedMlxpGpuType =
     mlxp.data?.find((n) => n.name === mlxpNode)?.gpu_type ||
     mlxpSettings.data?.gpu_type ||
@@ -1064,6 +1081,17 @@ export default function SubmitPage() {
 
                 </>
               )}
+              <TrainNoteField
+                value={trainNote}
+                defaultValue={trainNoteDefault}
+                variantName={variantName}
+                touched={activeTrainNoteEdit !== null}
+                valid={trainNoteValid}
+                onChange={(value) => {
+                  setTrainNoteEdit({ scope: trainNoteScope, value });
+                }}
+                onReset={() => setTrainNoteEdit(null)}
+              />
               <div className="flex justify-end border-t border-slate-100 pt-5 dark:border-slate-900">
                 <Button
                   onClick={() => setSubmitStep("config")}
@@ -1337,6 +1365,67 @@ function Field({
       <Label>{label}</Label>
       {children}
     </div>
+  );
+}
+
+function TrainNoteField({
+  value,
+  defaultValue,
+  variantName,
+  touched,
+  valid,
+  onChange,
+  onReset,
+}: {
+  value: string;
+  defaultValue: string;
+  variantName: string;
+  touched: boolean;
+  valid: boolean;
+  onChange: (value: string) => void;
+  onReset: () => void;
+}) {
+  return (
+    <Field
+      label={
+        <span className="flex items-center gap-2">
+          Train note
+          <span className="font-mono text-xs font-normal text-slate-500">
+            {value.length}
+          </span>
+        </span>
+      }
+    >
+      <div className="flex gap-2">
+        <Input
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={
+            variantName
+              ? defaultValue || "Describe this submission"
+              : "pick an experiment first"
+          }
+          className={
+            variantName && !valid
+              ? "flex-1 font-mono text-xs border-red-500 focus-visible:ring-red-500"
+              : "flex-1 font-mono text-xs"
+          }
+        />
+        {touched && (
+          <Button variant="outline" size="sm" onClick={onReset}>
+            Reset to default
+          </Button>
+        )}
+      </div>
+      <p className="text-xs text-slate-500">
+        Stored in the submitted <code>config.sh</code> and shown on Results.
+      </p>
+      {variantName && !valid && (
+        <p className="text-xs text-red-600 dark:text-red-400">
+          TRAIN_NOTE is required before reviewing config.sh.
+        </p>
+      )}
+    </Field>
   );
 }
 

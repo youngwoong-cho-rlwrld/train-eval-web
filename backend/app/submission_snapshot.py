@@ -611,6 +611,23 @@ def _set_array(config_text: str, name: str, values: list[str]) -> str:
     return f"{config_text}{suffix}{rendered}\n"
 
 
+def _apply_submission_config_overrides(
+    config_text: str,
+    *,
+    dataset_override: str | list[str] | None = None,
+    train_note: str | None = None,
+    data_dir: str | None = None,
+) -> str:
+    text = config_text
+    if dataset_override is not None:
+        text = apply_dataset_override(text, dataset_override)
+    if train_note is not None:
+        text = _set_scalar(text, "TRAIN_NOTE", train_note)
+    if data_dir:
+        text = _set_scalar(text, "DATA_DIR", data_dir)
+    return text
+
+
 def render_training_config_snapshot(
     *,
     base_config: str,
@@ -627,12 +644,15 @@ def render_training_config_snapshot(
     train_max_steps: int,
     train_save_steps: int,
     train_action_horizon: int | None = None,
+    train_note: str | None = None,
     wandb_project: str | None = None,
     git: SubmitGitInfo | None = None,
 ) -> str:
-    text = base_config
-    if dataset_override is not None:
-        text = apply_dataset_override(text, dataset_override)
+    text = _apply_submission_config_overrides(
+        base_config,
+        dataset_override=dataset_override,
+        train_note=train_note,
+    )
 
     text = _set_scalar(text, "TRAIN_NUM_GPUS", train_num_gpus)
     text = _set_scalar(text, "MAX_STEPS", train_max_steps)
@@ -697,12 +717,14 @@ def render_eval_config_preview(
     checkpoint_path: str | None = None,
     extra_args: list[str] | None = None,
     data_dir: str | None = None,
+    train_note: str | None = None,
 ) -> str:
-    text = base_config
-    if dataset_override is not None:
-        text = apply_dataset_override(text, dataset_override)
-    if data_dir:
-        text = _set_scalar(text, "DATA_DIR", data_dir)
+    text = _apply_submission_config_overrides(
+        base_config,
+        dataset_override=dataset_override,
+        train_note=train_note,
+        data_dir=data_dir,
+    )
     if eval_n_episodes is not None:
         text = _set_scalar(text, "N_EPISODES", eval_n_episodes)
     if eval_n_runs is not None:
@@ -751,6 +773,7 @@ def snapshot_metadata(
     train_max_steps: int | None = None,
     train_save_steps: int | None = None,
     train_action_horizon: int | None = None,
+    train_note: str | None = None,
     wandb_project: str | None = None,
     git: SubmitGitInfo | None = None,
 ) -> dict[str, Any]:
@@ -765,6 +788,7 @@ def snapshot_metadata(
         "node": node,
         "config_snapshot_path": path,
         "config_snapshot_meta_path": meta_path,
+        "train_note": train_note,
         "train": {
             "num_gpus": train_num_gpus,
             "global_batch_size": train_global_batch_size,

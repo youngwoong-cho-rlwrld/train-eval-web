@@ -257,6 +257,7 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
         variant = await variants.load_variant(req.variant)
         model = training_models.resolve_training_model(variant)
         job_name = submit.resolve_job_name(req.job_name, req.phase, req.variant)
+        train_note = submit.resolve_train_note(req.train_note, variant)
         partition = req.partition
         node = req.node
         env = None
@@ -306,6 +307,7 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
                 train_max_steps=train_settings.max_steps,
                 train_save_steps=train_settings.save_steps,
                 train_action_horizon=train_action_horizon,
+                train_note=train_note,
                 wandb_project=wandb_project(),
                 git=None,
             )
@@ -330,6 +332,7 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
                 checkpoint_path=checkpoint_path,
                 extra_args=req.extra_args,
                 data_dir=mlxp_config.get_settings().datasets_dir if req.cluster == "mlxp" else None,
+                train_note=train_note,
             )
         else:
             raise ValueError(f"unsupported phase: {req.phase}")
@@ -374,6 +377,7 @@ async def post_submit(req: submit.SubmitRequest):
             mlxp_req = mlxp_submit.MlxpSubmitRequest(
                 variant=req.variant,
                 phase=req.phase,
+                train_note=req.train_note,
                 num_gpus=num_gpus,
                 global_batch_size=req.train_global_batch_size if req.phase == "train" else None,
                 max_steps=req.train_max_steps if req.phase == "train" else None,

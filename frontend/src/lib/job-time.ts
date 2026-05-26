@@ -1,4 +1,5 @@
-export function parseJobTimestampMs(value?: string | null, cluster?: string | null): number {
+export function parseJobTimestampMs(value?: string | null, _cluster?: string | null): number {
+  void _cluster;
   const normalized = normalizeJobTimestamp(value);
   if (!normalized) return 0;
   const ms = Date.parse(normalized);
@@ -7,8 +8,9 @@ export function parseJobTimestampMs(value?: string | null, cluster?: string | nu
 
 export function formatJobTimestamp(
   value?: string | null,
-  cluster?: string | null,
+  _cluster?: string | null,
 ): { short: string; full: string } | null {
+  void _cluster;
   const raw = value?.trim();
   const normalized = normalizeJobTimestamp(raw);
   if (!raw || !normalized) return null;

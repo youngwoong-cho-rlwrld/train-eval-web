@@ -88,6 +88,7 @@ def mlxp_training_repo_path(model: str | TrainingModel) -> str:
 class MlxpSubmitRequest(BaseModel):
     variant: str
     phase: Literal["train", "eval"] = "train"
+    train_note: str | None = None
     num_gpus: int = 2
     global_batch_size: int | None = None
     max_steps: int | None = None
@@ -169,9 +170,10 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
     # job_id is the k8s Job resource name — 6-char alpha-leading so it's
     # DNS-safe and URL-short. job_name is the display name carried as an
     # annotation; same shape as slurm's job_name.
-    from .submit import resolve_job_name
+    from .submit import resolve_job_name, resolve_train_note
     job_id = "m" + uuid.uuid4().hex[:5]
     job_name = resolve_job_name(req.job_name, req.phase, req.variant)
+    train_note = resolve_train_note(req.train_note, variant)
     req.output_namespace = validate_output_namespace(
         req.output_namespace or make_output_namespace(job_name)
     )
@@ -195,6 +197,7 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
             submit_git=submit_git,
             model=model,
             settings=settings,
+            train_note=train_note,
         )
     else:
         snapshot = _build_snapshot_payload(
@@ -206,6 +209,7 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
             submit_git=submit_git,
             model=model,
             settings=settings,
+            train_note=train_note,
         )
     await _write_snapshot_to_ddn(snapshot)
     if req.phase == "eval":
@@ -247,7 +251,7 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
 
 def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job_name: str,
                             node: str, submit_git, model: TrainingModel,
-                            settings: MlxpSettings) -> dict:
+                            settings: MlxpSettings, train_note: str) -> dict:
     train_num_gpus = req.num_gpus
     train_max_steps = req.max_steps or variant_int(variant, "MAX_STEPS", 30000)
     train_save_steps = req.save_steps or variant_int(variant, "SAVE_STEPS", 1000)
@@ -271,6 +275,7 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
         train_max_steps=train_max_steps,
         train_save_steps=train_save_steps,
         train_action_horizon=req.action_horizon,
+        train_note=train_note,
         wandb_project=_wandb_project(),
         git=submit_git,
     )
@@ -289,6 +294,7 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
         train_max_steps=train_max_steps,
         train_save_steps=train_save_steps,
         train_action_horizon=req.action_horizon,
+        train_note=train_note,
         wandb_project=_wandb_project(),
         git=submit_git,
     )
@@ -314,7 +320,7 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
 
 def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job_name: str,
                                  node: str, submit_git, model: TrainingModel,
-                                 settings: MlxpSettings) -> dict:
+                                 settings: MlxpSettings, train_note: str) -> dict:
     from .submit import _normalize_eval_sets
 
     eval_sets = _normalize_eval_sets(req.eval_sets)
@@ -337,6 +343,7 @@ def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str
         checkpoint_path=checkpoint_path,
         extra_args=req.extra_args,
         data_dir=settings.datasets_dir,
+        train_note=train_note,
     )
     meta = snapshot_metadata(
         job_id=job_id,
@@ -349,6 +356,7 @@ def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str
         node=node,
         dataset_override=req.dataset_override,
         extra_args=req.extra_args,
+        train_note=train_note,
         wandb_project=_wandb_project(),
         git=submit_git,
     )

@@ -25,6 +25,7 @@ from .submission_snapshot import (
     apply_dataset_override,
     metadata_json,
     prepare_slurm_training_git,
+    render_eval_config_preview,
     render_training_config_snapshot,
     snapshot_metadata,
     snapshot_suffix,
@@ -48,6 +49,9 @@ class SubmitRequest(BaseModel):
     cluster: str
     variant: str
     phase: Literal["train", "eval"]
+    # Submitted config.sh must carry a non-empty TRAIN_NOTE. None or an empty
+    # string falls back to the variant's config value, mirroring job_name.
+    train_note: str | None = None
     # Internal job action: retry a timed-out training job from its existing
     # checkpoint. This is intentionally separate from the submit-page phase.
     resume: bool = False
@@ -114,6 +118,17 @@ def resolve_job_name(req_job_name: str | None, phase: str, variant: str) -> str:
     if not name:
         return make_default_job_name(phase, variant)
     return name
+
+
+def resolve_train_note(requested_note: str | None, variant) -> str:
+    requested = requested_note.strip() if requested_note is not None else ""
+    raw = requested or variant.vars.get("TRAIN_NOTE", "")
+    note = raw.strip()
+    if not note:
+        raise ValueError("TRAIN_NOTE is required")
+    if "\n" in note or "\r" in note:
+        raise ValueError("TRAIN_NOTE must be a single line")
+    return note
 
 
 def _normalize_eval_sets(eval_sets: list[str] | None) -> list[str] | None:
@@ -203,6 +218,28 @@ class SubmitResponse(BaseModel):
 MAX_EVAL_NUM_ENVS_PER_GPU = 1
 
 
+@dataclass(frozen=True)
+class ConfigSnapshotPaths:
+    suffix: str
+    rel: str
+    meta_rel: str
+    path: str
+    meta_path: str
+
+
+def config_snapshot_paths(variant: str, job_name: str) -> ConfigSnapshotPaths:
+    suffix = snapshot_suffix(job_name)
+    rel = f"{CLUSTER_STAGING_REL}/experiments/{variant}/config_{suffix}.sh"
+    meta_rel = f"{CLUSTER_STAGING_REL}/experiments/{variant}/config_{suffix}.meta.json"
+    return ConfigSnapshotPaths(
+        suffix=suffix,
+        rel=rel,
+        meta_rel=meta_rel,
+        path=f"$HOME/{rel}",
+        meta_path=f"$HOME/{meta_rel}",
+    )
+
+
 async def _rsync_text(host: str, text: str, remote_rel: str) -> None:
     with tempfile.NamedTemporaryFile(mode="w", suffix="_submit_snapshot", delete=False) as fp:
         fp.write(text)
@@ -255,6 +292,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
 
     cluster = await load_cluster(req.cluster)
     variant = await load_variant(req.variant)
+    train_note = resolve_train_note(req.train_note, variant)
 
     # ── Resolve partition + model + body script + walltime ──
     model = resolve_training_model(variant)
@@ -296,12 +334,13 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     )
     results_path = f"{eval_dir}/results.json" if eval_dir else None
     job_log_dir = f"{exp_dir_remote}/logs/{output_namespace}" if output_namespace else ""
+    snapshot_paths = config_snapshot_paths(req.variant, job_name)
 
     submit_git = None
-    snapshot_rel: str | None = None
-    snapshot_meta_rel: str | None = None
-    snapshot_path: str | None = None
-    snapshot_meta_path: str | None = None
+    snapshot_rel = snapshot_paths.rel
+    snapshot_meta_rel = snapshot_paths.meta_rel
+    snapshot_path = snapshot_paths.path
+    snapshot_meta_path = snapshot_paths.meta_path
     snapshot_text: str | None = None
     snapshot_meta_text: str | None = None
     submit_extra_args_rel: str | None = None
@@ -316,13 +355,8 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             commit_dirty_changes=req.commit_dirty_changes,
             require_clean=not req.resume,
         )
-        suffix = snapshot_suffix(job_name)
-        snapshot_rel = f"{CLUSTER_STAGING_REL}/experiments/{req.variant}/config_{suffix}.sh"
-        snapshot_meta_rel = f"{CLUSTER_STAGING_REL}/experiments/{req.variant}/config_{suffix}.meta.json"
-        snapshot_path = f"$HOME/{snapshot_rel}"
-        snapshot_meta_path = f"$HOME/{snapshot_meta_rel}"
         if req.extra_args:
-            safe_job_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", job_name).strip("_") or suffix
+            safe_job_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", job_name).strip("_") or snapshot_paths.suffix
             submit_extra_args_rel = f"{CLUSTER_STAGING_REL}/jobs/{safe_job_name}.extra_args.sh"
             submit_extra_args_path = f"$HOME/{submit_extra_args_rel}"
             submit_extra_args_text = (
@@ -344,6 +378,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             train_max_steps=train_settings.max_steps,
             train_save_steps=train_settings.save_steps,
             train_action_horizon=train_action_horizon,
+            train_note=train_note,
             wandb_project=submitted_wandb_project,
             git=submit_git,
         )
@@ -361,8 +396,38 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             train_max_steps=train_settings.max_steps,
             train_save_steps=train_settings.save_steps,
             train_action_horizon=train_action_horizon,
+            train_note=train_note,
             wandb_project=submitted_wandb_project,
             git=submit_git,
+        ))
+    else:
+        snapshot_text = render_eval_config_preview(
+            base_config=variant.raw,
+            variant=req.variant,
+            job_name=job_name,
+            cluster=req.cluster,
+            partition=partition,
+            dataset_override=req.dataset_override,
+            eval_n_episodes=req.eval_n_episodes,
+            eval_n_runs=req.eval_n_runs,
+            eval_sets=eval_sets,
+            eval_overwrite_results=req.eval_overwrite_results,
+            checkpoint_path=eval_checkpoint,
+            extra_args=req.extra_args,
+            train_note=train_note,
+        )
+        snapshot_meta_text = metadata_json(snapshot_metadata(
+            job_name=job_name,
+            cluster=req.cluster,
+            phase="eval",
+            variant=req.variant,
+            path=snapshot_path,
+            meta_path=snapshot_meta_path,
+            partition=partition,
+            dataset_override=req.dataset_override,
+            extra_args=req.extra_args,
+            train_note=train_note,
+            wandb_project=submitted_wandb_project,
         ))
 
     # ── Sync code to cluster staging ──
@@ -515,6 +580,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         f"SUBMIT_PARTITION={shlex.quote(partition)},"
         f"SUBMIT_TRAIN_REPO_DIR={shlex.quote(training_repo)},"
         f"SUBMIT_WANDB_PROJECT={shlex.quote(submitted_wandb_project)}"
+        + f",SUBMIT_CONFIG_FILE=$HOME/{shlex.quote(snapshot_rel)}"
         + (
             f",SUBMIT_OUTPUT_NAMESPACE={shlex.quote(output_namespace)}"
             if output_namespace else ""
@@ -595,6 +661,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         f"model_label={model.label}\n"
         f"submit_train_repo_dir={training_repo}\n"
         f"wandb_project={submitted_wandb_project}\n"
+        f"train_note={train_note}\n"
         f"job_name={job_name}\n"
         + (
             f"output_namespace={output_namespace}\n"
@@ -642,7 +709,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             f"config_snapshot_rel={snapshot_rel}\n"
             f"config_snapshot_meta_path={snapshot_meta_path}\n"
             f"config_snapshot_meta_rel={snapshot_meta_rel}\n"
-            if req.phase == "train" and snapshot_path and snapshot_rel and snapshot_meta_path and snapshot_meta_rel
+            if snapshot_path and snapshot_rel and snapshot_meta_path and snapshot_meta_rel
             else ""
         )
         + (
