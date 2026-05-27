@@ -318,8 +318,8 @@ export type GitCommitOption = {
 
 export type ResultCell = {
   eval_set: string;
-  mean_success_rate: number;
-  std_success_rate: number;
+  mean_success_rate: number | null;
+  std_success_rate: number | null;
   per_run_success_rate: number[];
   success_counts: Array<number | null>;
   episode_counts: Array<number | null>;

@@ -371,7 +371,7 @@ function ResultCellView({ cell }: { cell?: ResultCell }) {
   const episodes = totalEpisodes(cell);
   return (
     <ImmediateTooltip
-      content={cell.per_run_success_rate.map((v) => formatPct(v)).join(", ")}
+      content={cell.per_run_success_rate.length ? cell.per_run_success_rate.map((v) => formatPct(v)).join(", ") : "partial"}
       className="inline-flex"
     >
       <div>
@@ -479,7 +479,8 @@ function htmlCell(value: string) {
 }
 
 function formatMeanStd(cell: ResultCell) {
-  return `${formatPct(cell.mean_success_rate)} ± ${formatPct(cell.std_success_rate)}`;
+  if (cell.mean_success_rate == null) return "--";
+  return `${formatPct(cell.mean_success_rate)} ± ${formatPct(cell.std_success_rate ?? 0)}`;
 }
 
 function formatPct(value: number) {
@@ -498,13 +499,15 @@ function episodeWeightedAverage(cells: ResultCell[]) {
   for (const cell of cells) {
     cell.episode_counts.forEach((episodeCount, idx) => {
       if (episodeCount == null || episodeCount <= 0) return;
-      episodes += episodeCount;
       const successCount = cell.success_counts[idx];
       if (successCount != null) {
+        episodes += episodeCount;
         successes += successCount;
         return;
       }
-      const runRate = cell.per_run_success_rate[idx] ?? cell.mean_success_rate;
+      const runRate = cell.per_run_success_rate[idx];
+      if (runRate == null) return;
+      episodes += episodeCount;
       successes += runRate * episodeCount;
     });
   }

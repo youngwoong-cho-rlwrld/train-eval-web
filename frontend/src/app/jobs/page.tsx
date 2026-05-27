@@ -502,14 +502,18 @@ function ActiveProgressCell({ job }: { job: Job }) {
     p.total_runs !== undefined;
   const showBar = percent !== null || hasStepProgress || hasRunProgress;
   if (!showBar) {
-    return <span className="text-xs text-slate-500">{p?.current_label ?? "waiting for progress"}</span>;
+    return (
+      <span className="text-xs text-slate-500">
+        {activeProgressLabel(details.data, p) ?? "waiting for progress"}
+      </span>
+    );
   }
 
   const effectivePercent = Math.max(0, Math.min(100, percent ?? 0));
-  const label = p?.current_label ?? `${effectivePercent.toFixed(1)}%`;
+  const d = details.data;
+  const label = activeProgressLabel(d, p) ?? `${effectivePercent.toFixed(1)}%`;
   let etaLabel: string | null = null;
   let etaTitle = "";
-  const d = details.data;
   if (p?.current_step && p.max_steps && p.current_step < p.max_steps && d) {
     const elapsedSec = parseSlurmDuration(d.elapsed);
     if (elapsedSec > 0) {
@@ -543,6 +547,19 @@ function ActiveProgressCell({ job }: { job: Job }) {
       </div>
     </div>
   );
+}
+
+function activeProgressLabel(
+  details: JobDetails | undefined,
+  progress: JobDetails["progress"] | undefined,
+) {
+  if (details?.phase === "eval" && progress?.current_step != null && progress.max_steps != null) {
+    return `${progress.current_step}/${progress.max_steps} episodes`;
+  }
+  if (details?.phase === "eval" && progress?.current_label) {
+    return progress.current_label.replace(/^\d+\/\d+ runs\s*·\s*/, "");
+  }
+  return progress?.current_label ?? null;
 }
 
 function CopyCheckpointShortcut({ job }: { job: Job }) {

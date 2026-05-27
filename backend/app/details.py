@@ -1651,6 +1651,7 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
         active_eps = 0
         active_envs = 0
         job_completed_runs = 0
+        artifact_eps = 0
         job_log_dir = (slurm_meta or {}).get("job_log_dir") if slurm_meta else None
         if n_eps > 0:
             env = await load_cluster(cluster)
@@ -1696,6 +1697,20 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
             except (ValueError, IndexError):
                 active_envs = 0
 
+            # The eval client writes per-episode videos as each episode
+            # finishes, while results.json is only emitted after a full run.
+            # Count these artifacts so Active progress moves during long runs.
+            artifact_cmd = (
+                f"eval_dir={_remote_path_expr(eval_dir)}; "
+                "find \"$eval_dir\" -path '*/videos/ep*.mp4' "
+                "-type f 2>/dev/null | wc -l"
+            )
+            r = await ssh_run(host, artifact_cmd, timeout=10.0)
+            try:
+                artifact_eps = int(r.stdout.strip())
+            except ValueError:
+                artifact_eps = 0
+
         # Promote eval into the unified step-based shape so the frontend
         # ETA + progress bar work the same way as training:
         #   current_step = completed_runs · N_EPISODES + incomplete episodes in this job
@@ -1703,7 +1718,9 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
         if n_eps > 0:
             progress.max_steps = total * n_eps
             active_incomplete_eps = max(0, active_eps - job_completed_runs * n_eps)
-            progress.current_step = min(completed * n_eps + active_incomplete_eps, progress.max_steps)
+            current = completed * n_eps + active_incomplete_eps
+            current = max(current, artifact_eps)
+            progress.current_step = min(current, progress.max_steps)
             progress.percent = round(100.0 * progress.current_step / progress.max_steps, 1)
             episode_label = f"{progress.current_step}/{progress.max_steps} episodes"
             progress.current_label = f"{completed}/{total} runs · {episode_label}"

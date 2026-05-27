@@ -18,8 +18,8 @@ from .ssh import ssh_run
 
 class ResultCell(BaseModel):
     eval_set: str
-    mean_success_rate: float
-    std_success_rate: float
+    mean_success_rate: float | None
+    std_success_rate: float | None
     per_run_success_rate: list[float]
     success_counts: list[int | None] = []
     episode_counts: list[int | None] = []
@@ -264,15 +264,16 @@ def rate_from_run(data):
 
 
 def cell_from_rates(eval_set, rates, success_counts=None, episode_counts=None, expected_runs=None, source=None):
-    if not rates:
+    episode_counts = episode_counts or []
+    if not rates and not any((v or 0) > 0 for v in episode_counts):
         return None
     return {
         "eval_set": eval_set,
-        "mean_success_rate": statistics.mean(rates),
-        "std_success_rate": statistics.pstdev(rates) if len(rates) > 1 else 0.0,
+        "mean_success_rate": statistics.mean(rates) if rates else None,
+        "std_success_rate": (statistics.pstdev(rates) if len(rates) > 1 else 0.0) if rates else None,
         "per_run_success_rate": rates,
         "success_counts": success_counts or [],
-        "episode_counts": episode_counts or [],
+        "episode_counts": episode_counts,
         "completed_runs": len(rates),
         "expected_runs": expected_runs,
         "source": source,
@@ -321,6 +322,7 @@ def cells_from_runs(task_root, configured_eval_sets, expected_runs):
     for eval_set in scan_eval_sets(task_root, configured_eval_sets):
         eval_root = task_root / eval_set
         vals = []
+        partial_episode_counts = []
         for path in sorted(eval_root.glob("run_*/results.json"), key=run_path_key):
             try:
                 rate, success_count, total = rate_from_run(read_json(path))
@@ -328,12 +330,22 @@ def cells_from_runs(task_root, configured_eval_sets, expected_runs):
                 continue
             if rate is not None:
                 vals.append((rate, success_count, total, str(path)))
+        completed_run_dirs = {Path(v[3]).parent for v in vals}
+        for run_dir in sorted(eval_root.glob("run_*"), key=run_path_key):
+            if run_dir in completed_run_dirs:
+                continue
+            try:
+                count = sum(1 for _ in (run_dir / "videos").glob("ep*.mp4"))
+            except Exception:
+                count = 0
+            if count > 0:
+                partial_episode_counts.append(count)
         rates = [v[0] for v in vals]
         cell = cell_from_rates(
             eval_set,
             rates,
-            [v[1] for v in vals],
-            [v[2] for v in vals],
+            [v[1] for v in vals] + [None for _ in partial_episode_counts],
+            [v[2] for v in vals] + partial_episode_counts,
             expected_runs,
             str(eval_root),
         )
@@ -478,10 +490,11 @@ def result_job_info(eval_root, top_path, job_name=None, variant_name=None):
 
 
 def run_path_key(path):
+    name = path.name if path.is_dir() else path.parent.name
     try:
-        return (0, int(path.parent.name.rsplit("_", 1)[-1]))
+        return (0, int(name.rsplit("_", 1)[-1]))
     except Exception:
-        return (1, path.parent.name)
+        return (1, name)
 
 
 def task_name_for(short, configured_tasks, fallback=None):
@@ -633,8 +646,6 @@ def build_variant(meta):
     if eval_root.exists():
         for run_root in sorted(p for p in eval_root.iterdir() if p.is_dir()):
             top_path = run_root / "results.json"
-            if not top_path.exists():
-                continue
             item = build_variant_from_root(meta, exp_dir, run_root, top_path)
             if item:
                 rows.append(item)
