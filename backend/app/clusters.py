@@ -8,11 +8,10 @@ quoting / variable expansion correctly without us re-implementing bash.
 import asyncio
 import re
 import shutil
-from typing import Any
 
 from pydantic import BaseModel
 
-from .paths import CLUSTERS_DIR
+from . import cluster_settings
 
 
 def _find_bash() -> str:
@@ -43,7 +42,10 @@ class ClusterEnv(BaseModel):
 
     @property
     def ssh_alias(self) -> str:
-        """SSH alias to use. Per repo convention: kakao → 'kakao-login-1', skt → 'skt'."""
+        """SSH alias to use. Can be overridden with SSH_ALIAS in the cluster env."""
+        alias = (self.vars.get("SSH_ALIAS") or "").strip()
+        if alias:
+            return alias
         match self.name:
             case "kakao":
                 return "kakao-login-1"
@@ -53,25 +55,21 @@ class ClusterEnv(BaseModel):
                 return other
 
 
-# Non-slurm clusters that the web app knows about but don't have a
-# clusters/<name>.env file (k8s, future targets). They appear in the
-# Submit page's cluster dropdown but the submit flow is gated to slurm
-# until per-cluster submission paths are implemented.
-NON_SLURM_CLUSTERS = ["mlxp"]
-
-
 def list_clusters() -> list[str]:
-    slurm = sorted(
-        p.stem for p in CLUSTERS_DIR.glob("*.env") if p.is_file()
-    )
-    return slurm + NON_SLURM_CLUSTERS
+    return cluster_settings.list_cluster_names()
 
 
 async def load_cluster(name: str) -> ClusterEnv:
-    env_path = CLUSTERS_DIR / f"{name}.env"
-    if not env_path.is_file():
-        raise FileNotFoundError(f"Cluster env not found: {env_path}")
-    vars = await _source_and_dump(env_path.read_text())
+    text = cluster_settings.load_env_text(name)
+    if not text.strip():
+        raise FileNotFoundError(f"Cluster env for {name} is not configured")
+    vars = await _source_and_dump(text)
+    if name != "mlxp":
+        missing = [k for k in ("PARTITION", "LOG_DIR", "DATA_DIR") if not vars.get(k)]
+        if missing:
+            raise FileNotFoundError(
+                f"Cluster env for {name} is missing required values: {', '.join(missing)}"
+            )
     return ClusterEnv(name=name, vars=vars)
 
 

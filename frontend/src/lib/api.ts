@@ -258,6 +258,15 @@ export type MlxpSettings = {
   wandb_secret: string;
 };
 
+export type ClusterEnvSettings = {
+  name: string;
+  env_text: string;
+  template_text: string;
+  configured: boolean;
+  source: string;
+  path: string | null;
+};
+
 export type Partition = {
   name: string;
   is_default: boolean;

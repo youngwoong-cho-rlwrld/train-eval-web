@@ -17,6 +17,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from . import cluster_settings
 from .clusters import load_cluster
 from .data_interface import rewrite_action_horizon
 from .job_identity import comment_field_fragment
@@ -76,8 +77,10 @@ class SubmitRequest(BaseModel):
     # None means "use whatever the variant config.sh says".
     dataset_override: str | list[str] | None = None
     extra_args: list[str] = Field(default_factory=list)
-    # Train-only: per-submission overrides. None means "use config.sh".
+    # Per-submission GPU override. For train it controls torchrun/world size;
+    # for eval it controls scheduler allocation and eval worker count.
     train_num_gpus: int | None = Field(default=None, ge=1)
+    # Train-only: per-submission overrides. None means "use config.sh".
     train_global_batch_size: int | None = Field(default=None, ge=1)
     train_max_steps: int | None = Field(default=None, ge=1)
     train_save_steps: int | None = Field(default=None, ge=1)
@@ -303,7 +306,6 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     )):
         raise ValueError("eval overrides are only valid for phase=eval")
     if req.phase != "train" and any((
-        req.train_num_gpus is not None,
         req.train_global_batch_size is not None,
         req.train_max_steps is not None,
         req.train_save_steps is not None,
@@ -474,6 +476,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             eval_overwrite_results=req.eval_overwrite_results,
             checkpoint_path=eval_checkpoint,
             extra_args=req.extra_args,
+            train_num_gpus=train_settings.num_gpus,
             train_git_commit=train_git_commit,
             train_note=train_note,
         )
@@ -487,6 +490,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             partition=partition,
             dataset_override=req.dataset_override,
             extra_args=req.extra_args,
+            train_num_gpus=train_settings.num_gpus,
             train_git_commit=train_git_commit,
             train_note=train_note,
             wandb_project=submitted_wandb_project,
@@ -530,6 +534,12 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         if r.returncode != 0:
             raise RuntimeError(f"rsync failed for {local}: {r.stderr}")
         rsync_results.append(r)
+
+    await _rsync_text(
+        host,
+        cluster_settings.load_env_text(req.cluster),
+        f"{CLUSTER_STAGING_REL}/clusters/{req.cluster}.env",
+    )
 
     # Apply dataset override to the staged config.sh, if requested.
     if req.dataset_override is not None:
@@ -629,6 +639,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         if checkpoint_dir:
             comment += f";checkpoint_dir={checkpoint_dir}"
     else:
+        comment += f";eval_num_gpus={train_settings.num_gpus}"
         if eval_dir:
             comment += f";eval_dir={eval_dir}"
         if results_path:
@@ -659,9 +670,9 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         # Pin wandb run id to the slurm display name so the URL is stable
         # and matches MLXP's run-id format.
         + f",WANDB_RUN_ID={shlex.quote(job_name)}"
+        + f",SUBMIT_TRAIN_NUM_GPUS={train_settings.num_gpus}"
         + (
-            f",SUBMIT_TRAIN_NUM_GPUS={train_settings.num_gpus},"
-            f"SUBMIT_TRAIN_MAX_STEPS={train_settings.max_steps},"
+            f",SUBMIT_TRAIN_MAX_STEPS={train_settings.max_steps},"
             f"SUBMIT_TRAIN_SAVE_STEPS={train_settings.save_steps}"
             if req.phase == "train" else ""
         )
@@ -759,6 +770,11 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         + (
             f"eval_num_envs_per_gpu={eval_num_envs_per_gpu}\n"
             if req.phase == "eval" and eval_num_envs_per_gpu is not None
+            else ""
+        )
+        + (
+            f"eval_num_gpus={train_settings.num_gpus}\n"
+            if req.phase == "eval"
             else ""
         )
         + (

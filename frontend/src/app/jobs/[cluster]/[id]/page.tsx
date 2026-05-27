@@ -47,6 +47,7 @@ import { RefreshButton } from "@/components/refresh-button";
 import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state";
 import { JobStateBadge } from "@/components/job-state-badge";
 import { ImmediateTooltip } from "@/components/immediate-tooltip";
+import { formatPageTitle } from "@/components/page-title";
 
 const REFRESH_MS = 60_000;
 const LOG_PAGE_SIZE = 100;
@@ -131,10 +132,7 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
   const cancelLabel = cluster === "mlxp" ? "kubectl delete job" : "scancel";
 
   useEffect(() => {
-    document.title = details.data?.job_name ?? `${cluster}/${id}`;
-    return () => {
-      document.title = "train-eval-web";
-    };
+    document.title = formatPageTitle(details.data?.job_name ?? `${cluster}/${id}`);
   }, [cluster, details.data?.job_name, id]);
 
   return (
@@ -808,7 +806,15 @@ function EvalRunsCard({
         )}
         {!isLoading && !error && rows.length > 0 && (
           <div className="overflow-x-auto">
-            <table className="w-full text-sm">
+            <table className="min-w-[900px] w-full table-fixed text-sm">
+              <colgroup>
+                {hasTask && <col className="w-[190px]" />}
+                <col className="w-[56px]" />
+                <col className="w-[72px]" />
+                <col className="w-[70px]" />
+                <col className="w-[160px]" />
+                <col />
+              </colgroup>
               <thead className="border-b border-slate-200 text-left text-xs uppercase tracking-wide text-slate-500 dark:border-slate-800">
                 <tr>
                   {hasTask && <Th>Task</Th>}
@@ -836,24 +842,26 @@ function EvalRunRow({ row, showTask }: { row: EvalRun; showTask: boolean }) {
   return (
     <tr className="border-b border-slate-100 last:border-0 dark:border-slate-900">
       {showTask && (
-        <td className="py-2 pr-4 font-mono text-xs">
+        <td className="truncate py-2 pr-4 font-mono text-xs">
           {row.task ?? <span className="text-slate-400">—</span>}
         </td>
       )}
-      <td className="py-2 pr-4 font-mono text-xs">{row.eval_set}</td>
-      <td className="py-2 pr-4 font-mono text-xs">{row.run}</td>
-      <td className="py-2 pr-4 font-mono text-xs">
+      <td className="whitespace-nowrap py-2 pr-4 font-mono text-xs">{row.eval_set}</td>
+      <td className="whitespace-nowrap py-2 pr-4 font-mono text-xs">{row.run}</td>
+      <td className="whitespace-nowrap py-2 pr-4 font-mono text-xs">
         {row.seed ?? <span className="text-slate-400">—</span>}
       </td>
-      <td className="py-2 pr-4 font-mono text-xs">
+      <td className="whitespace-nowrap py-2 pr-4 font-mono text-xs">
         {formatEvalRunSuccess(row)}
       </td>
-      <td className="py-2 pr-4">
-        <div className="flex items-center gap-1">
-          <ImmediateTooltip content={row.path} className="max-w-[420px]">
-            <span className="truncate font-mono text-xs">{row.path}</span>
+      <td className="w-full py-2">
+        <div className="flex min-w-0 items-center justify-between gap-4">
+          <ImmediateTooltip content={row.path} className="min-w-0 flex-1">
+            <span className="block w-full truncate font-mono text-xs">{row.path}</span>
           </ImmediateTooltip>
-          <CopyButton value={row.path} title="Copy result file" />
+          <span className="shrink-0">
+            <CopyButton value={row.path} title="Copy result file" />
+          </span>
         </div>
       </td>
     </tr>

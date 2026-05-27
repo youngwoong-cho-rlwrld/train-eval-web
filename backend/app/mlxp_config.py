@@ -1,8 +1,4 @@
-"""Persisted MLXP settings.
-
-Only the MLXP user is user-configurable. Cluster-specific paths, images, and
-labels are derived from that user or pinned by environment variables.
-"""
+"""Persisted MLXP settings."""
 
 from __future__ import annotations
 
@@ -12,6 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
+
+from . import cluster_settings
 
 
 _SETTINGS_DIR = Path.home() / ".train-eval-web"
@@ -115,9 +113,21 @@ def _load_saved() -> dict[str, Any]:
 
 
 def _env_overrides() -> dict[str, Any]:
+    return _coerce_overrides(os.environ)
+
+
+def _cluster_env_overrides() -> dict[str, Any]:
+    try:
+        values = cluster_settings.parse_env_text(cluster_settings.load_env_text("mlxp"))
+    except FileNotFoundError:
+        return {}
+    return _coerce_overrides(values)
+
+
+def _coerce_overrides(values: dict[str, str] | os._Environ[str]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for env_name, field_name in _ENV_FIELDS.items():
-        raw = os.environ.get(env_name)
+        raw = values.get(env_name)
         if raw is None or raw == "":
             continue
         if field_name == "gpus_per_node":
@@ -132,8 +142,10 @@ def _env_overrides() -> dict[str, Any]:
 
 def get_settings() -> MlxpSettings:
     saved = _load_saved()
-    user = str(saved.get("user") or _default_user())
+    cluster_env = _cluster_env_overrides()
+    user = str(cluster_env.get("user") or saved.get("user") or _default_user())
     data = _defaults_for(user)
+    data.update(cluster_env)
     data.update(_env_overrides())
     return MlxpSettings.model_validate(data)
 

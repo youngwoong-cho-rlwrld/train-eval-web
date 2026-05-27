@@ -51,6 +51,7 @@ def _strip_state(s: str) -> str:
 
 async def list_partitions(cluster: str) -> list[PartitionInfo]:
     env = await load_cluster(cluster)
+    configured_default = (env.vars.get("PARTITION") or "").strip()
     r = await ssh_run(env.ssh_alias, "sinfo -h -o '%P|%t|%D|%G'", timeout=15.0)
     if r.returncode != 0:
         raise RuntimeError(f"sinfo failed: {r.stderr}")
@@ -98,9 +99,10 @@ async def list_partitions(cluster: str) -> list[PartitionInfo]:
     out = []
     for name in sorted(per_part):
         d = per_part[name]
+        is_default = name == configured_default if configured_default else name in defaults
         out.append(PartitionInfo(
             name=name,
-            is_default=(name in defaults),
+            is_default=is_default,
             is_background=is_bg(name),
             total_nodes=d["total_nodes"],
             idle_nodes=d["idle_nodes"],

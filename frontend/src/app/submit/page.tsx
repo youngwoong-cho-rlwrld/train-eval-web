@@ -425,11 +425,12 @@ export default function SubmitPage() {
     variant.data?.vars.MODEL_VERSION ??
     (trainModelId === "physixel" ? "n1.6" : trainModelId);
   const wantsTrainConfig = submitPhase === "train" && !!variantName;
+  const wantsGpuConfig = !!variantName;
   const wantsGitCommitConfig = !!variantName;
   const trainActionHorizonEnabled = wantsTrainConfig && trainModel === "n1.6";
   const modalityActionHorizon = dataInterface.data?.action_horizon ?? null;
   const trainNumGpusValid =
-    !wantsTrainConfig ||
+    !wantsGpuConfig ||
     (isPositiveInteger(trainNumGpus) &&
       (isSlurm || [1, 2, 4, 8].includes(trainNumGpusParsed)));
   const trainBatchSizeValid =
@@ -533,7 +534,7 @@ export default function SubmitPage() {
         multiDatasets,
       }),
       extra_args: submitPhase === "eval" && !isSlurm ? [] : splitArgs(extraArgs),
-      train_num_gpus: submitPhase === "train" ? trainNumGpusParsed : null,
+      train_num_gpus: wantsGpuConfig ? trainNumGpusParsed : null,
       train_global_batch_size: submittedTrainGlobalBatchSize,
       train_max_steps: submitPhase === "train" ? trainMaxStepsParsed : null,
       train_save_steps: submitPhase === "train" ? trainSaveStepsParsed : null,
@@ -555,7 +556,7 @@ export default function SubmitPage() {
     !variant.isLoading &&
     !variantError &&
     trainNoteValid &&
-    (submitPhase !== "train" || trainConfigValid) &&
+    trainConfigValid &&
     (!wantsCheckpoint ||
       (!!trimmedCkpt &&
         checkpointExistsValue === true &&
@@ -861,15 +862,19 @@ export default function SubmitPage() {
     flagEditors["--dataset-path"] = datasetEditor;
     flagEditors["--data-config"] = datasetEditor;
   }
-  if (wantsTrainConfig && variant.data) {
-    flagEditors["--num-gpus"] = (
+  const gpuCountEditor =
+    wantsGpuConfig && variant.data ? (
       <NumberCellEditor
         value={trainNumGpus}
         onChange={(value) => updateTrainConfig({ numGpus: value })}
         valid={trainNumGpusValid}
         invalidMessage={isSlurm ? "Positive integer." : "Use 1, 2, 4, or 8."}
       />
-    );
+    ) : undefined;
+  if (gpuCountEditor) {
+    flagEditors["--num-gpus"] = gpuCountEditor;
+  }
+  if (wantsTrainConfig && variant.data) {
     const batchEditor = (
       <NumberCellEditor
         value={trainBatchSize}
@@ -938,6 +943,14 @@ export default function SubmitPage() {
         ),
       });
     }
+  }
+  if (submitPhase === "eval" && wantsGpuConfig) {
+    extraFlagRows.push({
+      key: "eval-num-gpus",
+      flag: "TRAIN_NUM_GPUS",
+      value: trainNumGpus || "(unset)",
+      editor: gpuCountEditor,
+    });
   }
   if (wantsGitCommitConfig) {
     extraFlagRows.push({

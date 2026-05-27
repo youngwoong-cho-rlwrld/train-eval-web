@@ -9,6 +9,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from . import (
     clusters,
+    cluster_settings,
     copy_checkpoint,
     data_interface,
     datasets,
@@ -56,6 +57,24 @@ async def get_cluster(name: str):
     except FileNotFoundError:
         raise HTTPException(404, f"cluster {name} not found")
     return env
+
+
+@app.get("/api/cluster-settings", response_model=list[cluster_settings.ClusterEnvSettings])
+async def get_cluster_settings():
+    return cluster_settings.list_settings()
+
+
+@app.put("/api/cluster-settings/{name}", response_model=cluster_settings.ClusterEnvSettings)
+async def put_cluster_settings(name: str, req: cluster_settings.ClusterEnvSettingsUpdate):
+    try:
+        saved = cluster_settings.save_settings(name, req.env_text)
+        if name == "mlxp":
+            from .mlxp_data_pod import invalidate_pods_cache
+
+            invalidate_pods_cache()
+        return saved
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
 
 
 @app.get("/api/clusters/{name}/partitions", response_model=list[partitions.PartitionInfo])
@@ -403,6 +422,7 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
                 git=None,
             )
         elif req.phase == "eval":
+            train_settings = submit.resolve_train_settings(req, variant, model.family)
             checkpoint_path = submit.require_eval_checkpoint_path(req)
             eval_sets = submit.normalize_eval_sets(req.eval_sets)
             train_git_commit = submit.resolve_train_git_commit(req, variant)
@@ -424,6 +444,7 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
                 checkpoint_path=checkpoint_path,
                 extra_args=req.extra_args,
                 data_dir=mlxp_config.get_settings().datasets_dir if req.cluster == "mlxp" else None,
+                train_num_gpus=train_settings.num_gpus,
                 train_git_commit=train_git_commit,
                 train_note=train_note,
             )

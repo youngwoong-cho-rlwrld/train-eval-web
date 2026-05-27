@@ -4,12 +4,20 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ExternalLink } from "lucide-react";
-import { api, type MlxpSettings } from "@/lib/api";
+import { api, type ClusterEnvSettings } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { CopyButton } from "@/components/copy-button";
+import {
+  fieldsForClusterEnv,
+  normalizeEnvDraft,
+  parseEnvText,
+  renderEnvText,
+  sameEnvValues,
+} from "@/lib/cluster-env";
 
 type WandbStatus = {
   logged_in: boolean;
@@ -22,76 +30,134 @@ export default function SettingsPage() {
   return (
     <div className="mx-auto max-w-7xl px-8 py-12">
       <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
-      <MlxpSettingsCard />
+      <ClusterSettingsCard />
       <WandbCard />
     </div>
   );
 }
 
-function MlxpSettingsCard() {
+function ClusterSettingsCard() {
   const qc = useQueryClient();
-  const [draftUser, setDraftUser] = useState<string | null>(null);
+  const [edits, setEdits] = useState<Record<string, Record<string, string>>>({});
 
   const settings = useQuery({
-    queryKey: ["mlxp-settings"],
-    queryFn: () => api<MlxpSettings>("/api/mlxp/settings"),
+    queryKey: ["cluster-settings"],
+    queryFn: () => api<ClusterEnvSettings[]>("/api/cluster-settings"),
   });
-  const savedUser = settings.data?.user ?? "";
-  const currentUser = draftUser ?? savedUser;
 
   const save = useMutation({
-    mutationFn: (user: string) =>
-      api<MlxpSettings>("/api/mlxp/settings", {
-        method: "POST",
-        body: JSON.stringify({ user: user.trim() }),
+    mutationFn: ({ name, envText }: { name: string; envText: string }) =>
+      api<ClusterEnvSettings>(`/api/cluster-settings/${encodeURIComponent(name)}`, {
+        method: "PUT",
+        body: JSON.stringify({ env_text: envText }),
       }),
     onSuccess: (res) => {
-      toast.success("MLXP settings saved");
-      setDraftUser(null);
-      qc.setQueryData(["mlxp-settings"], res);
+      toast.success(`${res.name} settings saved`);
+      setEdits((prev) => {
+        const next = { ...prev };
+        delete next[res.name];
+        return next;
+      });
+      qc.setQueryData<ClusterEnvSettings[]>(["cluster-settings"], (old) =>
+        old?.map((item) => item.name === res.name ? res : item) ?? [res],
+      );
+      qc.invalidateQueries({ queryKey: ["cluster-settings"] });
+      qc.invalidateQueries({ queryKey: ["clusters"] });
+      qc.invalidateQueries({ queryKey: ["partitions"] });
+      qc.invalidateQueries({ queryKey: ["mlxp-settings"] });
       qc.invalidateQueries({ queryKey: ["mlxp-gpus"] });
     },
     onError: (e: Error) => toast.error(e.message),
   });
 
-  const dirty = draftUser !== null && draftUser.trim() !== savedUser;
-
   return (
     <Card className="mt-8">
       <CardHeader>
-        <CardTitle>MLXP</CardTitle>
+        <CardTitle>Cluster env</CardTitle>
         <p className="text-sm text-slate-500">
-          Used to derive /data/&lt;user&gt; paths, owner labels, data pod, and W&amp;B secret.
+          User-specific cluster paths and MLXP settings. Saved outside git under{" "}
+          <code className="font-mono">~/.train-eval-web/clusters</code>.
         </p>
       </CardHeader>
-      <CardContent className="space-y-4">
-        {settings.isLoading && <p className="text-sm text-slate-500">Loading MLXP settings...</p>}
+      <CardContent className="space-y-6">
+        {settings.isLoading && <p className="text-sm text-slate-500">Loading cluster settings...</p>}
         {settings.error && (
           <p className="text-sm text-red-600 dark:text-red-400">
             {(settings.error as Error).message}
           </p>
         )}
-        {settings.data && (
-          <>
-            <div className="space-y-2">
-              <Label>User</Label>
-              <Input
-                value={currentUser}
-                onChange={(e) => setDraftUser(e.target.value)}
-                className="font-mono text-xs"
-                autoComplete="off"
-              />
+        {settings.data?.map((item) => {
+          const savedValues = parseEnvText(item.env_text);
+          const draft = normalizeEnvDraft(edits[item.name], savedValues);
+          const fields = fieldsForClusterEnv(item.name, savedValues, draft);
+          const dirty = !sameEnvValues(savedValues, draft, fields);
+          const pending = save.isPending && save.variables?.name === item.name;
+          const envText = renderEnvText(fields, draft);
+          return (
+            <div key={item.name} className="space-y-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex min-w-0 items-center gap-2">
+                  <Label className="font-mono">{item.name}.env</Label>
+                  {item.path && (
+                    <div className="flex min-w-0 items-center gap-1 text-xs text-slate-500">
+                      <code className="truncate font-mono">{item.path}</code>
+                      <CopyButton value={item.path} title={`Copy ${item.name}.env path`} />
+                    </div>
+                  )}
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    onClick={() =>
+                      setEdits((prev) => {
+                        const next = { ...prev };
+                        delete next[item.name];
+                        return next;
+                      })
+                    }
+                    disabled={!dirty || pending}
+                  >
+                    Reset
+                  </Button>
+                  <Button
+                    onClick={() => save.mutate({ name: item.name, envText })}
+                    disabled={!dirty || pending}
+                  >
+                    {pending ? "Saving..." : "Save"}
+                  </Button>
+                </div>
+              </div>
+              <div className="divide-y divide-slate-100 rounded-md border border-slate-200 dark:divide-slate-900 dark:border-slate-800">
+                {fields.map((field) => (
+                  <div
+                    key={field.key}
+                    className="grid gap-3 px-3 py-3 md:grid-cols-[240px_minmax(0,1fr)]"
+                  >
+                    <div className="min-w-0">
+                      <div className="truncate font-mono text-xs font-semibold">{field.key}</div>
+                      <p className="mt-1 text-xs text-slate-500">{field.description}</p>
+                    </div>
+                    <Input
+                      value={draft[field.key] ?? ""}
+                      onChange={(e) =>
+                        setEdits((prev) => ({
+                          ...prev,
+                          [item.name]: {
+                            ...normalizeEnvDraft(prev[item.name], draft),
+                            [field.key]: e.target.value,
+                          },
+                        }))
+                      }
+                      placeholder={savedValues[field.key] ?? ""}
+                      className="font-mono text-xs"
+                      autoComplete="off"
+                    />
+                  </div>
+                ))}
+              </div>
             </div>
-            <div className="flex justify-end gap-2">
-              <Button variant="outline" onClick={() => setDraftUser(null)} disabled={!dirty || save.isPending}>
-                Reset
-              </Button>
-              <Button onClick={() => save.mutate(currentUser)} disabled={!dirty || save.isPending || !currentUser.trim()}>
-                {save.isPending ? "Saving..." : "Save"}
-              </Button>
-            </div>
-          </>
-        )}
+          );
+        })}
       </CardContent>
     </Card>
   );
