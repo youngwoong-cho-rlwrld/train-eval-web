@@ -750,6 +750,19 @@ async def get_checkpoints(cluster: str, job_id: str):
         raise HTTPException(500, str(e))
 
 
+@app.get(
+    "/api/jobs/{cluster}/{job_id}/checkpoint-copies",
+    response_model=list[copy_checkpoint.CheckpointCopyRecord],
+)
+async def get_checkpoint_copies(cluster: str, job_id: str):
+    try:
+        return await copy_checkpoint.list_checkpoint_copies(cluster, job_id)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+
 @app.post(
     "/api/jobs/{cluster}/{job_id}/copy-checkpoint",
     response_model=copy_checkpoint.CopyCheckpointStartResponse,

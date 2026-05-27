@@ -17,6 +17,7 @@ Transfer mechanism:
 
 import asyncio
 import contextlib
+import json
 import os
 import shutil
 import shlex
@@ -105,6 +106,19 @@ class CopyJobStatus(BaseModel):
     finished_at: float | None = None
 
 
+class CheckpointCopyRecord(BaseModel):
+    copy_id: str
+    source_cluster: str
+    source_job: str
+    source_path: str
+    dest_cluster: str
+    dest_path: str
+    copied_at: float
+    delete_source: bool = False
+    source_exists: bool | None = None
+    dest_exists: bool | None = None
+
+
 # In-memory registry of background transfer tasks. Keyed by copy_id.
 # Lost on uvicorn restart — fine for the user's solo workflow.
 _COPY_JOBS: dict[str, CopyJobStatus] = {}
@@ -112,6 +126,7 @@ _COPY_JOBS: dict[str, CopyJobStatus] = {}
 # Lets `cancel_copy` interrupt an in-flight transfer.
 _COPY_HANDLES: dict[str, dict] = {}
 _MLXP_STREAM_SEMAPHORE = asyncio.Semaphore(_MLXP_COPY_STREAMS)
+_COPY_HISTORY_DIR = ".train-eval-web/checkpoint-copies"
 
 
 def _track_proc(copy_id: str, proc: asyncio.subprocess.Process) -> None:
@@ -275,6 +290,125 @@ def _parse_paths(stdout: str, *, nested: bool, fallback_job: str = "") -> list[C
     return out
 
 
+# ── copy history ────────────────────────────────────────────────────────
+
+def _history_filename(job_id: str) -> str:
+    safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in job_id)
+    return f"{safe or 'job'}.jsonl"
+
+
+def _mlxp_history_paths(job_id: str) -> tuple[str, str]:
+    hist_dir = f"{get_settings().experiments_dir}/{_COPY_HISTORY_DIR}"
+    return hist_dir, f"{hist_dir}/{_history_filename(job_id)}"
+
+
+def _slurm_history_paths(job_id: str) -> tuple[str, str]:
+    hist_dir = f"$HOME/{_COPY_HISTORY_DIR}"
+    return hist_dir, f"{hist_dir}/{_history_filename(job_id)}"
+
+
+async def list_checkpoint_copies(cluster: str, job_id: str) -> list[CheckpointCopyRecord]:
+    """Return persisted checkpoint-copy history for a source job."""
+    records = await _read_copy_history(cluster, job_id)
+
+    async def enrich(record: CheckpointCopyRecord) -> CheckpointCopyRecord:
+        values = record.model_dump()
+        values["source_exists"] = await _path_exists(
+            record.source_cluster, record.source_path,
+        )
+        values["dest_exists"] = await _path_exists(record.dest_cluster, record.dest_path)
+        return CheckpointCopyRecord(**values)
+
+    enriched = await asyncio.gather(*(enrich(r) for r in records))
+    return sorted(enriched, key=lambda r: r.copied_at, reverse=True)
+
+
+async def _read_copy_history(cluster: str, job_id: str) -> list[CheckpointCopyRecord]:
+    if cluster == "mlxp":
+        _, path = _mlxp_history_paths(job_id)
+        pod = await ensure_listing_pod()
+        out = await _kubectl_exec_text(
+            pod,
+            "bash",
+            "-c",
+            f"cat {shlex.quote(path)} 2>/dev/null || true",
+            timeout=15.0,
+        )
+    else:
+        env = await load_cluster(cluster)
+        _, path = _slurm_history_paths(job_id)
+        r = await ssh_run(
+            env.ssh_alias,
+            f"cat {_remote_shell_path(path)} 2>/dev/null || true",
+            timeout=15.0,
+        )
+        out = r.stdout
+
+    records: list[CheckpointCopyRecord] = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        try:
+            records.append(CheckpointCopyRecord(**json.loads(line)))
+        except (TypeError, ValueError):
+            continue
+    return records
+
+
+async def _append_copy_history(cluster: str, job_id: str, record: CheckpointCopyRecord) -> None:
+    line = json.dumps(record.model_dump(), sort_keys=True) + "\n"
+    if cluster == "mlxp":
+        hist_dir, path = _mlxp_history_paths(job_id)
+        pod = await ensure_listing_pod()
+        await _kubectl_exec_text(
+            pod,
+            "bash",
+            "-c",
+            f"mkdir -p {shlex.quote(hist_dir)} && printf %s {shlex.quote(line)} >> {shlex.quote(path)}",
+            timeout=15.0,
+        )
+        return
+
+    env = await load_cluster(cluster)
+    hist_dir, path = _slurm_history_paths(job_id)
+    r = await ssh_run(
+        env.ssh_alias,
+        (
+            f"mkdir -p {_remote_shell_path(hist_dir)} && "
+            f"printf %s {shlex.quote(line)} >> {_remote_shell_path(path)}"
+        ),
+        timeout=15.0,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or r.stdout.strip() or "copy history write failed")
+
+
+async def _path_exists(cluster: str, path: str) -> bool | None:
+    try:
+        if cluster == "mlxp":
+            pod = await ensure_listing_pod()
+            out = await _kubectl_exec_text(
+                pod,
+                "bash",
+                "-c",
+                f"if [ -e {shlex.quote(path)} ]; then echo 1; else echo 0; fi",
+                timeout=15.0,
+            )
+        else:
+            env = await load_cluster(cluster)
+            r = await ssh_run(
+                env.ssh_alias,
+                f"if [ -e {_remote_shell_path(path)} ]; then echo 1; else echo 0; fi",
+                timeout=15.0,
+            )
+            if r.returncode != 0:
+                return None
+            out = r.stdout
+    except Exception:
+        return None
+    return out.strip() == "1"
+
+
 # ── transfer ────────────────────────────────────────────────────────────
 
 async def start_copy(
@@ -310,7 +444,8 @@ async def start_copy(
     _COPY_HANDLES[copy_id] = {"task": None, "proc": None}
     task = asyncio.create_task(
         _run_copy(
-            copy_id, src_cluster, dest_cluster, sources, dest_path_root, delete_source,
+            copy_id, src_cluster, src_job, dest_cluster, sources, dest_path_root,
+            delete_source,
         )
     )
     _COPY_HANDLES[copy_id]["task"] = task
@@ -384,7 +519,7 @@ def _select_model_artifact_files(parent_basename: str, names: list[str]) -> list
 
 
 async def _run_copy(
-    copy_id: str, src_cluster: str, dest_cluster: str,
+    copy_id: str, src_cluster: str, src_job: str, dest_cluster: str,
     sources: list[str], dest_path_root: str, delete_source: bool,
 ) -> None:
     state = _COPY_JOBS[copy_id]
@@ -438,6 +573,22 @@ async def _run_copy(
             state.dest_size_bytes = state.src_size_bytes
             state.copies_done = i + 1
 
+            await _append_copy_history(
+                src_cluster,
+                src_job,
+                CheckpointCopyRecord(
+                    copy_id=copy_id,
+                    source_cluster=src_cluster,
+                    source_job=src_job,
+                    source_path=src_path,
+                    dest_cluster=dest_cluster,
+                    dest_path=dest_path,
+                    copied_at=time.time(),
+                    delete_source=delete_source,
+                    source_exists=None,
+                    dest_exists=True,
+                ),
+            )
             if delete_source:
                 await _delete_source(src_cluster, src_path)
 

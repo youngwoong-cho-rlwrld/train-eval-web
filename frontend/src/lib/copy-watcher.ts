@@ -1,26 +1,11 @@
 "use client";
 
 import { toast } from "sonner";
-import { api } from "@/lib/api";
+import { api, type CopyJobStatus } from "@/lib/api";
 
 const STORAGE_KEY = "copy-checkpoint.active";
 const POLL_MS = 2000;
 const STATUS_RECONNECT_MS = 60_000;
-
-export type CopyJobStatus = {
-  copy_id: string;
-  status: "running" | "done" | "error";
-  error: string | null;
-  phase: string | null;
-  copies_total: number;
-  copies_done: number;
-  current_source: string | null;
-  current_dest: string | null;
-  src_size_bytes: number | null;
-  dest_size_bytes: number | null;
-  started_at: number;
-  finished_at: number | null;
-};
 
 type ActiveCopy = {
   copyId: string;

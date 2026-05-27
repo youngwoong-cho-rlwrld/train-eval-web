@@ -7,10 +7,18 @@ import {
   useMutation,
   useQuery,
   useQueryClient,
+  type UseQueryResult,
 } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ArrowLeft, ExternalLink } from "lucide-react";
-import { api, logStreamUrl, type EvalRun, type JobDetails } from "@/lib/api";
+import {
+  api,
+  logStreamUrl,
+  type CheckpointCopyRecord,
+  type EvalRun,
+  type JobDetails,
+  type PathExistence,
+} from "@/lib/api";
 import { formatDuration, parseSlurmDuration } from "@/lib/duration";
 import { formatJobTimestamp } from "@/lib/job-time";
 import {
@@ -33,6 +41,7 @@ import {
 import { ConfigCard, DataInterfaceCard } from "@/components/config-card";
 import { CopyButton } from "@/components/copy-button";
 import { CopyCheckpointDialog } from "@/components/copy-checkpoint-dialog";
+import { CheckpointCopyList } from "@/components/checkpoint-copy-history";
 import { ResumeJobButton } from "@/components/resume-job-button";
 import { RefreshButton } from "@/components/refresh-button";
 import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state";
@@ -70,6 +79,7 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
     qc.invalidateQueries({ queryKey: ["job", cluster, id] });
     qc.invalidateQueries({ queryKey: ["job-details", cluster, id] });
     qc.invalidateQueries({ queryKey: ["job-flags", cluster, id] });
+    qc.invalidateQueries({ queryKey: ["checkpoint-copies", cluster, id] });
     qc.invalidateQueries({ queryKey: ["variant"] });
   };
 
@@ -100,6 +110,16 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
   const isTrainPhase = isTrainJobPhase(phase);
   const isComplete = isCompletedJobState(sacct.data?.State);
   const stateForActions = sacct.data?.State ?? details.data?.state ?? "";
+  const checkpointPath = details.data?.paths.ckpt_dir ?? null;
+  const checkpointPathExists = useQuery({
+    queryKey: ["path-exists", cluster, checkpointPath],
+    queryFn: () =>
+      api<PathExistence>(
+        `/api/clusters/${cluster}/path-exists?path=${encodeURIComponent(checkpointPath!)}`,
+      ),
+    enabled: Boolean(checkpointPath),
+  });
+  const checkpointMissing = checkpointPathExists.data?.exists === false;
   const canResume = cluster !== "mlxp" && isTimeoutJobState(stateForActions);
   const canCopy = isTrainPhase && isComplete;
   const detailsError = details.error as Error | null;
@@ -180,6 +200,12 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
               variant="outline"
               size="sm"
               onClick={() => setCopyOpen(true)}
+              disabled={checkpointMissing}
+              title={
+                checkpointMissing
+                  ? "Checkpoint path is unavailable: moved/deleted or not generated yet."
+                  : undefined
+              }
             >
               Copy checkpoint
             </Button>
@@ -312,6 +338,7 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
       <PathsCard
         d={details.data}
         cluster={cluster}
+        checkpointPathExists={checkpointPathExists.data?.exists ?? null}
         isLoading={details.isLoading}
         error={detailsError}
       />
@@ -647,14 +674,25 @@ function ProgressCard({
 function PathsCard({
   d,
   cluster,
+  checkpointPathExists,
   isLoading = false,
   error,
 }: {
   d?: JobDetails;
   cluster: string;
+  checkpointPathExists?: boolean | null;
   isLoading?: boolean;
   error?: Error | null;
 }) {
+  const copyHistory = useQuery({
+    queryKey: ["checkpoint-copies", cluster, d?.job_id],
+    queryFn: () =>
+      api<CheckpointCopyRecord[]>(
+        `/api/jobs/${cluster}/${d!.job_id}/checkpoint-copies`,
+      ),
+    enabled: Boolean(d?.job_id),
+  });
+  const checkpointUnavailable = checkpointPathExists === false;
   const rows: { label: string; value: string }[] = [
     ...(d
       ? [
@@ -681,16 +719,66 @@ function PathsCard({
         {!isLoading && !error && d && (
           <div className="divide-y divide-slate-100 dark:divide-slate-900">
             {rows.map((r) => (
-              <div key={r.label} className="flex items-center justify-between gap-4 py-2">
-                <div className="min-w-[110px] text-xs uppercase tracking-wide text-slate-500">{r.label}</div>
-                <div className="flex-1 truncate font-mono text-xs">{r.value}</div>
-                <CopyButton value={r.value} />
+              <div key={r.label}>
+                <div className="flex items-center justify-between gap-4 py-2">
+                  <div className="min-w-[110px] text-xs uppercase tracking-wide text-slate-500">{r.label}</div>
+                  <div
+                    className={`flex-1 truncate font-mono text-xs ${
+                      r.label === "checkpoints" && checkpointUnavailable
+                        ? "line-through"
+                        : ""
+                    }`}
+                    title={r.value}
+                  >
+                    {r.value}
+                  </div>
+                  {r.label === "checkpoints" && checkpointUnavailable && (
+                    <span className="shrink-0 text-xs text-slate-500">
+                      unavailable: moved/deleted or not generated
+                    </span>
+                  )}
+                  <CopyButton value={r.value} />
+                </div>
+                {r.label === "checkpoints" && (
+                  <CheckpointCopyHistoryRows history={copyHistory} />
+                )}
               </div>
             ))}
           </div>
         )}
       </CardContent>
     </Card>
+  );
+}
+
+function CheckpointCopyHistoryRows({
+  history,
+}: {
+  history: UseQueryResult<CheckpointCopyRecord[], Error>;
+}) {
+  if (history.isLoading) {
+    return (
+      <div className="pb-2 pl-[110px] text-xs text-slate-500">
+        Loading copied checkpoints...
+      </div>
+    );
+  }
+  if (history.error) {
+    return (
+      <div className="pb-2 pl-[110px] text-xs text-red-600">
+        {(history.error as Error).message}
+      </div>
+    );
+  }
+  if (!history.data?.length) return null;
+
+  return (
+    <CheckpointCopyList
+      records={history.data}
+      className="space-y-1 pb-2 pl-[110px]"
+      itemClassName="min-w-0 rounded-md bg-slate-50 px-3 py-2 text-xs dark:bg-slate-900/40"
+      showTime={false}
+    />
   );
 }
 

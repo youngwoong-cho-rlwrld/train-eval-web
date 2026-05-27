@@ -122,6 +122,45 @@ export type Paths = {
   isaac_logs_glob: string | null;
 };
 
+export type PathExistence = {
+  exists: boolean;
+  kind: string | null;
+};
+
+export type CheckpointEntry = {
+  path: string;
+  job_name: string;
+  step: number;
+};
+
+export type CheckpointCopyRecord = {
+  copy_id: string;
+  source_cluster: string;
+  source_job: string;
+  source_path: string;
+  dest_cluster: string;
+  dest_path: string;
+  copied_at: number;
+  delete_source: boolean;
+  source_exists: boolean | null;
+  dest_exists: boolean | null;
+};
+
+export type CopyJobStatus = {
+  copy_id: string;
+  status: "running" | "done" | "error";
+  error: string | null;
+  phase: string | null;
+  copies_total: number;
+  copies_done: number;
+  current_source: string | null;
+  current_dest: string | null;
+  src_size_bytes: number | null;
+  dest_size_bytes: number | null;
+  started_at: number;
+  finished_at: number | null;
+};
+
 export type Progress = {
   phase: string;
   current_step: number | null;

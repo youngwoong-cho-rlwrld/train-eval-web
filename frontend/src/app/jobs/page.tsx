@@ -46,8 +46,14 @@ export default function JobsPage() {
     draftHistoryRange.startDate !== appliedHistoryRange.startDate ||
     draftHistoryRange.endDate !== appliedHistoryRange.endDate;
 
-  const { data, isLoading, error } = useQuery({
-    queryKey: ["jobs", historyQuery],
+  const activeJobs = useQuery({
+    queryKey: ["jobs", "active"],
+    queryFn: () =>
+      api<{ jobs: Job[] }>("/api/jobs?hours=0").then((d) => d.jobs),
+    refetchInterval: REFRESH_MS,
+  });
+  const recentJobs = useQuery({
+    queryKey: ["jobs", "recent", historyQuery],
     queryFn: () =>
       api<{ jobs: Job[] }>(`/api/jobs?${historyQuery}`).then((d) => d.jobs),
     refetchInterval: REFRESH_MS,
@@ -66,16 +72,16 @@ export default function JobsPage() {
       },
     }) > 0;
 
-  const { active, finished } = useMemo(() => {
-    const all = data ?? [];
-    const active = all
+  const active = useMemo(() => {
+    return (activeJobs.data ?? [])
       .filter((j) => isActiveJobState(j.state))
       .sort((a, b) => compareActiveDesc(a, b));
-    const finished = all
+  }, [activeJobs.data]);
+  const finished = useMemo(() => {
+    return (recentJobs.data ?? [])
       .filter((j) => !isActiveJobState(j.state))
       .sort((a, b) => compareEndedDesc(a, b));
-    return { active, finished };
-  }, [data]);
+  }, [recentJobs.data]);
   const recentStateOptions = useMemo(() => {
     const values = new Set(finished.map((j) => normalizeStateFilterValue(j.state)));
     return Array.from(values).sort();
@@ -109,9 +115,9 @@ export default function JobsPage() {
           <CardDescription>{active.length} {active.length === 1 ? "job" : "jobs"} in queue or running.</CardDescription>
         </CardHeader>
         <CardContent>
-          {isLoading && <LoadingState label="Loading active jobs..." rows={4} />}
-          {error && <ErrorState message={(error as Error).message} />}
-          {!isLoading && !error && active.length === 0 && (
+          {activeJobs.isLoading && <LoadingState label="Loading active jobs..." rows={4} />}
+          {activeJobs.error && <ErrorState message={(activeJobs.error as Error).message} />}
+          {!activeJobs.isLoading && !activeJobs.error && active.length === 0 && (
             <EmptyState message="No active jobs." />
           )}
           {active.length > 0 && <JobTable rows={active} showProgress showActions={false} />}
@@ -209,12 +215,12 @@ export default function JobsPage() {
               Apply
             </Button>
           </div>
-          {isLoading && <LoadingState label="Loading recent jobs..." rows={4} />}
-          {error && <ErrorState message={(error as Error).message} />}
-          {!isLoading && !error && finished.length === 0 && (
+          {recentJobs.isLoading && <LoadingState label="Loading recent jobs..." rows={4} />}
+          {recentJobs.error && <ErrorState message={(recentJobs.error as Error).message} />}
+          {!recentJobs.isLoading && !recentJobs.error && finished.length === 0 && (
             <EmptyState message="Nothing in this window." />
           )}
-          {!isLoading && !error && finished.length > 0 && filteredFinished.length === 0 && (
+          {!recentJobs.isLoading && !recentJobs.error && finished.length > 0 && filteredFinished.length === 0 && (
             <EmptyState message="No jobs match these filters." />
           )}
           {filteredFinished.length > 0 && <JobTable rows={filteredFinished} />}
