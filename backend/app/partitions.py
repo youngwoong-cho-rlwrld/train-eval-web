@@ -1,7 +1,9 @@
-"""Partition listing + node/GPU availability via `sinfo`.
+"""Partition listing + schedulable node/GPU availability via `sinfo`.
 
-Format used: `sinfo -h -o '%P|%t|%D|%G'` emits one row per (partition, state)
-group, with node count and GRES like `gpu:h200:8` or `gpu:8(S:0-1)`.
+The monitor should only label GPUs as available when Slurm reports the node as
+plain `idle`. Cloud/power/health-check states such as `idle~`, `idle#`, or
+`down#` are useful context, but they are not capacity a newly submitted job can
+reliably use right now.
 """
 
 import re
@@ -22,16 +24,15 @@ class PartitionInfo(BaseModel):
     is_default: bool
     is_background: bool          # treat as preemptible → submit auto-adds --requeue
     total_nodes: int
-    idle_nodes: int
+    idle_nodes: int              # schedulable plain-idle nodes
     gpu_total: int
-    gpu_idle: int
+    gpu_idle: int                # schedulable plain-idle GPUs
     gpu_type: str | None = None
-    states: dict[str, int]       # e.g. {"idle": 1, "mix": 5}
+    states: dict[str, int]       # e.g. {"idle": 1, "idle~": 2, "mix": 5}
 
 
-def _is_idle(state: str) -> bool:
-    # 'idle' or 'idle~' (cloud-suspended idle) both count as idle.
-    return state.startswith("idle")
+def _is_schedulable_idle(state: str, reason: str) -> bool:
+    return state == "idle" and reason.strip() in {"", "none"}
 
 
 def _gpus_per_node(gres: str) -> int:
@@ -44,54 +45,50 @@ def _gpu_type(gres: str) -> str | None:
     return m.group(1).upper() if m else None
 
 
-def _strip_state(s: str) -> str:
-    """Trim trailing modifiers like '*', '~', '-'. Keep the base state."""
-    return s.rstrip("*~-")
+def _clean_partition_name(name: str, defaults: set[str]) -> str:
+    clean = name.strip()
+    if clean.endswith("*"):
+        clean = clean[:-1]
+        defaults.add(clean)
+    return clean
 
 
 async def list_partitions(cluster: str) -> list[PartitionInfo]:
     env = await load_cluster(cluster)
     configured_default = (env.vars.get("PARTITION") or "").strip()
-    r = await ssh_run(env.ssh_alias, "sinfo -h -o '%P|%t|%D|%G'", timeout=15.0)
+    r = await ssh_run(env.ssh_alias, "sinfo -N -h -o '%P|%N|%t|%G|%E'", timeout=15.0)
     if r.returncode != 0:
         raise RuntimeError(f"sinfo failed: {r.stderr}")
 
-    # Each row: PARTITION | STATE | NODE_COUNT | GRES
-    rows: list[tuple[str, str, int, str]] = []
+    # Each row: PARTITION | NODE | STATE | GRES | REASON.
+    rows: list[tuple[str, str, str, str]] = []
     defaults: set[str] = set()
     for line in r.stdout.splitlines():
-        parts = line.split("|")
-        if len(parts) != 4:
+        parts = line.split("|", 4)
+        if len(parts) != 5:
             continue
-        name = parts[0]
-        if name.endswith("*"):
-            name = name[:-1]
-            defaults.add(name)
-        state = parts[1]
-        try:
-            count = int(parts[2])
-        except ValueError:
+        name = _clean_partition_name(parts[0], defaults)
+        if not name:
             continue
-        rows.append((name, state, count, parts[3]))
+        rows.append((name, parts[2].strip(), parts[3].strip(), parts[4].strip()))
 
     per_part: dict[str, dict] = defaultdict(lambda: {
         "states": defaultdict(int),
         "total_nodes": 0, "idle_nodes": 0,
         "gpu_total": 0, "gpu_idle": 0, "gpu_type": None,
     })
-    for name, state, count, gres in rows:
+    for name, state, gres, reason in rows:
         gpn = _gpus_per_node(gres)
         gpu_type = _gpu_type(gres)
         d = per_part[name]
         if gpu_type and not d["gpu_type"]:
             d["gpu_type"] = gpu_type
-        st_key = _strip_state(state)
-        d["states"][st_key] += count
-        d["total_nodes"] += count
-        d["gpu_total"] += count * gpn
-        if _is_idle(state):
-            d["idle_nodes"] += count
-            d["gpu_idle"] += count * gpn
+        d["states"][state] += 1
+        d["total_nodes"] += 1
+        d["gpu_total"] += gpn
+        if _is_schedulable_idle(state, reason):
+            d["idle_nodes"] += 1
+            d["gpu_idle"] += gpn
 
     def is_bg(name: str) -> bool:
         return name == "background" or name.endswith("_background")

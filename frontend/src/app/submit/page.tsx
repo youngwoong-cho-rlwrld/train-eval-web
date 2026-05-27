@@ -1130,7 +1130,7 @@ export default function SubmitPage() {
                                 </Badge>
                               )}
                               <span className="ml-2 text-xs text-slate-500">
-                                {p.gpu_idle}/{p.gpu_total} {p.gpu_type ?? "GPU"}
+                                {p.gpu_idle}/{p.gpu_total} {p.gpu_type ?? "GPU"} available
                               </span>
                             </span>
                           </SelectItem>
@@ -1198,7 +1198,7 @@ export default function SubmitPage() {
                               <span
                                 className={`text-xs ${n.gpu_free > 0 ? "text-green-600 dark:text-green-400" : "text-slate-500"}`}
                               >
-                                {n.gpu_free}/{n.gpu_total} free
+                                {n.gpu_free}/{n.gpu_total} available
                               </span>
                             </span>
                           </SelectItem>

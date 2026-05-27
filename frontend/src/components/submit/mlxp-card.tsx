@@ -20,7 +20,7 @@ export function MlxpCard({
   yoursNode: string;
 }) {
   const [open, setOpen] = useState(true);
-  const idle = nodes.reduce((s, n) => s + n.gpu_free, 0);
+  const available = nodes.reduce((s, n) => s + n.gpu_free, 0);
   const total = nodes.reduce((s, n) => s + n.gpu_total, 0);
   return (
     <Card>
@@ -39,11 +39,11 @@ export function MlxpCard({
           </CardTitle>
           <span className="font-mono text-xs text-slate-500">
             <span
-              className={idle > 0 ? "text-green-600 dark:text-green-400" : ""}
+              className={available > 0 ? "text-green-600 dark:text-green-400" : ""}
             >
-              {idle}
+              {available}
             </span>
-            <span className="text-slate-400"> / {total}</span>
+            <span className="text-slate-400"> / {total} available</span>
           </span>
         </div>
         <CardDescription>
@@ -78,7 +78,7 @@ export function MlxpCard({
                   </span>
                   <span className="text-slate-400">
                     {" "}
-                    / {n.gpu_total} GPU free
+                    / {n.gpu_total} GPU available
                   </span>
                 </div>
               </div>

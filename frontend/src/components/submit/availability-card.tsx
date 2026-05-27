@@ -21,7 +21,7 @@ export function AvailabilityCard({
   partitions: Partition[];
 }) {
   const [open, setOpen] = useState(true);
-  const totalIdleGpu = partitions.reduce((s, p) => s + p.gpu_idle, 0);
+  const totalAvailableGpu = partitions.reduce((s, p) => s + p.gpu_idle, 0);
   const totalGpu = partitions.reduce((s, p) => s + p.gpu_total, 0);
   return (
     <Card>
@@ -41,12 +41,12 @@ export function AvailabilityCard({
           <span className="font-mono text-xs text-slate-500">
             <span
               className={
-                totalIdleGpu > 0 ? "text-green-600 dark:text-green-400" : ""
+                totalAvailableGpu > 0 ? "text-green-600 dark:text-green-400" : ""
               }
             >
-              {totalIdleGpu}
+              {totalAvailableGpu}
             </span>
-            <span className="text-slate-400"> / {totalGpu}</span>
+            <span className="text-slate-400"> / {totalGpu} available</span>
           </span>
         </div>
         <CardDescription>

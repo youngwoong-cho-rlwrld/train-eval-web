@@ -93,7 +93,7 @@ function SlurmClusterPanel({ cluster }: { cluster: string }) {
     refetchInterval: REFRESH_MS,
   });
   const ps = q.data ?? [];
-  const idle = ps.reduce((s, p) => s + p.gpu_idle, 0);
+  const available = ps.reduce((s, p) => s + p.gpu_idle, 0);
   const total = ps.reduce((s, p) => s + p.gpu_total, 0);
 
   return (
@@ -102,8 +102,8 @@ function SlurmClusterPanel({ cluster }: { cluster: string }) {
         <div className="flex items-baseline justify-between">
           <CardTitle className="text-base">{cluster} <span className="ml-1 text-xs font-normal text-slate-500">slurm</span></CardTitle>
           <span className="font-mono text-sm">
-            <span className={idle > 0 ? "text-green-600 dark:text-green-400" : "text-slate-500"}>{idle}</span>
-            <span className="text-slate-400"> / {total} GPU free</span>
+            <span className={available > 0 ? "text-green-600 dark:text-green-400" : "text-slate-500"}>{available}</span>
+            <span className="text-slate-400"> / {total} GPU available</span>
           </span>
         </div>
         <CardDescription>{ps.length} partitions</CardDescription>
@@ -120,8 +120,8 @@ function SlurmClusterPanel({ cluster }: { cluster: string }) {
               <thead className="border-b border-slate-200 text-left text-xs uppercase tracking-wide text-slate-500 dark:border-slate-800">
                 <tr>
                   <th className="py-2 pr-4 font-medium">Partition</th>
-                  <th className="py-2 pr-4 font-medium">GPUs free / total</th>
-                  <th className="py-2 pr-4 font-medium">Nodes idle / total</th>
+                  <th className="py-2 pr-4 font-medium">GPUs available / total</th>
+                  <th className="py-2 pr-4 font-medium">Nodes available / total</th>
                   <th className="py-2 pr-4 font-medium">States</th>
                 </tr>
               </thead>
@@ -169,7 +169,7 @@ function MlxpPanel() {
   const nodes = q.data ?? [];
   // Same source of truth as the /submit page's Node picker.
   const [yoursNode, setYoursNode] = useMyMlxpNode();
-  const idle = nodes.reduce((s, n) => s + n.gpu_free, 0);
+  const available = nodes.reduce((s, n) => s + n.gpu_free, 0);
   const total = nodes.reduce((s, n) => s + n.gpu_total, 0);
 
   return (
@@ -178,8 +178,8 @@ function MlxpPanel() {
         <div className="flex items-baseline justify-between">
           <CardTitle className="text-base">MLXP <span className="ml-1 text-xs font-normal text-slate-500">naver, k8s</span></CardTitle>
           <span className="font-mono text-sm">
-            <span className={idle > 0 ? "text-green-600 dark:text-green-400" : "text-slate-500"}>{idle}</span>
-            <span className="text-slate-400"> / {total} GPU free</span>
+            <span className={available > 0 ? "text-green-600 dark:text-green-400" : "text-slate-500"}>{available}</span>
+            <span className="text-slate-400"> / {total} GPU available</span>
           </span>
         </div>
         <CardDescription className="flex items-center gap-2">
@@ -193,7 +193,7 @@ function MlxpPanel() {
                 <SelectItem key={n.name} value={n.name}>
                   <span className="font-mono">{n.name}</span>
                   <span className={`ml-2 text-[10px] ${n.gpu_free > 0 ? "text-green-600 dark:text-green-400" : "text-slate-500"}`}>
-                    {n.gpu_free}/{n.gpu_total} free
+                    {n.gpu_free}/{n.gpu_total} available
                   </span>
                 </SelectItem>
               ))}
@@ -214,7 +214,7 @@ function MlxpPanel() {
               <thead className="border-b border-slate-200 text-left text-xs uppercase tracking-wide text-slate-500 dark:border-slate-800">
                 <tr>
                   <th className="py-2 pr-4 font-medium">Node</th>
-                  <th className="py-2 pr-4 font-medium">GPUs free / total</th>
+                  <th className="py-2 pr-4 font-medium">GPUs available / total</th>
                 </tr>
               </thead>
               <tbody>
