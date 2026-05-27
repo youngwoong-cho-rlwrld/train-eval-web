@@ -16,18 +16,6 @@ frontend/.env
 configs/experiments/*
 !configs/experiments/_sample/
 !configs/experiments/_sample/**
-!configs/experiments/physixel_cube_stack_3cm_right_480/
-!configs/experiments/physixel_cube_stack_3cm_right_480/**
-!configs/experiments/physixel_multitask_3tasks_480_ah8/
-!configs/experiments/physixel_multitask_3tasks_480_ah8/**
-!configs/experiments/physixel_multitask_3tasks_480_ah16/
-!configs/experiments/physixel_multitask_3tasks_480_ah16/**
-!configs/experiments/physixel_multitask_3tasks_480_ah32/
-!configs/experiments/physixel_multitask_3tasks_480_ah32/**
-!configs/experiments/physixel_multitask_3tasks_480_ah40/
-!configs/experiments/physixel_multitask_3tasks_480_ah40/**
-!configs/experiments/physixel_multitask_3tasks_480_ah64/
-!configs/experiments/physixel_multitask_3tasks_480_ah64/**
 configs/experiments/*/.versions/
 configs/experiments/*/.versions/**
 
