@@ -776,7 +776,7 @@ function CheckpointCopyHistoryRows({
     <CheckpointCopyList
       records={history.data}
       className="space-y-1 pb-2 pl-[110px]"
-      itemClassName="min-w-0 rounded-md bg-slate-50 px-3 py-2 text-xs dark:bg-slate-900/40"
+      itemClassName="min-w-0 py-1 text-xs"
       showTime={false}
     />
   );

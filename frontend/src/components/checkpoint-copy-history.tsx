@@ -26,15 +26,11 @@ export function CheckpointCopyList({
             <CheckpointPath path={item.dest_path} exists={item.dest_exists} />
             <CopyButton value={item.dest_path} />
           </div>
-          <div className="mt-1 grid min-w-0 grid-cols-[76px_minmax(0,1fr)_auto] gap-2 text-[10px] text-slate-500">
-            <span className="uppercase tracking-wide">source</span>
-            <CheckpointPath path={item.source_path} exists={item.source_exists} />
-            {showTime && (
-              <span className="whitespace-nowrap">
-                {formatCopyTime(item.copied_at)}
-              </span>
-            )}
-          </div>
+          {showTime && (
+            <div className="mt-1 pl-[84px] text-[10px] text-slate-500">
+              {formatCopyTime(item.copied_at)}
+            </div>
+          )}
         </div>
       ))}
     </div>

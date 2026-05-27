@@ -265,8 +265,18 @@ function resolveShownFlags({
   loaded?: FlagEntry[];
   editors?: Record<string, FlagEditor>;
 }): FlagEntry[] | undefined {
-  if (override) return override;
-  if (loaded) return loaded;
+  const base = override ?? loaded;
+  if (base) {
+    const editableFlags = editors ? Object.keys(editors) : [];
+    if (editableFlags.length === 0) return base;
+    const seen = new Set(base.map((entry) => entry.flag));
+    const missingEditableRows = editableFlags
+      .filter((flag) => !seen.has(flag))
+      .map((flag) => ({ flag, value: "" }));
+    return missingEditableRows.length > 0
+      ? [...base, ...missingEditableRows]
+      : base;
+  }
   const editableFlags = editors ? Object.keys(editors) : [];
   return editableFlags.length > 0
     ? editableFlags.map((flag) => ({ flag, value: "" }))
