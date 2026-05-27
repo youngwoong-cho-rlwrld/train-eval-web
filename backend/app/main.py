@@ -405,6 +405,7 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
         elif req.phase == "eval":
             checkpoint_path = submit.require_eval_checkpoint_path(req)
             eval_sets = submit.normalize_eval_sets(req.eval_sets)
+            train_git_commit = submit.resolve_train_git_commit(req, variant)
             if req.cluster == "mlxp":
                 suffix = submission_snapshot.snapshot_suffix(job_name)
                 path = f"{mlxp_config.get_settings().experiments_dir}/{req.variant}/config_{suffix}.sh"
@@ -423,6 +424,7 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
                 checkpoint_path=checkpoint_path,
                 extra_args=req.extra_args,
                 data_dir=mlxp_config.get_settings().datasets_dir if req.cluster == "mlxp" else None,
+                train_git_commit=train_git_commit,
                 train_note=train_note,
             )
         else:
@@ -474,7 +476,7 @@ async def post_submit(req: submit.SubmitRequest):
                 max_steps=req.train_max_steps if req.phase == "train" else None,
                 save_steps=req.train_save_steps if req.phase == "train" else None,
                 action_horizon=req.train_action_horizon if req.phase == "train" else None,
-                train_git_commit=req.train_git_commit if req.phase == "train" else None,
+                train_git_commit=req.train_git_commit,
                 node=req.node,
                 dataset_override=req.dataset_override,
                 extra_args=req.extra_args,

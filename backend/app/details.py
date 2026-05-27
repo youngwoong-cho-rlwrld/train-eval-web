@@ -24,6 +24,7 @@ from .eval_completion import (
 )
 from .job_identity import (
     parse_comment_metadata,
+    parse_comment_fields,
     parse_phase_and_variant,
     phase_variant_from_meta,
     resolve_phase_and_variant,
@@ -140,14 +141,7 @@ class JobDetails(BaseModel):
 
 
 def _metadata_fields(text: str | None) -> dict[str, str]:
-    fields: dict[str, str] = {}
-    if not text:
-        return fields
-    for chunk in text.split(";"):
-        if "=" in chunk:
-            k, v = chunk.split("=", 1)
-            fields[k.strip()] = v.strip()
-    return fields
+    return parse_comment_fields(text)
 
 
 def _snapshot_wandb_project(text: str | None) -> str | None:

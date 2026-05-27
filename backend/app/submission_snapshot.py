@@ -963,6 +963,7 @@ def render_eval_config_preview(
     checkpoint_path: str | None = None,
     extra_args: list[str] | None = None,
     data_dir: str | None = None,
+    train_git_commit: str | None = None,
     train_note: str | None = None,
 ) -> str:
     text = _apply_submission_config_overrides(
@@ -971,6 +972,8 @@ def render_eval_config_preview(
         train_note=train_note,
         data_dir=data_dir,
     )
+    if train_git_commit is not None:
+        text = _set_scalar(text, "TRAIN_GIT_COMMIT", train_git_commit)
     if eval_n_episodes is not None:
         text = _set_scalar(text, "N_EPISODES", eval_n_episodes)
     if eval_n_runs is not None:
@@ -991,6 +994,8 @@ def render_eval_config_preview(
         footer.append(f"SUBMIT_NODE={shlex.quote(node)}")
     if checkpoint_path:
         footer.append(f"SUBMIT_EVAL_CHECKPOINT={shlex.quote(checkpoint_path)}")
+    if train_git_commit:
+        footer.append(f"SUBMIT_GIT_COMMIT={shlex.quote(train_git_commit)}")
     if eval_overwrite_results:
         footer.append("SUBMIT_EVAL_OVERWRITE_RESULTS=1")
     if extra_args:

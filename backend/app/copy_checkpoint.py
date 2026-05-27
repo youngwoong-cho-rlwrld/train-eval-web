@@ -38,7 +38,11 @@ from .ssh import ssh_run, _CM_OPTS
 from .submission_snapshot import is_mlxp_transport_error
 
 
-_MLXP_COPY_STREAMS = max(1, int(os.environ.get("TRAIN_EVAL_MLXP_COPY_STREAMS", "1")))
+# MLXP boundary copies use the shared data pod and local staging. Keep a
+# bounded semaphore, but allow independent copy jobs to make progress in
+# parallel by default. Set TRAIN_EVAL_MLXP_COPY_STREAMS=1 to force the old
+# serialized behavior if the pod/network gets saturated.
+_MLXP_COPY_STREAMS = max(1, int(os.environ.get("TRAIN_EVAL_MLXP_COPY_STREAMS", "8")))
 _MLXP_KUBECTL_CP_ATTEMPTS = max(1, int(os.environ.get("TRAIN_EVAL_MLXP_KUBECTL_CP_ATTEMPTS", "10")))
 _MLXP_KUBECTL_CP_RETRIES = max(0, int(os.environ.get("TRAIN_EVAL_MLXP_KUBECTL_CP_RETRIES", "10")))
 _MLXP_KUBECTL_CP_TIMEOUT = float(os.environ.get("TRAIN_EVAL_MLXP_KUBECTL_CP_TIMEOUT", "3600"))
@@ -1156,6 +1160,9 @@ async def _mlxp_to_slurm_once(
 async def _mlxp_to_slurm(copy_id: str, src_path: str, dest_cluster: str, dest_path: str,
                           include_only: list[str] | None = None) -> str:
     pod = await ensure_listing_pod()
+    state = _COPY_JOBS.get(copy_id)
+    if state is not None:
+        state.phase = "waiting for MLXP copy slot"
     async with _MLXP_STREAM_SEMAPHORE:
         return await _mlxp_to_slurm_once(
             copy_id, pod, src_path, dest_cluster, dest_path, include_only
@@ -1171,7 +1178,12 @@ async def _slurm_to_mlxp(copy_id: str, src_cluster: str, src_path: str, dest_pat
     dest_parent = str(Path(dest_path).parent)
     tar_args = _tar_artifact_args(src_leaf, include_only)
 
+    state = _COPY_JOBS.get(copy_id)
+    if state is not None:
+        state.phase = "waiting for MLXP copy slot"
     async with _MLXP_STREAM_SEMAPHORE:
+        if state is not None:
+            state.phase = "streaming to MLXP"
         settings = get_settings()
         src_proc = await asyncio.create_subprocess_exec(
             "ssh", "-o", "BatchMode=yes", *_CM_OPTS, src_env.ssh_alias,

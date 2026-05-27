@@ -18,10 +18,17 @@ import shutil
 from datetime import datetime, timezone
 from typing import Any
 
+from .job_identity import parse_comment_fields
 from .jobs import Job
 from .kubectl_errors import is_kubectl_transport_error
 from .mlxp_config import get_settings, owner_selector
 from .time_utils import to_kst_iso
+
+
+def _path_leaf(path: str | None) -> str | None:
+    if not path:
+        return None
+    return path.rstrip("/").rsplit("/", 1)[-1] or None
 
 
 async def _kubectl_json(*args: str, timeout: float = 20.0) -> dict[str, Any]:
@@ -149,8 +156,8 @@ async def list_jobs(start: str | None = None, end: str | None = None) -> list[Jo
     `<exp_dir>/checkpoints/<job-name>` on DDN — every completed training
     run leaves one of those behind for the lifetime of the checkpoints.
     """
-    live = await _list_live_jobs()
-    archived = await _list_archived_jobs(seen={j.job_name for j in live})
+    live, seen = await _list_live_jobs()
+    archived = await _list_archived_jobs(seen=seen)
     rows = live + archived
     if not start and not end:
         return rows
@@ -183,7 +190,7 @@ def _job_in_range(job: Job, start: str | None, end: str | None) -> bool:
     return True
 
 
-async def _list_live_jobs() -> list[Job]:
+async def _list_live_jobs() -> tuple[list[Job], set[str]]:
     from .job_identity import parse_comment_metadata, parse_phase_and_variant
 
     settings = get_settings()
@@ -192,7 +199,7 @@ async def _list_live_jobs() -> list[Job]:
             "get", "jobs", "-n", settings.namespace, "-l", owner_selector(settings)
         )
     except RuntimeError:
-        return []
+        return [], set()
 
     # We need pod-level info too (nodeName + start time of the actual pod, not the Job).
     pods_by_job: dict[str, dict] = {}
@@ -209,11 +216,19 @@ async def _list_live_jobs() -> list[Job]:
         pass
 
     out: list[Job] = []
+    seen: set[str] = set()
     for j in data.get("items", []):
         job_id = j["metadata"]["name"]
         annotations = (j["metadata"].get("annotations") or {})
         job_name = annotations.get("train-eval-web/display-name") or job_id
         comment = annotations.get("train-eval-web/comment") or ""
+        comment_fields = parse_comment_fields(comment)
+        seen.update(x for x in (
+            job_id,
+            job_name,
+            comment_fields.get("output_namespace"),
+            _path_leaf(comment_fields.get("checkpoint_dir")),
+        ) if x)
         phase, variant = parse_comment_metadata(comment)
         if not phase or not variant:
             phase, variant = parse_phase_and_variant(job_name)
@@ -233,11 +248,33 @@ async def _list_live_jobs() -> list[Job]:
             phase=None if phase == "unknown" else phase,
             variant=variant,
         ))
-    return out
+    return out, seen
 
 
 async def _list_archived_jobs(seen: set[str]) -> list[Job]:
     """Scan DDN for completed runs whose k8s Job has been GC'd."""
+    out: list[Job] = []
+    for run in await _list_archived_runs():
+        identities = {run["job_id"], run["job_name"], run["output_namespace"]}
+        if identities & seen:
+            continue
+        out.append(Job(
+            cluster="mlxp",
+            job_id=run["job_id"],
+            job_name=run["job_name"],
+            partition="mlxp",
+            state="COMPLETED",
+            elapsed=run["elapsed"],
+            nodelist="(archived)",
+            start=run["start"],
+            end=run["end"],
+            phase="train",
+            variant=run["variant"],
+        ))
+    return out
+
+
+async def _list_archived_runs() -> list[dict[str, str]]:
     import asyncio
     from .mlxp_data_pod import ensure_listing_pod
 
@@ -246,25 +283,26 @@ async def _list_archived_jobs(seen: set[str]) -> list[Job]:
     except Exception:
         return []
 
-    # One liner per run: <variant>|<job_name>|<latest_step>|<start_epoch>|<end_epoch>
+    settings = get_settings()
+    meta_index = await _archived_metadata_index(pod)
+    experiments_root = shlex.quote(settings.experiments_dir)
+    # One liner per run: <variant>|<output_namespace>|<latest_step>|<start_epoch>|<end_epoch>
     # NOTE: array glob with nullglob, not `ls $glob` — `ls` with zero-arg
     # falls back to listing `.` which used to slip past the empty check and
     # produced fake rows (`experiment_cfg`, `logs`, `runs`) in the table.
-    settings = get_settings()
-    experiments_root = shlex.quote(settings.experiments_dir)
     script = r"""
 shopt -s nullglob
 for d in __EXPERIMENTS_ROOT__/*/checkpoints/ __EXPERIMENTS_ROOT__/*/checkpoints/*/ __EXPERIMENTS_ROOT__/*/checkpoints/*/*/; do
     matches=( "$d"checkpoint-* )
     [ ${#matches[@]} -eq 0 ] && continue
-    job_name=$(basename "$d")
+    output_namespace=$(basename "$d")
     rel="${d#__EXPERIMENTS_ROOT__/}"
     variant="${rel%%/*}"
-    [ "$job_name" = "checkpoints" ] && job_name="$variant"
+    [ "$output_namespace" = "checkpoints" ] && output_namespace="$variant"
     latest=$(for m in "${matches[@]}"; do basename "$m" | sed 's:^checkpoint-::'; done | sort -n | tail -1)
     start_epoch=$(stat -c %Y "$d" 2>/dev/null || echo 0)
     end_epoch=$(stat -c %Y "$d"checkpoint-$latest 2>/dev/null || echo "$start_epoch")
-    printf '%s|%s|%s|%s|%s\n' "$variant" "$job_name" "$latest" "$start_epoch" "$end_epoch"
+    printf '%s|%s|%s|%s|%s\n' "$variant" "$output_namespace" "$latest" "$start_epoch" "$end_epoch"
 done
 """.replace("__EXPERIMENTS_ROOT__", experiments_root)
     try:
@@ -277,19 +315,15 @@ done
     except Exception:
         return []
 
-    out: list[Job] = []
+    out: list[dict[str, str]] = []
     for line in stdout.decode(errors="replace").splitlines():
         parts = line.split("|")
         if len(parts) != 5:
             continue
-        variant, job_name, latest, start_e, end_e = parts
-        # The shell script only emits rows where checkpoint-N exists, so
-        # `latest` is always a number for real runs. Anything else means the
-        # shell got confused; drop it.
+        variant, output_namespace, latest, start_e, end_e = parts
         if not latest.isdigit():
             continue
-        if job_name in seen:
-            continue
+        meta = meta_index.get(output_namespace, {})
         try:
             start_i = int(start_e)
             end_i = int(end_e)
@@ -299,13 +333,59 @@ done
             end_iso = to_kst_iso(datetime.fromtimestamp(end_i, tz=timezone.utc).isoformat())
         except ValueError:
             continue
-        elapsed = _elapsed(start_iso, end_iso)
-        out.append(Job(
-            cluster="mlxp", job_id=job_name, job_name=job_name, partition="mlxp",
-            state="COMPLETED", elapsed=elapsed, nodelist="(archived)",
-            start=start_iso, end=end_iso, phase="train", variant=variant,
-        ))
+        job_id = str(meta.get("job_id") or output_namespace)
+        job_name = str(meta.get("job_name") or output_namespace)
+        out.append({
+            "job_id": job_id,
+            "job_name": job_name,
+            "output_namespace": output_namespace,
+            "variant": str(meta.get("variant") or variant),
+            "start": start_iso or "",
+            "end": end_iso or "",
+            "elapsed": _elapsed(start_iso, end_iso),
+        })
     return out
+
+
+async def _archived_metadata_index(pod: str) -> dict[str, dict[str, Any]]:
+    settings = get_settings()
+    experiments_root = shlex.quote(settings.experiments_dir)
+    script = r"""
+shopt -s nullglob
+for f in __EXPERIMENTS_ROOT__/*/config_*.meta.json; do
+    printf '\036%s\n' "$f"
+    cat "$f"
+    printf '\n'
+done
+""".replace("__EXPERIMENTS_ROOT__", experiments_root)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "kubectl", "exec", "-n", settings.namespace, pod, "--", "bash", "-c", script,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20.0)
+    except Exception:
+        return {}
+
+    index: dict[str, dict[str, Any]] = {}
+    for chunk in stdout.decode(errors="replace").split("\x1e"):
+        if not chunk.strip():
+            continue
+        _, _, body = chunk.partition("\n")
+        try:
+            meta = json.loads(body)
+        except json.JSONDecodeError:
+            continue
+        keys = {
+            str(meta.get("output_namespace") or ""),
+            str(meta.get("job_id") or ""),
+            _path_leaf(str(meta.get("checkpoint_dir") or "")) or "",
+        }
+        for key in keys:
+            if key:
+                index[key] = meta
+    return index
 
 
 async def get_job(name: str) -> dict[str, Any]:
@@ -549,70 +629,26 @@ async def _iter_logical_lines(reader):
 async def _archived_record(name: str) -> dict[str, Any] | None:
     """Return a sacct-shaped dict for a single archived (k8s-gone) job by
     walking DDN. Returns None if no checkpoint dir matches the name."""
-    from .mlxp_data_pod import ensure_listing_pod
-
-    try:
-        pod = await ensure_listing_pod()
-    except Exception:
+    archived = None
+    for run in await _list_archived_runs():
+        if name in {run["job_id"], run["job_name"], run["output_namespace"]}:
+            archived = run
+            break
+    if archived is None:
         return None
-
-    settings = get_settings()
-    experiments_root = shlex.quote(settings.experiments_dir)
-    quoted_name = shlex.quote(name)
-    script = r"""
-shopt -s nullglob
-for d in __EXPERIMENTS_ROOT__/*/checkpoints/__JOB_NAME__/ __EXPERIMENTS_ROOT__/*/checkpoints/__JOB_NAME__/__JOB_NAME__/; do
-    matches=( "$d"checkpoint-* )
-    [ ${#matches[@]} -eq 0 ] && continue
-    rel="${d#__EXPERIMENTS_ROOT__/}"
-    variant="${rel%%/*}"
-    job_name=$(basename "$d")
-    latest=$(for m in "${matches[@]}"; do basename "$m" | sed 's:^checkpoint-::'; done | sort -n | tail -1)
-    start_epoch=$(stat -c %Y "$d" 2>/dev/null || echo 0)
-    end_epoch=$(stat -c %Y "$d"checkpoint-$latest 2>/dev/null || echo "$start_epoch")
-    printf '%s|%s|%s|%s|%s\n' "$variant" "$job_name" "$latest" "$start_epoch" "$end_epoch"
-    break
-done
-""".replace("__EXPERIMENTS_ROOT__", experiments_root).replace("__JOB_NAME__", quoted_name)
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "kubectl", "exec", "-n", settings.namespace, pod, "--", "bash", "-c", script,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20.0)
-    except Exception:
-        return None
-
-    line = stdout.decode(errors="replace").strip().splitlines()
-    if not line:
-        return None
-    parts = line[0].split("|")
-    if len(parts) != 5:
-        return None
-    variant, job_name, latest, start_e, end_e = parts
-    if not latest.isdigit():
-        return None
-    try:
-        start_i = int(start_e)
-        end_i = int(end_e)
-        if end_i < start_i:
-            start_i, end_i = end_i, start_i
-        start_iso = to_kst_iso(datetime.fromtimestamp(start_i, tz=timezone.utc).isoformat())
-        end_iso = to_kst_iso(datetime.fromtimestamp(end_i, tz=timezone.utc).isoformat())
-    except ValueError:
-        return None
-    elapsed = _elapsed(start_iso, end_iso)
     return {
-        "JobID": job_name,
-        "JobName": job_name,
-        "JobComment": f"phase=train;variant={variant}",
+        "JobID": archived["job_id"],
+        "JobName": archived["job_name"],
+        "JobComment": (
+            f"phase=train;variant={archived['variant']};"
+            f"output_namespace={archived['output_namespace']}"
+        ),
         "Partition": "mlxp",
         "State": "COMPLETED",
         "ExitCode": "",
-        "Start": start_iso,
-        "End": end_iso,
-        "Elapsed": elapsed,
+        "Start": archived["start"],
+        "End": archived["end"],
+        "Elapsed": archived["elapsed"],
         "NodeList": "(archived)",
         "Reason": "(archived; k8s record GC'd)",
         "cluster": "mlxp",

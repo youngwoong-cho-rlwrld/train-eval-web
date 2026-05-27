@@ -41,6 +41,8 @@ RESULTS_PATH="${SUBMIT_RESULTS_PATH:-$EVAL_DIR/results.json}"
 JOB_LOG_DIR="$EXP_DIR/logs/${OUTPUT_NAMESPACE:-${SLURM_JOB_ID:-$EXP_NAME}}"
 mkdir -p "$JOB_LOG_DIR" "$LOG_DIR" "$EVAL_DIR"
 LOG_FILE="$JOB_LOG_DIR/eval.log"
+SUBMIT_GIT_COMMIT="${SUBMIT_GIT_COMMIT:-${TRAIN_GIT_COMMIT:-}}"
+pin_training_repo_dir "$TRAIN_REPO_DIR" "$SUBMIT_GIT_COMMIT" "${SLURM_JOB_ID:-$OUTPUT_NAMESPACE}"
 
 log "========================================================"
 log "$EXP_NAME"

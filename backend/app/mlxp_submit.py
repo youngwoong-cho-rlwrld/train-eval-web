@@ -28,6 +28,7 @@ import yaml
 from pydantic import BaseModel, Field
 
 from .data_interface import rewrite_action_horizon
+from .job_identity import comment_field_fragment
 from .mlxp_config import (
     MlxpSettings,
     get_settings,
@@ -153,7 +154,6 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
         req.max_steps is not None,
         req.save_steps is not None,
         req.action_horizon is not None,
-        bool(req.train_git_commit and req.train_git_commit.strip()),
     )):
         raise ValueError("train overrides are only valid for phase=train")
 
@@ -162,11 +162,10 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
     cpu, mem = _GPU_RESOURCES[req.num_gpus]
     model = resolve_training_model(variant)
     action_horizon_mode = action_horizon_mode_for_variant(model, variant)
-    if req.phase == "train":
-        req.train_git_commit = resolve_train_git_commit_override(
-            req.train_git_commit,
-            variant.vars,
-        )
+    req.train_git_commit = resolve_train_git_commit_override(
+        req.train_git_commit,
+        variant.vars,
+    )
     if req.phase == "train" and model.family == "n1.6":
         req.action_horizon = resolve_train_action_horizon(
             variant=variant,
@@ -196,9 +195,9 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
         repo_path=repo_path,
         repo_label=training_repo_label(model),
         job_name=job_name,
-        commit_dirty_changes=req.commit_dirty_changes,
+        commit_dirty_changes=req.commit_dirty_changes if req.phase == "train" else False,
         require_clean=(req.phase == "train"),
-        requested_commit=req.train_git_commit if req.phase == "train" else None,
+        requested_commit=req.train_git_commit,
     )
 
     node = req.node or settings.default_node
@@ -389,6 +388,7 @@ def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str
         checkpoint_path=checkpoint_path,
         extra_args=req.extra_args,
         data_dir=settings.datasets_dir,
+        train_git_commit=req.train_git_commit,
         train_note=train_note,
     )
     meta = snapshot_metadata(
@@ -402,6 +402,7 @@ def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str
         node=node,
         dataset_override=req.dataset_override,
         extra_args=req.extra_args,
+        train_git_commit=req.train_git_commit,
         train_note=train_note,
         wandb_project=_wandb_project(),
         git=submit_git,
@@ -1038,18 +1039,17 @@ def _job_comment(req: MlxpSubmitRequest, variant, snapshot: dict) -> str:
     comment += (
         f";config_snapshot_path={snapshot['path']}"
         f";config_snapshot_meta_path={snapshot['meta_path']}"
-        f";submit_git_repo_path={snapshot['git_repo_path']}"
-        f";submit_git_repo_label={snapshot['git_repo_label']}"
     )
-    if snapshot.get("git_branch"):
-        comment += f";submit_git_branch={snapshot['git_branch']}"
-    if snapshot.get("git_commit"):
-        comment += f";submit_git_commit={snapshot['git_commit']}"
-    if snapshot.get("git_commit_subject"):
-        comment += f";submit_git_commit_subject={snapshot['git_commit_subject']}"
-    comment += (
-        f";submit_git_dirty_at_submit={'true' if snapshot.get('git_dirty_at_submit') else 'false'}"
-        f";submit_git_committed_dirty={'true' if snapshot.get('git_committed_dirty') else 'false'}"
+    comment += ";" + comment_field_fragment(
+        {
+            "submit_git_repo_path": snapshot.get("git_repo_path"),
+            "submit_git_repo_label": snapshot.get("git_repo_label"),
+            "submit_git_branch": snapshot.get("git_branch"),
+            "submit_git_commit": snapshot.get("git_commit"),
+            "submit_git_commit_subject": snapshot.get("git_commit_subject"),
+            "submit_git_dirty_at_submit": "true" if snapshot.get("git_dirty_at_submit") else "false",
+            "submit_git_committed_dirty": "true" if snapshot.get("git_committed_dirty") else "false",
+        }
     )
     return comment
 

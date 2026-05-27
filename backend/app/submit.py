@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from .clusters import load_cluster
 from .data_interface import rewrite_action_horizon
+from .job_identity import comment_field_fragment
 from .output_namespace import make_output_namespace, validate_output_namespace
 from .paths import CLUSTER_STAGING_REL, CONFIGS_DIR, LIB_DIR
 from .ssh import rsync_to, ssh_run
@@ -81,9 +82,9 @@ class SubmitRequest(BaseModel):
     train_max_steps: int | None = Field(default=None, ge=1)
     train_save_steps: int | None = Field(default=None, ge=1)
     train_action_horizon: int | None = Field(default=None, ge=1)
-    # Train-only: optional model-code git commit. If set, the backend verifies
-    # the commit exists in the selected model repo and runs from a detached
-    # worktree at that exact revision.
+    # Optional model-code git commit. If set, the backend verifies the commit
+    # exists in the selected model repo and runs from a detached worktree at
+    # that exact revision.
     train_git_commit: str | None = None
     # Eval-only: override Isaac's native vectorized env count per GPU.
     eval_num_envs_per_gpu: int | None = Field(default=None, ge=1)
@@ -307,7 +308,6 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         req.train_max_steps is not None,
         req.train_save_steps is not None,
         req.train_action_horizon is not None,
-        bool(req.train_git_commit and req.train_git_commit.strip()),
     )):
         raise ValueError("train overrides are only valid for phase=train")
     if (
@@ -345,7 +345,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         model,
         action_horizon_mode,
     ) if req.phase == "train" else None
-    train_git_commit = resolve_train_git_commit(req, variant) if req.phase == "train" else None
+    train_git_commit = resolve_train_git_commit(req, variant)
     gpus = str(train_settings.num_gpus)
 
     # Unified shape across slurm + MLXP. The cluster/partition are shown in
@@ -373,7 +373,6 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     job_log_dir = f"{exp_dir_remote}/logs/{output_namespace}" if output_namespace else ""
     snapshot_paths = config_snapshot_paths(req.variant, job_name)
 
-    submit_git = None
     snapshot_rel = snapshot_paths.rel
     snapshot_meta_rel = snapshot_paths.meta_rel
     snapshot_path = snapshot_paths.path
@@ -386,16 +385,17 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     submit_extra_args_rel: str | None = None
     submit_extra_args_path: str | None = None
     submit_extra_args_text: str | None = None
+    submit_git = await prepare_slurm_training_git(
+        host=host,
+        repo_path=training_repo,
+        repo_label=training_repo_label(model),
+        job_name=job_name,
+        commit_dirty_changes=req.commit_dirty_changes if req.phase == "train" else False,
+        require_clean=(req.phase == "train" and not req.resume),
+        requested_commit=train_git_commit,
+    )
+
     if req.phase == "train":
-        submit_git = await prepare_slurm_training_git(
-            host=host,
-            repo_path=training_repo,
-            repo_label=training_repo_label(model),
-            job_name=job_name,
-            commit_dirty_changes=req.commit_dirty_changes,
-            require_clean=not req.resume,
-            requested_commit=train_git_commit,
-        )
         if req.extra_args:
             safe_job_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", job_name).strip("_") or snapshot_paths.suffix
             submit_extra_args_rel = f"{CLUSTER_STAGING_REL}/jobs/{safe_job_name}.extra_args.sh"
@@ -474,6 +474,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             eval_overwrite_results=req.eval_overwrite_results,
             checkpoint_path=eval_checkpoint,
             extra_args=req.extra_args,
+            train_git_commit=train_git_commit,
             train_note=train_note,
         )
         snapshot_meta_text = metadata_json(snapshot_metadata(
@@ -486,8 +487,10 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             partition=partition,
             dataset_override=req.dataset_override,
             extra_args=req.extra_args,
+            train_git_commit=train_git_commit,
             train_note=train_note,
             wandb_project=submitted_wandb_project,
+            git=submit_git,
         ))
 
     # ── Sync code to cluster staging ──
@@ -599,6 +602,16 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         comment += f";output_namespace={output_namespace}"
     if req.resume_of and req.resume_of.strip():
         comment += f";resume_of={req.resume_of.strip()}"
+    if submit_git:
+        comment += ";" + comment_field_fragment(
+            {
+                "submit_git_repo_path": submit_git.repo_path,
+                "submit_git_repo_label": submit_git.repo_label,
+                "submit_git_branch": submit_git.branch,
+                "submit_git_commit": submit_git.commit,
+                "submit_git_commit_subject": submit_git.commit_subject,
+            }
+        )
     if req.phase == "train":
         comment += (
             f";train_num_gpus={train_settings.num_gpus}"
@@ -615,17 +628,6 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             comment += f";config_snapshot_path={snapshot_path}"
         if checkpoint_dir:
             comment += f";checkpoint_dir={checkpoint_dir}"
-        if submit_git:
-            comment += (
-                f";submit_git_repo_path={submit_git.repo_path}"
-                f";submit_git_repo_label={submit_git.repo_label}"
-            )
-            if submit_git.branch:
-                comment += f";submit_git_branch={submit_git.branch}"
-        if submit_git and submit_git.commit:
-            comment += f";submit_git_commit={submit_git.commit}"
-        if submit_git and submit_git.commit_subject:
-            comment += f";submit_git_commit_subject={submit_git.commit_subject}"
     else:
         if eval_dir:
             comment += f";eval_dir={eval_dir}"
@@ -681,7 +683,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         )
         + (
             f",SUBMIT_GIT_COMMIT={shlex.quote(submit_git.commit)}"
-            if req.phase == "train" and submit_git and submit_git.commit else ""
+            if submit_git and submit_git.commit else ""
         )
         + (
             f",SUBMIT_EVAL_NUM_ENVS_PER_GPU={eval_num_envs_per_gpu}"
@@ -808,7 +810,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             f"submit_git_commit_subject={submit_git.commit_subject or ''}\n"
             f"submit_git_dirty_at_submit={'true' if submit_git.dirty_before else 'false'}\n"
             f"submit_git_committed_dirty={'true' if submit_git.committed_dirty else 'false'}\n"
-            if req.phase == "train" and submit_git
+            if submit_git
             else ""
         )
         + (

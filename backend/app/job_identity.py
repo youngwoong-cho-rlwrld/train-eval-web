@@ -5,6 +5,32 @@ import re
 from .variants import list_variants
 
 
+def parse_comment_fields(comment: str | None) -> dict[str, str]:
+    """Parse the semicolon-delimited scheduler Comment metadata."""
+    fields: dict[str, str] = {}
+    if not comment:
+        return fields
+    for chunk in comment.split(";"):
+        if "=" not in chunk:
+            continue
+        key, value = chunk.split("=", 1)
+        fields[key.strip()] = value.strip()
+    return fields
+
+
+def comment_field_fragment(fields: dict[str, object | None]) -> str:
+    """Render scheduler Comment metadata without a leading semicolon."""
+    parts: list[str] = []
+    for key, value in fields.items():
+        if value is None:
+            continue
+        rendered = str(value)
+        if not rendered:
+            continue
+        parts.append(f"{key}={rendered}")
+    return ";".join(parts)
+
+
 def _match_known_variant(candidate: str) -> str:
     """Normalize variant slugs from all historical job-name conventions."""
     try:
@@ -63,13 +89,7 @@ def parse_comment_metadata(comment: str) -> tuple[str | None, str | None]:
 
     Shape: `phase=<p>;variant=<v>`.
     """
-    if not comment:
-        return None, None
-    fields: dict[str, str] = {}
-    for chunk in comment.split(";"):
-        if "=" in chunk:
-            k, v = chunk.split("=", 1)
-            fields[k.strip()] = v.strip()
+    fields = parse_comment_fields(comment)
     phase = fields.get("phase")
     variant = fields.get("variant")
     if phase not in ("train", "resume", "eval"):
