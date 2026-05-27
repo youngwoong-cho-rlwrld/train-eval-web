@@ -1876,7 +1876,8 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
             "[ -f \"$f\" ] || continue; "
             "envs=$(grep -m1 'Num envs:' \"$f\" 2>/dev/null | sed -E 's/.*Num envs: ([0-9]+).*/\\1/'); "
             "case \"$envs\" in ''|*[!0-9]*) envs=1 ;; esac; "
-            "c=$(grep -c 'Resetting environment with seed:' \"$f\" 2>/dev/null || echo 0); "
+            "c=$(grep -c 'Resetting environment with seed:' \"$f\" 2>/dev/null); "
+            "case \"$c\" in ''|*[!0-9]*) c=0 ;; esac; "
             "if [ \"$c\" -gt 0 ]; then c=$((c - 1)); fi; "
             f"if [ \"$c\" -gt {n_eps} ]; then c={n_eps}; fi; "
             "server_eps=$((server_eps + c * envs)); "
@@ -1886,18 +1887,19 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
             "printf '%s %s %s %s %s\\n' \"$completed\" \"$stdout_eps\" \"$stdout_runs\" \"$server_eps\" \"$artifact_eps\""
         )
         r = await ssh_run(host, probe_cmd, timeout=12.0)
+        if r.returncode != 0:
+            raise RuntimeError((r.stderr or r.stdout or "eval progress probe failed").strip())
         try:
             parts = r.stdout.strip().split()
-            completed = int(parts[0]) if len(parts) > 0 else 0
-            active_eps = int(parts[1]) if len(parts) > 1 else 0
-            job_completed_runs = int(parts[2]) if len(parts) > 2 else 0
-            active_eps = max(active_eps, int(parts[3]) if len(parts) > 3 else 0)
-            artifact_eps = int(parts[4]) if len(parts) > 4 else 0
-        except (ValueError, IndexError):
-            completed = 0
-            active_eps = 0
-            job_completed_runs = 0
-            artifact_eps = 0
+            if len(parts) != 5:
+                raise ValueError(f"expected 5 counters, got {len(parts)}")
+            completed = int(parts[0])
+            active_eps = int(parts[1])
+            job_completed_runs = int(parts[2])
+            active_eps = max(active_eps, int(parts[3]))
+            artifact_eps = int(parts[4])
+        except ValueError as exc:
+            raise RuntimeError(f"invalid eval progress probe output: {r.stdout.strip()!r}") from exc
         progress.completed_runs = completed
 
         # Episode counter inside this job. Prefer client stdout because native

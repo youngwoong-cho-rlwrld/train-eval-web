@@ -40,14 +40,34 @@ _CM_OPTS = (
     "-o", "ControlPersist=600",
 )
 
+_CM_FAILURE_MARKERS = (
+    "Control socket connect",
+    "mux_client",
+    "Connection to master",
+)
+
 
 async def ssh_run(host: str, cmd: str, timeout: float = 60.0) -> SSHResult:
     """Run `cmd` on `host` over ssh and return its output."""
+    result = await _ssh_run_once(host, cmd, timeout=timeout, use_control_master=True)
+    if result.returncode == 255 and any(marker in result.stderr for marker in _CM_FAILURE_MARKERS):
+        return await _ssh_run_once(host, cmd, timeout=timeout, use_control_master=False)
+    return result
+
+
+async def _ssh_run_once(
+    host: str,
+    cmd: str,
+    *,
+    timeout: float,
+    use_control_master: bool,
+) -> SSHResult:
+    opts = _CM_OPTS if use_control_master else ()
     proc = await asyncio.create_subprocess_exec(
         "ssh",
         "-o", "BatchMode=yes",
         "-o", "ConnectTimeout=10",
-        *_CM_OPTS,
+        *opts,
         host,
         _SLURM_PATH_PREFIX + cmd,
         stdout=asyncio.subprocess.PIPE,
