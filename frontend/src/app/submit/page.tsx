@@ -136,13 +136,11 @@ function trainConfigFieldChanged(
 }
 
 function submittedGitCommitValue(
-  phase: Phase,
-  trainConfigEditActive: boolean,
+  configEditActive: boolean,
   gitCommit: string,
 ): string | null {
-  if (phase !== "train") return null;
   const trimmed = gitCommit.trim();
-  return trainConfigEditActive ? trimmed : trimmed || null;
+  return configEditActive ? trimmed : trimmed || null;
 }
 
 function submitGitQueryParams(
@@ -427,6 +425,7 @@ export default function SubmitPage() {
     variant.data?.vars.MODEL_VERSION ??
     (trainModelId === "physixel" ? "n1.6" : trainModelId);
   const wantsTrainConfig = submitPhase === "train" && !!variantName;
+  const wantsGitCommitConfig = !!variantName;
   const trainActionHorizonEnabled = wantsTrainConfig && trainModel === "n1.6";
   const modalityActionHorizon = dataInterface.data?.action_horizon ?? null;
   const trainNumGpusValid =
@@ -443,7 +442,7 @@ export default function SubmitPage() {
     !trainActionHorizonEnabled ||
     isPositiveInteger(trainActionHorizon);
   const trainGitCommitValid =
-    !wantsTrainConfig ||
+    !wantsGitCommitConfig ||
     !trainGitCommitTrimmed ||
     /^[0-9a-fA-F]{7,40}$/.test(trainGitCommitTrimmed);
   const trainConfigValid =
@@ -514,8 +513,7 @@ export default function SubmitPage() {
     trainConfigDefaults,
   );
   const includeGitCommitParam = trainConfigEditActive || !!trainGitCommitTrimmed;
-  const submittedTrainGitCommit = submittedGitCommitValue(
-    submitPhase,
+  const submittedGitCommit = submittedGitCommitValue(
     trainConfigEditActive,
     trainGitCommit,
   );
@@ -540,7 +538,7 @@ export default function SubmitPage() {
       train_max_steps: submitPhase === "train" ? trainMaxStepsParsed : null,
       train_save_steps: submitPhase === "train" ? trainSaveStepsParsed : null,
       train_action_horizon: submittedTrainActionHorizon,
-      train_git_commit: submittedTrainGitCommit,
+      train_git_commit: submittedGitCommit,
       eval_num_envs_per_gpu: null,
       eval_n_episodes: wantsCheckpoint ? evalNEpisodesParsed : null,
       eval_n_runs: wantsCheckpoint ? evalNRunsParsed : null,
@@ -582,7 +580,7 @@ export default function SubmitPage() {
       trainMaxSteps,
       trainSaveSteps,
       trainActionHorizon,
-      submittedTrainGitCommit,
+      submittedGitCommit,
       evalNEpisodes,
       evalNRuns,
       evalSetValues,
@@ -600,8 +598,8 @@ export default function SubmitPage() {
     retry: false,
   });
   const displayedConfigPreview = configPreview.data ?? null;
-  const trainGitStatus = useQuery({
-    queryKey: ["submit-git-status", cluster, variantName, submittedTrainGitCommit],
+  const jobGitStatus = useQuery({
+    queryKey: ["submit-git-status", cluster, variantName, submittedGitCommit],
     queryFn: () => {
       const qs = submitGitQueryParams(
         cluster,
@@ -612,7 +610,6 @@ export default function SubmitPage() {
       return api<GitStatus>(`/api/submit/git-status?${qs}`);
     },
     enabled:
-      submitPhase === "train" &&
       !!variantName &&
       !variant.isLoading &&
       !variantError &&
@@ -643,7 +640,6 @@ export default function SubmitPage() {
     },
     enabled:
       gitCommitDialogOpen &&
-      submitPhase === "train" &&
       !!variantName &&
       !variant.isLoading &&
       !variantError,
@@ -651,14 +647,14 @@ export default function SubmitPage() {
     staleTime: 30_000,
     refetchOnWindowFocus: false,
   });
-  const gitStatusFetchError = trainGitStatus.error as Error | null;
+  const jobGitStatusFetchError = jobGitStatus.error as Error | null;
   const modelRepoError =
-    configPreview.data?.model_repo_error ?? trainGitStatus.data?.error ?? null;
+    configPreview.data?.model_repo_error ?? jobGitStatus.data?.error ?? null;
   const modelRepoMessage =
-    gitStatusFetchError ? "Git status will be checked again when submitting." : null;
+    jobGitStatusFetchError ? "Git status will be checked again when submitting." : null;
   const selectedGitCommitValue =
     trainGitCommitValid
-      ? trainGitCommitTrimmed || trainGitStatus.data?.commit || undefined
+      ? trainGitCommitTrimmed || jobGitStatus.data?.commit || undefined
       : undefined;
 
   const submit = useMutation({
@@ -942,6 +938,8 @@ export default function SubmitPage() {
         ),
       });
     }
+  }
+  if (wantsGitCommitConfig) {
     extraFlagRows.push({
       key: "train-git-commit",
       flag: "TRAIN_GIT_COMMIT",
@@ -1001,6 +999,14 @@ export default function SubmitPage() {
   }
   const selectedVariantName = variant.data?.name ?? variantName;
   const canReviewConfig = !!variantName && trainNoteValid;
+  const canReviewModality =
+    canReviewConfig &&
+    (!wantsCheckpoint ||
+      (!!trimmedCkpt &&
+        checkpointExistsValue === true &&
+        evalNEpisodesValid &&
+        evalNRunsValid &&
+        evalSetsValid));
   const selectedMlxpGpuType =
     mlxp.data?.find((n) => n.name === mlxpNode)?.gpu_type ||
     mlxpSettings.data?.gpu_type ||
@@ -1018,7 +1024,7 @@ export default function SubmitPage() {
       <SubmitStepper
         activeStep={submitStep}
         configEnabled={canReviewConfig}
-        modalityEnabled={canReviewConfig}
+        modalityEnabled={canReviewModality}
         onStepChange={setSubmitStep}
       />
 
@@ -1253,10 +1259,10 @@ export default function SubmitPage() {
                 effectiveConfigPath={displayedConfigPreview?.path ?? null}
                 modelLabel={displayedConfigPreview?.model_label ?? null}
                 modelRepoPath={displayedConfigPreview?.model_repo_path ?? null}
-                modelGitCommit={trainGitStatus.data?.commit ?? null}
+                modelGitCommit={jobGitStatus.data?.commit ?? null}
                 modelRepoError={modelRepoError}
                 modelRepoMessage={modelRepoMessage}
-                modelRepoChecking={submitPhase === "train" && trainGitStatus.isLoading}
+                modelRepoChecking={jobGitStatus.isLoading}
                 effectiveConfigLoading={configPreview.isLoading && !displayedConfigPreview}
                 effectiveConfigError={configPreview.error as Error | null}
                 flagsOverride={displayedConfigPreview?.flags ?? null}
@@ -1271,7 +1277,7 @@ export default function SubmitPage() {
                   Back to Job
                 </Button>
                 <div className="flex items-center gap-2">
-                  {wantsTrainConfig && trainOverridesChanged && (
+                  {trainOverridesChanged && (
                     <Button
                       variant="destructiveOutline"
                       onClick={() => setTrainConfigEdit(null)}
@@ -1281,7 +1287,7 @@ export default function SubmitPage() {
                   )}
                   <Button
                     onClick={() => setSubmitStep("modality")}
-                    disabled={!canReviewConfig}
+                    disabled={!canReviewModality}
                     className="gap-1"
                   >
                     Review modality.py
@@ -1375,7 +1381,7 @@ export default function SubmitPage() {
           <DialogHeader>
             <DialogTitle>Training commit</DialogTitle>
             <DialogDescription>
-              Set <code>TRAIN_GIT_COMMIT</code> for this training submission.
+              Set <code>TRAIN_GIT_COMMIT</code> for this submission.
               Leave it empty to use the repo HEAD at submit time.
             </DialogDescription>
           </DialogHeader>

@@ -171,7 +171,7 @@ export function ConfigCard({
               <ConfigPathRow
                 label="training commit"
                 value={modelGitCommit}
-                labelHelp="The model-code commit that this training job will run. Pinned submissions use a detached worktree at this revision."
+                labelHelp="The model-code commit that this job will run. Pinned submissions use a detached worktree at this revision."
                 valueTooltip={modelGitCommit}
               />
             )}
