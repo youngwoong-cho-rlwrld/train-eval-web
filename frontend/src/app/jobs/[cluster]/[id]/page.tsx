@@ -47,7 +47,6 @@ import { RefreshButton } from "@/components/refresh-button";
 import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state";
 import { JobStateBadge } from "@/components/job-state-badge";
 import { ImmediateTooltip } from "@/components/immediate-tooltip";
-import { formatPageTitle } from "@/components/page-title";
 
 const REFRESH_MS = 60_000;
 const LOG_PAGE_SIZE = 100;
@@ -130,10 +129,6 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
   const [copyOpen, setCopyOpen] = useState(false);
 
   const cancelLabel = cluster === "mlxp" ? "kubectl delete job" : "scancel";
-
-  useEffect(() => {
-    document.title = formatPageTitle(details.data?.job_name ?? `${cluster}/${id}`);
-  }, [cluster, details.data?.job_name, id]);
 
   return (
     <div className="mx-auto max-w-7xl px-8 py-12">

@@ -9,7 +9,10 @@ const geistSans = Geist({ variable: "--font-geist-sans", subsets: ["latin"] });
 const geistMono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin"] });
 
 export const metadata: Metadata = {
-  title: "train-eval-web",
+  title: {
+    default: "train-eval-web",
+    template: "%s · train-eval-web",
+  },
   description: "GR00T train/eval orchestrator",
 };
 
