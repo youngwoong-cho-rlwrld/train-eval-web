@@ -6,6 +6,7 @@ plain `idle`. Cloud/power/health-check states such as `idle~`, `idle#`, or
 reliably use right now.
 """
 
+import asyncio
 import re
 from collections import defaultdict
 
@@ -27,6 +28,8 @@ class PartitionInfo(BaseModel):
     idle_nodes: int              # schedulable plain-idle nodes
     gpu_total: int
     gpu_idle: int                # schedulable plain-idle GPUs
+    queued_jobs: int = 0         # pending jobs requesting GPUs
+    queued_gpus: int = 0         # pending GPU requests
     gpu_type: str | None = None
     states: dict[str, int]       # e.g. {"idle": 1, "idle~": 2, "mix": 5}
 
@@ -56,9 +59,17 @@ def _clean_partition_name(name: str, defaults: set[str]) -> str:
 async def list_partitions(cluster: str) -> list[PartitionInfo]:
     env = await load_cluster(cluster)
     configured_default = (env.vars.get("PARTITION") or "").strip()
-    r = await ssh_run(env.ssh_alias, "sinfo -N -h -o '%P|%N|%t|%G|%E'", timeout=15.0)
+    sinfo_task = asyncio.create_task(
+        ssh_run(env.ssh_alias, "sinfo -N -h -o '%P|%N|%t|%G|%E'", timeout=15.0)
+    )
+    squeue_task = asyncio.create_task(
+        ssh_run(env.ssh_alias, "squeue -h -t PD -o '%P|%D|%b'", timeout=15.0)
+    )
+    r, queue_r = await asyncio.gather(sinfo_task, squeue_task)
     if r.returncode != 0:
         raise RuntimeError(f"sinfo failed: {r.stderr}")
+    if queue_r.returncode != 0:
+        raise RuntimeError(f"squeue failed: {queue_r.stderr}")
 
     # Each row: PARTITION | NODE | STATE | GRES | REASON.
     rows: list[tuple[str, str, str, str]] = []
@@ -75,7 +86,9 @@ async def list_partitions(cluster: str) -> list[PartitionInfo]:
     per_part: dict[str, dict] = defaultdict(lambda: {
         "states": defaultdict(int),
         "total_nodes": 0, "idle_nodes": 0,
-        "gpu_total": 0, "gpu_idle": 0, "gpu_type": None,
+        "gpu_total": 0, "gpu_idle": 0,
+        "queued_jobs": 0, "queued_gpus": 0,
+        "gpu_type": None,
     })
     for name, state, gres, reason in rows:
         gpn = _gpus_per_node(gres)
@@ -89,6 +102,27 @@ async def list_partitions(cluster: str) -> list[PartitionInfo]:
         if _is_schedulable_idle(state, reason):
             d["idle_nodes"] += 1
             d["gpu_idle"] += gpn
+
+    # Each pending squeue row: PARTITION | NODE_COUNT | TRES_PER_NODE.
+    # Count only jobs that request GPUs; CPU-only pending jobs are not useful
+    # signal in the GPU monitor.
+    for line in queue_r.stdout.splitlines():
+        parts = line.split("|", 2)
+        if len(parts) != 3:
+            continue
+        name = _clean_partition_name(parts[0], defaults)
+        if not name:
+            continue
+        try:
+            node_count = max(1, int(parts[1]))
+        except ValueError:
+            node_count = 1
+        requested_gpus = _gpus_per_node(parts[2]) * node_count
+        if requested_gpus <= 0:
+            continue
+        d = per_part[name]
+        d["queued_jobs"] += 1
+        d["queued_gpus"] += requested_gpus
 
     def is_bg(name: str) -> bool:
         return name == "background" or name.endswith("_background")
@@ -105,6 +139,8 @@ async def list_partitions(cluster: str) -> list[PartitionInfo]:
             idle_nodes=d["idle_nodes"],
             gpu_total=d["gpu_total"],
             gpu_idle=d["gpu_idle"],
+            queued_jobs=d["queued_jobs"],
+            queued_gpus=d["queued_gpus"],
             gpu_type=d["gpu_type"],
             states=dict(d["states"]),
         ))

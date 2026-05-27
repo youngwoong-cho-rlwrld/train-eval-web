@@ -42,6 +42,7 @@ export type Job = {
   nodelist: string;
   reason?: string;
   time_left?: string | null;
+  queue_position?: number | null;
   start?: string | null;
   end?: string | null;
   phase?: string | null;
@@ -231,6 +232,8 @@ export type MlxpNode = {
   gpu_used: number;
   gpu_total: number;
   gpu_free: number;
+  queued_jobs: number;
+  queued_gpus: number;
   gpu_type: string | null;
 };
 
@@ -275,6 +278,8 @@ export type Partition = {
   idle_nodes: number;
   gpu_total: number;
   gpu_idle: number;
+  queued_jobs: number;
+  queued_gpus: number;
   gpu_type: string | null;
   states: Record<string, number>;
 };

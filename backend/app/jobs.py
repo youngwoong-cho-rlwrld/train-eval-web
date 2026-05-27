@@ -23,6 +23,7 @@ class Job(BaseModel):
     nodelist: str
     reason: str = ""
     time_left: str | None = None     # `squeue %L`; None for sacct-only rows
+    queue_position: int | None = None # 1-based pending position within partition
     start: str | None = None         # ISO timestamp, or None / "Unknown"
     end: str | None = None           # ISO timestamp, or None / "Unknown"
     phase: str | None = None
@@ -71,6 +72,27 @@ async def list_jobs(
                 return None
             return r.stdout if r.returncode == 0 else None
 
+        async def _queue_positions() -> dict[str, int]:
+            try:
+                r = await ssh_run(host, "squeue -h -t PD -o '%i|%P'", timeout=15.0)
+            except Exception:
+                return {}
+            if r.returncode != 0:
+                return {}
+            per_partition: dict[str, int] = {}
+            positions: dict[str, int] = {}
+            for line in r.stdout.strip().splitlines():
+                parts = line.split("|", 1)
+                if len(parts) != 2:
+                    continue
+                job_id = parts[0].strip()
+                partition = parts[1].strip()
+                if not job_id or not partition:
+                    continue
+                per_partition[partition] = per_partition.get(partition, 0) + 1
+                positions[job_id] = per_partition[partition]
+            return positions
+
         async def _sacct() -> str | None:
             if start or end:
                 start_arg = shlex.quote(start or f"now-{hours}hours")
@@ -88,7 +110,12 @@ async def list_jobs(
                 return None
             return r.stdout if r.returncode == 0 else None
 
-        sq_out, sa_out, source_tz = await asyncio.gather(_squeue(), _sacct(), source_tz_task)
+        sq_out, sa_out, queue_positions, source_tz = await asyncio.gather(
+            _squeue(),
+            _sacct(),
+            _queue_positions(),
+            source_tz_task,
+        )
 
         local: list[Job] = []
         seen: set[str] = set()
@@ -103,7 +130,8 @@ async def list_jobs(
                 local.append(Job(
                     cluster=c, job_id=parts[0], job_name=parts[1], partition=parts[2],
                     state=parts[3], elapsed=parts[4], nodelist=parts[5],
-                    time_left=time_left, start=job_start,
+                    time_left=time_left, queue_position=queue_positions.get(parts[0]),
+                    start=job_start,
                 ))
         if sa_out is not None:
             for line in sa_out.strip().splitlines():

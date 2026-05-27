@@ -20,6 +20,7 @@ from typing import Any
 
 from .job_identity import parse_comment_fields
 from .jobs import Job
+from .k8s_resources import affinity_node
 from .kubectl_errors import is_kubectl_transport_error
 from .mlxp_config import get_settings, owner_selector
 from .time_utils import to_kst_iso
@@ -214,6 +215,7 @@ async def _list_live_jobs() -> tuple[list[Job], set[str]]:
                 pods_by_job[jn] = p
     except RuntimeError:
         pass
+    queue_positions = _pending_queue_positions(pods_by_job)
 
     out: list[Job] = []
     seen: set[str] = set()
@@ -239,16 +241,45 @@ async def _list_live_jobs() -> tuple[list[Job], set[str]]:
         end = to_kst_iso(_end_time(status, pod))
         elapsed = _elapsed(start, end)
 
-        nodelist = (pod or {}).get("spec", {}).get("nodeName") or "(unscheduled)"
+        pod_spec = (pod or {}).get("spec") or {}
+        nodelist = pod_spec.get("nodeName") or affinity_node(pod_spec) or "(unscheduled)"
 
         out.append(Job(
             cluster="mlxp", job_id=job_id, job_name=job_name, partition="mlxp",
             state=state, elapsed=elapsed, nodelist=nodelist,
+            queue_position=queue_positions.get(job_id),
             start=start, end=end,
             phase=None if phase == "unknown" else phase,
             variant=variant,
         ))
     return out, seen
+
+
+def _pending_queue_positions(pods_by_job: dict[str, dict]) -> dict[str, int]:
+    pending: list[tuple[str, str | None, datetime, str]] = []
+    max_time = datetime.max.replace(tzinfo=timezone.utc)
+    for job_id, pod in pods_by_job.items():
+        phase = ((pod.get("status") or {}).get("phase") or "").strip()
+        if phase != "Pending":
+            continue
+        metadata = pod.get("metadata") or {}
+        spec = pod.get("spec") or {}
+        node = spec.get("nodeName") or affinity_node(spec)
+        created = _parse_k8s_time(metadata.get("creationTimestamp")) or max_time
+        pending.append((job_id, node, created, metadata.get("name") or job_id))
+
+    pending.sort(key=lambda item: (item[2], item[3]))
+    per_node: dict[str, int] = {}
+    positions: dict[str, int] = {}
+    global_position = 0
+    for job_id, node, _, _ in pending:
+        global_position += 1
+        if node:
+            per_node[node] = per_node.get(node, 0) + 1
+            positions[job_id] = per_node[node]
+        else:
+            positions[job_id] = global_position
+    return positions
 
 
 async def _list_archived_jobs(seen: set[str]) -> list[Job]:

@@ -19,6 +19,7 @@ from collections import defaultdict
 
 from pydantic import BaseModel
 
+from .k8s_resources import affinity_node, requested_gpus
 from .mlxp_config import get_settings
 
 
@@ -27,6 +28,8 @@ class MlxpNode(BaseModel):
     gpu_used: int
     gpu_total: int
     gpu_free: int
+    queued_jobs: int = 0
+    queued_gpus: int = 0
     gpu_type: str | None = None
 
 
@@ -37,7 +40,6 @@ async def list_nodes() -> list[MlxpNode]:
 
     proc = await asyncio.create_subprocess_exec(
         "kubectl", "get", "pod", "-n", settings.namespace,
-        "--field-selector", "status.phase=Running",
         "-o", "json",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -48,19 +50,25 @@ async def list_nodes() -> list[MlxpNode]:
 
     data = json.loads(stdout.decode())
     used: dict[str, int] = defaultdict(int)
+    queued_gpus: dict[str, int] = defaultdict(int)
+    queued_jobs: dict[str, int] = defaultdict(int)
     for p in data.get("items", []):
-        node = p.get("spec", {}).get("nodeName")
+        phase = (p.get("status") or {}).get("phase")
+        spec = p.get("spec") or {}
+        node = spec.get("nodeName") or affinity_node(spec)
         if not node:
             continue
-        for c in p.get("spec", {}).get("containers", []):
-            req = (c.get("resources") or {}).get("requests") or {}
-            try:
-                used[node] += int(req.get("nvidia.com/gpu", 0))
-            except (TypeError, ValueError):
-                pass
+        gpu_count = requested_gpus(spec)
+        if gpu_count <= 0:
+            continue
+        if phase == "Running":
+            used[node] += gpu_count
+        elif phase == "Pending":
+            queued_gpus[node] += gpu_count
+            queued_jobs[node] += 1
 
     out: list[MlxpNode] = []
-    for name in sorted(used):
+    for name in sorted(set(used) | set(queued_gpus)):
         # GPU nodes only. CPU/control-plane nodes show up if we have a data
         # pod or pipeline pod there; those aren't GPU-relevant.
         if settings.gpu_node_prefix and not name.startswith(settings.gpu_node_prefix):
@@ -71,6 +79,8 @@ async def list_nodes() -> list[MlxpNode]:
             gpu_used=u,
             gpu_total=settings.gpus_per_node,
             gpu_free=max(0, settings.gpus_per_node - u),
+            queued_jobs=queued_jobs[name],
+            queued_gpus=queued_gpus[name],
             gpu_type=_gpu_type_for_node(name, settings.gpu_type),
         ))
     if settings.default_node and all(n.name != settings.default_node for n in out):
@@ -79,6 +89,8 @@ async def list_nodes() -> list[MlxpNode]:
             gpu_used=0,
             gpu_total=settings.gpus_per_node,
             gpu_free=settings.gpus_per_node,
+            queued_jobs=queued_jobs[settings.default_node],
+            queued_gpus=queued_gpus[settings.default_node],
             gpu_type=_gpu_type_for_node(settings.default_node, settings.gpu_type),
         ))
         out.sort(key=lambda n: n.name)

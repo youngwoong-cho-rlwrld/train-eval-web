@@ -468,7 +468,11 @@ function ActiveProgressCell({ job }: { job: Job }) {
   });
 
   if (!shouldFetch) {
-    return <span className="text-xs text-slate-500">{job.state.toLowerCase()}</span>;
+    const state = job.state.toLowerCase();
+    const label = /^PENDING$/i.test(job.state) && job.queue_position
+      ? `${state} (${job.queue_position} in queue)`
+      : state;
+    return <span className="text-xs text-slate-500">{label}</span>;
   }
 
   if (progressQuery.isLoading) {

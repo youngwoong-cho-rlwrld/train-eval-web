@@ -95,6 +95,7 @@ function SlurmClusterPanel({ cluster }: { cluster: string }) {
   const ps = q.data ?? [];
   const available = ps.reduce((s, p) => s + p.gpu_idle, 0);
   const total = ps.reduce((s, p) => s + p.gpu_total, 0);
+  const queued = ps.reduce((s, p) => s + p.queued_gpus, 0);
 
   return (
     <Card>
@@ -104,6 +105,9 @@ function SlurmClusterPanel({ cluster }: { cluster: string }) {
           <span className="font-mono text-sm">
             <span className={available > 0 ? "text-green-600 dark:text-green-400" : "text-slate-500"}>{available}</span>
             <span className="text-slate-400"> / {total} GPU available</span>
+            <span className="text-slate-400"> · </span>
+            <span className={queued > 0 ? "text-amber-600 dark:text-amber-400" : "text-slate-500"}>{queued}</span>
+            <span className="text-slate-400"> GPU queued</span>
           </span>
         </div>
         <CardDescription>{ps.length} partitions</CardDescription>
@@ -121,6 +125,7 @@ function SlurmClusterPanel({ cluster }: { cluster: string }) {
                 <tr>
                   <th className="py-2 pr-4 font-medium">Partition</th>
                   <th className="py-2 pr-4 font-medium">GPUs available / total</th>
+                  <th className="py-2 pr-4 font-medium">Queue</th>
                   <th className="py-2 pr-4 font-medium">Nodes available / total</th>
                   <th className="py-2 pr-4 font-medium">States</th>
                 </tr>
@@ -137,6 +142,9 @@ function SlurmClusterPanel({ cluster }: { cluster: string }) {
                         {p.gpu_idle}
                       </span>
                       <span className="text-slate-400"> / {p.gpu_total}</span>
+                    </td>
+                    <td className="py-2 pr-4 font-mono text-xs">
+                      <QueueLabel queuedGpus={p.queued_gpus} queuedJobs={p.queued_jobs} />
                     </td>
                     <td className="py-2 pr-4 font-mono text-xs">
                       {p.idle_nodes} / {p.total_nodes}
@@ -171,6 +179,7 @@ function MlxpPanel() {
   const [yoursNode, setYoursNode] = useMyMlxpNode();
   const available = nodes.reduce((s, n) => s + n.gpu_free, 0);
   const total = nodes.reduce((s, n) => s + n.gpu_total, 0);
+  const queued = nodes.reduce((s, n) => s + n.queued_gpus, 0);
 
   return (
     <Card>
@@ -180,6 +189,9 @@ function MlxpPanel() {
           <span className="font-mono text-sm">
             <span className={available > 0 ? "text-green-600 dark:text-green-400" : "text-slate-500"}>{available}</span>
             <span className="text-slate-400"> / {total} GPU available</span>
+            <span className="text-slate-400"> · </span>
+            <span className={queued > 0 ? "text-amber-600 dark:text-amber-400" : "text-slate-500"}>{queued}</span>
+            <span className="text-slate-400"> GPU queued</span>
           </span>
         </div>
         <CardDescription className="flex items-center gap-2">
@@ -215,6 +227,7 @@ function MlxpPanel() {
                 <tr>
                   <th className="py-2 pr-4 font-medium">Node</th>
                   <th className="py-2 pr-4 font-medium">GPUs available / total</th>
+                  <th className="py-2 pr-4 font-medium">Queue</th>
                 </tr>
               </thead>
               <tbody>
@@ -230,6 +243,9 @@ function MlxpPanel() {
                       </span>
                       <span className="text-slate-400"> / {n.gpu_total}</span>
                     </td>
+                    <td className="py-2 pr-4 font-mono text-xs">
+                      <QueueLabel queuedGpus={n.queued_gpus} queuedJobs={n.queued_jobs} />
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -238,5 +254,23 @@ function MlxpPanel() {
         )}
       </CardContent>
     </Card>
+  );
+}
+
+function QueueLabel({
+  queuedGpus,
+  queuedJobs,
+}: {
+  queuedGpus: number;
+  queuedJobs: number;
+}) {
+  if (queuedGpus <= 0 && queuedJobs <= 0) {
+    return <span className="text-slate-400">—</span>;
+  }
+  return (
+    <span>
+      <span className="text-amber-600 dark:text-amber-400">{queuedGpus}</span>
+      <span className="text-slate-400"> GPU / {queuedJobs} {queuedJobs === 1 ? "job" : "jobs"}</span>
+    </span>
   );
 }
