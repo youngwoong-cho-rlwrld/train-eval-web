@@ -246,6 +246,7 @@ export type JobDetails = {
   progress: Progress;
   gpu: GpuUsage | null;
   config_snapshot: ConfigSnapshot | null;
+  data_interface: DataInterfaceSummary | null;
   eval_runs: EvalRun[];
 };
 

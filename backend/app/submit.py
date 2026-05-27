@@ -517,6 +517,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
                 "results.json",
                 "config_*.sh",
                 "config_*.meta.json",
+                "modality_*.py",
                 "extra_args_*.sh",
             ]
             if remote_name == "experiments"

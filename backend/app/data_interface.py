@@ -52,10 +52,25 @@ def load_data_interface_for_variant(variant: Variant) -> DataInterfaceSummary:
         )
 
     text = path.read_text()
+    return summarize_data_interface_text(
+        variant_name=variant.name,
+        source=rel,
+        path=shown_path,
+        text=text,
+    )
+
+
+def summarize_data_interface_text(
+    *,
+    variant_name: str,
+    source: str | None,
+    path: str | None,
+    text: str,
+) -> DataInterfaceSummary:
     base = {
-        "variant": variant.name,
-        "source": rel,
-        "path": shown_path,
+        "variant": variant_name,
+        "source": source,
+        "path": path,
         "text": text,
     }
     try:

@@ -222,7 +222,10 @@ async def get_variant_data_interface(name: str):
     try:
         return await data_interface.load_data_interface(name)
     except FileNotFoundError:
-        raise HTTPException(404, f"variant {name} not found")
+        return data_interface.DataInterfaceSummary(
+            variant=name,
+            error=f"local experiment config not found for {name}",
+        )
 
 
 # ── submit ──
@@ -683,7 +686,7 @@ async def get_job_flags(cluster: str, job_id: str):
         else:
             v = await variants.load_variant(det.variant)
     except FileNotFoundError:
-        raise HTTPException(404, f"variant {det.variant} not found")
+        return {"flags": []}
     out = flags.flags_for(v, cluster, det.phase)
     submitted_extra_args = det.config_snapshot.extra_args if det.config_snapshot else []
     if submitted_extra_args:

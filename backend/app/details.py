@@ -16,6 +16,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 from pydantic import BaseModel, Field
 
 from .clusters import load_cluster
+from .data_interface import DataInterfaceSummary, summarize_data_interface_text
 from .eval_completion import (
     eval_job_completed,
     eval_shape,
@@ -134,6 +135,7 @@ class JobDetails(BaseModel):
     progress: Progress
     gpu: GpuUsage | None = None
     config_snapshot: ConfigSnapshot | None = None
+    data_interface: DataInterfaceSummary | None = None
     eval_runs: list[EvalRun] = Field(default_factory=list)
 
 
@@ -343,6 +345,12 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
         isaac_logs_glob=isaac_logs_glob,
     )
     config_snapshot = await _slurm_config_snapshot(env.ssh_alias, slurm_meta, cluster=cluster)
+    data_interface = await _slurm_data_interface_snapshot(
+        env.ssh_alias,
+        slurm_meta,
+        config_snapshot,
+        variant=variant,
+    )
     job_wandb_project = (
         slurm_meta.get("wandb_project")
         or slurm_meta.get("submit_wandb_project")
@@ -391,6 +399,7 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
         wandb_project=job_wandb_project,
         wandb_url=wandb_url, paths=paths, progress=progress, gpu=gpu,
         config_snapshot=config_snapshot,
+        data_interface=data_interface,
         eval_runs=eval_runs,
     )
 
@@ -443,6 +452,11 @@ async def _mlxp_details(
     if phase == "eval":
         paths.eval_checkpoint = metadata.get("checkpoint_path") or None
     config_snapshot = await _mlxp_config_snapshot(metadata)
+    data_interface = await _mlxp_data_interface_snapshot(
+        metadata,
+        config_snapshot,
+        variant=variant,
+    )
     job_wandb_project = (
         metadata.get("wandb_project")
         or metadata.get("submit_wandb_project")
@@ -467,6 +481,7 @@ async def _mlxp_details(
         wandb_project=job_wandb_project,
         wandb_url=wandb_url, paths=paths, progress=progress, gpu=gpu,
         config_snapshot=config_snapshot,
+        data_interface=data_interface,
         eval_runs=eval_runs,
     )
 
@@ -613,6 +628,78 @@ def _snapshot_git_from_meta(meta: dict[str, str]) -> SubmitGitInfo | None:
     )
 
 
+async def _slurm_data_interface_snapshot(
+    host: str,
+    meta: dict[str, str],
+    config_snapshot: ConfigSnapshot | None,
+    *,
+    variant: str | None,
+) -> DataInterfaceSummary | None:
+    if not variant:
+        return None
+    source, path = _resolve_remote_modality_path(meta, config_snapshot)
+    if not source and not path:
+        return None
+    if not path:
+        return DataInterfaceSummary(
+            variant=variant,
+            source=source,
+            error="TRAIN_MODALITY_CONFIG is set, but the submitted config snapshot path is unavailable",
+        )
+    text = await _slurm_optional_text(host, path, None)
+    if text is None:
+        return DataInterfaceSummary(
+            variant=variant,
+            source=source,
+            path=path,
+            error=f"modality.py not found on cluster: {path}",
+        )
+    return summarize_data_interface_text(
+        variant_name=variant,
+        source=source,
+        path=path,
+        text=text,
+    )
+
+
+def _resolve_remote_modality_path(
+    meta: dict[str, str],
+    config_snapshot: ConfigSnapshot | None,
+) -> tuple[str | None, str | None]:
+    path = (meta.get("train_modality_config") or "").strip() or None
+    if path:
+        return path.rsplit("/", 1)[-1], path
+
+    source = _snapshot_shell_value(config_snapshot.text if config_snapshot else None, "TRAIN_MODALITY_CONFIG")
+    if not source:
+        return None, None
+    if source.startswith("$HOME/") or source.startswith("/") or source.startswith("~/"):
+        return source, source
+
+    config_path = config_snapshot.path if config_snapshot else None
+    if not config_path or "/" not in config_path:
+        return source, None
+    return source, f"{config_path.rsplit('/', 1)[0]}/{source}"
+
+
+def _snapshot_shell_value(text: str | None, key: str) -> str | None:
+    if not text:
+        return None
+    match = re.search(rf"^{re.escape(key)}=(.*)$", text, flags=re.MULTILINE)
+    if not match:
+        return None
+    raw = match.group(1).strip()
+    if not raw:
+        return None
+    try:
+        parts = shlex.split(raw, comments=False, posix=True)
+        if parts:
+            return parts[0]
+    except ValueError:
+        pass
+    return raw.strip("'\"") or None
+
+
 def _meta_int(meta: dict[str, str], key: str) -> int | None:
     raw = meta.get(key)
     if raw is None or raw == "":
@@ -630,6 +717,8 @@ async def _slurm_optional_text(host: str, path: str | None, rel: str | None = No
         cmd = f"cat $HOME/{shlex.quote(rel)} 2>/dev/null"
     elif path and path.startswith("$HOME/"):
         cmd = f"cat $HOME/{shlex.quote(path[len('$HOME/'):])} 2>/dev/null"
+    elif path and path.startswith("~/"):
+        cmd = f"cat $HOME/{shlex.quote(path[len('~/'):])} 2>/dev/null"
     elif path:
         cmd = f"cat {shlex.quote(path)} 2>/dev/null"
     else:
@@ -663,37 +752,7 @@ async def _mlxp_config_snapshot(meta: dict[str, str]) -> ConfigSnapshot | None:
         return None
     meta_path = meta.get("config_snapshot_meta_path")
 
-    import asyncio
-    import shutil
-    from .mlxp_data_pod import ensure_listing_pod
-
-    settings = get_settings()
-    text: str | None = None
-    error: str | None = None
-    if shutil.which("kubectl") is None:
-        error = "kubectl not found on PATH"
-    else:
-        try:
-            pod = await ensure_listing_pod()
-            proc = await asyncio.create_subprocess_exec(
-                "kubectl",
-                "exec",
-                "-n",
-                settings.namespace,
-                pod,
-                "--",
-                "cat",
-                path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=12.0)
-            if proc.returncode == 0:
-                text = stdout.decode(errors="replace")
-            else:
-                error = stderr.decode(errors="replace").strip() or "config snapshot not found"
-        except Exception as exc:
-            error = str(exc)
+    text, error = await _mlxp_read_file(path)
 
     return ConfigSnapshot(
         path=path,
@@ -710,6 +769,69 @@ async def _mlxp_config_snapshot(meta: dict[str, str]) -> ConfigSnapshot | None:
         git_committed_dirty=_meta_bool(meta.get("submit_git_committed_dirty")),
         error=error,
     )
+
+
+async def _mlxp_data_interface_snapshot(
+    meta: dict[str, str],
+    config_snapshot: ConfigSnapshot | None,
+    *,
+    variant: str | None,
+) -> DataInterfaceSummary | None:
+    if not variant:
+        return None
+    source, path = _resolve_remote_modality_path(meta, config_snapshot)
+    if not source and not path:
+        return None
+    if not path:
+        return DataInterfaceSummary(
+            variant=variant,
+            source=source,
+            error="TRAIN_MODALITY_CONFIG is set, but the submitted config snapshot path is unavailable",
+        )
+    text, _ = await _mlxp_read_file(path)
+    if text is None:
+        return DataInterfaceSummary(
+            variant=variant,
+            source=source,
+            path=path,
+            error=f"modality.py not found on MLXP: {path}",
+        )
+    return summarize_data_interface_text(
+        variant_name=variant,
+        source=source,
+        path=path,
+        text=text,
+    )
+
+
+async def _mlxp_read_file(path: str) -> tuple[str | None, str | None]:
+    import asyncio
+    import shutil
+    from .mlxp_data_pod import ensure_listing_pod
+
+    if shutil.which("kubectl") is None:
+        return None, "kubectl not found on PATH"
+    settings = get_settings()
+    try:
+        pod = await ensure_listing_pod()
+        proc = await asyncio.create_subprocess_exec(
+            "kubectl",
+            "exec",
+            "-n",
+            settings.namespace,
+            pod,
+            "--",
+            "cat",
+            path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=12.0)
+        if proc.returncode == 0:
+            return stdout.decode(errors="replace"), None
+        return None, stderr.decode(errors="replace").strip() or "file not found"
+    except Exception as exc:
+        return None, str(exc)
 
 
 _EVAL_RUNS_SCRIPT = r'''
@@ -1502,8 +1624,14 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
             )
 
     elif phase == "eval":
-        v = await load_variant(variant)
-        eval_sets, n_runs, n_eps, tasks = eval_shape(v, slurm_meta)
+        try:
+            v = await load_variant(variant)
+            eval_sets, n_runs, n_eps, tasks = eval_shape(v, slurm_meta)
+        except FileNotFoundError:
+            eval_sets = [s for s in ((slurm_meta or {}).get("eval_sets") or "").split() if s]
+            n_runs = _meta_int(slurm_meta or {}, "eval_n_runs") or 0
+            n_eps = _meta_int(slurm_meta or {}, "eval_n_episodes") or 0
+            tasks = []
         total = max(len(tasks) * len(eval_sets) * n_runs, 0)
         progress.total_runs = total or None
 

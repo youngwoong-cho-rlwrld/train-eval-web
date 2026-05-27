@@ -297,6 +297,7 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
 
       <DataInterfaceCard
         variantName={details.data?.variant ?? null}
+        summaryOverride={details.data?.data_interface ?? null}
         loading={details.isLoading}
         error={detailsError}
         className="mt-6"

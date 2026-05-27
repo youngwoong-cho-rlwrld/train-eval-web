@@ -304,11 +304,13 @@ function normalizeEditor(editor?: FlagEditor):
 
 export function DataInterfaceCard({
   variantName,
+  summaryOverride,
   loading = false,
   error,
   className,
 }: {
   variantName: string | null;
+  summaryOverride?: DataInterfaceSummary | null;
   loading?: boolean;
   error?: Error | null;
   className?: string;
@@ -316,8 +318,9 @@ export function DataInterfaceCard({
   const dataInterface = useQuery({
     queryKey: ["variant-data-interface", variantName],
     queryFn: () => api<DataInterfaceSummary>(`/api/variants/${variantName}/data-interface`),
-    enabled: !!variantName && !loading && !error,
+    enabled: !!variantName && !summaryOverride && !loading && !error,
   });
+  const summary = summaryOverride ?? dataInterface.data ?? null;
 
   return (
     <Card className={className}>
@@ -342,9 +345,9 @@ export function DataInterfaceCard({
         )}
         {!loading && !error && variantName && (
           <DataInterfaceContent
-            loading={dataInterface.isLoading}
-            error={dataInterface.error as Error | null}
-            summary={dataInterface.data ?? null}
+            loading={!summaryOverride && dataInterface.isLoading}
+            error={!summaryOverride ? (dataInterface.error as Error | null) : null}
+            summary={summary}
           />
         )}
       </CardContent>
