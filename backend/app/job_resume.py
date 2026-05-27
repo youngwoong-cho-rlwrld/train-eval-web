@@ -27,7 +27,7 @@ async def resume_timed_out_job(cluster: str, job_id: str) -> submit.SubmitRespon
     if not _is_timeout(state):
         raise ValueError(f"job {job_id} on {cluster} is {state or 'unknown'}, not TIMEOUT")
 
-    det = await details.get_details(cluster, job_id)
+    det = await details.get_details(cluster, job_id, include_progress=False)
     variant = det.variant
     if not variant:
         raise ValueError(f"cannot resume job {job_id}: variant is unknown")
@@ -95,7 +95,7 @@ async def resume_timed_out_job(cluster: str, job_id: str) -> submit.SubmitRespon
     resume_of = (meta.get("resume_of") or "").strip()
     if resume_of and resume_of != job_id:
         try:
-            original = await details.get_details(cluster, resume_of)
+            original = await details.get_details(cluster, resume_of, include_progress=False)
             if original.paths.eval_dir and original.paths.eval_dir not in seed_eval_dirs:
                 seed_eval_dirs.append(original.paths.eval_dir)
         except Exception:

@@ -34,6 +34,7 @@ from .jobs import get_job
 from .kubectl_errors import is_completed_pod_exec_error
 from .mlxp_config import get_settings
 from .mlxp_data_pod import ensure_listing_pod, invalidate_pods_cache
+from .remote_paths import remote_path_exists
 from .ssh import ssh_run, _CM_OPTS
 from .submission_snapshot import is_mlxp_transport_error
 
@@ -252,7 +253,7 @@ done
     # known roots for the normalized variant. Include one-level nested
     # checkpoint layouts used by newer launchers.
     env = await load_cluster(cluster)
-    det = await get_details(cluster, job_id)
+    det = await get_details(cluster, job_id, include_progress=False)
     variant = det.variant
     if not variant:
         return []
@@ -317,10 +318,10 @@ async def list_checkpoint_copies(cluster: str, job_id: str) -> list[CheckpointCo
 
     async def enrich(record: CheckpointCopyRecord) -> CheckpointCopyRecord:
         values = record.model_dump()
-        values["source_exists"] = await _path_exists(
+        values["source_exists"] = await remote_path_exists(
             record.source_cluster, record.source_path,
         )
-        values["dest_exists"] = await _path_exists(record.dest_cluster, record.dest_path)
+        values["dest_exists"] = await remote_path_exists(record.dest_cluster, record.dest_path)
         return CheckpointCopyRecord(**values)
 
     enriched = await asyncio.gather(*(enrich(r) for r in records))
@@ -387,32 +388,6 @@ async def _append_copy_history(cluster: str, job_id: str, record: CheckpointCopy
         raise RuntimeError(r.stderr.strip() or r.stdout.strip() or "copy history write failed")
 
 
-async def _path_exists(cluster: str, path: str) -> bool | None:
-    try:
-        if cluster == "mlxp":
-            pod = await ensure_listing_pod()
-            out = await _kubectl_exec_text(
-                pod,
-                "bash",
-                "-c",
-                f"if [ -e {shlex.quote(path)} ]; then echo 1; else echo 0; fi",
-                timeout=15.0,
-            )
-        else:
-            env = await load_cluster(cluster)
-            r = await ssh_run(
-                env.ssh_alias,
-                f"if [ -e {_remote_shell_path(path)} ]; then echo 1; else echo 0; fi",
-                timeout=15.0,
-            )
-            if r.returncode != 0:
-                return None
-            out = r.stdout
-    except Exception:
-        return None
-    return out.strip() == "1"
-
-
 # ── transfer ────────────────────────────────────────────────────────────
 
 async def start_copy(
@@ -429,7 +404,7 @@ async def start_copy(
         sacct = await get_job(src_cluster, src_job)
         _, variant = resolve_phase_and_variant(sacct.get("JobName") or src_job, sacct)
     else:
-        variant = (await get_details(src_cluster, src_job)).variant
+        variant = (await get_details(src_cluster, src_job, include_progress=False)).variant
     if not variant:
         raise ValueError("could not resolve variant from job name")
 

@@ -21,6 +21,7 @@ import {
   type MlxpSettings,
   type GitStatus,
   type GitCommitOption,
+  type PathExistence,
 } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import {
@@ -271,7 +272,7 @@ export default function SubmitPage() {
   const checkpointExists = useQuery({
     queryKey: ["path-exists", cluster, trimmedCkpt],
     queryFn: () =>
-      api<{ exists: boolean; kind: "dir" | "file" | null }>(
+      api<PathExistence>(
         `/api/clusters/${cluster}/path-exists?path=${encodeURIComponent(trimmedCkpt)}`,
       ),
     enabled: wantsCheckpoint && !!trimmedCkpt,
@@ -1086,153 +1087,106 @@ export default function SubmitPage() {
                 {variantNames.error && <ErrorState message={(variantNames.error as Error).message} />}
               </Field>
 
-              {isSlurm && (
-                <>
-                  <Field label="Phase">
-                    <Select
-                      value={phase}
-                      onValueChange={(v) => changePhase(v as Phase)}
-                    >
-                      <SelectTrigger>
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="train">train</SelectItem>
-                        <SelectItem value="eval">eval</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </Field>
+              <PhaseField value={phase} onChange={changePhase} />
 
-                  <Field label="Partition">
-                    <Select value={selectedPartitionName} onValueChange={setPartition}>
-                      <SelectTrigger>
-                        <SelectValue placeholder="loading partitions…" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {partitions.data?.map((p) => (
-                          <SelectItem key={p.name} value={p.name}>
-                            <span className="flex items-center gap-2">
-                              <span>{p.name}</span>
-                              {p.is_default && (
-                                <Badge
-                                  variant="secondary"
-                                  className="text-[10px]"
-                                >
-                                  default
-                                </Badge>
-                              )}
-                              {p.is_background && (
-                                <Badge
-                                  variant="outline"
-                                  className="text-[10px]"
-                                >
-                                  preemptible
-                                </Badge>
-                              )}
-                              <span className="ml-2 text-xs text-slate-500">
-                                {p.gpu_idle}/{p.gpu_total} {p.gpu_type ?? "GPU"} available
-                              </span>
-                            </span>
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                    {selectedPartition?.is_background && (
-                      <p className="text-xs text-slate-500">
-                        Preemptible partition — submit auto-adds{" "}
-                        <code>--requeue</code>; train_body resumes from latest
-                        checkpoint after preemption.
-                      </p>
-                    )}
-                    {partitions.isLoading && <LoadingState label="Loading partitions..." rows={2} />}
-                    {partitions.error && <ErrorState message={(partitions.error as Error).message} />}
-                  </Field>
-
-                  <JobNameField
-                    value={shownJobName}
-                    defaultValue={defaultJobName}
-                    variantName={variantName}
-                    touched={jobNameTouched}
-                    description={
-                      <>
-                        Used as <code>--job-name</code> and the wandb run id.
-                      </>
-                    }
-                    onChange={(value) => {
-                      setJobName(value);
-                      setJobNameTouched(true);
-                    }}
-                    onReset={() => setJobNameTouched(false)}
-                  />
-
-                </>
-              )}
-
-              {!isSlurm && (
-                <>
-                  <Field label="Phase">
-                    <Select
-                      value={phase}
-                      onValueChange={(v) => changePhase(v as Phase)}
-                    >
-                      <SelectTrigger>
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="train">train</SelectItem>
-                        <SelectItem value="eval">eval</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </Field>
-
-                  <Field label="Node">
-                    <Select value={mlxpNode} onValueChange={setMlxpNode}>
-                      <SelectTrigger>
-                        <SelectValue placeholder="select a default node..." />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {mlxp.data?.map((n) => (
-                          <SelectItem key={n.name} value={n.name}>
-                            <span className="flex items-center gap-2">
-                              <span className="font-mono">{n.name}</span>
-                              <span
-                                className={`text-xs ${n.gpu_free > 0 ? "text-green-600 dark:text-green-400" : "text-slate-500"}`}
+              {isSlurm ? (
+                <Field label="Partition">
+                  <Select value={selectedPartitionName} onValueChange={setPartition}>
+                    <SelectTrigger>
+                      <SelectValue placeholder="loading partitions…" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {partitions.data?.map((p) => (
+                        <SelectItem key={p.name} value={p.name}>
+                          <span className="flex items-center gap-2">
+                            <span>{p.name}</span>
+                            {p.is_default && (
+                              <Badge
+                                variant="secondary"
+                                className="text-[10px]"
                               >
-                                {n.gpu_free}/{n.gpu_total} available
-                              </span>
+                                default
+                              </Badge>
+                            )}
+                            {p.is_background && (
+                              <Badge
+                                variant="outline"
+                                className="text-[10px]"
+                              >
+                                preemptible
+                              </Badge>
+                            )}
+                            <span className="ml-2 text-xs text-slate-500">
+                              {p.gpu_idle}/{p.gpu_total} {p.gpu_type ?? "GPU"} available
                             </span>
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                    {mlxp.isLoading && <LoadingState label="Loading MLXP nodes..." rows={2} />}
-                    {mlxp.error && <ErrorState message={(mlxp.error as Error).message} />}
+                          </span>
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  {selectedPartition?.is_background && (
                     <p className="text-xs text-slate-500">
-                      Pick the MLXP node this app should target by default.
-                      Your selection is saved locally for next time.
+                      Preemptible partition — submit auto-adds{" "}
+                      <code>--requeue</code>; train_body resumes from latest
+                      checkpoint after preemption.
                     </p>
-                  </Field>
-
-                  <JobNameField
-                    value={shownJobName}
-                    defaultValue={defaultJobName}
-                    variantName={variantName}
-                    touched={jobNameTouched}
-                    description={
-                      <>
-                        Carried as the MLXP <code>display-name</code>{" "}
-                        annotation and the wandb run id.
-                      </>
-                    }
-                    onChange={(value) => {
-                      setJobName(value);
-                      setJobNameTouched(true);
-                    }}
-                    onReset={() => setJobNameTouched(false)}
-                  />
-
-                </>
+                  )}
+                  {partitions.isLoading && <LoadingState label="Loading partitions..." rows={2} />}
+                  {partitions.error && <ErrorState message={(partitions.error as Error).message} />}
+                </Field>
+              ) : (
+                <Field label="Node">
+                  <Select value={mlxpNode} onValueChange={setMlxpNode}>
+                    <SelectTrigger>
+                      <SelectValue placeholder="select a default node..." />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {mlxp.data?.map((n) => (
+                        <SelectItem key={n.name} value={n.name}>
+                          <span className="flex items-center gap-2">
+                            <span className="font-mono">{n.name}</span>
+                            <span
+                              className={`text-xs ${n.gpu_free > 0 ? "text-green-600 dark:text-green-400" : "text-slate-500"}`}
+                            >
+                              {n.gpu_free}/{n.gpu_total} available
+                            </span>
+                          </span>
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  {mlxp.isLoading && <LoadingState label="Loading MLXP nodes..." rows={2} />}
+                  {mlxp.error && <ErrorState message={(mlxp.error as Error).message} />}
+                  <p className="text-xs text-slate-500">
+                    Pick the MLXP node this app should target by default.
+                    Your selection is saved locally for next time.
+                  </p>
+                </Field>
               )}
+
+              <JobNameField
+                value={shownJobName}
+                defaultValue={defaultJobName}
+                variantName={variantName}
+                touched={jobNameTouched}
+                description={
+                  isSlurm ? (
+                    <>
+                      Used as <code>--job-name</code> and the wandb run id.
+                    </>
+                  ) : (
+                    <>
+                      Carried as the MLXP <code>display-name</code>{" "}
+                      annotation and the wandb run id.
+                    </>
+                  )
+                }
+                onChange={(value) => {
+                  setJobName(value);
+                  setJobNameTouched(true);
+                }}
+                onReset={() => setJobNameTouched(false)}
+              />
               <TrainNoteField
                 value={trainNote}
                 defaultValue={trainNoteDefault}
@@ -1594,6 +1548,28 @@ function Field({
       <Label>{label}</Label>
       {children}
     </div>
+  );
+}
+
+function PhaseField({
+  value,
+  onChange,
+}: {
+  value: Phase;
+  onChange: (value: Phase) => void;
+}) {
+  return (
+    <Field label="Phase">
+      <Select value={value} onValueChange={(next) => onChange(next as Phase)}>
+        <SelectTrigger>
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="train">train</SelectItem>
+          <SelectItem value="eval">eval</SelectItem>
+        </SelectContent>
+      </Select>
+    </Field>
   );
 }
 

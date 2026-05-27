@@ -22,6 +22,7 @@ from . import (
     mlxp_submit,
     partitions,
     results,
+    remote_paths,
     submission_snapshot,
     submit,
     training_models,
@@ -119,47 +120,14 @@ async def get_path_exists(name: str, path: str):
     Used by the submit page to verify a user-typed eval checkpoint path
     before launching.
     """
-    if not path or not path.strip():
-        return {"exists": False, "kind": None}
-    if name == "mlxp":
-        try:
-            from .mlxp_data_pod import ensure_listing_pod
-            import asyncio
-            import shlex
-
-            settings = mlxp_config.get_settings()
-            pod = await ensure_listing_pod()
-            p = shlex.quote(path.strip())
-            proc = await asyncio.create_subprocess_exec(
-                "kubectl", "exec", "-n", settings.namespace, pod, "--", "bash", "-lc",
-                f'if [ -d {p} ]; then echo dir; elif [ -f {p} ]; then echo file; else echo none; fi',
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
-            if proc.returncode != 0:
-                raise RuntimeError(stderr.decode(errors="replace").strip())
-            kind = stdout.decode(errors="replace").strip()
-            if kind not in ("dir", "file"):
-                return {"exists": False, "kind": None}
-            return {"exists": True, "kind": kind}
-        except RuntimeError as e:
-            raise HTTPException(503, str(e))
-        except Exception as e:
-            raise HTTPException(500, str(e))
     try:
-        env = await clusters.load_cluster(name)
+        kind = await remote_paths.remote_path_kind(name, path)
     except FileNotFoundError:
         raise HTTPException(404, f"cluster {name} not found")
-    from .ssh import ssh_run
-    import shlex
-    p = shlex.quote(path.strip())
-    cmd = f'if [ -d {p} ]; then echo dir; elif [ -f {p} ]; then echo file; else echo none; fi'
-    r = await ssh_run(env.ssh_alias, cmd, timeout=10.0)
-    kind = r.stdout.strip()
-    if kind not in ("dir", "file"):
-        return {"exists": False, "kind": None}
-    return {"exists": True, "kind": kind}
+    except RuntimeError as e:
+        status = 503 if name == "mlxp" else 500
+        raise HTTPException(status, str(e))
+    return {"exists": kind is not None, "kind": kind}
 
 
 @app.get("/api/clusters/{name}/datasets", response_model=list[datasets.DatasetInfo])
@@ -551,9 +519,49 @@ async def get_job(cluster: str, job_id: str):
 
 
 @app.get("/api/jobs/{cluster}/{job_id}/details", response_model=details.JobDetails)
-async def get_job_details(cluster: str, job_id: str, include_gpu: bool = False):
+async def get_job_details(cluster: str, job_id: str):
     try:
-        return await details.get_details(cluster, job_id, include_gpu=include_gpu)
+        return await details.get_details(cluster, job_id, include_progress=False)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/jobs/{cluster}/{job_id}/metadata", response_model=details.JobMetadataPayload)
+async def get_job_metadata(cluster: str, job_id: str):
+    try:
+        return await details.get_metadata(cluster, job_id)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/jobs/{cluster}/{job_id}/progress", response_model=details.JobProgressPayload)
+async def get_job_progress(cluster: str, job_id: str):
+    try:
+        return await details.get_progress(cluster, job_id)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/jobs/{cluster}/{job_id}/gpu", response_model=details.JobGpuPayload)
+async def get_job_gpu(cluster: str, job_id: str):
+    try:
+        return await details.get_gpu(cluster, job_id)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/jobs/{cluster}/{job_id}/eval-runs", response_model=details.JobEvalRunsPayload)
+async def get_job_eval_runs(cluster: str, job_id: str):
+    try:
+        return await details.get_eval_runs(cluster, job_id)
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
     except RuntimeError as e:
@@ -651,7 +659,7 @@ async def stream_logs(request: Request, cluster: str, job_id: str, stream: str =
         raise HTTPException(404, f"cluster {cluster} not found")
 
     if stream == "isaac":
-        det = await details.get_details(cluster, job_id)
+        det = await details.get_details(cluster, job_id, include_progress=False)
         if not det.paths.isaac_logs_glob:
             raise HTTPException(400, "isaac logs only available for eval jobs")
         pattern = det.paths.isaac_logs_glob
@@ -700,7 +708,12 @@ async def post_wandb_project(req: wandb_auth.ProjectRequest):
 @app.get("/api/jobs/{cluster}/{job_id}/flags")
 async def get_job_flags(cluster: str, job_id: str):
     """All flags the training/eval entrypoint receives for this job."""
-    det = await details.get_details(cluster, job_id)
+    det = await details.get_details(
+        cluster,
+        job_id,
+        include_config=True,
+        include_progress=False,
+    )
     if not det.variant:
         return {"flags": []}
     try:

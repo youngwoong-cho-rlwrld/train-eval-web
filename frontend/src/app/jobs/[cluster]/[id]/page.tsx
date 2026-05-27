@@ -16,7 +16,12 @@ import {
   logStreamUrl,
   type CheckpointCopyRecord,
   type EvalRun,
+  type GpuUsage,
+  type JobEvalRuns,
   type JobDetails,
+  type JobGpu,
+  type JobMetadata,
+  type JobProgress,
   type PathExistence,
 } from "@/lib/api";
 import { formatDuration, parseSlurmDuration } from "@/lib/duration";
@@ -65,12 +70,40 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
   });
 
   const details = useQuery({
-    queryKey: ["job-details", cluster, id, "gpu"],
-    queryFn: () => api<JobDetails>(`/api/jobs/${cluster}/${id}/details?include_gpu=true`),
+    queryKey: ["job-details", cluster, id],
+    queryFn: () => api<JobDetails>(`/api/jobs/${cluster}/${id}/details`),
     refetchInterval: (q) =>
       isTerminalJobState((q.state.data as JobDetails | undefined)?.state)
         ? false
         : REFRESH_MS,
+  });
+
+  const progress = useQuery({
+    queryKey: ["job-progress", cluster, id],
+    queryFn: () => api<JobProgress>(`/api/jobs/${cluster}/${id}/progress`),
+    enabled: Boolean(details.data),
+    refetchInterval: isTerminalJobState(details.data?.state) ? false : REFRESH_MS,
+  });
+
+  const metadata = useQuery({
+    queryKey: ["job-metadata", cluster, id],
+    queryFn: () => api<JobMetadata>(`/api/jobs/${cluster}/${id}/metadata`),
+    enabled: Boolean(details.data),
+    staleTime: 5 * 60_000,
+  });
+
+  const gpu = useQuery({
+    queryKey: ["job-gpu", cluster, id],
+    queryFn: () => api<JobGpu>(`/api/jobs/${cluster}/${id}/gpu`),
+    enabled: /^(RUNNING|COMPLETING)/i.test(details.data?.state ?? ""),
+    refetchInterval: REFRESH_MS,
+  });
+
+  const evalRuns = useQuery({
+    queryKey: ["job-eval-runs", cluster, id],
+    queryFn: () => api<JobEvalRuns>(`/api/jobs/${cluster}/${id}/eval-runs`),
+    enabled: details.data?.phase === "eval",
+    refetchInterval: isTerminalJobState(details.data?.state) ? false : REFRESH_MS,
   });
 
   const stopped = isTerminalJobState(sacct.data?.State) || isTerminalJobState(details.data?.state);
@@ -78,6 +111,10 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
   const refreshAll = () => {
     qc.invalidateQueries({ queryKey: ["job", cluster, id] });
     qc.invalidateQueries({ queryKey: ["job-details", cluster, id] });
+    qc.invalidateQueries({ queryKey: ["job-progress", cluster, id] });
+    qc.invalidateQueries({ queryKey: ["job-metadata", cluster, id] });
+    qc.invalidateQueries({ queryKey: ["job-gpu", cluster, id] });
+    qc.invalidateQueries({ queryKey: ["job-eval-runs", cluster, id] });
     qc.invalidateQueries({ queryKey: ["job-flags", cluster, id] });
     qc.invalidateQueries({ queryKey: ["checkpoint-copies", cluster, id] });
     qc.invalidateQueries({ queryKey: ["variant"] });
@@ -88,7 +125,15 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
       predicate: (q) => {
         const [k0, k1, k2] = q.queryKey as unknown[];
         return (
-          (k0 === "job" || k0 === "job-details" || k0 === "job-flags") &&
+          (
+            k0 === "job" ||
+            k0 === "job-details" ||
+            k0 === "job-progress" ||
+            k0 === "job-flags" ||
+            k0 === "job-metadata" ||
+            k0 === "job-gpu" ||
+            k0 === "job-eval-runs"
+          ) &&
           k1 === cluster &&
           k2 === id
         );
@@ -123,6 +168,10 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
   const canResume = cluster !== "mlxp" && isTimeoutJobState(stateForActions);
   const canCopy = isTrainPhase && isComplete;
   const detailsError = details.error as Error | null;
+  const progressError = progress.error as Error | null;
+  const metadataError = metadata.error as Error | null;
+  const gpuError = gpu.error as Error | null;
+  const evalRunsError = evalRuns.error as Error | null;
   const resumeOf = details.data?.resume_of ?? null;
   const [stream, setStream] = useState<"out" | "err" | "isaac">("out");
   const [confirmCancel, setConfirmCancel] = useState(false);
@@ -266,6 +315,12 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
       <div className="mt-6 grid gap-6 lg:grid-cols-2">
         <ProgressCard
           d={details.data}
+          progress={progress.data}
+          progressLoading={progress.isLoading}
+          progressError={progressError}
+          gpu={gpu.data?.gpu ?? null}
+          gpuLoading={gpu.isLoading}
+          gpuError={gpuError}
           isLoading={details.isLoading}
           error={detailsError}
         />
@@ -305,10 +360,12 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
             ? details.data.paths.eval_checkpoint
             : null
         }
-        effectiveConfigText={details.data?.config_snapshot?.text ?? null}
-        effectiveConfigPath={details.data?.config_snapshot?.path ?? null}
-        modelLabel={details.data?.config_snapshot?.git_repo_label ?? null}
-        modelRepoPath={details.data?.config_snapshot?.git_repo_path ?? null}
+        effectiveConfigText={metadata.data?.config_snapshot?.text ?? null}
+        effectiveConfigPath={metadata.data?.config_snapshot?.path ?? null}
+        modelLabel={metadata.data?.config_snapshot?.git_repo_label ?? null}
+        modelRepoPath={metadata.data?.config_snapshot?.git_repo_path ?? null}
+        effectiveConfigLoading={metadata.isLoading}
+        effectiveConfigError={metadataError}
         loading={details.isLoading}
         error={detailsError}
         className="mt-6"
@@ -316,16 +373,18 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
 
       <DataInterfaceCard
         variantName={details.data?.variant ?? null}
-        summaryOverride={details.data?.data_interface ?? null}
-        loading={details.isLoading}
-        error={detailsError}
+        summaryOverride={metadata.data?.data_interface ?? null}
+        loading={details.isLoading || metadata.isLoading}
+        error={detailsError ?? metadataError}
         className="mt-6"
       />
 
       <SubmissionSnapshotCard
         d={details.data}
-        isLoading={details.isLoading}
-        error={detailsError}
+        snapshot={metadata.data?.config_snapshot ?? null}
+        wandbProject={metadata.data?.wandb_project ?? details.data?.wandb_project ?? null}
+        isLoading={details.isLoading || metadata.isLoading}
+        error={detailsError ?? metadataError}
       />
 
       <PathsCard
@@ -339,8 +398,9 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
       {isEval && (
         <EvalRunsCard
           d={details.data}
-          isLoading={details.isLoading}
-          error={detailsError}
+          rows={evalRuns.data?.eval_runs ?? []}
+          isLoading={details.isLoading || evalRuns.isLoading}
+          error={detailsError ?? evalRunsError}
         />
       )}
 
@@ -372,16 +432,19 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
 
 function SubmissionSnapshotCard({
   d,
+  snapshot = null,
+  wandbProject = null,
   isLoading = false,
   error,
 }: {
   d?: JobDetails;
+  snapshot?: JobMetadata["config_snapshot"];
+  wandbProject?: string | null;
   isLoading?: boolean;
   error?: Error | null;
 }) {
-  const snapshot = d?.config_snapshot;
   const isTrain = isTrainJobPhase(d?.phase);
-  const wandbProject = snapshot?.wandb_project ?? d?.wandb_project ?? null;
+  const shownWandbProject = snapshot?.wandb_project ?? wandbProject;
   const extraArgs = snapshot?.extra_args?.length
     ? snapshot.extra_args.join(" ")
     : snapshotExtraArgs(snapshot?.text);
@@ -400,10 +463,10 @@ function SubmissionSnapshotCard({
         {!isLoading && !error && d && !isTrain && (
           <EmptyState message="Submission snapshots are recorded for training jobs." />
         )}
-        {!isLoading && !error && d && isTrain && !snapshot && !wandbProject && (
+        {!isLoading && !error && d && isTrain && !snapshot && !shownWandbProject && (
           <EmptyState message="No submission snapshot was recorded for this job." />
         )}
-        {!isLoading && !error && d && isTrain && (snapshot || wandbProject) && (
+        {!isLoading && !error && d && isTrain && (snapshot || shownWandbProject) && (
           <>
             <div className="divide-y divide-slate-100 dark:divide-slate-900">
               {snapshot?.path && (
@@ -415,8 +478,8 @@ function SubmissionSnapshotCard({
               {snapshot?.extra_args_path && (
                 <SnapshotRow label="extra args file" value={snapshot.extra_args_path} />
               )}
-              {wandbProject && (
-                <SnapshotRow label="wandb project" value={wandbProject} />
+              {shownWandbProject && (
+                <SnapshotRow label="wandb project" value={shownWandbProject} />
               )}
               {snapshot?.git_repo_label && (
                 <SnapshotRow label="code repo" value={snapshot.git_repo_label} />
@@ -496,22 +559,31 @@ function formatSacctValue(key: string, value: string, cluster: string) {
   );
 }
 
-function GpuUsageSection({ d }: { d: JobDetails }) {
-  const gpu = d.gpu;
+function GpuUsageSection({
+  gpu,
+  isLoading = false,
+  error,
+}: {
+  gpu?: GpuUsage | null;
+  isLoading?: boolean;
+  error?: Error | null;
+}) {
   const hasUsage = !!gpu?.devices.length;
 
   return (
     <div className="mt-5 border-t border-slate-100 pt-4 dark:border-slate-900">
-      {!gpu && (
+      {isLoading && <LoadingState label="Loading GPU sample..." rows={2} />}
+      {!isLoading && error && <ErrorState message={error.message} />}
+      {!isLoading && !error && !gpu && (
         <p className="text-sm text-slate-500">GPU sample unavailable.</p>
       )}
-      {gpu && !hasUsage && (
+      {!isLoading && !error && gpu && !hasUsage && (
         <div className="space-y-1 text-sm text-slate-500">
           <p>{gpu.error ?? "GPU utilization is unavailable."}</p>
           {gpu.node && <p className="font-mono text-xs">node: {gpu.node}</p>}
         </div>
       )}
-      {gpu && hasUsage && (
+      {!isLoading && !error && gpu && hasUsage && (
         <div className="space-y-3 text-xs text-slate-500">
           {gpu.node && <div className="font-mono">node: {gpu.node}</div>}
           {gpu.devices.map((dev) => {
@@ -547,15 +619,31 @@ function GpuUsageSection({ d }: { d: JobDetails }) {
 
 function ProgressCard({
   d,
+  progress,
+  progressLoading = false,
+  progressError,
+  gpu,
+  gpuLoading = false,
+  gpuError,
   isLoading = false,
   error,
 }: {
   d?: JobDetails;
+  progress?: JobProgress;
+  progressLoading?: boolean;
+  progressError?: Error | null;
+  gpu?: GpuUsage | null;
+  gpuLoading?: boolean;
+  gpuError?: Error | null;
   isLoading?: boolean;
   error?: Error | null;
 }) {
-  const p = d?.progress;
-  const isComplete = isCompletedJobState(d?.state);
+  const p = progress?.progress ?? d?.progress;
+  const phase = progress?.phase ?? d?.phase;
+  const state = progress?.state ?? d?.state;
+  const elapsed = progress?.elapsed ?? d?.elapsed;
+  const wandbUrl = progress?.wandb_url ?? d?.wandb_url;
+  const isComplete = isCompletedJobState(state);
   // Treat a completed job as 100% even when the backend signal didn't make
   // it (e.g. wandb run already archived, checkpoint path moved off DDN).
   const effectivePercent = isComplete ? 100 : (p?.percent ?? 0);
@@ -569,24 +657,24 @@ function ProgressCard({
   const wandbStatus = useQuery({
     queryKey: ["wandb-status"],
     queryFn: () => api<{ logged_in: boolean; entity: string | null; project: string; error: string | null }>("/api/wandb/status"),
-    enabled: !!d && isTrainJobPhase(d.phase) && !isComplete,
+    enabled: !!d && isTrainJobPhase(phase) && !isComplete,
     staleTime: 60_000,
   });
-  const isTrain = isTrainJobPhase(d?.phase);
+  const isTrain = isTrainJobPhase(phase);
   const wandbMissing =
     !isComplete && isTrain && wandbStatus.data && !wandbStatus.data.logged_in;
-  const showGpu = /^(RUNNING|COMPLETING)/i.test(d?.state ?? "");
+  const showGpu = /^(RUNNING|COMPLETING)/i.test(state ?? "");
 
   // ETA from elapsed × steps-remaining / current-step. Same linear model the
   // /jobs table uses.
   let etaLabel: string | null = null;
   let etaTitle = "";
-  if (!isComplete && p?.current_step && p.max_steps && p.current_step < p.max_steps && d) {
-    const elapsedSec = parseSlurmDuration(d.elapsed);
+  if (!isComplete && p?.current_step && p.max_steps && p.current_step < p.max_steps && elapsed) {
+    const elapsedSec = parseSlurmDuration(elapsed);
     if (elapsedSec > 0) {
       const etaSec = (elapsedSec * (p.max_steps - p.current_step)) / p.current_step;
       etaLabel = formatDuration(etaSec);
-      const unit = d.phase === "eval" ? "episode" : "step";
+      const unit = phase === "eval" ? "episode" : "step";
       etaTitle = `Estimated from aggregate ${unit} throughput`;
     }
   }
@@ -594,7 +682,7 @@ function ProgressCard({
   // Training jobs deserve a tidy "step N/N" at completion even if the live
   // current_label decayed; eval/other phases already carry a meaningful
   // current_label (e.g. "15/15 runs · episode 70/70") so respect it.
-  const isTrainPhase = isTrainJobPhase(d?.phase);
+  const isTrainPhase = isTrainJobPhase(phase);
   const label = isComplete && isTrainPhase
     ? p?.max_steps
       ? `step ${p.max_steps.toLocaleString()}/${p.max_steps.toLocaleString()}`
@@ -605,9 +693,9 @@ function ProgressCard({
     <Card>
       <CardHeader className="flex flex-row items-center justify-between">
         <CardTitle>Progress</CardTitle>
-        {d?.wandb_url && (
+        {wandbUrl && (
           <a
-            href={d.wandb_url}
+            href={wandbUrl}
             target="_blank"
             rel="noreferrer"
             className="inline-flex items-center gap-1 text-sm text-blue-600 hover:underline"
@@ -624,6 +712,10 @@ function ProgressCard({
         )}
         {!isLoading && !error && d && (
           <>
+            {progressLoading && !progress && (
+              <LoadingState label="Loading progress..." rows={2} />
+            )}
+            {progressError && <ErrorState message={progressError.message} />}
             {!showBar && wandbMissing && (
               <p className="text-sm text-slate-600 dark:text-slate-400">
                 <Link href="/settings" className="text-blue-600 hover:underline">
@@ -632,10 +724,10 @@ function ProgressCard({
                 to see live progress
               </p>
             )}
-            {!showBar && !wandbMissing && (
+            {!progressLoading && !progressError && !showBar && !wandbMissing && (
               <p className="text-sm text-slate-500">{p?.current_label ?? "No progress yet."}</p>
             )}
-            {showBar && (
+            {!progressError && showBar && (
               <>
                 <div className="flex items-baseline justify-between text-sm">
                   <span className="font-mono">{label}</span>
@@ -656,7 +748,13 @@ function ProgressCard({
                 )}
               </>
             )}
-            {showGpu && <GpuUsageSection d={d} />}
+            {showGpu && (
+              <GpuUsageSection
+                gpu={gpu}
+                isLoading={gpuLoading}
+                error={gpuError}
+              />
+            )}
           </>
         )}
       </CardContent>
@@ -777,14 +875,15 @@ function CheckpointCopyHistoryRows({
 
 function EvalRunsCard({
   d,
+  rows,
   isLoading = false,
   error,
 }: {
   d?: JobDetails;
+  rows: EvalRun[];
   isLoading?: boolean;
   error?: Error | null;
 }) {
-  const rows = d?.eval_runs ?? [];
   const hasTask = rows.some((row) => row.task);
 
   return (

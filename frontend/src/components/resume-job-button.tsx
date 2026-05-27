@@ -52,6 +52,7 @@ export function ResumeJobButton({
       qc.invalidateQueries({ queryKey: ["jobs"] });
       qc.invalidateQueries({ queryKey: ["job", cluster, jobId] });
       qc.invalidateQueries({ queryKey: ["job-details"] });
+      qc.invalidateQueries({ queryKey: ["job-progress"] });
       qc.invalidateQueries({ queryKey: ["resumed-jobs", cluster, jobId] });
       router.push(`/jobs/${cluster}/${data.job_id}`);
     },

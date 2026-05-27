@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useMemo, useState } from "react";
 import { useIsFetching, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, type Job, type JobDetails } from "@/lib/api";
+import { api, type Job, type JobProgress, type Progress } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -61,14 +61,14 @@ export default function JobsPage() {
 
   const refreshAll = () => {
     qc.invalidateQueries({ queryKey: ["jobs"] });
-    qc.invalidateQueries({ queryKey: ["job-details"] });
+    qc.invalidateQueries({ queryKey: ["job-progress"] });
   };
 
   const isFetching =
     useIsFetching({
       predicate: (q) => {
         const k = q.queryKey[0];
-        return k === "jobs" || k === "job-details";
+        return k === "jobs" || k === "job-progress";
       },
     }) > 0;
 
@@ -457,10 +457,10 @@ function JobTable({
 
 function ActiveProgressCell({ job }: { job: Job }) {
   const shouldFetch = /^(RUNNING|COMPLETING)$/i.test(job.state);
-  const details = useQuery({
-    queryKey: ["job-details", job.cluster, job.job_id, "progress"],
+  const progressQuery = useQuery({
+    queryKey: ["job-progress", job.cluster, job.job_id],
     queryFn: () =>
-      api<JobDetails>(`/api/jobs/${job.cluster}/${job.job_id}/details`),
+      api<JobProgress>(`/api/jobs/${job.cluster}/${job.job_id}/progress`),
     enabled: shouldFetch,
     refetchInterval: REFRESH_MS,
     staleTime: 10_000,
@@ -471,7 +471,7 @@ function ActiveProgressCell({ job }: { job: Job }) {
     return <span className="text-xs text-slate-500">{job.state.toLowerCase()}</span>;
   }
 
-  if (details.isLoading) {
+  if (progressQuery.isLoading) {
     return (
       <div className="space-y-1.5" aria-busy="true">
         <div className="h-3 w-24 animate-pulse rounded bg-slate-100 dark:bg-slate-800" />
@@ -480,15 +480,16 @@ function ActiveProgressCell({ job }: { job: Job }) {
     );
   }
 
-  if (details.error) {
+  if (progressQuery.error) {
     return (
-      <ImmediateTooltip content={(details.error as Error).message}>
+      <ImmediateTooltip content={(progressQuery.error as Error).message}>
         <span className="text-xs text-slate-500">unavailable</span>
       </ImmediateTooltip>
     );
   }
 
-  const p = details.data?.progress;
+  const d = progressQuery.data;
+  const p = d?.progress;
   const percent = p?.percent ?? null;
   const hasStepProgress =
     p?.current_step !== null &&
@@ -504,13 +505,12 @@ function ActiveProgressCell({ job }: { job: Job }) {
   if (!showBar) {
     return (
       <span className="text-xs text-slate-500">
-        {activeProgressLabel(details.data, p) ?? "waiting for progress"}
+        {activeProgressLabel(d, p) ?? "waiting for progress"}
       </span>
     );
   }
 
   const effectivePercent = Math.max(0, Math.min(100, percent ?? 0));
-  const d = details.data;
   const label = activeProgressLabel(d, p) ?? `${effectivePercent.toFixed(1)}%`;
   let etaLabel: string | null = null;
   let etaTitle = "";
@@ -550,8 +550,8 @@ function ActiveProgressCell({ job }: { job: Job }) {
 }
 
 function activeProgressLabel(
-  details: JobDetails | undefined,
-  progress: JobDetails["progress"] | undefined,
+  details: JobProgress | undefined,
+  progress: Progress | undefined,
 ) {
   if (details?.phase === "eval" && progress?.current_step != null && progress.max_steps != null) {
     return `${progress.current_step}/${progress.max_steps} episodes`;

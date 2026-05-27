@@ -298,6 +298,30 @@ export type JobDetails = {
   eval_runs: EvalRun[];
 };
 
+export type JobMetadata = {
+  wandb_project: string | null;
+  config_snapshot: ConfigSnapshot | null;
+  data_interface: DataInterfaceSummary | null;
+};
+
+export type JobGpu = {
+  gpu: GpuUsage | null;
+};
+
+export type JobProgress = {
+  cluster: string;
+  job_id: string;
+  phase: "train" | "resume" | "eval" | "unknown";
+  state: string;
+  elapsed: string;
+  wandb_url: string | null;
+  progress: Progress;
+};
+
+export type JobEvalRuns = {
+  eval_runs: EvalRun[];
+};
+
 export type GitStatus = {
   repo_path: string | null;
   repo_label: string | null;

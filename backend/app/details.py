@@ -6,6 +6,7 @@ the cluster a few small questions over SSH (slurm) or kubectl (mlxp) to
 compute progress.
 """
 
+import asyncio
 import json
 import os
 import re
@@ -249,8 +250,67 @@ async def _resolve_runtime_exp_dir(
     return None
 
 
-async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> JobDetails:
-    sacct = await get_job(cluster, job_id)
+def _exp_dir_from_meta(meta: dict[str, str]) -> str | None:
+    for key, marker in (
+        ("checkpoint_dir", "/checkpoints"),
+        ("eval_dir", "/eval_results"),
+        ("job_log_dir", "/logs"),
+    ):
+        path = (meta.get(key) or "").strip()
+        if marker in path:
+            return path.split(marker, 1)[0]
+
+    config_path = (meta.get("config_snapshot_path") or "").strip()
+    if config_path and "/" in config_path:
+        return config_path.rsplit("/", 1)[0]
+    return None
+
+
+class JobMetadataPayload(BaseModel):
+    wandb_project: str | None = None
+    config_snapshot: ConfigSnapshot | None = None
+    data_interface: DataInterfaceSummary | None = None
+
+
+class JobGpuPayload(BaseModel):
+    gpu: GpuUsage | None = None
+
+
+class JobEvalRunsPayload(BaseModel):
+    eval_runs: list[EvalRun] = Field(default_factory=list)
+
+
+class JobProgressPayload(BaseModel):
+    cluster: str
+    job_id: str
+    phase: str
+    state: str
+    elapsed: str
+    wandb_url: str | None = None
+    progress: Progress
+
+
+async def get_details(
+    cluster: str,
+    job_id: str,
+    *,
+    include_gpu: bool = False,
+    include_config: bool = False,
+    include_data_interface: bool = False,
+    include_eval_runs: bool = False,
+    include_progress: bool = True,
+) -> JobDetails:
+    if cluster != "mlxp":
+        env = await load_cluster(cluster)
+        sacct, slurm_meta = await asyncio.gather(
+            get_job(cluster, job_id),
+            read_slurm_meta(env.ssh_alias, job_id),
+        )
+    else:
+        env = None
+        slurm_meta = {}
+        sacct = await get_job(cluster, job_id)
+
     job_name = sacct.get("JobName", "")
     state = sacct.get("State", "")
     elapsed = sacct.get("Elapsed", "")
@@ -266,13 +326,20 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
             phase,
             variant,
             include_gpu=include_gpu,
+            include_config=include_config,
+            include_data_interface=include_data_interface,
+            include_eval_runs=include_eval_runs,
+            include_progress=include_progress,
             pod_name=sacct.get("_pod_name") or None,
             node=sacct.get("NodeList") or None,
             job_comment=sacct.get("JobComment") or None,
         )
 
-    env = await load_cluster(cluster)
-    slurm_meta: dict[str, str] = await read_slurm_meta(env.ssh_alias, job_id)
+    assert env is not None
+    log_dir = env.vars["LOG_DIR"]
+    meta_job_name = (slurm_meta.get("job_name") or "").strip()
+    if meta_job_name:
+        job_name = meta_job_name
     meta_phase, meta_variant = phase_variant_from_meta(slurm_meta)
     if meta_phase and meta_variant:
         phase, variant = meta_phase, meta_variant
@@ -286,13 +353,17 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
             p, v = parse_comment_metadata(scontrol_comment)
             if p and v:
                 phase, variant = p, v
-    log_dir = env.vars["LOG_DIR"]
-    stdout_path, stderr_path, log_job_name = await _resolve_slurm_log_paths(
-        env.ssh_alias,
-        log_dir,
-        job_name,
-        job_id,
-    )
+    if meta_job_name:
+        stdout_path = f"{log_dir}/{meta_job_name}_{job_id}.out"
+        stderr_path = f"{log_dir}/{meta_job_name}_{job_id}.err"
+        log_job_name = meta_job_name
+    else:
+        stdout_path, stderr_path, log_job_name = await _resolve_slurm_log_paths(
+            env.ssh_alias,
+            log_dir,
+            job_name,
+            job_id,
+        )
     if not variant and log_job_name:
         p, v = parse_phase_and_variant(log_job_name)
         if p != "unknown" and v:
@@ -302,10 +373,24 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
     # web-submitted jobs use ~/.train-eval-web/experiments/<variant>; jobs
     # launched via the bash `./submit` use ~/train-eval-scripts/experiments/<variant>.
     # Probe both, prefer one that actually exists.
-    exp_dir_remote = await _resolve_exp_dir(env.ssh_alias, job_id, variant) if variant else f"$HOME/{CLUSTER_STAGING_REL}/experiments"
-    runtime_exp_dir = await _resolve_runtime_exp_dir(env.ssh_alias, stdout_path, phase)
-    if runtime_exp_dir:
-        exp_dir_remote = runtime_exp_dir
+    exp_dir_from_meta = _exp_dir_from_meta(slurm_meta)
+    if exp_dir_from_meta:
+        exp_dir_remote = exp_dir_from_meta
+    else:
+        exp_dir_task = (
+            asyncio.create_task(_resolve_exp_dir(env.ssh_alias, job_id, variant))
+            if variant
+            else None
+        )
+        runtime_exp_dir_task = asyncio.create_task(
+            _resolve_runtime_exp_dir(env.ssh_alias, stdout_path, phase)
+        )
+        exp_dir_remote = (
+            await exp_dir_task if exp_dir_task else f"$HOME/{CLUSTER_STAGING_REL}/experiments"
+        )
+        runtime_exp_dir = await runtime_exp_dir_task
+        if runtime_exp_dir:
+            exp_dir_remote = runtime_exp_dir
     ckpt_dir = (
         slurm_meta.get("checkpoint_dir")
         or (f"{exp_dir_remote}/checkpoints" if phase in ("train", "resume") else None)
@@ -314,15 +399,60 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
         slurm_meta.get("eval_dir")
         or (f"{exp_dir_remote}/eval_results" if phase == "eval" else None)
     )
-    eval_checkpoint = (
-        await _resolve_eval_checkpoint(
+    submitted_eval_checkpoint = slurm_meta.get("checkpoint_path") or None
+    eval_checkpoint_task = (
+        asyncio.create_task(_resolve_eval_checkpoint(
             env.ssh_alias,
             stdout_path,
             exp_dir_remote,
             slurm_meta.get("checkpoint_path"),
-        )
-        if phase == "eval" and variant
+        ))
+        if phase == "eval" and variant and not submitted_eval_checkpoint
         else None
+    )
+    progress_task = (
+        asyncio.create_task(
+            _compute_progress(
+                cluster,
+                job_id,
+                phase,
+                variant,
+                stdout_path,
+                stderr_path,
+                ckpt_dir,
+                eval_dir,
+                slurm_meta,
+            )
+        )
+        if include_progress
+        else None
+    )
+    eval_runs_task = (
+        asyncio.create_task(_slurm_eval_runs(env.ssh_alias, eval_dir))
+        if include_eval_runs and phase == "eval" and eval_dir
+        else None
+    )
+    active_state = state.upper().startswith(("RUNNING", "PENDING", "CONFIGURING", "COMPLETING"))
+    completion_task = (
+        asyncio.create_task(eval_job_completed(env.ssh_alias, stdout_path, eval_dir, variant, slurm_meta))
+        if include_progress and phase == "eval" and variant and eval_dir and not active_state
+        else None
+    )
+    gpu_task = (
+        asyncio.create_task(
+            _slurm_gpu_usage(
+                env.ssh_alias,
+                job_id,
+                sacct.get("NodeList") or "",
+                state,
+            )
+        )
+        if include_gpu
+        else None
+    )
+
+    eval_checkpoint = submitted_eval_checkpoint or (
+        await eval_checkpoint_task if eval_checkpoint_task else None
     )
     isaac_logs_glob = (
         f"{slurm_meta.get('job_log_dir')}/server_*.log"
@@ -338,13 +468,17 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
         eval_dir=eval_dir,
         isaac_logs_glob=isaac_logs_glob,
     )
-    config_snapshot = await _slurm_config_snapshot(env.ssh_alias, slurm_meta, cluster=cluster)
-    data_interface = await _slurm_data_interface_snapshot(
-        env.ssh_alias,
-        slurm_meta,
-        config_snapshot,
-        variant=variant,
-    )
+    config_snapshot = None
+    data_interface = None
+    if include_config or include_data_interface:
+        config_snapshot = await _slurm_config_snapshot(env.ssh_alias, slurm_meta, cluster=cluster)
+    if include_data_interface:
+        data_interface = await _slurm_data_interface_snapshot(
+            env.ssh_alias,
+            slurm_meta,
+            config_snapshot,
+            variant=variant,
+        )
     job_wandb_project = (
         slurm_meta.get("wandb_project")
         or slurm_meta.get("submit_wandb_project")
@@ -352,39 +486,21 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
     )
 
     wandb_url: str | None = None
-    if phase in ("train", "resume"):
+    if include_progress and phase in ("train", "resume"):
         # submit.py pins WANDB_RUN_ID = job_name via sbatch --export.
         wandb_url = await _wandb_url(job_name, project=job_wandb_project)
 
-    progress = await _compute_progress(
-        cluster,
-        job_id,
-        phase,
-        variant,
-        stdout_path,
-        stderr_path,
-        ckpt_dir,
-        eval_dir,
-        slurm_meta,
-        wandb_project=job_wandb_project,
-    )
-    if phase == "eval" and variant and eval_dir:
+    progress = await progress_task if progress_task else Progress(phase=phase)
+    if completion_task:
         try:
-            if await eval_job_completed(env.ssh_alias, stdout_path, eval_dir, variant, slurm_meta):
+            if await completion_task:
                 state = "COMPLETED"
         except Exception:
             pass
-    gpu = (
-        await _slurm_gpu_usage(
-            env.ssh_alias,
-            job_id,
-            sacct.get("NodeList") or "",
-            state,
-        )
-        if include_gpu
-        else None
-    )
-    eval_runs = await _slurm_eval_runs(env.ssh_alias, eval_dir) if phase == "eval" and eval_dir else []
+    gpu = await gpu_task if gpu_task else None
+    eval_runs = await eval_runs_task if eval_runs_task else []
+    if include_progress:
+        _reconcile_eval_progress_from_runs(progress, eval_runs)
 
     return JobDetails(
         cluster=cluster, job_id=job_id, job_name=job_name,
@@ -398,6 +514,87 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
     )
 
 
+async def get_metadata(cluster: str, job_id: str) -> JobMetadataPayload:
+    det = await get_details(
+        cluster,
+        job_id,
+        include_config=True,
+        include_data_interface=True,
+        include_progress=False,
+    )
+    return JobMetadataPayload(
+        wandb_project=det.wandb_project,
+        config_snapshot=det.config_snapshot,
+        data_interface=det.data_interface,
+    )
+
+
+async def get_progress(cluster: str, job_id: str) -> JobProgressPayload:
+    det = await get_details(
+        cluster,
+        job_id,
+        include_progress=True,
+    )
+    return JobProgressPayload(
+        cluster=det.cluster,
+        job_id=det.job_id,
+        phase=det.phase,
+        state=det.state,
+        elapsed=det.elapsed,
+        wandb_url=det.wandb_url,
+        progress=det.progress,
+    )
+
+
+async def get_gpu(cluster: str, job_id: str) -> JobGpuPayload:
+    det = await get_details(
+        cluster,
+        job_id,
+        include_gpu=True,
+        include_progress=False,
+    )
+    return JobGpuPayload(gpu=det.gpu)
+
+
+async def get_eval_runs(cluster: str, job_id: str) -> JobEvalRunsPayload:
+    det = await get_details(
+        cluster,
+        job_id,
+        include_eval_runs=True,
+        include_progress=False,
+    )
+    return JobEvalRunsPayload(eval_runs=det.eval_runs)
+
+
+def _reconcile_eval_progress_from_runs(progress: Progress, eval_runs: list[EvalRun]) -> None:
+    if progress.phase != "eval" or not eval_runs:
+        return
+
+    completed = len(eval_runs)
+    if progress.completed_runs is None or completed > progress.completed_runs:
+        progress.completed_runs = completed
+
+    episode_total = sum(row.total_episodes or 0 for row in eval_runs)
+    if episode_total <= 0 and progress.max_steps and progress.total_runs:
+        episode_total = completed * max(1, progress.max_steps // progress.total_runs)
+    if episode_total <= 0:
+        if progress.total_runs:
+            progress.percent = round(100.0 * progress.completed_runs / progress.total_runs, 1)
+            progress.current_label = f"{progress.completed_runs}/{progress.total_runs} runs"
+        return
+
+    current_step = max(progress.current_step or 0, episode_total)
+    if progress.max_steps:
+        progress.current_step = min(current_step, progress.max_steps)
+        progress.percent = round(100.0 * progress.current_step / progress.max_steps, 1)
+        progress.current_label = (
+            f"{progress.completed_runs}/{progress.total_runs} runs · "
+            f"{progress.current_step}/{progress.max_steps} episodes"
+            if progress.total_runs
+            else f"{progress.current_step}/{progress.max_steps} episodes"
+        )
+
+
 async def _mlxp_details(
     job_id: str,
     job_name: str,
@@ -406,6 +603,10 @@ async def _mlxp_details(
     phase: str,
     variant: str | None,
     include_gpu: bool = False,
+    include_config: bool = False,
+    include_data_interface: bool = False,
+    include_eval_runs: bool = False,
+    include_progress: bool = True,
     pod_name: str | None = None,
     node: str | None = None,
     job_comment: str | None = None,
@@ -445,12 +646,16 @@ async def _mlxp_details(
     )
     if phase == "eval":
         paths.eval_checkpoint = metadata.get("checkpoint_path") or None
-    config_snapshot = await _mlxp_config_snapshot(metadata)
-    data_interface = await _mlxp_data_interface_snapshot(
-        metadata,
-        config_snapshot,
-        variant=variant,
-    )
+    config_snapshot = None
+    data_interface = None
+    if include_config or include_data_interface:
+        config_snapshot = await _mlxp_config_snapshot(metadata)
+    if include_data_interface:
+        data_interface = await _mlxp_data_interface_snapshot(
+            metadata,
+            config_snapshot,
+            variant=variant,
+        )
     job_wandb_project = (
         metadata.get("wandb_project")
         or metadata.get("submit_wandb_project")
@@ -461,12 +666,20 @@ async def _mlxp_details(
     # run behind it.
     wandb_url = (
         await _wandb_url(job_name, project=job_wandb_project)
-        if phase in ("train", "resume")
+        if include_progress and phase in ("train", "resume")
         else None
     )
-    progress = await _mlxp_progress(job_name, variant, phase, metadata, project=job_wandb_project)
+    progress = (
+        await _mlxp_progress(job_name, variant, phase, metadata, project=job_wandb_project)
+        if include_progress
+        else Progress(phase=phase)
+    )
     gpu = await _mlxp_gpu_usage(pod_name, node, state) if include_gpu else None
-    eval_runs = await _mlxp_eval_runs(paths.eval_dir) if phase == "eval" and paths.eval_dir else []
+    eval_runs = (
+        await _mlxp_eval_runs(paths.eval_dir)
+        if include_eval_runs and phase == "eval" and paths.eval_dir
+        else []
+    )
 
     return JobDetails(
         cluster="mlxp", job_id=job_id, job_name=job_name,
@@ -1560,8 +1773,7 @@ _TQDM_STEP_RE = re.compile(r"(\d+)/(\d+)\s*\[")
 async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str | None,
                              stdout: str, stderr: str,
                              ckpt_dir: str | None, eval_dir: str | None,
-                             slurm_meta: dict[str, str] | None = None,
-                             wandb_project: str | None = None) -> Progress:
+                             slurm_meta: dict[str, str] | None = None) -> Progress:
     progress = Progress(phase=phase)
     if not variant:
         return progress
@@ -1632,90 +1844,70 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
         if not (eval_dir and total > 0):
             return progress
 
-        host = (await load_cluster(cluster)).ssh_alias
-        # Completed runs = number of results.json files written by the body.
-        r = await ssh_run(
-            host,
-            f"find {eval_dir} -type f -name results.json 2>/dev/null | wc -l",
-            timeout=10.0,
+        env = await load_cluster(cluster)
+        host = env.ssh_alias
+        completed = 0
+        active_eps = 0
+        job_completed_runs = 0
+        artifact_eps = 0
+        job_log_dir = (slurm_meta or {}).get("job_log_dir") if slurm_meta else None
+
+        # One remote probe is materially faster than several serial SSH calls on
+        # SKT. It returns: completed result files, stdout episode count, stdout
+        # completed-run count, server-log episode fallback, and video artifacts.
+        eval_dir_expr = _remote_path_expr(eval_dir)
+        log_dir_q = shlex.quote(env.vars["LOG_DIR"])
+        job_id_q = shlex.quote(job_id)
+        job_logs_expr = _remote_path_expr(
+            job_log_dir or f"{eval_dir.rsplit('/', 1)[0]}/logs/{job_id}"
         )
+        probe_cmd = (
+            f"eval_dir={eval_dir_expr}; "
+            f"log_dir={log_dir_q}; "
+            f"job_id={job_id_q}; "
+            f"job_logs={job_logs_expr}; "
+            'completed=$(find "$eval_dir" -type f -name results.json 2>/dev/null | wc -l); '
+            'pattern="$log_dir"/*_"$job_id".out; '
+            "stdout_eps=$(grep -h '^Episode .* completed' $pattern 2>/dev/null | wc -l); "
+            "stdout_runs=$(grep -h '^Results saved to:' $pattern 2>/dev/null | wc -l); "
+            "server_eps=0; "
+            "if [ -d \"$job_logs\" ]; then "
+            "for f in \"$job_logs\"/server_*.log; do "
+            "[ -f \"$f\" ] || continue; "
+            "envs=$(grep -m1 'Num envs:' \"$f\" 2>/dev/null | sed -E 's/.*Num envs: ([0-9]+).*/\\1/'); "
+            "case \"$envs\" in ''|*[!0-9]*) envs=1 ;; esac; "
+            "c=$(grep -c 'Resetting environment with seed:' \"$f\" 2>/dev/null || echo 0); "
+            "if [ \"$c\" -gt 0 ]; then c=$((c - 1)); fi; "
+            f"if [ \"$c\" -gt {n_eps} ]; then c={n_eps}; fi; "
+            "server_eps=$((server_eps + c * envs)); "
+            "done; "
+            "fi; "
+            "artifact_eps=$(find \"$eval_dir\" -path '*/videos/ep*.mp4' -type f 2>/dev/null | wc -l); "
+            "printf '%s %s %s %s %s\\n' \"$completed\" \"$stdout_eps\" \"$stdout_runs\" \"$server_eps\" \"$artifact_eps\""
+        )
+        r = await ssh_run(host, probe_cmd, timeout=12.0)
         try:
-            completed = int(r.stdout.strip())
-        except ValueError:
+            parts = r.stdout.strip().split()
+            completed = int(parts[0]) if len(parts) > 0 else 0
+            active_eps = int(parts[1]) if len(parts) > 1 else 0
+            job_completed_runs = int(parts[2]) if len(parts) > 2 else 0
+            active_eps = max(active_eps, int(parts[3]) if len(parts) > 3 else 0)
+            artifact_eps = int(parts[4]) if len(parts) > 4 else 0
+        except (ValueError, IndexError):
             completed = 0
+            active_eps = 0
+            job_completed_runs = 0
+            artifact_eps = 0
         progress.completed_runs = completed
 
         # Episode counter inside this job. Prefer client stdout because native
         # Isaac vectorization can complete multiple environments per server
         # reset; server reset counts are only a fallback.
-        active_eps = 0
-        active_envs = 0
-        job_completed_runs = 0
-        artifact_eps = 0
-        job_log_dir = (slurm_meta or {}).get("job_log_dir") if slurm_meta else None
         if n_eps > 0:
-            env = await load_cluster(cluster)
-            log_dir_q = shlex.quote(env.vars["LOG_DIR"])
-            job_id_q = shlex.quote(job_id)
-            stdout_cmd = (
-                f"pattern={log_dir_q}/*_{job_id_q}.out; "
-                "episodes=$(grep -h '^Episode .* completed' $pattern 2>/dev/null | wc -l); "
-                "runs=$(grep -h '^Results saved to:' $pattern 2>/dev/null | wc -l); "
-                "echo \"$episodes $runs\""
-            )
-            r = await ssh_run(host, stdout_cmd, timeout=10.0)
-            try:
-                parts = r.stdout.strip().split()
-                active_eps = int(parts[0]) if parts else 0
-                job_completed_runs = int(parts[1]) if len(parts) > 1 else 0
-            except (ValueError, IndexError):
-                active_eps = 0
-                job_completed_runs = 0
-
-            job_logs_q = shlex.quote(job_log_dir or f"{eval_dir.rsplit('/', 1)[0]}/logs/{job_id}")
-            ep_cmd = (
-                f"job_logs={job_logs_q}; "
-                "if [ -d \"$job_logs\" ]; then pattern=\"$job_logs/server_*.log\"; "
-                "else echo '0 0'; exit 0; fi; "
-                "total=0; envs_started=0; "
-                "for f in $pattern; do "
-                "[ -f \"$f\" ] || continue; "
-                "envs=$(grep -m1 'Num envs:' \"$f\" 2>/dev/null | sed -E 's/.*Num envs: ([0-9]+).*/\\1/'); "
-                "case \"$envs\" in ''|*[!0-9]*) envs=1 ;; esac; "
-                "c=$(grep -c 'Resetting environment with seed:' \"$f\" 2>/dev/null || echo 0); "
-                "if [ \"$c\" -gt 0 ]; then c=$((c - 1)); fi; "
-                f"if [ \"$c\" -gt {n_eps} ]; then c={n_eps}; fi; "
-                "total=$((total + c * envs)); envs_started=$((envs_started + envs)); "
-                "done; "
-                "echo \"$total $envs_started\""
-            )
-            r = await ssh_run(host, ep_cmd, timeout=10.0)
-            try:
-                parts = r.stdout.strip().split()
-                active_eps = max(active_eps, int(parts[0]) if parts else 0)
-                active_envs = int(parts[1]) if len(parts) > 1 else 0
-            except (ValueError, IndexError):
-                active_envs = 0
-
-            # The eval client writes per-episode videos as each episode
-            # finishes, while results.json is only emitted after a full run.
-            # Count these artifacts so Active progress moves during long runs.
-            artifact_cmd = (
-                f"eval_dir={_remote_path_expr(eval_dir)}; "
-                "find \"$eval_dir\" -path '*/videos/ep*.mp4' "
-                "-type f 2>/dev/null | wc -l"
-            )
-            r = await ssh_run(host, artifact_cmd, timeout=10.0)
-            try:
-                artifact_eps = int(r.stdout.strip())
-            except ValueError:
-                artifact_eps = 0
-
-        # Promote eval into the unified step-based shape so the frontend
-        # ETA + progress bar work the same way as training:
-        #   current_step = completed_runs · N_EPISODES + incomplete episodes in this job
-        #   max_steps    = total_runs    · N_EPISODES
-        if n_eps > 0:
+            # Promote eval into the unified step-based shape so the frontend
+            # ETA + progress bar work the same way as training:
+            #   current_step = completed_runs · N_EPISODES + incomplete episodes in this job
+            #   max_steps    = total_runs    · N_EPISODES
             progress.max_steps = total * n_eps
             active_incomplete_eps = max(0, active_eps - job_completed_runs * n_eps)
             current = completed * n_eps + active_incomplete_eps

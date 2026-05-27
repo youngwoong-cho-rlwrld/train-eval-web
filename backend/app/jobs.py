@@ -155,10 +155,13 @@ async def get_job(cluster: str, job_id: str) -> dict:
         from . import mlxp_jobs
         return await mlxp_jobs.get_job(job_id)
     env = await load_cluster(cluster)
-    source_tz = await scheduler_timezone(env.ssh_alias)
-    r = await ssh_run(env.ssh_alias,
-                      f'sacct -j {job_id} -X --parsable2 --format={_SACCT_FMT}',
-                      timeout=15.0)
+    source_tz_task = asyncio.create_task(scheduler_timezone(env.ssh_alias))
+    r = await ssh_run(
+        env.ssh_alias,
+        f'sacct -j {job_id} -X --parsable2 --format={_SACCT_FMT}',
+        timeout=15.0,
+    )
+    source_tz = await source_tz_task
     if r.returncode == 0:
         lines = r.stdout.strip().splitlines()
         if len(lines) >= 2:
