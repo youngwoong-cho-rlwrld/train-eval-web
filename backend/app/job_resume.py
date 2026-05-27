@@ -1,8 +1,11 @@
 """Resume timed-out jobs from their original train/eval intent."""
 
+import shlex
+
 from . import details, jobs, submit
 from .clusters import load_cluster
-from .slurm_meta import read_slurm_meta
+from .slurm_meta import read_slurm_meta, read_slurm_meta_many
+from .ssh import ssh_run
 
 
 def _is_timeout(state: str) -> bool:
@@ -116,3 +119,70 @@ async def resume_timed_out_job(cluster: str, job_id: str) -> submit.SubmitRespon
             resume_of=job_id,
         )
     )
+
+
+async def list_resumed_jobs(cluster: str, job_id: str) -> list[jobs.Job]:
+    """Return direct jobs submitted by resuming `job_id`.
+
+    Resume links are persisted in Slurm sidecar metadata as
+    `resume_of=<job_id>`. Historical jobs without that sidecar cannot be linked.
+    """
+    if cluster == "mlxp":
+        return []
+
+    env = await load_cluster(cluster)
+    cmd = (
+        'for f in "$HOME/.train-eval-web/jobs"/*.meta; do '
+        '[ -s "$f" ] || continue; '
+        f"if grep -qx {shlex.quote(f'resume_of={job_id}')} \"$f\"; then "
+        'b="${f##*/}"; printf "%s\\n" "${b%.meta}"; '
+        "fi; "
+        "done"
+    )
+    r = await ssh_run(env.ssh_alias, cmd, timeout=15.0)
+    if r.returncode != 0:
+        return []
+
+    child_ids = sorted({line.strip() for line in r.stdout.splitlines() if line.strip()}, reverse=True)
+    if not child_ids:
+        return []
+
+    meta_by_job_id = await read_slurm_meta_many(env.ssh_alias, child_ids)
+    linked: list[jobs.Job] = []
+    for child_id in child_ids:
+        meta = meta_by_job_id.get(child_id, {})
+        try:
+            record = await jobs.get_job(cluster, child_id)
+            state = str(record.get("State") or "")
+            linked.append(
+                jobs.Job(
+                    cluster=cluster,
+                    job_id=child_id,
+                    job_name=str(record.get("JobName") or meta.get("job_name") or child_id),
+                    partition=str(record.get("Partition") or ""),
+                    state=state.split(" ")[0],
+                    elapsed=str(record.get("Elapsed") or ""),
+                    nodelist=str(record.get("NodeList") or record.get("Reason") or ""),
+                    start=str(record.get("Start") or "") or None,
+                    end=str(record.get("End") or "") or None,
+                    phase=meta.get("phase") or None,
+                    variant=meta.get("variant") or None,
+                    resume_of=meta.get("resume_of") or None,
+                )
+            )
+        except Exception:
+            linked.append(
+                jobs.Job(
+                    cluster=cluster,
+                    job_id=child_id,
+                    job_name=meta.get("job_name") or child_id,
+                    partition="",
+                    state="UNKNOWN",
+                    elapsed="",
+                    nodelist="",
+                    phase=meta.get("phase") or None,
+                    variant=meta.get("variant") or None,
+                    resume_of=meta.get("resume_of") or None,
+                )
+            )
+    return linked

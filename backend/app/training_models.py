@@ -15,6 +15,8 @@ from typing import Any
 
 from .paths import MODELS_DIR
 
+ACTION_HORIZON_MODES = {"none", "modality", "cli", "modality_and_cli"}
+
 
 @dataclass(frozen=True)
 class TrainingModel:
@@ -29,6 +31,7 @@ class TrainingModel:
     eval_body_script: str
     train_walltime: str
     eval_walltime: str
+    action_horizon_mode: str
 
     def body_for_phase(self, phase: str) -> tuple[str, str]:
         if phase == "train":
@@ -36,6 +39,14 @@ class TrainingModel:
         if phase == "eval":
             return self.eval_body_script, self.eval_walltime
         raise ValueError(f"unsupported phase: {phase}")
+
+    @property
+    def rewrites_modality_action_horizon(self) -> bool:
+        return self.action_horizon_mode in {"modality", "modality_and_cli"}
+
+    @property
+    def passes_action_horizon_cli(self) -> bool:
+        return self.action_horizon_mode in {"cli", "modality_and_cli"}
 
 
 def model_id_for_variant(variant: Any) -> str:
@@ -50,6 +61,24 @@ def model_id_for_variant(variant: Any) -> str:
 
 def resolve_training_model(variant: Any) -> TrainingModel:
     return load_training_model(model_id_for_variant(variant))
+
+
+def action_horizon_mode_for_variant(model: TrainingModel, variant: Any) -> str:
+    vars = getattr(variant, "vars", {}) or {}
+    mode = (
+        vars.get("TRAIN_ACTION_HORIZON_MODE")
+        or vars.get("ACTION_HORIZON_MODE")
+        or model.action_horizon_mode
+    ).strip()
+    return _validate_action_horizon_mode(model.id, mode)
+
+
+def rewrites_modality_action_horizon(mode: str) -> bool:
+    return mode in {"modality", "modality_and_cli"}
+
+
+def passes_action_horizon_cli(mode: str) -> bool:
+    return mode in {"cli", "modality_and_cli"}
 
 
 def load_training_model(model_id: str) -> TrainingModel:
@@ -67,6 +96,11 @@ def load_training_model(model_id: str) -> TrainingModel:
         raise ValueError(f"model {model_id}: unsupported MODEL_FAMILY {family!r}")
     if flags_profile not in supported_profiles:
         raise ValueError(f"model {model_id}: unsupported FLAGS_PROFILE {flags_profile!r}")
+    action_horizon_mode = (
+        data.get("ACTION_HORIZON_MODE")
+        or ("modality" if family == "n1.6" else "none")
+    ).strip()
+    action_horizon_mode = _validate_action_horizon_mode(model_id, action_horizon_mode)
     train_body_script = (data.get("TRAIN_BODY_SCRIPT") or "").strip()
     eval_body_script = (data.get("EVAL_BODY_SCRIPT") or "").strip()
     if not train_body_script or not eval_body_script:
@@ -83,6 +117,7 @@ def load_training_model(model_id: str) -> TrainingModel:
         eval_body_script=eval_body_script,
         train_walltime=(data.get("TRAIN_WALLTIME") or "48:00:00").strip(),
         eval_walltime=(data.get("EVAL_WALLTIME") or "08:00:00").strip(),
+        action_horizon_mode=action_horizon_mode,
     )
 
 
@@ -144,3 +179,11 @@ def _parse_value(raw: str) -> str:
     if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"'):
         return raw[1:-1]
     return raw
+
+
+def _validate_action_horizon_mode(model_id: str, mode: str) -> str:
+    if mode not in ACTION_HORIZON_MODES:
+        raise ValueError(
+            f"model {model_id}: unsupported ACTION_HORIZON_MODE {mode!r}"
+        )
+    return mode

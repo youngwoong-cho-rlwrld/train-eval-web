@@ -125,6 +125,7 @@ class JobDetails(BaseModel):
     job_name: str
     phase: str            # "train" | "resume" | "eval" | "unknown"
     variant: str | None
+    resume_of: str | None = None
     state: str
     elapsed: str
     wandb_project: str | None = None
@@ -385,7 +386,8 @@ async def get_details(cluster: str, job_id: str, include_gpu: bool = False) -> J
 
     return JobDetails(
         cluster=cluster, job_id=job_id, job_name=job_name,
-        phase=phase, variant=variant, state=state, elapsed=elapsed,
+        phase=phase, variant=variant, resume_of=slurm_meta.get("resume_of") or None,
+        state=state, elapsed=elapsed,
         wandb_project=job_wandb_project,
         wandb_url=wandb_url, paths=paths, progress=progress, gpu=gpu,
         config_snapshot=config_snapshot,
@@ -460,7 +462,8 @@ async def _mlxp_details(
 
     return JobDetails(
         cluster="mlxp", job_id=job_id, job_name=job_name,
-        phase=phase, variant=variant, state=state, elapsed=elapsed,
+        phase=phase, variant=variant, resume_of=metadata.get("resume_of") or None,
+        state=state, elapsed=elapsed,
         wandb_project=job_wandb_project,
         wandb_url=wandb_url, paths=paths, progress=progress, gpu=gpu,
         config_snapshot=config_snapshot,
@@ -602,6 +605,7 @@ def _snapshot_git_from_meta(meta: dict[str, str]) -> SubmitGitInfo | None:
         repo_path=repo_path or "",
         repo_label=repo_label or "",
         commit=commit or None,
+        commit_subject=meta.get("submit_git_commit_subject") or None,
         branch=meta.get("submit_git_branch") or None,
         dirty_before=bool(_meta_bool(meta.get("submit_git_dirty_at_submit"))),
         committed_dirty=bool(_meta_bool(meta.get("submit_git_committed_dirty"))),

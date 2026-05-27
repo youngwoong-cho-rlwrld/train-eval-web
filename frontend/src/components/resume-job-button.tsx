@@ -1,10 +1,11 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { api, type SubmitResponse } from "@/lib/api";
+import { api, type Job, type SubmitResponse } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -35,6 +36,11 @@ export function ResumeJobButton({
   const router = useRouter();
   const qc = useQueryClient();
   const [open, setOpen] = useState(false);
+  const resumedJobs = useQuery({
+    queryKey: ["resumed-jobs", cluster, jobId],
+    queryFn: () => api<Job[]>(`/api/jobs/${cluster}/${jobId}/resumes`),
+    enabled: open,
+  });
   const resume = useMutation({
     mutationFn: () =>
       api<SubmitResponse>(`/api/jobs/${cluster}/${jobId}/resume`, {
@@ -46,6 +52,7 @@ export function ResumeJobButton({
       qc.invalidateQueries({ queryKey: ["jobs"] });
       qc.invalidateQueries({ queryKey: ["job", cluster, jobId] });
       qc.invalidateQueries({ queryKey: ["job-details"] });
+      qc.invalidateQueries({ queryKey: ["resumed-jobs", cluster, jobId] });
       router.push(`/jobs/${cluster}/${data.job_id}`);
     },
     onError: (err: Error) => toast.error(`Resume failed: ${err.message}`),
@@ -88,14 +95,6 @@ export function ResumeJobButton({
           </DialogHeader>
 
           <div className="space-y-2 text-sm text-slate-600 dark:text-slate-400">
-            {jobName && (
-              <p className="grid gap-1">
-                <span>Original job name:</span>
-                <span className="min-w-0 break-all font-mono text-xs text-slate-700 dark:text-slate-300">
-                  {jobName}
-                </span>
-              </p>
-            )}
             {normalizedPhase === "train" ? (
               <p>
                 Training resumes from the latest checkpoint found for this
@@ -119,6 +118,50 @@ export function ResumeJobButton({
               This can update staged result artifacts for the same experiment.
               Continue only if this is the timeout you intend to resume.
             </p>
+            <div className="border-t border-slate-200 pt-3 dark:border-slate-800" />
+            {jobName && (
+              <p className="grid gap-1">
+                <span>Original job name:</span>
+                <span className="min-w-0 break-all font-mono text-xs text-slate-700 dark:text-slate-300">
+                  {jobName}
+                </span>
+              </p>
+            )}
+            <div className="grid gap-1">
+              <span>Resumed jobs:</span>
+              {resumedJobs.isLoading ? (
+                <span className="font-mono text-xs text-slate-500">loading...</span>
+              ) : resumedJobs.data?.length ? (
+                <ul className="space-y-1">
+                  {resumedJobs.data.map((job) => (
+                    <li key={`${job.cluster}-${job.job_id}`} className="min-w-0 text-xs">
+                      <Link
+                        href={`/jobs/${encodeURIComponent(job.cluster)}/${encodeURIComponent(job.job_id)}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="font-mono text-blue-600 hover:underline dark:text-blue-400"
+                      >
+                        {job.job_id}
+                      </Link>
+                      <span className="text-slate-400"> · </span>
+                      <span className="font-mono text-slate-700 dark:text-slate-300">
+                        {job.state}
+                      </span>
+                      <span className="text-slate-400"> · </span>
+                      <span className="break-all font-mono text-slate-700 dark:text-slate-300">
+                        {job.job_name}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              ) : resumedJobs.isError ? (
+                <span className="text-xs text-red-600 dark:text-red-400">
+                  Could not load resumed jobs.
+                </span>
+              ) : (
+                <span className="font-mono text-xs text-slate-500">none</span>
+              )}
+            </div>
           </div>
 
           <DialogFooter>

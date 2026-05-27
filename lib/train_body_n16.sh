@@ -35,6 +35,8 @@ CKPT_DIR="$EXP_DIR/checkpoints"
 RUN_CKPT_DIR="$CKPT_DIR/$OUTPUT_NAMESPACE"
 mkdir -p "$EXP_DIR/logs" "$LOG_DIR" "$CKPT_DIR"
 LOG_FILE="$EXP_DIR/logs/train.log"
+SUBMIT_GIT_COMMIT="${SUBMIT_GIT_COMMIT:-${TRAIN_GIT_COMMIT:-}}"
+pin_training_repo_dir "$TRAIN_REPO_DIR" "$SUBMIT_GIT_COMMIT" "${SLURM_JOB_ID:-$OUTPUT_NAMESPACE}"
 
 log "============================================="
 log "$EXP_NAME"
@@ -65,14 +67,15 @@ log "Modality config: $MODALITY_CONFIG_FILE"
 # ── Per-device → global batch size (default: keep TRAIN_BATCH_SIZE per-device) ──
 GLOBAL_BATCH_SIZE="${SUBMIT_TRAIN_GLOBAL_BATCH_SIZE:-$((TRAIN_NUM_GPUS * TRAIN_BATCH_SIZE))}"
 TRAIN_ACTION_HORIZON="${SUBMIT_TRAIN_ACTION_HORIZON:-${TRAIN_ACTION_HORIZON:-}}"
+ACTION_HORIZON_MODE="${SUBMIT_ACTION_HORIZON_MODE:-${ACTION_HORIZON_MODE:-modality}}"
 ACTION_HORIZON_ARGS=()
-if [[ -n "$TRAIN_ACTION_HORIZON" ]]; then
+if [[ -n "$TRAIN_ACTION_HORIZON" && ( "$ACTION_HORIZON_MODE" == "cli" || "$ACTION_HORIZON_MODE" == "modality_and_cli" ) ]]; then
     ACTION_HORIZON_ARGS=(--action-horizon "$TRAIN_ACTION_HORIZON")
 fi
 log "Global batch: $GLOBAL_BATCH_SIZE"
 log "Train GPUs: $TRAIN_NUM_GPUS"
 log "Save steps: $SAVE_STEPS"
-log "Action horizon: ${TRAIN_ACTION_HORIZON:-default}"
+log "Action horizon: ${TRAIN_ACTION_HORIZON:-default} ($ACTION_HORIZON_MODE)"
 
 if [[ "${RESUME_EXPECTED:-0}" == "1" ]]; then
     if compgen -G "$RUN_CKPT_DIR/checkpoint-*" > /dev/null; then

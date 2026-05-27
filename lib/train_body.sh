@@ -42,10 +42,13 @@ CKPT_ROOT="$EXP_DIR/checkpoints"
 CKPT_DIR="$CKPT_ROOT/$OUTPUT_NAMESPACE"
 mkdir -p "$EXP_DIR/logs" "$LOG_DIR" "$CKPT_DIR"
 LOG_FILE="$EXP_DIR/logs/train.log"
+SUBMIT_GIT_COMMIT="${SUBMIT_GIT_COMMIT:-${TRAIN_GIT_COMMIT:-}}"
+pin_training_repo_dir "$TRAIN_REPO_DIR" "$SUBMIT_GIT_COMMIT" "${SLURM_JOB_ID:-$OUTPUT_NAMESPACE}"
 
 log "========================================="
 log "$EXP_NAME"
 log "  cluster=$CLUSTER  partition=${SUBMIT_PARTITION:-$PARTITION}  gpu=$GPU_INSTANCE"
+log "  train repo=$TRAIN_REPO_DIR"
 log "  variant note: $TRAIN_NOTE"
 log "========================================="
 

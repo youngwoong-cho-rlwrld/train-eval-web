@@ -5,21 +5,27 @@ from __future__ import annotations
 from typing import Any
 
 from .data_interface import load_data_interface_for_variant
+from .training_models import (
+    TrainingModel,
+    rewrites_modality_action_horizon,
+)
 
 
 def resolve_train_action_horizon(
     *,
     variant: Any,
-    model_family: str,
+    model: TrainingModel,
+    action_horizon_mode: str | None = None,
     requested: int | None = None,
 ) -> int | None:
-    """Resolve and validate the action horizon for N1.6 training.
+    """Resolve and validate the action horizon for train submissions.
 
-    The modality config determines the data action delta length. The value
-    passed to the training entrypoint must match that length so model,
-    action-head, processor, and data horizon stay aligned.
+    Model registry entries decide how a resolved horizon is applied. Plain
+    GR00T N1.6 only stages a matching modality config; PhysiXel can also pass
+    the value to model code through --action-horizon.
     """
-    if model_family != "n1.6":
+    mode = action_horizon_mode or model.action_horizon_mode
+    if model.family != "n1.6" or mode == "none":
         return None
 
     modality_horizon = load_data_interface_for_variant(variant).action_horizon
@@ -30,7 +36,11 @@ def resolve_train_action_horizon(
         return None
     if action_horizon <= 0:
         raise ValueError(f"action horizon must be positive, got {action_horizon}")
-    if modality_horizon is not None and action_horizon != modality_horizon:
+    if (
+        not rewrites_modality_action_horizon(mode)
+        and modality_horizon is not None
+        and action_horizon != modality_horizon
+    ):
         source = "requested" if requested is not None else "configured"
         raise ValueError(
             f"{source} action horizon {action_horizon} does not match "

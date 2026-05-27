@@ -62,6 +62,55 @@ append_submit_extra_train_args() {
     fi
 }
 
+pin_training_repo_dir() {
+    local repo_src="$1"
+    local commit="${2:-}"
+    local namespace="${3:-job}"
+
+    if [ -z "$commit" ]; then
+        TRAIN_REPO_DIR="$repo_src"
+        return 0
+    fi
+
+    local safe_namespace worktree_parent worktree current expected
+    safe_namespace="$(printf '%s' "$namespace" | sed -E 's/[^A-Za-z0-9_.-]+/_/g' | sed -E 's/^_+|_+$//g')"
+    safe_namespace="${safe_namespace:-job}"
+    worktree_parent="$REPO_ROOT/.worktrees"
+    worktree="$worktree_parent/$safe_namespace"
+
+    mkdir -p "$worktree_parent"
+    git -c safe.directory="$repo_src" -C "$repo_src" worktree prune || true
+
+    if [ ! -e "$worktree/.git" ]; then
+        if [ -e "$worktree" ]; then
+            log "ERROR: refusing to use non-git worktree path: $worktree"
+            exit 1
+        fi
+        for attempt in 1 2 3 4 5; do
+            if git -c safe.directory="$repo_src" -C "$repo_src" worktree add --detach "$worktree" "$commit"; then
+                break
+            fi
+            rc=$?
+            if [ "$attempt" = "5" ]; then
+                exit "$rc"
+            fi
+            sleep $((attempt * 2))
+        done
+    fi
+
+    current="$(git -c safe.directory="$worktree" -C "$worktree" rev-parse HEAD)"
+    expected="$(git -c safe.directory="$repo_src" -C "$repo_src" rev-parse "$commit^{commit}")"
+    if [ "$current" != "$expected" ]; then
+        log "ERROR: training repo worktree commit mismatch: expected $expected got $current"
+        exit 1
+    fi
+    if [ -d "$repo_src/.venv" ] && [ ! -e "$worktree/.venv" ]; then
+        ln -s "$repo_src/.venv" "$worktree/.venv"
+    fi
+    TRAIN_REPO_DIR="$worktree"
+    log "Pinned training repo: $TRAIN_REPO_DIR ($current)"
+}
+
 finish_eval_launch_phase() {
     local launched="$1"
     local failed="$2"

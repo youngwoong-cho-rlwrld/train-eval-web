@@ -72,6 +72,29 @@ def load_data_interface_for_variant(variant: Variant) -> DataInterfaceSummary:
     )
 
 
+def rewrite_action_horizon(text: str, action_horizon: int) -> str:
+    """Return modality config text with action delta_indices set to range(N)."""
+    if action_horizon <= 0:
+        raise ValueError(f"action horizon must be positive, got {action_horizon}")
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as e:
+        raise ValueError(f"could not parse modality config: {e.msg}") from e
+
+    config_name, _ = _registered_metadata(tree)
+    dicts = _top_level_dicts(tree)
+    for config in _candidate_config_dicts(dicts, config_name):
+        action = _dict_value(config, "action")
+        if action is None:
+            continue
+        delta_indices = _call_keyword(action, "delta_indices")
+        if delta_indices is None:
+            continue
+        start, end = _node_span(text, delta_indices)
+        return text[:start] + f"list(range({action_horizon}))" + text[end:]
+    raise ValueError("modality config action.delta_indices was not found")
+
+
 def _registered_metadata(tree: ast.Module) -> tuple[str | None, str | None]:
     dict_names = list(_top_level_dicts(tree))
     registered_name: str | None = None
@@ -199,3 +222,21 @@ def _simple_expr(node: ast.AST) -> str | None:
         return ast.unparse(node)
     except Exception:
         return None
+
+
+def _node_span(text: str, node: ast.AST) -> tuple[int, int]:
+    if (
+        getattr(node, "lineno", None) is None
+        or getattr(node, "col_offset", None) is None
+        or getattr(node, "end_lineno", None) is None
+        or getattr(node, "end_col_offset", None) is None
+    ):
+        raise ValueError("could not locate action.delta_indices source span")
+    offsets: list[int] = []
+    total = 0
+    for line in text.splitlines(keepends=True):
+        offsets.append(total)
+        total += len(line)
+    start = offsets[node.lineno - 1] + node.col_offset
+    end = offsets[node.end_lineno - 1] + node.end_col_offset
+    return start, end

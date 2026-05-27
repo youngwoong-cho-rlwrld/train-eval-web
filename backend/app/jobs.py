@@ -27,6 +27,7 @@ class Job(BaseModel):
     end: str | None = None           # ISO timestamp, or None / "Unknown"
     phase: str | None = None
     variant: str | None = None
+    resume_of: str | None = None
 
 
 _SQUEUE_FMT = "%i|%j|%P|%T|%M|%R|%L|%S"
@@ -141,6 +142,7 @@ def _attach_phase_metadata(rows: list[Job], meta_by_job_id: dict[str, dict[str, 
             phase, variant = resolve_phase_and_variant(job.job_name)
         job.phase = None if phase == "unknown" else phase
         job.variant = variant
+        job.resume_of = meta.get("resume_of") or None
 
 
 _SACCT_FMT = "JobID,JobName,Partition,State,ExitCode,Start,End,Elapsed,NodeList,Reason"

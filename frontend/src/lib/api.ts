@@ -46,6 +46,7 @@ export type Job = {
   end?: string | null;
   phase?: string | null;
   variant?: string | null;
+  resume_of?: string | null;
 };
 
 export type SubmitResponse = {
@@ -236,6 +237,7 @@ export type JobDetails = {
   job_name: string;
   phase: "train" | "resume" | "eval" | "unknown";
   variant: string | null;
+  resume_of: string | null;
   state: string;
   elapsed: string;
   wandb_project: string | null;
@@ -252,10 +254,17 @@ export type GitStatus = {
   repo_label: string | null;
   commit: string | null;
   short_commit: string | null;
+  commit_subject: string | null;
   branch: string | null;
   dirty: boolean;
   files: string[];
   error: string | null;
+};
+
+export type GitCommitOption = {
+  commit: string;
+  short_commit: string;
+  subject: string;
 };
 
 export type ResultCell = {

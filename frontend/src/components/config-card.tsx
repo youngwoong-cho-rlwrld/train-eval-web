@@ -41,6 +41,7 @@ export function ConfigCard({
   effectiveConfigPath,
   modelLabel,
   modelRepoPath,
+  modelGitCommit,
   modelRepoError,
   modelRepoMessage,
   modelRepoChecking = false,
@@ -68,6 +69,7 @@ export function ConfigCard({
   effectiveConfigPath?: string | null;
   modelLabel?: string | null;
   modelRepoPath?: string | null;
+  modelGitCommit?: string | null;
   modelRepoError?: string | null;
   modelRepoMessage?: string | null;
   modelRepoChecking?: boolean;
@@ -163,6 +165,14 @@ export function ConfigCard({
                   (modelRepoChecking ? "Checking model repository..." : modelRepoMessage)
                 }
                 copyValue={modelRepoPath ?? null}
+              />
+            )}
+            {modelGitCommit && !modelRepoError && (
+              <ConfigPathRow
+                label="training commit"
+                value={modelGitCommit}
+                labelHelp="The model-code commit that this training job will run. Pinned submissions use a detached worktree at this revision."
+                valueTooltip={modelGitCommit}
               />
             )}
             {wantsCheckpoint && showCheckpointPathRow && (

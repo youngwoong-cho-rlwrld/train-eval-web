@@ -33,10 +33,17 @@ class GitStatus(BaseModel):
     repo_label: str | None = None
     commit: str | None
     short_commit: str | None
+    commit_subject: str | None = None
     branch: str | None = None
     dirty: bool
     files: list[str] = Field(default_factory=list)
     error: str | None = None
+
+
+class GitCommitSummary(BaseModel):
+    commit: str
+    short_commit: str
+    subject: str
 
 
 @dataclass(frozen=True)
@@ -44,6 +51,7 @@ class SubmitGitInfo:
     repo_path: str
     repo_label: str
     commit: str | None
+    commit_subject: str | None
     branch: str | None
     dirty_before: bool
     committed_dirty: bool
@@ -52,6 +60,7 @@ class SubmitGitInfo:
 
 
 GitRunner = Callable[[str, float], Awaitable[tuple[int, str, str]]]
+_GIT_COMMIT_RE = re.compile(r"[0-9a-fA-F]{7,40}")
 
 
 def _short(commit: str | None) -> str | None:
@@ -89,11 +98,136 @@ def _safe_git(repo_path: str) -> str:
     return f"git -c {shlex.quote(f'safe.directory={repo_path}')}"
 
 
+def normalize_requested_git_commit(value: str | None) -> str | None:
+    requested = (value or "").strip()
+    if not requested:
+        return None
+    if not _GIT_COMMIT_RE.fullmatch(requested):
+        raise ValueError("TRAIN_GIT_COMMIT must be a 7-40 character hex commit hash")
+    return requested
+
+
+def resolve_train_git_commit_override(
+    requested: str | None,
+    variant_vars: dict[str, str],
+) -> str | None:
+    fallback = variant_vars.get("TRAIN_GIT_COMMIT")
+    return normalize_requested_git_commit(requested if requested is not None else fallback)
+
+
+async def _resolve_git_commit(
+    run: GitRunner,
+    *,
+    repo_path: str,
+    requested_commit: str,
+) -> tuple[str | None, str | None]:
+    repo = shlex.quote(repo_path)
+    git = _safe_git(repo_path)
+    rev = shlex.quote(f"{requested_commit}^{{commit}}")
+    rc, out, err = await run(f"cd {repo} && {git} rev-parse --verify {rev}", 20.0)
+    if rc != 0:
+        return None, (err or out).strip() or f"commit {requested_commit} not found"
+    return out.strip(), None
+
+
+async def _branch_containing_commit(
+    run: GitRunner,
+    *,
+    repo_path: str,
+    commit: str,
+) -> str | None:
+    repo = shlex.quote(repo_path)
+    git = _safe_git(repo_path)
+    rev = shlex.quote(commit)
+    rc, out, _ = await run(
+        f"cd {repo} && {git} branch --contains {rev} --format='%(refname:short)'",
+        20.0,
+    )
+    if rc != 0:
+        return None
+    for line in out.splitlines():
+        item = line.strip().lstrip("*").strip()
+        if item:
+            return item
+    return None
+
+
+def _parse_git_log_entries(out: str) -> list[GitCommitSummary]:
+    entries: list[GitCommitSummary] = []
+    seen: set[str] = set()
+    for line in out.splitlines():
+        if "\0" not in line:
+            continue
+        commit, subject = line.split("\0", 1)
+        commit = commit.strip()
+        if not commit or commit in seen:
+            continue
+        seen.add(commit)
+        entries.append(
+            GitCommitSummary(
+                commit=commit,
+                short_commit=_short(commit) or commit,
+                subject=subject.strip(),
+            )
+        )
+    return entries
+
+
+async def _git_commit_summary(
+    run: GitRunner,
+    *,
+    repo_path: str,
+    commit: str,
+) -> GitCommitSummary | None:
+    repo = shlex.quote(repo_path)
+    git = _safe_git(repo_path)
+    rev = shlex.quote(commit)
+    rc, out, _ = await run(f"cd {repo} && {git} log -1 --format='%H%x00%s' {rev}", 20.0)
+    if rc != 0:
+        return None
+    entries = _parse_git_log_entries(out)
+    return entries[0] if entries else None
+
+
+async def _git_commits(
+    run: GitRunner,
+    *,
+    repo_path: str,
+    limit: int = 50,
+    selected_commit: str | None = None,
+) -> list[GitCommitSummary]:
+    bounded_limit = max(1, min(limit, 200))
+    repo = shlex.quote(repo_path)
+    git = _safe_git(repo_path)
+    rc, out, err = await run(
+        f"cd {repo} && {git} log -n {bounded_limit} --format='%H%x00%s'",
+        20.0,
+    )
+    if rc != 0:
+        raise RuntimeError((err or out).strip() or "git log failed")
+    entries = _parse_git_log_entries(out)
+    selected = normalize_requested_git_commit(selected_commit)
+    if selected:
+        resolved, selected_error = await _resolve_git_commit(
+            run,
+            repo_path=repo_path,
+            requested_commit=selected,
+        )
+        if selected_error:
+            raise RuntimeError(f"TRAIN_GIT_COMMIT {selected!r} is not available: {selected_error}")
+        if resolved and all(entry.commit != resolved for entry in entries):
+            summary = await _git_commit_summary(run, repo_path=repo_path, commit=resolved)
+            if summary:
+                entries.insert(0, summary)
+    return entries
+
+
 async def _git_status(
     run: GitRunner,
     *,
     repo_path: str,
     repo_label: str,
+    requested_commit: str | None = None,
 ) -> GitStatus:
     repo = shlex.quote(repo_path)
     git = _safe_git(repo_path)
@@ -104,33 +238,66 @@ async def _git_status(
             repo_label=repo_label,
             commit=None,
             short_commit=None,
+            commit_subject=None,
             branch=None,
             dirty=True,
             files=[],
             error=(err or head).strip() or "git rev-parse failed",
         )
+    resolved_commit = head.strip()
+    requested = normalize_requested_git_commit(requested_commit)
+    requested_error: str | None = None
+    if requested:
+        resolved_commit, requested_error = await _resolve_git_commit(
+            run,
+            repo_path=repo_path,
+            requested_commit=requested,
+        )
+        if requested_error:
+            return GitStatus(
+                repo_path=repo_path,
+                repo_label=repo_label,
+                commit=None,
+                short_commit=None,
+                commit_subject=None,
+                branch=None,
+                dirty=True,
+                files=[],
+                error=f"TRAIN_GIT_COMMIT {requested!r} is not available in {repo_label}: {requested_error}",
+            )
     rc, branch, _ = await run(f"cd {repo} && {git} branch --show-current", 20.0)
     branch = branch if rc == 0 else ""
+    commit_summary = (
+        await _git_commit_summary(run, repo_path=repo_path, commit=resolved_commit)
+        if resolved_commit
+        else None
+    )
     rc, status, err = await run(f"cd {repo} && {git} status --short", 20.0)
     if rc != 0:
-        commit = head.strip()
         return GitStatus(
             repo_path=repo_path,
             repo_label=repo_label,
-            commit=commit,
-            short_commit=_short(commit),
+            commit=resolved_commit,
+            short_commit=_short(resolved_commit),
+            commit_subject=commit_summary.subject if commit_summary else None,
             branch=_clean_branch(branch),
             dirty=True,
             files=[],
             error=(err or status).strip() or "git status failed",
         )
     files = [line for line in status.splitlines() if line.strip()]
-    commit = head.strip()
+    if requested and resolved_commit:
+        branch = await _branch_containing_commit(
+            run,
+            repo_path=repo_path,
+            commit=resolved_commit,
+        ) or branch
     return GitStatus(
         repo_path=repo_path,
         repo_label=repo_label,
-        commit=commit,
-        short_commit=_short(commit),
+        commit=resolved_commit,
+        short_commit=_short(resolved_commit),
+        commit_subject=commit_summary.subject if commit_summary else None,
         branch=_clean_branch(branch),
         dirty=bool(files),
         files=files,
@@ -145,15 +312,36 @@ async def _prepare_training_git(
     job_name: str,
     commit_dirty_changes: bool,
     require_clean: bool = True,
+    requested_commit: str | None = None,
 ) -> SubmitGitInfo:
-    status = await _git_status(run, repo_path=repo_path, repo_label=repo_label)
+    requested = normalize_requested_git_commit(requested_commit)
+    status = await _git_status(
+        run,
+        repo_path=repo_path,
+        repo_label=repo_label,
+        requested_commit=requested,
+    )
     if status.error:
         raise RuntimeError(status.error)
+    if requested:
+        if commit_dirty_changes:
+            raise ValueError("cannot commit dirty changes when TRAIN_GIT_COMMIT is pinned")
+        return SubmitGitInfo(
+            repo_path=repo_path,
+            repo_label=repo_label,
+            commit=status.commit,
+            commit_subject=status.commit_subject,
+            branch=status.branch,
+            dirty_before=status.dirty,
+            committed_dirty=False,
+            dirty_files=status.files,
+        )
     if not status.dirty:
         return SubmitGitInfo(
             repo_path=repo_path,
             repo_label=repo_label,
             commit=status.commit,
+            commit_subject=status.commit_subject,
             branch=status.branch,
             dirty_before=False,
             committed_dirty=False,
@@ -164,6 +352,7 @@ async def _prepare_training_git(
             repo_path=repo_path,
             repo_label=repo_label,
             commit=status.commit,
+            commit_subject=status.commit_subject,
             branch=status.branch,
             dirty_before=True,
             committed_dirty=False,
@@ -191,6 +380,7 @@ async def _prepare_training_git(
         repo_path=repo_path,
         repo_label=repo_label,
         commit=clean.commit,
+        commit_subject=clean.commit_subject,
         branch=clean.branch,
         dirty_before=True,
         committed_dirty=True,
@@ -204,11 +394,33 @@ async def _slurm_git_run(host: str, cmd: str, timeout: float) -> tuple[int, str,
     return r.returncode, r.stdout, r.stderr
 
 
-async def slurm_git_status(*, host: str, repo_path: str, repo_label: str) -> GitStatus:
+async def slurm_git_status(
+    *,
+    host: str,
+    repo_path: str,
+    repo_label: str,
+    requested_commit: str | None = None,
+) -> GitStatus:
     return await _git_status(
         lambda cmd, timeout: _slurm_git_run(host, cmd, timeout),
         repo_path=repo_path,
         repo_label=repo_label,
+        requested_commit=requested_commit,
+    )
+
+
+async def slurm_git_commits(
+    *,
+    host: str,
+    repo_path: str,
+    limit: int = 50,
+    selected_commit: str | None = None,
+) -> list[GitCommitSummary]:
+    return await _git_commits(
+        lambda cmd, timeout: _slurm_git_run(host, cmd, timeout),
+        repo_path=repo_path,
+        limit=limit,
+        selected_commit=selected_commit,
     )
 
 
@@ -220,6 +432,7 @@ async def prepare_slurm_training_git(
     job_name: str,
     commit_dirty_changes: bool,
     require_clean: bool = True,
+    requested_commit: str | None = None,
 ) -> SubmitGitInfo:
     return await _prepare_training_git(
         lambda cmd, timeout: _slurm_git_run(host, cmd, timeout),
@@ -228,6 +441,7 @@ async def prepare_slurm_training_git(
         job_name=job_name,
         commit_dirty_changes=commit_dirty_changes,
         require_clean=require_clean,
+        requested_commit=requested_commit,
     )
 
 
@@ -511,11 +725,31 @@ def _parse_mlxp_git_termination_message(message: str) -> tuple[int, str, str] | 
     return rc, stdout, stderr
 
 
-async def mlxp_git_status(*, repo_path: str, repo_label: str) -> GitStatus:
+async def mlxp_git_status(
+    *,
+    repo_path: str,
+    repo_label: str,
+    requested_commit: str | None = None,
+) -> GitStatus:
     return await _git_status(
         _mlxp_git_run,
         repo_path=repo_path,
         repo_label=repo_label,
+        requested_commit=requested_commit,
+    )
+
+
+async def mlxp_git_commits(
+    *,
+    repo_path: str,
+    limit: int = 50,
+    selected_commit: str | None = None,
+) -> list[GitCommitSummary]:
+    return await _git_commits(
+        _mlxp_git_run,
+        repo_path=repo_path,
+        limit=limit,
+        selected_commit=selected_commit,
     )
 
 
@@ -526,6 +760,7 @@ async def prepare_mlxp_training_git(
     job_name: str,
     commit_dirty_changes: bool,
     require_clean: bool = True,
+    requested_commit: str | None = None,
 ) -> SubmitGitInfo:
     return await _prepare_training_git(
         _mlxp_git_run,
@@ -534,6 +769,7 @@ async def prepare_mlxp_training_git(
         job_name=job_name,
         commit_dirty_changes=commit_dirty_changes,
         require_clean=require_clean,
+        requested_commit=requested_commit,
     )
 
 
@@ -644,6 +880,8 @@ def render_training_config_snapshot(
     train_max_steps: int,
     train_save_steps: int,
     train_action_horizon: int | None = None,
+    train_modality_config: str | None = None,
+    train_git_commit: str | None = None,
     train_note: str | None = None,
     wandb_project: str | None = None,
     git: SubmitGitInfo | None = None,
@@ -659,6 +897,10 @@ def render_training_config_snapshot(
     text = _set_scalar(text, "SAVE_STEPS", train_save_steps)
     if train_action_horizon is not None:
         text = _set_scalar(text, "TRAIN_ACTION_HORIZON", train_action_horizon)
+    if train_modality_config is not None:
+        text = _set_scalar(text, "TRAIN_MODALITY_CONFIG", train_modality_config)
+    if train_git_commit is not None:
+        text = _set_scalar(text, "TRAIN_GIT_COMMIT", train_git_commit)
     if train_global_batch_size is not None:
         text = _set_scalar(text, "TRAIN_GLOBAL_BATCH_SIZE", train_global_batch_size)
         if model == "n1.5" and train_num_gpus > 0:
@@ -679,6 +921,8 @@ def render_training_config_snapshot(
         footer.append(f"SUBMIT_NODE={shlex.quote(node)}")
     if train_action_horizon is not None:
         footer.append(f"SUBMIT_TRAIN_ACTION_HORIZON={train_action_horizon}")
+    if train_modality_config is not None:
+        footer.append(f"SUBMIT_TRAIN_MODALITY_CONFIG={shlex.quote(train_modality_config)}")
     if git:
         footer.append(f"SUBMIT_GIT_REPO_LABEL={shlex.quote(git.repo_label)}")
         footer.append(f"SUBMIT_GIT_REPO_PATH={shlex.quote(git.repo_path)}")
@@ -686,6 +930,8 @@ def render_training_config_snapshot(
             footer.append(f"SUBMIT_GIT_BRANCH={shlex.quote(git.branch)}")
         if git.commit:
             footer.append(f"SUBMIT_GIT_COMMIT={shlex.quote(git.commit)}")
+        if git.commit_subject:
+            footer.append(f"SUBMIT_GIT_COMMIT_SUBJECT={shlex.quote(git.commit_subject)}")
         footer.append(f"SUBMIT_GIT_DIRTY_AT_SUBMIT={'1' if git.dirty_before else '0'}")
         footer.append(f"SUBMIT_GIT_COMMITTED_DIRTY={'1' if git.committed_dirty else '0'}")
     if dataset_override is not None:
@@ -773,6 +1019,8 @@ def snapshot_metadata(
     train_max_steps: int | None = None,
     train_save_steps: int | None = None,
     train_action_horizon: int | None = None,
+    train_modality_config: str | None = None,
+    train_git_commit: str | None = None,
     train_note: str | None = None,
     wandb_project: str | None = None,
     git: SubmitGitInfo | None = None,
@@ -795,6 +1043,8 @@ def snapshot_metadata(
             "max_steps": train_max_steps,
             "save_steps": train_save_steps,
             "action_horizon": train_action_horizon,
+            "modality_config": train_modality_config,
+            "requested_git_commit": train_git_commit,
             "wandb_project": wandb_project,
         },
         "dataset_override": dataset_override,
@@ -804,6 +1054,7 @@ def snapshot_metadata(
             "repo_label": git.repo_label if git else None,
             "branch": git.branch if git else None,
             "commit": git.commit if git else None,
+            "commit_subject": git.commit_subject if git else None,
             "dirty_at_submit": git.dirty_before if git else None,
             "committed_dirty": git.committed_dirty if git else None,
             "dirty_files": git.dirty_files if git else [],

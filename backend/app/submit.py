@@ -18,6 +18,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from .clusters import load_cluster
+from .data_interface import rewrite_action_horizon
 from .output_namespace import make_output_namespace, validate_output_namespace
 from .paths import CLUSTER_STAGING_REL, CONFIGS_DIR, LIB_DIR
 from .ssh import rsync_to, ssh_run
@@ -27,13 +28,19 @@ from .submission_snapshot import (
     prepare_slurm_training_git,
     render_eval_config_preview,
     render_training_config_snapshot,
+    resolve_train_git_commit_override,
     snapshot_metadata,
     snapshot_suffix,
     shell_array_assignment,
     slurm_training_repo_path,
     training_repo_label,
 )
-from .training_models import resolve_training_model
+from .training_models import (
+    TrainingModel,
+    action_horizon_mode_for_variant,
+    resolve_training_model,
+    rewrites_modality_action_horizon,
+)
 from .train_overrides import resolve_train_action_horizon as resolve_action_horizon_override
 from .variants import load_variant
 from .variant_values import variant_int
@@ -74,6 +81,10 @@ class SubmitRequest(BaseModel):
     train_max_steps: int | None = Field(default=None, ge=1)
     train_save_steps: int | None = Field(default=None, ge=1)
     train_action_horizon: int | None = Field(default=None, ge=1)
+    # Train-only: optional model-code git commit. If set, the backend verifies
+    # the commit exists in the selected model repo and runs from a detached
+    # worktree at that exact revision.
+    train_git_commit: str | None = None
     # Eval-only: override Isaac's native vectorized env count per GPU.
     eval_num_envs_per_gpu: int | None = Field(default=None, ge=1)
     # Legacy request field accepted from older frontends/resume metadata.
@@ -131,7 +142,7 @@ def resolve_train_note(requested_note: str | None, variant) -> str:
     return note
 
 
-def _normalize_eval_sets(eval_sets: list[str] | None) -> list[str] | None:
+def normalize_eval_sets(eval_sets: list[str] | None) -> list[str] | None:
     if eval_sets is None:
         return None
     out: list[str] = []
@@ -198,11 +209,24 @@ def resolve_train_settings(req: SubmitRequest, variant, model_family: str) -> Tr
     )
 
 
-def resolve_train_action_horizon(req: SubmitRequest, variant, model_family: str) -> int | None:
+def resolve_train_action_horizon(
+    req: SubmitRequest,
+    variant,
+    model: TrainingModel,
+    action_horizon_mode: str | None = None,
+) -> int | None:
     return resolve_action_horizon_override(
         variant=variant,
-        model_family=model_family,
+        model=model,
+        action_horizon_mode=action_horizon_mode,
         requested=req.train_action_horizon,
+    )
+
+
+def resolve_train_git_commit(req: SubmitRequest, variant) -> str | None:
+    return resolve_train_git_commit_override(
+        req.train_git_commit,
+        variant.vars,
     )
 
 
@@ -223,20 +247,25 @@ class ConfigSnapshotPaths:
     suffix: str
     rel: str
     meta_rel: str
+    modality_rel: str
     path: str
     meta_path: str
+    modality_path: str
 
 
 def config_snapshot_paths(variant: str, job_name: str) -> ConfigSnapshotPaths:
     suffix = snapshot_suffix(job_name)
     rel = f"{CLUSTER_STAGING_REL}/experiments/{variant}/config_{suffix}.sh"
     meta_rel = f"{CLUSTER_STAGING_REL}/experiments/{variant}/config_{suffix}.meta.json"
+    modality_rel = f"{CLUSTER_STAGING_REL}/experiments/{variant}/modality_{suffix}.py"
     return ConfigSnapshotPaths(
         suffix=suffix,
         rel=rel,
         meta_rel=meta_rel,
+        modality_rel=modality_rel,
         path=f"$HOME/{rel}",
         meta_path=f"$HOME/{meta_rel}",
+        modality_path=f"$HOME/{modality_rel}",
     )
 
 
@@ -261,7 +290,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     if req.resume and req.phase != "train":
         raise ValueError("resume=true is only valid for phase=train")
     eval_num_envs_per_gpu = req.eval_num_envs_per_gpu or req.eval_parallel_sims_per_gpu
-    eval_sets = _normalize_eval_sets(req.eval_sets)
+    eval_sets = normalize_eval_sets(req.eval_sets)
     eval_checkpoint = require_eval_checkpoint_path(req) if req.phase == "eval" else None
     if req.phase != "eval" and any((
         eval_num_envs_per_gpu is not None,
@@ -278,6 +307,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         req.train_max_steps is not None,
         req.train_save_steps is not None,
         req.train_action_horizon is not None,
+        bool(req.train_git_commit and req.train_git_commit.strip()),
     )):
         raise ValueError("train overrides are only valid for phase=train")
     if (
@@ -296,6 +326,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
 
     # ── Resolve partition + model + body script + walltime ──
     model = resolve_training_model(variant)
+    action_horizon_mode = action_horizon_mode_for_variant(model, variant)
     body_script, walltime = model.body_for_phase(req.phase)
     training_repo = slurm_training_repo_path(cluster.vars, model)
 
@@ -308,7 +339,13 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         sbatch_flags.append(f"--exclude={shlex.quote(exclude_nodes)}")
 
     train_settings = resolve_train_settings(req, variant, model.family)
-    train_action_horizon = resolve_train_action_horizon(req, variant, model.family) if req.phase == "train" else None
+    train_action_horizon = resolve_train_action_horizon(
+        req,
+        variant,
+        model,
+        action_horizon_mode,
+    ) if req.phase == "train" else None
+    train_git_commit = resolve_train_git_commit(req, variant) if req.phase == "train" else None
     gpus = str(train_settings.num_gpus)
 
     # Unified shape across slurm + MLXP. The cluster/partition are shown in
@@ -341,6 +378,9 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     snapshot_meta_rel = snapshot_paths.meta_rel
     snapshot_path = snapshot_paths.path
     snapshot_meta_path = snapshot_paths.meta_path
+    snapshot_modality_rel: str | None = None
+    snapshot_modality_path: str | None = None
+    snapshot_modality_text: str | None = None
     snapshot_text: str | None = None
     snapshot_meta_text: str | None = None
     submit_extra_args_rel: str | None = None
@@ -354,6 +394,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             job_name=job_name,
             commit_dirty_changes=req.commit_dirty_changes,
             require_clean=not req.resume,
+            requested_commit=train_git_commit,
         )
         if req.extra_args:
             safe_job_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", job_name).strip("_") or snapshot_paths.suffix
@@ -363,6 +404,21 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
                 "# Generated by train-eval-web for this submission.\n"
                 + shell_array_assignment("SUBMIT_EXTRA_ARGS", req.extra_args)
                 + "\n"
+            )
+        if rewrites_modality_action_horizon(action_horizon_mode) and train_action_horizon is not None:
+            modality_rel = (variant.vars.get("TRAIN_MODALITY_CONFIG") or "").strip()
+            if not modality_rel:
+                raise ValueError(f"variant {variant.name}: TRAIN_MODALITY_CONFIG missing")
+            if Path(modality_rel).is_absolute() or ".." in Path(modality_rel).parts:
+                raise ValueError("TRAIN_MODALITY_CONFIG must be relative to the experiment directory")
+            modality_path = CONFIGS_DIR / "experiments" / req.variant / modality_rel
+            if not modality_path.is_file():
+                raise FileNotFoundError(f"modality config not found: {modality_path}")
+            snapshot_modality_rel = snapshot_paths.modality_rel
+            snapshot_modality_path = snapshot_paths.modality_path
+            snapshot_modality_text = rewrite_action_horizon(
+                modality_path.read_text(),
+                train_action_horizon,
             )
         snapshot_text = render_training_config_snapshot(
             base_config=variant.raw,
@@ -378,6 +434,8 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             train_max_steps=train_settings.max_steps,
             train_save_steps=train_settings.save_steps,
             train_action_horizon=train_action_horizon,
+            train_modality_config=Path(snapshot_modality_rel).name if snapshot_modality_rel else None,
+            train_git_commit=train_git_commit,
             train_note=train_note,
             wandb_project=submitted_wandb_project,
             git=submit_git,
@@ -396,6 +454,8 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             train_max_steps=train_settings.max_steps,
             train_save_steps=train_settings.save_steps,
             train_action_horizon=train_action_horizon,
+            train_modality_config=snapshot_modality_path,
+            train_git_commit=train_git_commit,
             train_note=train_note,
             wandb_project=submitted_wandb_project,
             git=submit_git,
@@ -488,6 +548,8 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     if snapshot_rel and snapshot_text and snapshot_meta_rel and snapshot_meta_text:
         await _rsync_text(host, snapshot_text, snapshot_rel)
         await _rsync_text(host, snapshot_meta_text, snapshot_meta_rel)
+    if snapshot_modality_rel and snapshot_modality_text:
+        await _rsync_text(host, snapshot_modality_text, snapshot_modality_rel)
     if submit_extra_args_rel and submit_extra_args_text:
         await _rsync_text(host, submit_extra_args_text, submit_extra_args_rel)
 
@@ -534,6 +596,8 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     )
     if output_namespace:
         comment += f";output_namespace={output_namespace}"
+    if req.resume_of and req.resume_of.strip():
+        comment += f";resume_of={req.resume_of.strip()}"
     if req.phase == "train":
         comment += (
             f";train_num_gpus={train_settings.num_gpus}"
@@ -542,6 +606,8 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         )
         if train_action_horizon is not None:
             comment += f";train_action_horizon={train_action_horizon}"
+        if snapshot_modality_path:
+            comment += f";train_modality_config={snapshot_modality_path}"
         if req.train_global_batch_size is not None:
             comment += f";train_global_batch_size={req.train_global_batch_size}"
         if snapshot_path:
@@ -557,6 +623,8 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
                 comment += f";submit_git_branch={submit_git.branch}"
         if submit_git and submit_git.commit:
             comment += f";submit_git_commit={submit_git.commit}"
+        if submit_git and submit_git.commit_subject:
+            comment += f";submit_git_commit_subject={submit_git.commit_subject}"
     else:
         if eval_dir:
             comment += f";eval_dir={eval_dir}"
@@ -603,8 +671,16 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             if req.phase == "train" and train_action_horizon is not None else ""
         )
         + (
+            f",SUBMIT_ACTION_HORIZON_MODE={shlex.quote(action_horizon_mode)}"
+            if req.phase == "train" else ""
+        )
+        + (
             f",SUBMIT_EXTRA_ARGS_FILE={submit_extra_args_path}"
             if req.phase == "train" and submit_extra_args_path else ""
+        )
+        + (
+            f",SUBMIT_GIT_COMMIT={shlex.quote(submit_git.commit)}"
+            if req.phase == "train" and submit_git and submit_git.commit else ""
         )
         + (
             f",SUBMIT_EVAL_NUM_ENVS_PER_GPU={eval_num_envs_per_gpu}"
@@ -700,6 +776,11 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             else ""
         )
         + (
+            f"train_modality_config={snapshot_modality_path}\n"
+            if req.phase == "train" and snapshot_modality_path
+            else ""
+        )
+        + (
             f"train_global_batch_size={req.train_global_batch_size}\n"
             if req.phase == "train" and req.train_global_batch_size is not None
             else ""
@@ -723,6 +804,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             f"submit_git_repo_label={submit_git.repo_label}\n"
             f"submit_git_branch={submit_git.branch or ''}\n"
             f"submit_git_commit={submit_git.commit}\n"
+            f"submit_git_commit_subject={submit_git.commit_subject or ''}\n"
             f"submit_git_dirty_at_submit={'true' if submit_git.dirty_before else 'false'}\n"
             f"submit_git_committed_dirty={'true' if submit_git.committed_dirty else 'false'}\n"
             if req.phase == "train" and submit_git

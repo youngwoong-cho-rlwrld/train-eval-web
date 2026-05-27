@@ -22,10 +22,12 @@ import tarfile
 import time
 import uuid
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field
 
+from .data_interface import rewrite_action_horizon
 from .mlxp_config import (
     MlxpSettings,
     get_settings,
@@ -38,21 +40,24 @@ from .submission_snapshot import (
     prepare_mlxp_training_git,
     render_eval_config_preview,
     render_training_config_snapshot,
+    resolve_train_git_commit_override,
     snapshot_metadata,
     snapshot_suffix,
     training_repo_label,
 )
 from .training_models import (
     TrainingModel,
+    action_horizon_mode_for_variant,
     load_training_model,
     mlxp_repo_path,
+    passes_action_horizon_cli,
     resolve_training_model,
+    rewrites_modality_action_horizon,
 )
 from .train_overrides import resolve_train_action_horizon
 from .variant_values import variant_int
 from .wandb_config import get_project as _wandb_project
 from .variants import load_variant
-from typing import Literal
 
 
 # Per-GPU resource map (from the Notion MLXP guide section 3.1).
@@ -94,6 +99,7 @@ class MlxpSubmitRequest(BaseModel):
     max_steps: int | None = None
     save_steps: int | None = None
     action_horizon: int | None = Field(default=None, ge=1)
+    train_git_commit: str | None = None
     # The k8s node to pin via nodeAffinity. Leave None to fall back to the
     # configured default node.
     node: str | None = None
@@ -147,6 +153,7 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
         req.max_steps is not None,
         req.save_steps is not None,
         req.action_horizon is not None,
+        bool(req.train_git_commit and req.train_git_commit.strip()),
     )):
         raise ValueError("train overrides are only valid for phase=train")
 
@@ -154,10 +161,17 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
     settings = get_settings()
     cpu, mem = _GPU_RESOURCES[req.num_gpus]
     model = resolve_training_model(variant)
+    action_horizon_mode = action_horizon_mode_for_variant(model, variant)
+    if req.phase == "train":
+        req.train_git_commit = resolve_train_git_commit_override(
+            req.train_git_commit,
+            variant.vars,
+        )
     if req.phase == "train" and model.family == "n1.6":
         req.action_horizon = resolve_train_action_horizon(
             variant=variant,
-            model_family=model.family,
+            model=model,
+            action_horizon_mode=action_horizon_mode,
             requested=req.action_horizon,
         )
     if (
@@ -184,6 +198,7 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
         job_name=job_name,
         commit_dirty_changes=req.commit_dirty_changes,
         require_clean=(req.phase == "train"),
+        requested_commit=req.train_git_commit if req.phase == "train" else None,
     )
 
     node = req.node or settings.default_node
@@ -210,6 +225,7 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
             model=model,
             settings=settings,
             train_note=train_note,
+            action_horizon_mode=action_horizon_mode,
         )
     await _write_snapshot_to_ddn(snapshot)
     if req.phase == "eval":
@@ -251,7 +267,8 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
 
 def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job_name: str,
                             node: str, submit_git, model: TrainingModel,
-                            settings: MlxpSettings, train_note: str) -> dict:
+                            settings: MlxpSettings, train_note: str,
+                            action_horizon_mode: str) -> dict:
     train_num_gpus = req.num_gpus
     train_max_steps = req.max_steps or variant_int(variant, "MAX_STEPS", 30000)
     train_save_steps = req.save_steps or variant_int(variant, "SAVE_STEPS", 1000)
@@ -275,6 +292,12 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
         train_max_steps=train_max_steps,
         train_save_steps=train_save_steps,
         train_action_horizon=req.action_horizon,
+        train_modality_config=(
+            f"modality_{suffix}.py"
+            if rewrites_modality_action_horizon(action_horizon_mode) and req.action_horizon is not None
+            else None
+        ),
+        train_git_commit=req.train_git_commit,
         train_note=train_note,
         wandb_project=_wandb_project(),
         git=submit_git,
@@ -294,13 +317,19 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
         train_max_steps=train_max_steps,
         train_save_steps=train_save_steps,
         train_action_horizon=req.action_horizon,
+        train_modality_config=(
+            f"{exp_dir}/modality_{suffix}.py"
+            if rewrites_modality_action_horizon(action_horizon_mode) and req.action_horizon is not None
+            else None
+        ),
+        train_git_commit=req.train_git_commit,
         train_note=train_note,
         wandb_project=_wandb_project(),
         git=submit_git,
     )
     meta["output_namespace"] = req.output_namespace
     meta["checkpoint_dir"] = f"{exp_dir}/checkpoints/{req.output_namespace}"
-    return {
+    payload = {
         "job_id": job_id,
         "job_name": job_name,
         "output_namespace": req.output_namespace,
@@ -310,20 +339,37 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
         "config_text": config_text,
         "meta_text": metadata_json(meta),
         "git_commit": submit_git.commit,
+        "git_commit_subject": submit_git.commit_subject,
         "git_branch": submit_git.branch,
         "git_repo_path": submit_git.repo_path,
         "git_repo_label": submit_git.repo_label,
         "git_dirty_at_submit": submit_git.dirty_before,
         "git_committed_dirty": submit_git.committed_dirty,
+        "action_horizon_mode": action_horizon_mode,
     }
+    if rewrites_modality_action_horizon(action_horizon_mode) and req.action_horizon is not None:
+        modality_rel = (variant.vars.get("TRAIN_MODALITY_CONFIG") or "").strip()
+        if not modality_rel:
+            raise ValueError(f"variant {variant.name}: TRAIN_MODALITY_CONFIG missing")
+        if Path(modality_rel).is_absolute() or ".." in Path(modality_rel).parts:
+            raise ValueError("TRAIN_MODALITY_CONFIG must be relative to the experiment directory")
+        modality_path = EXPERIMENTS_DIR / variant.name / modality_rel
+        if not modality_path.is_file():
+            raise FileNotFoundError(f"modality config not found: {modality_path}")
+        payload["modality_path"] = f"{exp_dir}/modality_{suffix}.py"
+        payload["modality_text"] = rewrite_action_horizon(
+            modality_path.read_text(),
+            req.action_horizon,
+        )
+    return payload
 
 
 def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job_name: str,
                                  node: str, submit_git, model: TrainingModel,
                                  settings: MlxpSettings, train_note: str) -> dict:
-    from .submit import _normalize_eval_sets
+    from .submit import normalize_eval_sets
 
-    eval_sets = _normalize_eval_sets(req.eval_sets)
+    eval_sets = normalize_eval_sets(req.eval_sets)
     suffix = req.output_namespace or f"{snapshot_suffix(job_name)}_{job_id}"
     exp_dir = f"{settings.experiments_dir}/{variant.name}"
     path = f"{exp_dir}/config_{suffix}.sh"
@@ -384,6 +430,7 @@ def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str
         "eval_sets": eval_sets,
         "checkpoint_path": checkpoint_path,
         "git_commit": submit_git.commit,
+        "git_commit_subject": submit_git.commit_subject,
         "git_branch": submit_git.branch,
         "git_repo_path": submit_git.repo_path,
         "git_repo_label": submit_git.repo_label,
@@ -474,12 +521,23 @@ def _snapshot_preamble(snapshot: dict) -> str:
     meta_text = snapshot["meta_text"]
     path = snapshot["path"]
     meta_path = snapshot["meta_path"]
+    modality_path = snapshot.get("modality_path")
+    modality_text = snapshot.get("modality_text")
+    modality_block = ""
+    if isinstance(modality_path, str) and isinstance(modality_text, str):
+        modality_text = _ensure_trailing_newline(modality_text)
+        modality_block = f"""
+mkdir -p {shlex.quote(modality_path.rsplit('/', 1)[0])}
+cat > {shlex.quote(modality_path)} <<'TRAIN_EVAL_MODALITY_SNAPSHOT'
+{modality_text}TRAIN_EVAL_MODALITY_SNAPSHOT
+"""
     return f"""\
 mkdir -p {shlex.quote(path.rsplit('/', 1)[0])}
 cat > {shlex.quote(path)} <<'TRAIN_EVAL_CONFIG_SNAPSHOT'
 {config_text}TRAIN_EVAL_CONFIG_SNAPSHOT
 cat > {shlex.quote(meta_path)} <<'TRAIN_EVAL_CONFIG_META'
 {meta_text}TRAIN_EVAL_CONFIG_META
+{modality_block}
 """
 
 
@@ -489,7 +547,10 @@ def _snapshot_tar(snapshot: dict) -> bytes:
         for path_key, text_key in (
             ("path", "config_text"),
             ("meta_path", "meta_text"),
+            ("modality_path", "modality_text"),
         ):
+            if path_key not in snapshot or text_key not in snapshot:
+                continue
             data = snapshot[text_key].encode()
             info = tarfile.TarInfo(snapshot[path_key].lstrip("/"))
             info.size = len(data)
@@ -599,7 +660,7 @@ def _render_body_script(
             variant=variant, req=req, job_name=job_name, names=names,
             max_steps=max_steps, save_steps=save_steps, batch_size=batch_size,
             train_extra=train_extra, user_extra=user_extra, ckpt_dir=ckpt_dir,
-            snapshot=snapshot, repo_path=repo_path, settings=settings,
+            snapshot=snapshot, model=model, repo_path=repo_path, settings=settings,
         )
     if family != "n1.5":
         raise ValueError(f"unsupported MLXP model family: {family}")
@@ -723,7 +784,7 @@ def _safe_yaml_relpath(rel: str) -> bool:
 def _render_body_n16(*, variant, req: MlxpSubmitRequest, job_name: str,
                      names: list[str], max_steps: str, save_steps: str,
                      batch_size: str, train_extra: str, user_extra: str,
-                     ckpt_dir: str, snapshot: dict, repo_path: str,
+                     ckpt_dir: str, snapshot: dict, model: TrainingModel, repo_path: str,
                      settings: MlxpSettings) -> str:
     """Body script for GR00T N1.6 (launch_finetune.py).
 
@@ -737,7 +798,10 @@ def _render_body_n16(*, variant, req: MlxpSubmitRequest, job_name: str,
     modality_path = EXPERIMENTS_DIR / variant.name / modality_rel
     if not modality_path.is_file():
         raise FileNotFoundError(f"modality config not found: {modality_path}")
-    modality_text = modality_path.read_text()
+    modality_text = snapshot.get("modality_text")
+    if not isinstance(modality_text, str):
+        modality_text = modality_path.read_text()
+    modality_text = _ensure_trailing_newline(modality_text)
 
     dataset_paths_arg = " \\\n        ".join(
         f"{settings.datasets_dir}/{n}" for n in names
@@ -749,9 +813,10 @@ def _render_body_n16(*, variant, req: MlxpSubmitRequest, job_name: str,
     uv_bin_dir = shlex.quote(f"{settings.ddn_user_home}/.local/bin")
     output_namespace = ckpt_dir.rstrip("/").rsplit("/", 1)[-1]
     output_parent = ckpt_dir.rsplit("/", 1)[0]
+    action_horizon_mode = str(snapshot.get("action_horizon_mode") or model.action_horizon_mode)
     action_horizon_arg = (
         f" --action-horizon {req.action_horizon}"
-        if req.action_horizon is not None
+        if passes_action_horizon_cli(action_horizon_mode) and req.action_horizon is not None
         else ""
     )
 
@@ -980,6 +1045,8 @@ def _job_comment(req: MlxpSubmitRequest, variant, snapshot: dict) -> str:
         comment += f";submit_git_branch={snapshot['git_branch']}"
     if snapshot.get("git_commit"):
         comment += f";submit_git_commit={snapshot['git_commit']}"
+    if snapshot.get("git_commit_subject"):
+        comment += f";submit_git_commit_subject={snapshot['git_commit_subject']}"
     comment += (
         f";submit_git_dirty_at_submit={'true' if snapshot.get('git_dirty_at_submit') else 'false'}"
         f";submit_git_committed_dirty={'true' if snapshot.get('git_committed_dirty') else 'false'}"

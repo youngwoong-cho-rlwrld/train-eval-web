@@ -7,7 +7,26 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from . import clusters, copy_checkpoint, data_interface, datasets, details, flags, job_resume, jobs, mlxp, mlxp_config, mlxp_submit, partitions, results, submission_snapshot, submit, training_models, variants, wandb_auth
+from . import (
+    clusters,
+    copy_checkpoint,
+    data_interface,
+    datasets,
+    details,
+    flags,
+    job_resume,
+    jobs,
+    mlxp,
+    mlxp_config,
+    mlxp_submit,
+    partitions,
+    results,
+    submission_snapshot,
+    submit,
+    training_models,
+    variants,
+    wandb_auth,
+)
 from .paths import CLUSTER_STAGING_REL
 from .slurm_meta import read_slurm_meta
 from .ssh import ssh_tail_lines
@@ -222,27 +241,83 @@ class SubmitConfigPreview(BaseModel):
     text: str
     flags: list[ConfigPreviewFlag]
 
+
+class SubmitGitCommitsResponse(BaseModel):
+    commits: list[submission_snapshot.GitCommitSummary]
+
+
+async def _submit_git_repo(cluster: str, model) -> tuple[str | None, str]:
+    if cluster == "mlxp":
+        return None, mlxp_submit.mlxp_training_repo_path(model)
+    env = await clusters.load_cluster(cluster)
+    return env.ssh_alias, submission_snapshot.slurm_training_repo_path(env.vars, model)
+
+
 @app.get("/api/submit/git-status", response_model=submission_snapshot.GitStatus)
-async def get_submit_git_status(cluster: str, variant: str):
+async def get_submit_git_status(cluster: str, variant: str, commit: str | None = None):
     try:
         v = await variants.load_variant(variant)
         model = training_models.resolve_training_model(v)
         repo_label = submission_snapshot.training_repo_label(model)
-        if cluster == "mlxp":
+        host, repo_path = await _submit_git_repo(cluster, model)
+        requested_commit = submission_snapshot.resolve_train_git_commit_override(
+            commit,
+            v.vars,
+        )
+        if host is None:
             status = await submission_snapshot.mlxp_git_status(
-                repo_path=mlxp_submit.mlxp_training_repo_path(model),
+                repo_path=repo_path,
                 repo_label=repo_label,
+                requested_commit=requested_commit,
             )
             if status.error and submission_snapshot.is_mlxp_transport_error(status.error):
                 raise HTTPException(503, status.error)
             return status
 
-        env = await clusters.load_cluster(cluster)
         return await submission_snapshot.slurm_git_status(
-            host=env.ssh_alias,
-            repo_path=submission_snapshot.slurm_training_repo_path(env.vars, model),
+            host=host,
+            repo_path=repo_path,
             repo_label=repo_label,
+            requested_commit=requested_commit,
         )
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/submit/git-commits", response_model=SubmitGitCommitsResponse)
+async def get_submit_git_commits(
+    cluster: str,
+    variant: str,
+    limit: int = 50,
+    selected: str | None = None,
+):
+    try:
+        v = await variants.load_variant(variant)
+        model = training_models.resolve_training_model(v)
+        host, repo_path = await _submit_git_repo(cluster, model)
+        selected_commit = submission_snapshot.resolve_train_git_commit_override(
+            selected,
+            v.vars,
+        )
+        if host is None:
+            commits = await submission_snapshot.mlxp_git_commits(
+                repo_path=repo_path,
+                limit=limit,
+                selected_commit=selected_commit,
+            )
+            return {"commits": commits}
+
+        commits = await submission_snapshot.slurm_git_commits(
+            host=host,
+            repo_path=repo_path,
+            limit=limit,
+            selected_commit=selected_commit,
+        )
+        return {"commits": commits}
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
     except ValueError as e:
@@ -256,6 +331,7 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
     try:
         variant = await variants.load_variant(req.variant)
         model = training_models.resolve_training_model(variant)
+        action_horizon_mode = training_models.action_horizon_mode_for_variant(model, variant)
         job_name = submit.resolve_job_name(req.job_name, req.phase, req.variant)
         train_note = submit.resolve_train_note(req.train_note, variant)
         partition = req.partition
@@ -270,13 +346,9 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
                 model_repo_path = submission_snapshot.slurm_training_repo_path(env.vars, model)
             except ValueError as e:
                 model_repo_error = str(e)
-        elif not node:
-            node = mlxp_config.get_settings().default_node
-            try:
-                model_repo_path = mlxp_submit.mlxp_training_repo_path(model)
-            except ValueError as e:
-                model_repo_error = str(e)
         else:
+            if not node:
+                node = mlxp_config.get_settings().default_node
             try:
                 model_repo_path = mlxp_submit.mlxp_training_repo_path(model)
             except ValueError as e:
@@ -285,9 +357,23 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
         path: str | None = None
         if req.phase == "train":
             train_settings = submit.resolve_train_settings(req, variant, model.family)
-            train_action_horizon = submit.resolve_train_action_horizon(req, variant, model.family)
+            train_action_horizon = submit.resolve_train_action_horizon(
+                req,
+                variant,
+                model,
+                action_horizon_mode,
+            )
+            train_git_commit = submit.resolve_train_git_commit(req, variant)
 
             suffix = submission_snapshot.snapshot_suffix(job_name)
+            train_modality_config = (
+                f"modality_{suffix}.py"
+                if (
+                    training_models.rewrites_modality_action_horizon(action_horizon_mode)
+                    and train_action_horizon is not None
+                )
+                else None
+            )
             if req.cluster == "mlxp":
                 path = f"{mlxp_config.get_settings().experiments_dir}/{req.variant}/config_{suffix}.sh"
             else:
@@ -307,13 +393,15 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
                 train_max_steps=train_settings.max_steps,
                 train_save_steps=train_settings.save_steps,
                 train_action_horizon=train_action_horizon,
+                train_modality_config=train_modality_config,
+                train_git_commit=train_git_commit,
                 train_note=train_note,
                 wandb_project=wandb_project(),
                 git=None,
             )
         elif req.phase == "eval":
             checkpoint_path = submit.require_eval_checkpoint_path(req)
-            eval_sets = submit._normalize_eval_sets(req.eval_sets)
+            eval_sets = submit.normalize_eval_sets(req.eval_sets)
             if req.cluster == "mlxp":
                 suffix = submission_snapshot.snapshot_suffix(job_name)
                 path = f"{mlxp_config.get_settings().experiments_dir}/{req.variant}/config_{suffix}.sh"
@@ -383,6 +471,7 @@ async def post_submit(req: submit.SubmitRequest):
                 max_steps=req.train_max_steps if req.phase == "train" else None,
                 save_steps=req.train_save_steps if req.phase == "train" else None,
                 action_horizon=req.train_action_horizon if req.phase == "train" else None,
+                train_git_commit=req.train_git_commit if req.phase == "train" else None,
                 node=req.node,
                 dataset_override=req.dataset_override,
                 extra_args=req.extra_args,
@@ -453,6 +542,16 @@ async def post_resume_job(cluster: str, job_id: str):
         raise HTTPException(404, str(e))
     except ValueError as e:
         raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/jobs/{cluster}/{job_id}/resumes", response_model=list[jobs.Job])
+async def get_resumed_jobs(cluster: str, job_id: str):
+    try:
+        return await job_resume.list_resumed_jobs(cluster, job_id)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
     except RuntimeError as e:
         raise HTTPException(500, str(e))
 

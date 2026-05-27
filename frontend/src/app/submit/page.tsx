@@ -20,6 +20,7 @@ import {
   type MlxpNode,
   type MlxpSettings,
   type GitStatus,
+  type GitCommitOption,
 } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import {
@@ -39,7 +40,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
-import { ChevronRight } from "lucide-react";
+import { ChevronRight, Loader2 } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
 import {
   Dialog,
@@ -76,12 +77,22 @@ type TrainConfigEdit = {
   maxSteps: string;
   saveSteps: string;
   actionHorizon: string;
+  gitCommit: string;
 };
+type TrainConfigValues = Omit<TrainConfigEdit, "scope">;
 type TrainNoteEdit = {
   scope: string;
   value: string;
 };
 type SubmitStep = "job" | "config" | "modality";
+const TRAIN_CONFIG_FIELDS: readonly (keyof TrainConfigValues)[] = [
+  "numGpus",
+  "batchSize",
+  "maxSteps",
+  "saveSteps",
+  "actionHorizon",
+  "gitCommit",
+] as const;
 
 function buildDefaultJobName(phase: Phase, variant: string): string {
   if (!variant) return "";
@@ -91,6 +102,58 @@ function buildDefaultJobName(phase: Phase, variant: string): string {
     `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}` +
     `_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
   return `${phase}_${variant}_${ts}`;
+}
+
+function ellipsize(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function makeTrainConfigEdit(
+  scope: string,
+  defaults: TrainConfigValues,
+  patch: Partial<TrainConfigValues> = {},
+): TrainConfigEdit {
+  return { scope, ...defaults, ...patch };
+}
+
+function trainConfigHasChanges(
+  edit: TrainConfigEdit | null,
+  defaults: TrainConfigValues,
+): boolean {
+  return (
+    edit !== null &&
+    TRAIN_CONFIG_FIELDS.some((field) => edit[field] !== defaults[field])
+  );
+}
+
+function trainConfigFieldChanged(
+  edit: TrainConfigEdit | null,
+  defaults: TrainConfigValues,
+  field: keyof TrainConfigValues,
+): boolean {
+  return edit !== null && edit[field] !== defaults[field];
+}
+
+function submittedGitCommitValue(
+  phase: Phase,
+  trainConfigEditActive: boolean,
+  gitCommit: string,
+): string | null {
+  if (phase !== "train") return null;
+  const trimmed = gitCommit.trim();
+  return trainConfigEditActive ? trimmed : trimmed || null;
+}
+
+function submitGitQueryParams(
+  cluster: string,
+  variant: string,
+  gitCommit: string,
+  includeCommit: boolean,
+): URLSearchParams {
+  const qs = new URLSearchParams({ cluster, variant });
+  if (includeCommit) qs.set("commit", gitCommit.trim());
+  return qs;
 }
 
 export default function SubmitPage() {
@@ -123,6 +186,7 @@ export default function SubmitPage() {
   const [preflightPending, setPreflightPending] = useState<boolean>(false);
   const [submitStep, setSubmitStep] = useState<SubmitStep>("job");
   const [datasetDialogOpen, setDatasetDialogOpen] = useState<boolean>(false);
+  const [gitCommitDialogOpen, setGitCommitDialogOpen] = useState<boolean>(false);
 
   const changeCluster = (next: string) => {
     setCluster(next);
@@ -281,10 +345,11 @@ export default function SubmitPage() {
     };
     setEvalConfigEdit({ ...base, ...patch, scope: evalConfigScope });
   };
-  const trainConfigDefaults = useMemo(() => {
+  const trainConfigDefaults = useMemo<TrainConfigValues>(() => {
     const vars = variant.data?.vars;
     const numGpus = vars?.TRAIN_NUM_GPUS ?? "2";
-    const model = vars?.MODEL_VERSION ?? "n1.5";
+    const modelId = vars?.MODEL_ID ?? vars?.MODEL_VERSION ?? "n1.5";
+    const model = vars?.MODEL_VERSION ?? (modelId === "physixel" ? "n1.6" : modelId);
     const perGpuBatch = vars?.TRAIN_BATCH_SIZE ?? "";
     const globalBatch =
       vars?.TRAIN_GLOBAL_BATCH_SIZE ?? vars?.GLOBAL_BATCH_SIZE ?? "";
@@ -320,6 +385,7 @@ export default function SubmitPage() {
         (dataInterface.data?.action_horizon != null
           ? String(dataInterface.data.action_horizon)
           : ""),
+      gitCommit: vars?.TRAIN_GIT_COMMIT ?? "",
     };
   }, [variant.data, dataInterface.data?.action_horizon]);
   const activeTrainConfigEdit =
@@ -339,6 +405,10 @@ export default function SubmitPage() {
   const trainActionHorizon = activeTrainConfigEdit
     ? activeTrainConfigEdit.actionHorizon
     : trainConfigDefaults.actionHorizon;
+  const trainGitCommit = activeTrainConfigEdit
+    ? activeTrainConfigEdit.gitCommit
+    : trainConfigDefaults.gitCommit;
+  const trainGitCommitTrimmed = trainGitCommit.trim();
   const trainNumGpusParsed = Number.parseInt(trainNumGpus.trim(), 10);
   const trainBatchSizeParsed = Number.parseInt(
     trainBatchSize.trim(),
@@ -351,7 +421,11 @@ export default function SubmitPage() {
     10,
   );
   const isPositiveInteger = (value: string) => /^[1-9]\d*$/.test(value.trim());
-  const trainModel = variant.data?.vars.MODEL_VERSION ?? "n1.5";
+  const trainModelId =
+    variant.data?.vars.MODEL_ID ?? variant.data?.vars.MODEL_VERSION ?? "n1.5";
+  const trainModel =
+    variant.data?.vars.MODEL_VERSION ??
+    (trainModelId === "physixel" ? "n1.6" : trainModelId);
   const wantsTrainConfig = submitPhase === "train" && !!variantName;
   const trainActionHorizonEnabled = wantsTrainConfig && trainModel === "n1.6";
   const modalityActionHorizon = dataInterface.data?.action_horizon ?? null;
@@ -367,26 +441,24 @@ export default function SubmitPage() {
     !wantsTrainConfig || isPositiveInteger(trainSaveSteps);
   const trainActionHorizonValid =
     !trainActionHorizonEnabled ||
-    (isPositiveInteger(trainActionHorizon) &&
-      (modalityActionHorizon == null ||
-        trainActionHorizonParsed === modalityActionHorizon));
+    isPositiveInteger(trainActionHorizon);
+  const trainGitCommitValid =
+    !wantsTrainConfig ||
+    !trainGitCommitTrimmed ||
+    /^[0-9a-fA-F]{7,40}$/.test(trainGitCommitTrimmed);
   const trainConfigValid =
     trainNumGpusValid &&
     trainBatchSizeValid &&
     trainMaxStepsValid &&
     trainSaveStepsValid &&
-    trainActionHorizonValid;
+    trainActionHorizonValid &&
+    trainGitCommitValid;
   const updateTrainConfig = (
     patch: Partial<Omit<TrainConfigEdit, "scope">>,
   ) => {
-    const base = activeTrainConfigEdit ?? {
-      scope: trainConfigScope,
-      numGpus: trainConfigDefaults.numGpus,
-      batchSize: trainConfigDefaults.batchSize,
-      maxSteps: trainConfigDefaults.maxSteps,
-      saveSteps: trainConfigDefaults.saveSteps,
-      actionHorizon: trainConfigDefaults.actionHorizon,
-    };
+    const base =
+      activeTrainConfigEdit ??
+      makeTrainConfigEdit(trainConfigScope, trainConfigDefaults);
     setTrainConfigEdit({ ...base, ...patch, scope: trainConfigScope });
   };
 
@@ -431,6 +503,22 @@ export default function SubmitPage() {
       : null;
   const submittedTrainActionHorizon =
     trainActionHorizonEnabled ? trainActionHorizonParsed : null;
+  const trainConfigEditActive = activeTrainConfigEdit !== null;
+  const trainGitCommitChanged = trainConfigFieldChanged(
+    activeTrainConfigEdit,
+    trainConfigDefaults,
+    "gitCommit",
+  );
+  const trainOverridesChanged = trainConfigHasChanges(
+    activeTrainConfigEdit,
+    trainConfigDefaults,
+  );
+  const includeGitCommitParam = trainConfigEditActive || !!trainGitCommitTrimmed;
+  const submittedTrainGitCommit = submittedGitCommitValue(
+    submitPhase,
+    trainConfigEditActive,
+    trainGitCommit,
+  );
 
   const buildSubmitBody = (commitDirtyChanges: boolean) => {
     return {
@@ -452,6 +540,7 @@ export default function SubmitPage() {
       train_max_steps: submitPhase === "train" ? trainMaxStepsParsed : null,
       train_save_steps: submitPhase === "train" ? trainSaveStepsParsed : null,
       train_action_horizon: submittedTrainActionHorizon,
+      train_git_commit: submittedTrainGitCommit,
       eval_num_envs_per_gpu: null,
       eval_n_episodes: wantsCheckpoint ? evalNEpisodesParsed : null,
       eval_n_runs: wantsCheckpoint ? evalNRunsParsed : null,
@@ -493,6 +582,7 @@ export default function SubmitPage() {
       trainMaxSteps,
       trainSaveSteps,
       trainActionHorizon,
+      submittedTrainGitCommit,
       evalNEpisodes,
       evalNRuns,
       evalSetValues,
@@ -511,9 +601,14 @@ export default function SubmitPage() {
   });
   const displayedConfigPreview = configPreview.data ?? null;
   const trainGitStatus = useQuery({
-    queryKey: ["submit-git-status", cluster, variantName],
+    queryKey: ["submit-git-status", cluster, variantName, submittedTrainGitCommit],
     queryFn: () => {
-      const qs = new URLSearchParams({ cluster, variant: variantName });
+      const qs = submitGitQueryParams(
+        cluster,
+        variantName,
+        trainGitCommit,
+        includeGitCommitParam,
+      );
       return api<GitStatus>(`/api/submit/git-status?${qs}`);
     },
     enabled:
@@ -526,18 +621,45 @@ export default function SubmitPage() {
     retry: false,
     staleTime: 30_000,
     refetchOnWindowFocus: false,
+    placeholderData: keepPreviousData,
+  });
+  const gitCommitOptions = useQuery({
+    queryKey: [
+      "submit-git-commits",
+      cluster,
+      variantName,
+      trainGitCommitValid ? trainGitCommitTrimmed : "",
+    ],
+    queryFn: () => {
+      const qs = new URLSearchParams({
+        cluster,
+        variant: variantName,
+        limit: "25",
+      });
+      if (trainGitCommitValid && trainGitCommitTrimmed) {
+        qs.set("selected", trainGitCommitTrimmed);
+      }
+      return api<{ commits: GitCommitOption[] }>(`/api/submit/git-commits?${qs}`);
+    },
+    enabled:
+      gitCommitDialogOpen &&
+      submitPhase === "train" &&
+      !!variantName &&
+      !variant.isLoading &&
+      !variantError,
+    retry: false,
+    staleTime: 30_000,
+    refetchOnWindowFocus: false,
   });
   const gitStatusFetchError = trainGitStatus.error as Error | null;
   const modelRepoError =
     configPreview.data?.model_repo_error ?? trainGitStatus.data?.error ?? null;
   const modelRepoMessage =
-    !modelRepoError && trainGitStatus.data
-      ? `Git ${trainGitStatus.data.branch ? `${trainGitStatus.data.branch} @ ` : ""}${
-          trainGitStatus.data.short_commit ?? "unknown"
-        } · ${trainGitStatus.data.dirty ? "uncommitted changes" : "clean"}`
-      : gitStatusFetchError
-        ? "Git status will be checked again when submitting."
-      : null;
+    gitStatusFetchError ? "Git status will be checked again when submitting." : null;
+  const selectedGitCommitValue =
+    trainGitCommitValid
+      ? trainGitCommitTrimmed || trainGitStatus.data?.commit || undefined
+      : undefined;
 
   const submit = useMutation({
     mutationFn: ({ commitDirtyChanges = false }: { commitDirtyChanges?: boolean } = {}) => {
@@ -561,13 +683,18 @@ export default function SubmitPage() {
     }
     setPreflightPending(true);
     try {
-      const qs = new URLSearchParams({ cluster, variant: variantName });
+      const qs = submitGitQueryParams(
+        cluster,
+        variantName,
+        trainGitCommit,
+        includeGitCommitParam,
+      );
       const status = await api<GitStatus>(`/api/submit/git-status?${qs}`);
       if (status.error) {
         toast.error(`Git status failed: ${status.error}`);
         return;
       }
-      if (status.dirty) {
+      if (status.dirty && !trainGitCommitTrimmed) {
         setDirtyGitStatus(status);
         setGitDialogOpen(true);
         return;
@@ -773,20 +900,6 @@ export default function SubmitPage() {
         invalidMessage="Positive integer."
       />
     );
-    if (trainActionHorizonEnabled) {
-      flagEditors["--action-horizon"] = (
-        <NumberCellEditor
-          value={trainActionHorizon}
-          onChange={(value) => updateTrainConfig({ actionHorizon: value })}
-          valid={trainActionHorizonValid}
-          invalidMessage={
-            modalityActionHorizon == null
-              ? "Positive integer."
-              : `Must match modality horizon ${modalityActionHorizon}.`
-          }
-        />
-      );
-    }
   }
   if (wantsCheckpoint) {
     flagEditors["--n-episodes"] = (
@@ -808,18 +921,38 @@ export default function SubmitPage() {
     if (evalSetsEditor) flagEditors["(eval_sets)"] = evalSetsEditor;
   }
   const extraFlagRows: ExtraFlagRow[] = [];
-  if (wantsTrainConfig && activeTrainConfigEdit) {
+  if (wantsTrainConfig) {
+    if (trainActionHorizonEnabled) {
+      extraFlagRows.push({
+        key: "train-action-horizon",
+        flag: "TRAIN_ACTION_HORIZON",
+        value: trainActionHorizon || "(unset)",
+        editor: (
+          <NumberCellEditor
+            value={trainActionHorizon}
+            onChange={(value) => updateTrainConfig({ actionHorizon: value })}
+            valid={trainActionHorizonValid}
+            invalidMessage="Positive integer."
+            hint={
+              modalityActionHorizon != null && trainActionHorizonParsed !== modalityActionHorizon
+                ? `Will stage modality delta_indices=list(range(${trainActionHorizonParsed})).`
+                : undefined
+            }
+          />
+        ),
+      });
+    }
     extraFlagRows.push({
-      key: "reset-train",
-      flag: "train overrides",
-      value: "modified",
+      key: "train-git-commit",
+      flag: "TRAIN_GIT_COMMIT",
+      value: trainGitCommitTrimmed || "(current HEAD)",
       editor: (
         <Button
           variant="outline"
           size="sm"
-          onClick={() => setTrainConfigEdit(null)}
+          onClick={() => setGitCommitDialogOpen(true)}
         >
-          Reset train defaults
+          {trainGitCommitChanged ? "Edit override" : "Override commit"}
         </Button>
       ),
     });
@@ -1120,6 +1253,7 @@ export default function SubmitPage() {
                 effectiveConfigPath={displayedConfigPreview?.path ?? null}
                 modelLabel={displayedConfigPreview?.model_label ?? null}
                 modelRepoPath={displayedConfigPreview?.model_repo_path ?? null}
+                modelGitCommit={trainGitStatus.data?.commit ?? null}
                 modelRepoError={modelRepoError}
                 modelRepoMessage={modelRepoMessage}
                 modelRepoChecking={submitPhase === "train" && trainGitStatus.isLoading}
@@ -1136,14 +1270,24 @@ export default function SubmitPage() {
                 <Button variant="outline" onClick={() => setSubmitStep("job")}>
                   Back to Job
                 </Button>
-                <Button
-                  onClick={() => setSubmitStep("modality")}
-                  disabled={!canReviewConfig}
-                  className="gap-1"
-                >
-                  Review modality.py
-                  <ChevronRight className="h-4 w-4" />
-                </Button>
+                <div className="flex items-center gap-2">
+                  {wantsTrainConfig && trainOverridesChanged && (
+                    <Button
+                      variant="destructiveOutline"
+                      onClick={() => setTrainConfigEdit(null)}
+                    >
+                      Reset defaults
+                    </Button>
+                  )}
+                  <Button
+                    onClick={() => setSubmitStep("modality")}
+                    disabled={!canReviewConfig}
+                    className="gap-1"
+                  >
+                    Review modality.py
+                    <ChevronRight className="h-4 w-4" />
+                  </Button>
+                </div>
               </div>
             </>
           )}
@@ -1222,6 +1366,72 @@ export default function SubmitPage() {
               </Button>
             )}
             <Button onClick={() => setDatasetDialogOpen(false)}>Done</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={gitCommitDialogOpen} onOpenChange={setGitCommitDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Training commit</DialogTitle>
+            <DialogDescription>
+              Set <code>TRAIN_GIT_COMMIT</code> for this training submission.
+              Leave it empty to use the repo HEAD at submit time.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2">
+            <Select
+              value={selectedGitCommitValue}
+              onValueChange={(value) => updateTrainConfig({ gitCommit: value })}
+            >
+              <SelectTrigger className="gap-2">
+                <SelectValue placeholder="select a commit..." />
+                {gitCommitOptions.isFetching && (
+                  <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-slate-400" />
+                )}
+              </SelectTrigger>
+              <SelectContent className="w-[var(--radix-select-trigger-width)] max-w-[var(--radix-select-trigger-width)] min-w-0">
+                {gitCommitOptions.data?.commits.map((commit) => (
+                  <SelectItem
+                    key={commit.commit}
+                    value={commit.commit}
+                    className="w-full max-w-full overflow-hidden"
+                  >
+                    <span className="flex min-w-0 max-w-full items-center gap-2 overflow-hidden">
+                      <span className="shrink-0 font-mono text-xs">
+                        {commit.short_commit}
+                      </span>
+                      <span
+                        className="min-w-0 truncate text-xs text-slate-500"
+                        title={commit.subject}
+                      >
+                        {ellipsize(commit.subject, 40)}
+                      </span>
+                    </span>
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {gitCommitOptions.error && (
+              <ErrorState message={(gitCommitOptions.error as Error).message} />
+            )}
+            {!trainGitCommitValid && (
+              <p className="text-xs text-red-600 dark:text-red-400">
+                The configured TRAIN_GIT_COMMIT is invalid. Pick a commit from
+                the list.
+              </p>
+            )}
+          </div>
+          <DialogFooter>
+            {trainGitCommitTrimmed && (
+              <Button
+                variant="outline"
+                onClick={() => updateTrainConfig({ gitCommit: "" })}
+              >
+                Use current HEAD
+              </Button>
+            )}
+            <Button onClick={() => setGitCommitDialogOpen(false)}>Done</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

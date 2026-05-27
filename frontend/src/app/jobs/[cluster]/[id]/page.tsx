@@ -103,6 +103,7 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
   const canResume = cluster !== "mlxp" && isTimeoutJobState(stateForActions);
   const canCopy = isTrainPhase && isComplete;
   const detailsError = details.error as Error | null;
+  const resumeOf = details.data?.resume_of ?? null;
   const [stream, setStream] = useState<"out" | "err" | "isaac">("out");
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [copyOpen, setCopyOpen] = useState(false);
@@ -128,7 +129,21 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
       <div className="mt-4 flex items-baseline justify-between gap-4">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">
-            Job <span className="font-mono">{id}</span>{" "}
+            Job <span className="font-mono">{id}</span>
+            {resumeOf && (
+              <span className="text-base font-normal text-slate-500">
+                {" "}(resumed from{" "}
+                <Link
+                  href={`/jobs/${encodeURIComponent(cluster)}/${encodeURIComponent(resumeOf)}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="font-mono text-blue-600 hover:underline dark:text-blue-400"
+                >
+                  {resumeOf}
+                </Link>
+                )
+              </span>
+            )}{" "}
             <span className="text-slate-400">·</span>{" "}
             <span className="text-slate-500">{cluster}</span>
           </h1>
