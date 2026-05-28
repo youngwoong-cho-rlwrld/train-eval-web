@@ -26,7 +26,7 @@ import time
 import uuid
 from pathlib import Path
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .clusters import load_cluster
 from .details import get_details, resolve_phase_and_variant
@@ -34,7 +34,7 @@ from .jobs import get_job
 from .kubectl_errors import is_completed_pod_exec_error
 from .mlxp_config import get_settings
 from .mlxp_data_pod import ensure_listing_pod, invalidate_pods_cache
-from .remote_paths import remote_path_exists
+from .remote_paths import expand_cluster_home, remote_path_exists
 from .ssh import ssh_run, _CM_OPTS
 from .submission_snapshot import is_mlxp_transport_error
 
@@ -82,7 +82,7 @@ class CopyCheckpointRequest(BaseModel):
     dest_path_root: str | None = None
     # Explicit list of source checkpoint paths to copy. Empty → fall back to
     # auto-picking the latest under this job's dir.
-    sources: list[str] = []
+    sources: list[str] = Field(default_factory=list)
     delete_source: bool = False
 
 
@@ -247,7 +247,7 @@ done
             result.append(CheckpointEntry(
                 path=path, job_name=job_name, step=int(step),
             ))
-        return result
+        return _dedupe_checkpoints(result)
 
     # slurm — prefer the exact path resolved for this job, then probe both
     # known roots for the normalized variant. Include one-level nested
@@ -292,6 +292,18 @@ def _parse_paths(stdout: str, *, nested: bool, fallback_job: str = "") -> list[C
         parent = line.rsplit("/", 2)[1] if "/" in line else ""
         job_name = parent if (nested or parent != "checkpoints") else fallback_job
         out.append(CheckpointEntry(path=line, job_name=job_name, step=step))
+    return _dedupe_checkpoints(out)
+
+
+def _dedupe_checkpoints(rows: list[CheckpointEntry]) -> list[CheckpointEntry]:
+    seen: set[str] = set()
+    out: list[CheckpointEntry] = []
+    for row in rows:
+        key = row.path.rstrip("/")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
     return out
 
 
@@ -318,10 +330,16 @@ async def list_checkpoint_copies(cluster: str, job_id: str) -> list[CheckpointCo
 
     async def enrich(record: CheckpointCopyRecord) -> CheckpointCopyRecord:
         values = record.model_dump()
+        source_path = await expand_cluster_home(record.source_cluster, record.source_path)
+        dest_path = await expand_cluster_home(record.dest_cluster, record.dest_path)
+        if source_path:
+            values["source_path"] = source_path
+        if dest_path:
+            values["dest_path"] = dest_path
         values["source_exists"] = await remote_path_exists(
-            record.source_cluster, record.source_path,
+            record.source_cluster, values["source_path"],
         )
-        values["dest_exists"] = await remote_path_exists(record.dest_cluster, record.dest_path)
+        values["dest_exists"] = await remote_path_exists(record.dest_cluster, values["dest_path"])
         return CheckpointCopyRecord(**values)
 
     enriched = await asyncio.gather(*(enrich(r) for r in records))
@@ -413,6 +431,7 @@ async def start_copy(
             dest_path_root = f"{get_settings().experiments_dir}/{variant}/checkpoints"
         else:
             dest_path_root = f"$HOME/.train-eval-web/experiments/{variant}/checkpoints"
+    dest_path_root = await expand_cluster_home(dest_cluster, dest_path_root) or dest_path_root
 
     copy_id = uuid.uuid4().hex[:12]
     _COPY_JOBS[copy_id] = CopyJobStatus(
@@ -505,6 +524,7 @@ async def _run_copy(
     try:
         for i, src_path in enumerate(sources):
             src_path = await _resolve_model_source_path(src_cluster, src_path)
+            src_path = await expand_cluster_home(src_cluster, src_path) or src_path
             leaf = Path(src_path).name
             dest_path = f"{dest_path_root.rstrip('/')}/{leaf}"
             state.current_source = src_path

@@ -291,6 +291,7 @@ export type JobDetails = {
   phase: "train" | "resume" | "eval" | "unknown";
   variant: string | null;
   resume_of: string | null;
+  train_note: string | null;
   state: string;
   elapsed: string;
   wandb_project: string | null;
@@ -368,6 +369,8 @@ export type ResultVariant = {
   cluster: string;
   job_id?: string | null;
   job_name?: string | null;
+  checkpoint_job_id?: string | null;
+  checkpoint_job_name?: string | null;
   variant: string;
   experiment?: string | null;
   model_version?: string | null;

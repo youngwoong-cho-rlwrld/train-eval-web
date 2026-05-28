@@ -241,6 +241,7 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
         req.wandb_secret or settings.wandb_secret,
         node,
         _job_comment(req, variant, snapshot),
+        train_note,
         settings,
     )
     yaml_text = yaml.safe_dump(spec, sort_keys=False)
@@ -1055,7 +1056,7 @@ def _job_comment(req: MlxpSubmitRequest, variant, snapshot: dict) -> str:
 
 
 def _render_job_yaml(job_id: str, job_name: str, body: str, num_gpus: int, cpu: str, mem: str,
-                     wandb_secret: str, node: str, comment: str,
+                     wandb_secret: str, node: str, comment: str, train_note: str,
                      settings: MlxpSettings) -> dict:
     return {
         "apiVersion": "batch/v1",
@@ -1072,6 +1073,7 @@ def _render_job_yaml(job_id: str, job_name: str, body: str, num_gpus: int, cpu: 
             "annotations": {
                 "train-eval-web/display-name": job_name,
                 "train-eval-web/comment": comment,
+                "train-eval-web/train-note": train_note,
             },
         },
         "spec": {

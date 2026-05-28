@@ -221,10 +221,17 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
             </div>
           )}
           {details.data && (
-            <div className="mt-1 flex items-center gap-2 text-sm text-slate-600 dark:text-slate-400">
-              <Badge variant={phase === "eval" ? "outline" : "default"}>{phase ?? "unknown"}</Badge>
-              {details.data.variant && (
-                <span className="font-mono text-xs">{details.data.variant}</span>
+            <div className="mt-1 space-y-1">
+              <div className="flex items-center gap-2 text-sm text-slate-600 dark:text-slate-400">
+                <Badge variant={phase === "eval" ? "outline" : "default"}>{phase ?? "unknown"}</Badge>
+                {details.data.variant && (
+                  <span className="font-mono text-xs">{details.data.variant}</span>
+                )}
+              </div>
+              {details.data.train_note && (
+                <div className="max-w-3xl text-sm text-slate-600 dark:text-slate-400">
+                  {details.data.train_note}
+                </div>
               )}
             </div>
           )}

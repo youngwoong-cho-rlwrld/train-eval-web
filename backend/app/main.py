@@ -368,6 +368,7 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
                 path = f"{mlxp_config.get_settings().experiments_dir}/{req.variant}/config_{suffix}.sh"
             else:
                 path = f"$HOME/{CLUSTER_STAGING_REL}/experiments/{req.variant}/config_{suffix}.sh"
+                path = await remote_paths.expand_cluster_home(req.cluster, path) or path
             text = submission_snapshot.render_training_config_snapshot(
                 base_config=variant.raw,
                 variant=req.variant,

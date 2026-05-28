@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useMutation, useQuery, type UseQueryResult } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
@@ -98,6 +98,10 @@ export function CopyCheckpointDialog({
 
   const clusterOptions = Array.isArray(clusters.data) ? clusters.data : [];
   const options = clusterOptions.filter((c) => c !== cluster);
+  const checkpointOptions = useMemo(
+    () => dedupeCheckpoints(checkpoints.data ?? []),
+    [checkpoints.data],
+  );
 
   function toggle(path: string) {
     const next = new Set(selected);
@@ -128,12 +132,12 @@ export function CopyCheckpointDialog({
             {checkpoints.error && (
               <ErrorState message={(checkpoints.error as Error).message} />
             )}
-            {checkpoints.data && checkpoints.data.length === 0 && (
+            {checkpoints.data && checkpointOptions.length === 0 && (
               <EmptyState message="No checkpoints found for this experiment." />
             )}
-            {checkpoints.data && checkpoints.data.length > 0 && (
+            {checkpoints.data && checkpointOptions.length > 0 && (
               <div className="max-h-56 min-w-0 overflow-hidden overflow-y-auto rounded-md border border-slate-200 dark:border-slate-800">
-                {checkpoints.data.map((c) => (
+                {checkpointOptions.map((c) => (
                   <label
                     key={c.path}
                     className="grid min-w-0 cursor-pointer grid-cols-[auto_auto_minmax(0,1fr)] items-center gap-2 border-b border-slate-100 px-3 py-1.5 text-xs last:border-0 hover:bg-slate-50 dark:border-slate-900 dark:hover:bg-slate-900/40"
@@ -218,6 +222,16 @@ export function CopyCheckpointDialog({
       </DialogContent>
     </Dialog>
   );
+}
+
+function dedupeCheckpoints(rows: CheckpointEntry[]) {
+  const seen = new Set<string>();
+  return rows.filter((row) => {
+    const key = row.path.replace(/\/+$/, "");
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function PreviousCopies({

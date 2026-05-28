@@ -171,6 +171,7 @@ function resultVariantMatchesName(variant: ResultVariant, filter: string) {
     variant.experiment ?? "",
     variant.note ?? "",
     variant.checkpoint ?? "",
+    variant.checkpoint_job_name ?? "",
     variant.source ?? "",
   ].join(" ").toLowerCase().includes(needle);
 }
@@ -187,7 +188,7 @@ function ResultSection({ title, variants }: { title: string; variants: ResultVar
       <div className="space-y-5">
         {variants.map((variant) => (
           <ResultCard
-            key={`${variant.cluster}-${variant.variant}-${variant.experiment ?? variant.source ?? ""}`}
+            key={resultVariantKey(variant)}
             variant={variant}
           />
         ))}
@@ -200,6 +201,7 @@ function ResultCard({ variant }: { variant: ResultVariant }) {
   const evalSets = evalSetColumns(variant.tasks);
   const nRuns = variant.n_runs ?? maxExpectedRuns(variant.tasks);
   const nEpisodes = variant.n_episodes ?? maxEpisodeCount(variant.tasks);
+  const checkpointJobHref = jobDetailHref(variant.cluster, variant.checkpoint_job_id);
 
   return (
     <Card>
@@ -209,7 +211,7 @@ function ResultCard({ variant }: { variant: ResultVariant }) {
             <ResultTitle variant={variant} />
           </CardTitle>
           <CardDescription className="mt-1">
-            {[variant.note, variant.experiment].filter(Boolean).join(" / ") || "eval results"}
+            {variant.note || "eval results"}
           </CardDescription>
         </div>
         <div className="flex shrink-0 flex-wrap justify-end gap-2">
@@ -251,7 +253,12 @@ function ResultCard({ variant }: { variant: ResultVariant }) {
         </div>
         <div className="mt-4 grid gap-2 text-xs text-slate-500 dark:text-slate-400 md:grid-cols-2">
           {variant.checkpoint && (
-            <Meta label="checkpoint" value={basename(variant.checkpoint)} title={variant.checkpoint} />
+            <Meta
+              label="checkpoint"
+              value={basename(variant.checkpoint)}
+              title={variant.checkpoint_job_name ? `Open ${variant.checkpoint_job_name}` : variant.checkpoint}
+              href={checkpointJobHref}
+            />
           )}
           {variant.source && (
             <Meta label="source" value={basename(variant.source)} title={variant.source} />
@@ -272,7 +279,7 @@ function ResultTitle({ variant }: { variant: ResultVariant }) {
   if (!variant.job_id) return variant.variant;
   return (
     <Link
-      href={`/jobs/${encodeURIComponent(variant.cluster)}/${encodeURIComponent(variant.job_id)}`}
+      href={jobDetailHref(variant.cluster, variant.job_id)!}
       target="_blank"
       rel="noreferrer"
       className="inline-flex max-w-full items-center gap-1.5 text-blue-600 hover:underline dark:text-blue-400"
@@ -282,6 +289,22 @@ function ResultTitle({ variant }: { variant: ResultVariant }) {
       <ExternalLink className="h-3.5 w-3.5 shrink-0" />
     </Link>
   );
+}
+
+function resultVariantKey(variant: ResultVariant) {
+  return [
+    variant.cluster,
+    variant.variant,
+    variant.source,
+    variant.experiment,
+    variant.job_id,
+    variant.checkpoint,
+  ].filter(Boolean).join(":");
+}
+
+function jobDetailHref(cluster: string, jobId?: string | null) {
+  if (!jobId) return undefined;
+  return `/jobs/${encodeURIComponent(cluster)}/${encodeURIComponent(jobId)}`;
 }
 
 function CopyResultTableButton({
@@ -386,12 +409,25 @@ function ResultCellView({ cell }: { cell?: ResultCell }) {
   );
 }
 
-function Meta({ label, value, title }: { label: string; value: string; title?: string }) {
+function Meta({ label, value, title, href }: { label: string; value: string; title?: string; href?: string }) {
+  const body = href ? (
+    <Link
+      href={href}
+      target="_blank"
+      rel="noreferrer"
+      className="font-mono text-blue-600 hover:underline dark:text-blue-400"
+    >
+      {value}
+    </Link>
+  ) : (
+    <span className="font-mono">{value}</span>
+  );
+
   return (
     <div className="min-w-0">
       <span className="mr-1 text-slate-400">{label}:</span>
       <ImmediateTooltip content={title ?? value}>
-        <span className="font-mono">{value}</span>
+        {body}
       </ImmediateTooltip>
     </div>
   );

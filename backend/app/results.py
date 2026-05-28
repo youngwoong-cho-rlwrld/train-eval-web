@@ -8,7 +8,7 @@ import json
 import shlex
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from . import variants
 from .clusters import load_cluster, list_clusters
@@ -21,8 +21,8 @@ class ResultCell(BaseModel):
     mean_success_rate: float | None
     std_success_rate: float | None
     per_run_success_rate: list[float]
-    success_counts: list[int | None] = []
-    episode_counts: list[int | None] = []
+    success_counts: list[int | None] = Field(default_factory=list)
+    episode_counts: list[int | None] = Field(default_factory=list)
     completed_runs: int
     expected_runs: int | None = None
     source: str | None = None
@@ -32,13 +32,15 @@ class ResultTask(BaseModel):
     task: str
     task_name: str | None = None
     instruction: str | None = None
-    eval_sets: list[ResultCell]
+    eval_sets: list[ResultCell] = Field(default_factory=list)
 
 
 class ResultVariant(BaseModel):
     cluster: str
     job_id: str | None = None
     job_name: str | None = None
+    checkpoint_job_id: str | None = None
+    checkpoint_job_name: str | None = None
     variant: str
     experiment: str | None = None
     model_version: str | None = None
@@ -49,7 +51,7 @@ class ResultVariant(BaseModel):
     num_envs_per_gpu: int | None = None
     total_num_envs: int | None = None
     source: str | None = None
-    tasks: list[ResultTask]
+    tasks: list[ResultTask] = Field(default_factory=list)
 
 
 class ClusterResultError(BaseModel):
@@ -60,7 +62,7 @@ class ClusterResultError(BaseModel):
 class ResultsResponse(BaseModel):
     clusters: list[str]
     variants: list[ResultVariant]
-    errors: list[ClusterResultError] = []
+    errors: list[ClusterResultError] = Field(default_factory=list)
 
 
 async def list_results(cluster: str | None = None) -> ResultsResponse:
@@ -409,10 +411,47 @@ def add_job_name_index(index, info):
         index[job_name] = info
 
 
-def add_variant_job_index(index, variant, info):
-    variant = (variant or "").strip()
-    if variant:
-        index[variant] = info
+def add_checkpoint_index_entry(index, key, info):
+    key = path_key(key)
+    if not key:
+        return
+    index[key] = info
+    leaf = Path(key).name
+    if leaf:
+        index[leaf] = info
+
+
+def job_info_from_meta(job_id, meta):
+    return {
+        "job_id": str(job_id),
+        "job_name": meta.get("job_name") or str(job_id),
+        "train_note": meta.get("train_note"),
+    }
+
+
+def add_eval_job_indexes(path_index, name_index, info, meta):
+    add_job_name_index(name_index, info)
+    add_job_index_entry(path_index, meta.get("eval_dir"), info)
+    add_job_index_entry(path_index, meta.get("results_path"), info)
+    if meta.get("variant") and meta.get("output_namespace"):
+        add_job_index_entry(
+            path_index,
+            experiments_root / meta["variant"] / "eval_results" / meta["output_namespace"],
+            info,
+        )
+
+
+def add_checkpoint_job_indexes(checkpoint_index, info, meta):
+    add_checkpoint_index_entry(checkpoint_index, meta.get("checkpoint_dir"), info)
+    add_checkpoint_index_entry(checkpoint_index, meta.get("output_namespace"), info)
+
+
+def add_job_indexes(path_index, name_index, checkpoint_index, info, meta):
+    phase = meta.get("phase")
+    if phase in ("train", "resume"):
+        add_checkpoint_job_indexes(checkpoint_index, info, meta)
+    elif phase == "eval":
+        add_eval_job_indexes(path_index, name_index, info, meta)
 
 
 def parse_sidecar_meta(path):
@@ -431,26 +470,14 @@ def parse_sidecar_meta(path):
 def load_result_job_index():
     path_index = {}
     name_index = {}
-    variant_index = {}
+    checkpoint_index = {}
 
     job_meta_root = Path.home() / staging_rel / "jobs"
     job_meta_paths = sorted(job_meta_root.glob("*.meta")) if job_meta_root.exists() else []
     for path in job_meta_paths:
         meta = parse_sidecar_meta(path)
-        if meta.get("phase") != "eval":
-            continue
-        job_id = path.stem
-        info = {"job_id": job_id, "job_name": meta.get("job_name") or job_id}
-        add_job_name_index(name_index, info)
-        add_variant_job_index(variant_index, meta.get("variant"), info)
-        add_job_index_entry(path_index, meta.get("eval_dir"), info)
-        add_job_index_entry(path_index, meta.get("results_path"), info)
-        if meta.get("variant") and meta.get("output_namespace"):
-            add_job_index_entry(
-                path_index,
-                experiments_root / meta["variant"] / "eval_results" / meta["output_namespace"],
-                info,
-            )
+        info = job_info_from_meta(path.stem, meta)
+        add_job_indexes(path_index, name_index, checkpoint_index, info, meta)
 
     snapshot_meta_paths = sorted(experiments_root.glob("*/config_*.meta.json")) if experiments_root.exists() else []
     for path in snapshot_meta_paths:
@@ -458,24 +485,15 @@ def load_result_job_index():
             meta = read_json(path)
         except Exception:
             continue
-        if meta.get("phase") != "eval" or not meta.get("job_id"):
+        if not meta.get("job_id"):
             continue
-        info = {"job_id": str(meta["job_id"]), "job_name": meta.get("job_name") or str(meta["job_id"])}
-        add_job_name_index(name_index, info)
-        add_variant_job_index(variant_index, meta.get("variant"), info)
-        add_job_index_entry(path_index, meta.get("eval_dir"), info)
-        add_job_index_entry(path_index, meta.get("results_path"), info)
-        if meta.get("variant") and meta.get("output_namespace"):
-            add_job_index_entry(
-                path_index,
-                experiments_root / meta["variant"] / "eval_results" / meta["output_namespace"],
-                info,
-            )
+        info = job_info_from_meta(meta["job_id"], meta)
+        add_job_indexes(path_index, name_index, checkpoint_index, info, meta)
 
-    return path_index, name_index, variant_index
+    return path_index, name_index, checkpoint_index
 
 
-def result_job_info(eval_root, top_path, job_name=None, variant_name=None):
+def result_job_info(eval_root, top_path, job_name=None):
     for candidate in (top_path, eval_root):
         info = job_path_index.get(path_key(candidate))
         if info:
@@ -484,9 +502,40 @@ def result_job_info(eval_root, top_path, job_name=None, variant_name=None):
         info = job_name_index.get(job_name)
         if info:
             return info
-    if variant_name:
-        return job_variant_index.get(variant_name)
     return None
+
+
+def apply_job_info(result, info):
+    if not info:
+        return
+    result["job_id"] = info.get("job_id")
+    result["job_name"] = info.get("job_name")
+    train_note = str(info.get("train_note") or "").strip()
+    if train_note:
+        result["note"] = train_note
+
+
+def checkpoint_job_info(checkpoint):
+    checkpoint = path_key(checkpoint)
+    if not checkpoint:
+        return None
+    candidates = [checkpoint, Path(checkpoint).name]
+    parent = Path(checkpoint).parent
+    if Path(checkpoint).name.startswith("checkpoint-"):
+        candidates.extend([str(parent), parent.name])
+    for candidate in candidates:
+        info = checkpoint_index.get(path_key(candidate) or candidate)
+        if info:
+            return info
+    return None
+
+
+def apply_checkpoint_job_info(result):
+    info = checkpoint_job_info(result.get("checkpoint"))
+    if not info:
+        return
+    result["checkpoint_job_id"] = info.get("job_id")
+    result["checkpoint_job_name"] = info.get("job_name")
 
 
 def run_path_key(path):
@@ -511,7 +560,7 @@ def instruction_for(short, configured_tasks, fallback=None):
     return fallback
 
 
-def build_variant_from_root(meta, exp_dir, eval_root, top_path):
+def build_variant_from_root(meta, eval_root, top_path):
     variant = meta["variant"]
     configured_tasks = meta.get("tasks") or []
     configured_eval_sets = meta.get("eval_sets") or []
@@ -528,6 +577,8 @@ def build_variant_from_root(meta, exp_dir, eval_root, top_path):
         "cluster": cluster,
         "job_id": None,
         "job_name": None,
+        "checkpoint_job_id": None,
+        "checkpoint_job_name": None,
         "variant": variant,
         "experiment": None,
         "model_version": meta.get("model_version"),
@@ -540,10 +591,8 @@ def build_variant_from_root(meta, exp_dir, eval_root, top_path):
         "source": str(top_path) if top_path.exists() else str(eval_root),
         "tasks": [],
     }
-    job_info = result_job_info(eval_root, top_path, variant_name=variant)
-    if job_info:
-        result["job_id"] = job_info.get("job_id")
-        result["job_name"] = job_info.get("job_name")
+    job_info = result_job_info(eval_root, top_path)
+    apply_job_info(result, job_info)
     if top:
         result.update({
             "experiment": top.get("experiment") or top.get("experiment_name"),
@@ -555,12 +604,11 @@ def build_variant_from_root(meta, exp_dir, eval_root, top_path):
             "num_envs_per_gpu": int_or_none(top.get("num_envs_per_gpu")),
             "total_num_envs": int_or_none(top.get("total_num_envs")),
         })
+        apply_job_info(result, job_info)
         expected_runs = result["n_runs"]
         if not result["job_id"]:
-            job_info = result_job_info(eval_root, top_path, result.get("experiment"), variant)
-            if job_info:
-                result["job_id"] = job_info.get("job_id")
-                result["job_name"] = job_info.get("job_name")
+            job_info = result_job_info(eval_root, top_path, result.get("experiment"))
+            apply_job_info(result, job_info)
         if isinstance(top.get("tasks"), dict):
             for short, task_data in sorted(top["tasks"].items()):
                 cells = cells_from_aggregate(
@@ -595,6 +643,7 @@ def build_variant_from_root(meta, exp_dir, eval_root, top_path):
     if not eval_root.exists():
         if aggregate_tasks:
             result["tasks"] = aggregate_tasks
+            apply_checkpoint_job_info(result)
             return result
         return None
 
@@ -625,9 +674,11 @@ def build_variant_from_root(meta, exp_dir, eval_root, top_path):
 
     if result["tasks"]:
         result["source"] = str(eval_root)
+        apply_checkpoint_job_info(result)
         return result
     if aggregate_tasks:
         result["tasks"] = aggregate_tasks
+        apply_checkpoint_job_info(result)
         return result
     return None
 
@@ -646,13 +697,13 @@ def build_variant(meta):
     if eval_root.exists():
         for run_root in sorted(p for p in eval_root.iterdir() if p.is_dir()):
             top_path = run_root / "results.json"
-            item = build_variant_from_root(meta, exp_dir, run_root, top_path)
+            item = build_variant_from_root(meta, run_root, top_path)
             if item:
                 rows.append(item)
 
     # Legacy layout: all eval runs directly under <variant>/eval_results and
     # aggregate at <variant>/results.json.
-    legacy_item = build_variant_from_root(meta, exp_dir, eval_root, exp_dir / "results.json")
+    legacy_item = build_variant_from_root(meta, eval_root, exp_dir / "results.json")
     if legacy_item:
         legacy_source = legacy_item.get("source") or ""
         duplicate_new_source = "/eval_results/" in legacy_source and legacy_source.endswith("/results.json")
@@ -662,7 +713,7 @@ def build_variant(meta):
 
 
 rows = []
-job_path_index, job_name_index, job_variant_index = load_result_job_index()
+job_path_index, job_name_index, checkpoint_index = load_result_job_index()
 for meta in payload:
     rows.extend(build_variant(meta))
 print(json.dumps(rows))

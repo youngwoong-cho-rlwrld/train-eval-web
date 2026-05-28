@@ -378,6 +378,7 @@ done
             "job_name": job_name,
             "output_namespace": output_namespace,
             "variant": str(meta.get("variant") or variant),
+            "train_note": str(meta.get("train_note") or ""),
             "start": start_iso or "",
             "end": end_iso or "",
             "elapsed": _elapsed(start_iso, end_iso),
@@ -469,10 +470,12 @@ async def get_job(name: str) -> dict[str, Any]:
     annotations = ((job_data.get("metadata") or {}).get("annotations") or {})
     job_name = annotations.get("train-eval-web/display-name") or name
     job_comment = annotations.get("train-eval-web/comment") or ""
+    train_note = annotations.get("train-eval-web/train-note") or ""
     return {
         "JobID": name,
         "JobName": job_name,
         "JobComment": job_comment,
+        "JobTrainNote": train_note,
         "Partition": "mlxp",
         "State": state,
         "ExitCode": exit_code,
@@ -677,6 +680,7 @@ async def _archived_record(name: str) -> dict[str, Any] | None:
     return {
         "JobID": archived["job_id"],
         "JobName": archived["job_name"],
+        "JobTrainNote": archived.get("train_note", ""),
         "JobComment": (
             f"phase=train;variant={archived['variant']};"
             f"output_namespace={archived['output_namespace']}"

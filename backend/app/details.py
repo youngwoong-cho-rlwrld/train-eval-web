@@ -33,6 +33,7 @@ from .job_identity import (
 from .jobs import get_job
 from .mlxp_config import get_settings
 from .paths import CLUSTER_STAGING_REL
+from .remote_paths import expand_cluster_home, expand_home_path, remote_home
 from .submission_snapshot import SubmitGitInfo, render_training_config_snapshot
 from .ssh import ssh_run
 from .slurm_meta import read_slurm_meta
@@ -129,6 +130,7 @@ class JobDetails(BaseModel):
     phase: str            # "train" | "resume" | "eval" | "unknown"
     variant: str | None
     resume_of: str | None = None
+    train_note: str | None = None
     state: str
     elapsed: str
     wandb_project: str | None = None
@@ -333,6 +335,7 @@ async def get_details(
             pod_name=sacct.get("_pod_name") or None,
             node=sacct.get("NodeList") or None,
             job_comment=sacct.get("JobComment") or None,
+            train_note=sacct.get("JobTrainNote") or None,
         )
 
     assert env is not None
@@ -399,7 +402,12 @@ async def get_details(
         slurm_meta.get("eval_dir")
         or (f"{exp_dir_remote}/eval_results" if phase == "eval" else None)
     )
+    home = await remote_home(cluster)
+    exp_dir_remote = expand_home_path(exp_dir_remote, home) or exp_dir_remote
+    ckpt_dir = expand_home_path(ckpt_dir, home)
+    eval_dir = expand_home_path(eval_dir, home)
     submitted_eval_checkpoint = slurm_meta.get("checkpoint_path") or None
+    submitted_eval_checkpoint = expand_home_path(submitted_eval_checkpoint, home)
     eval_checkpoint_task = (
         asyncio.create_task(_resolve_eval_checkpoint(
             env.ssh_alias,
@@ -454,11 +462,13 @@ async def get_details(
     eval_checkpoint = submitted_eval_checkpoint or (
         await eval_checkpoint_task if eval_checkpoint_task else None
     )
+    eval_checkpoint = expand_home_path(eval_checkpoint, home)
     isaac_logs_glob = (
         f"{slurm_meta.get('job_log_dir')}/server_*.log"
         if phase == "eval" and slurm_meta.get("job_log_dir")
         else (f"{exp_dir_remote}/logs/{job_id}/server_*.log" if phase == "eval" else None)
     )
+    isaac_logs_glob = expand_home_path(isaac_logs_glob, home)
     paths = Paths(
         stdout=stdout_path,
         stderr=stderr_path,
@@ -477,6 +487,7 @@ async def get_details(
             env.ssh_alias,
             slurm_meta,
             config_snapshot,
+            cluster=cluster,
             variant=variant,
         )
     job_wandb_project = (
@@ -505,6 +516,7 @@ async def get_details(
     return JobDetails(
         cluster=cluster, job_id=job_id, job_name=job_name,
         phase=phase, variant=variant, resume_of=slurm_meta.get("resume_of") or None,
+        train_note=slurm_meta.get("train_note") or None,
         state=state, elapsed=elapsed,
         wandb_project=job_wandb_project,
         wandb_url=wandb_url, paths=paths, progress=progress, gpu=gpu,
@@ -610,11 +622,15 @@ async def _mlxp_details(
     pod_name: str | None = None,
     node: str | None = None,
     job_comment: str | None = None,
+    train_note: str | None = None,
 ) -> JobDetails:
     """MLXP runs train via `kubectl apply` on a pod. All paths live on DDN."""
     settings = get_settings()
     exp_dir = f"{settings.experiments_dir}/{variant}" if variant else settings.experiments_dir
     metadata = _metadata_fields(job_comment)
+    train_note = train_note or metadata.get("train_note") or None
+    if not train_note and not include_progress:
+        train_note = await _mlxp_train_note_from_metadata(metadata)
     output_namespace = metadata.get("output_namespace") or None
     ckpt_dir = (
         metadata.get("checkpoint_dir")
@@ -684,6 +700,7 @@ async def _mlxp_details(
     return JobDetails(
         cluster="mlxp", job_id=job_id, job_name=job_name,
         phase=phase, variant=variant, resume_of=metadata.get("resume_of") or None,
+        train_note=train_note,
         state=state, elapsed=elapsed,
         wandb_project=job_wandb_project,
         wandb_url=wandb_url, paths=paths, progress=progress, gpu=gpu,
@@ -743,16 +760,22 @@ async def _slurm_config_snapshot(
     if extra_args_path is None and extra_args_rel:
         extra_args_path = f"$HOME/{extra_args_rel}"
 
+    home = await remote_home(cluster) if cluster else None
+    display_path = expand_home_path(path, home)
+    display_meta_path = expand_home_path(meta_path, home)
+    display_extra_args_path = expand_home_path(extra_args_path, home)
+    display_git_repo_path = expand_home_path(meta.get("submit_git_repo_path"), home)
+
     return ConfigSnapshot(
-        path=path,
-        meta_path=meta_path,
+        path=display_path,
+        meta_path=display_meta_path,
         text=text,
-        extra_args_path=extra_args_path,
+        extra_args_path=display_extra_args_path,
         extra_args=extra_args,
         wandb_project=meta.get("wandb_project")
         or meta.get("submit_wandb_project")
         or _snapshot_wandb_project(text),
-        git_repo_path=meta.get("submit_git_repo_path") or None,
+        git_repo_path=display_git_repo_path or None,
         git_repo_label=meta.get("submit_git_repo_label") or None,
         git_branch=meta.get("submit_git_branch") or None,
         git_commit=meta.get("submit_git_commit") or None,
@@ -840,6 +863,7 @@ async def _slurm_data_interface_snapshot(
     meta: dict[str, str],
     config_snapshot: ConfigSnapshot | None,
     *,
+    cluster: str,
     variant: str | None,
 ) -> DataInterfaceSummary | None:
     if not variant:
@@ -854,17 +878,18 @@ async def _slurm_data_interface_snapshot(
             error="TRAIN_MODALITY_CONFIG is set, but the submitted config snapshot path is unavailable",
         )
     text = await _slurm_optional_text(host, path, None)
+    display_path = expand_home_path(path, await remote_home(cluster))
     if text is None:
         return DataInterfaceSummary(
             variant=variant,
             source=source,
-            path=path,
-            error=f"modality.py not found on cluster: {path}",
+            path=display_path,
+            error=f"modality.py not found on cluster: {display_path}",
         )
     return summarize_data_interface_text(
         variant_name=variant,
         source=source,
-        path=path,
+        path=display_path,
         text=text,
     )
 
@@ -960,15 +985,18 @@ async def _mlxp_config_snapshot(meta: dict[str, str]) -> ConfigSnapshot | None:
     meta_path = meta.get("config_snapshot_meta_path")
 
     text, error = await _mlxp_read_file(path)
+    display_path = await expand_cluster_home("mlxp", path)
+    display_meta_path = await expand_cluster_home("mlxp", meta_path)
+    display_git_repo_path = await expand_cluster_home("mlxp", meta.get("submit_git_repo_path"))
 
     return ConfigSnapshot(
-        path=path,
-        meta_path=meta_path,
+        path=display_path,
+        meta_path=display_meta_path,
         text=text,
         wandb_project=meta.get("wandb_project")
         or meta.get("submit_wandb_project")
         or _snapshot_wandb_project(text),
-        git_repo_path=meta.get("submit_git_repo_path") or None,
+        git_repo_path=display_git_repo_path or None,
         git_repo_label=meta.get("submit_git_repo_label") or None,
         git_branch=meta.get("submit_git_branch") or None,
         git_commit=meta.get("submit_git_commit") or None,
@@ -976,6 +1004,23 @@ async def _mlxp_config_snapshot(meta: dict[str, str]) -> ConfigSnapshot | None:
         git_committed_dirty=_meta_bool(meta.get("submit_git_committed_dirty")),
         error=error,
     )
+
+
+async def _mlxp_train_note_from_metadata(meta: dict[str, str]) -> str | None:
+    meta_path = meta.get("config_snapshot_meta_path")
+    if not meta_path:
+        return None
+    text, _ = await _mlxp_read_file(meta_path)
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    note = data.get("train_note")
+    if isinstance(note, str) and note.strip():
+        return note.strip()
+    return None
 
 
 async def _mlxp_data_interface_snapshot(
@@ -996,17 +1041,18 @@ async def _mlxp_data_interface_snapshot(
             error="TRAIN_MODALITY_CONFIG is set, but the submitted config snapshot path is unavailable",
         )
     text, _ = await _mlxp_read_file(path)
+    display_path = await expand_cluster_home("mlxp", path)
     if text is None:
         return DataInterfaceSummary(
             variant=variant,
             source=source,
-            path=path,
-            error=f"modality.py not found on MLXP: {path}",
+            path=display_path,
+            error=f"modality.py not found on MLXP: {display_path}",
         )
     return summarize_data_interface_text(
         variant_name=variant,
         source=source,
-        path=path,
+        path=display_path,
         text=text,
     )
 
@@ -1849,12 +1895,11 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
         completed = 0
         active_eps = 0
         job_completed_runs = 0
-        artifact_eps = 0
         job_log_dir = (slurm_meta or {}).get("job_log_dir") if slurm_meta else None
 
         # One remote probe is materially faster than several serial SSH calls on
         # SKT. It returns: completed result files, stdout episode count, stdout
-        # completed-run count, server-log episode fallback, and video artifacts.
+        # completed-run count, and server-log episode fallback.
         eval_dir_expr = _remote_path_expr(eval_dir)
         log_dir_q = shlex.quote(env.vars["LOG_DIR"])
         job_id_q = shlex.quote(job_id)
@@ -1883,21 +1928,19 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
             "server_eps=$((server_eps + c * envs)); "
             "done; "
             "fi; "
-            "artifact_eps=$(find \"$eval_dir\" -path '*/videos/ep*.mp4' -type f 2>/dev/null | wc -l); "
-            "printf '%s %s %s %s %s\\n' \"$completed\" \"$stdout_eps\" \"$stdout_runs\" \"$server_eps\" \"$artifact_eps\""
+            "printf '%s %s %s %s\\n' \"$completed\" \"$stdout_eps\" \"$stdout_runs\" \"$server_eps\""
         )
         r = await ssh_run(host, probe_cmd, timeout=12.0)
         if r.returncode != 0:
             raise RuntimeError((r.stderr or r.stdout or "eval progress probe failed").strip())
         try:
             parts = r.stdout.strip().split()
-            if len(parts) != 5:
-                raise ValueError(f"expected 5 counters, got {len(parts)}")
+            if len(parts) != 4:
+                raise ValueError(f"expected 4 counters, got {len(parts)}")
             completed = int(parts[0])
             active_eps = int(parts[1])
             job_completed_runs = int(parts[2])
             active_eps = max(active_eps, int(parts[3]))
-            artifact_eps = int(parts[4])
         except ValueError as exc:
             raise RuntimeError(f"invalid eval progress probe output: {r.stdout.strip()!r}") from exc
         progress.completed_runs = completed
@@ -1911,9 +1954,8 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
             #   current_step = completed_runs · N_EPISODES + incomplete episodes in this job
             #   max_steps    = total_runs    · N_EPISODES
             progress.max_steps = total * n_eps
-            active_incomplete_eps = max(0, active_eps - job_completed_runs * n_eps)
+            active_incomplete_eps = min(n_eps, max(0, active_eps - job_completed_runs * n_eps))
             current = completed * n_eps + active_incomplete_eps
-            current = max(current, artifact_eps)
             progress.current_step = min(current, progress.max_steps)
             progress.percent = round(100.0 * progress.current_step / progress.max_steps, 1)
             episode_label = f"{progress.current_step}/{progress.max_steps} episodes"
