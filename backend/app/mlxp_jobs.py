@@ -148,7 +148,18 @@ def _end_time(job_status: dict, pod: dict | None = None) -> str | None:
     return _latest_k8s_time(candidates)
 
 
-async def list_jobs(start: str | None = None, end: str | None = None) -> list[Job]:
+def _actual_pod_start(state: str, pod: dict | None, job_status: dict) -> str | None:
+    if state.upper() == "PENDING":
+        return None
+    pod_status = (pod or {}).get("status") or {}
+    return to_kst_iso(pod_status.get("startTime") or job_status.get("startTime"))
+
+
+async def list_jobs(
+    start: str | None = None,
+    end: str | None = None,
+    active_only: bool = False,
+) -> list[Job]:
     """All MLXP jobs we know about: live k8s Jobs + archived runs derived
     from DDN checkpoint directories.
 
@@ -158,6 +169,8 @@ async def list_jobs(start: str | None = None, end: str | None = None) -> list[Jo
     run leaves one of those behind for the lifetime of the checkpoints.
     """
     live, seen = await _list_live_jobs()
+    if active_only:
+        return [j for j in live if _is_active_state(j.state)]
     archived = await _list_archived_jobs(seen=seen)
     rows = live + archived
     if not start and not end:
@@ -195,26 +208,20 @@ async def _list_live_jobs() -> tuple[list[Job], set[str]]:
     from .job_identity import parse_comment_metadata, parse_phase_and_variant
 
     settings = get_settings()
-    try:
-        data = await _kubectl_json(
-            "get", "jobs", "-n", settings.namespace, "-l", owner_selector(settings)
-        )
-    except RuntimeError:
-        return [], set()
+    data = await _kubectl_json(
+        "get", "jobs", "-n", settings.namespace, "-l", owner_selector(settings)
+    )
 
     # We need pod-level info too (nodeName + start time of the actual pod, not the Job).
     pods_by_job: dict[str, dict] = {}
-    try:
-        pod_data = await _kubectl_json(
-            "get", "pods", "-n", settings.namespace, "-l", owner_selector(settings)
-        )
-        for p in pod_data.get("items", []):
-            labels = p.get("metadata", {}).get("labels", {})
-            jn = labels.get("job-name") or labels.get("batch.kubernetes.io/job-name")
-            if jn:
-                pods_by_job[jn] = p
-    except RuntimeError:
-        pass
+    pod_data = await _kubectl_json(
+        "get", "pods", "-n", settings.namespace, "-l", owner_selector(settings)
+    )
+    for p in pod_data.get("items", []):
+        labels = p.get("metadata", {}).get("labels", {})
+        jn = labels.get("job-name") or labels.get("batch.kubernetes.io/job-name")
+        if jn:
+            pods_by_job[jn] = p
     queue_positions = _pending_queue_positions(pods_by_job)
 
     out: list[Job] = []
@@ -237,7 +244,7 @@ async def _list_live_jobs() -> tuple[list[Job], set[str]]:
         status = j.get("status", {}) or {}
         pod = pods_by_job.get(job_id)
         state = _state_from_pod_and_job(status, pod)
-        start = to_kst_iso(status.get("startTime"))
+        start = _actual_pod_start(state, pod, status)
         end = to_kst_iso(_end_time(status, pod))
         elapsed = _elapsed(start, end)
 
@@ -434,7 +441,6 @@ async def get_job(name: str) -> dict[str, Any]:
             return archived
         raise FileNotFoundError(f"mlxp job not found: {name}")
     status = job_data.get("status", {}) or {}
-    start = to_kst_iso(status.get("startTime")) or ""
     pod_data = await _kubectl_json("get", "pods", "-n", settings.namespace, "-l", f"job-name={name}")
     pods = pod_data.get("items", [])
     pod = pods[0] if pods else {}
@@ -442,6 +448,7 @@ async def get_job(name: str) -> dict[str, Any]:
     pod_name = pod.get("metadata", {}).get("name", "")
     node = pod.get("spec", {}).get("nodeName", "") or ""
     state = _state_from_pod_and_job(status, pod if pods else None)
+    start = _actual_pod_start(state, pod if pods else None, status) or ""
     end = to_kst_iso(_end_time(status, pod if pods else None)) or ""
 
     # Per-container exit code if available

@@ -36,6 +36,15 @@ _SACCT_LIST_FMT = "JobID,JobName,Partition,State,Elapsed,Start,End,NodeList"
 _ACTIVE_STATES = {"RUNNING", "PENDING", "COMPLETING", "CONFIGURING", "SUSPENDED"}
 
 
+def _actual_start_for_state(state: str, value: str | None, source_tz=None) -> str | None:
+    # In squeue, %S is the actual start for running jobs, but for pending jobs
+    # Slurm may report an estimated future start time. The UI's "Started"
+    # field should stay empty until a job has actually started.
+    if state.upper() == "PENDING":
+        return None
+    return to_kst_iso(value, source_tz)
+
+
 async def list_jobs(
     clusters: list[str] | None = None,
     hours: int = 24,
@@ -51,13 +60,14 @@ async def list_jobs(
     """
     from . import mlxp_jobs
     target_clusters = clusters or list_clusters()
+    active_only = not start and not end and hours <= 0
 
     async def _for_cluster(c: str) -> list[Job]:
         if c == "mlxp":
             try:
-                return await mlxp_jobs.list_jobs(start=start, end=end)
-            except Exception:
-                return []
+                return await mlxp_jobs.list_jobs(start=start, end=end, active_only=active_only)
+            except Exception as exc:
+                raise RuntimeError(f"mlxp job listing failed: {exc}") from exc
         try:
             env = await load_cluster(c)
         except FileNotFoundError:
@@ -65,12 +75,15 @@ async def list_jobs(
         host = env.ssh_alias
         source_tz_task = asyncio.create_task(scheduler_timezone(host))
 
-        async def _squeue() -> str | None:
+        async def _squeue() -> str:
             try:
                 r = await ssh_run(host, f'squeue -u "$USER" -h -o "{_SQUEUE_FMT}"', timeout=15.0)
-            except Exception:
-                return None
-            return r.stdout if r.returncode == 0 else None
+            except Exception as exc:
+                raise RuntimeError(f"{c} squeue failed: {exc}") from exc
+            if r.returncode != 0:
+                message = (r.stderr or r.stdout or "unknown error").strip()
+                raise RuntimeError(f"{c} squeue failed: {message}")
+            return r.stdout
 
         async def _queue_positions() -> dict[str, int]:
             try:
@@ -93,7 +106,7 @@ async def list_jobs(
                 positions[job_id] = per_partition[partition]
             return positions
 
-        async def _sacct() -> str | None:
+        async def _sacct() -> str:
             if start or end:
                 start_arg = shlex.quote(start or f"now-{hours}hours")
                 end_arg = f" -E {shlex.quote(end)}" if end else ""
@@ -106,53 +119,63 @@ async def list_jobs(
                     f'sacct -X -u "$USER" {window} -P -n -o {_SACCT_LIST_FMT}',
                     timeout=30.0,
                 )
-            except Exception:
-                return None
-            return r.stdout if r.returncode == 0 else None
+            except Exception as exc:
+                raise RuntimeError(f"{c} sacct failed: {exc}") from exc
+            if r.returncode != 0:
+                message = (r.stderr or r.stdout or "unknown error").strip()
+                raise RuntimeError(f"{c} sacct failed: {message}")
+            return r.stdout
 
-        sq_out, sa_out, queue_positions, source_tz = await asyncio.gather(
-            _squeue(),
-            _sacct(),
-            _queue_positions(),
-            source_tz_task,
-        )
+        if active_only:
+            sq_out, queue_positions, source_tz = await asyncio.gather(
+                _squeue(),
+                _queue_positions(),
+                source_tz_task,
+            )
+            sa_out = ""
+        else:
+            sq_out, sa_out, queue_positions, source_tz = await asyncio.gather(
+                _squeue(),
+                _sacct(),
+                _queue_positions(),
+                source_tz_task,
+            )
 
         local: list[Job] = []
         seen: set[str] = set()
-        if sq_out is not None:
-            for line in sq_out.strip().splitlines():
-                parts = line.split("|")
-                if len(parts) < 8:
-                    continue
-                seen.add(parts[0])
-                time_left = parts[6] if parts[6] not in ("", "N/A") else None
-                job_start = to_kst_iso(parts[7], source_tz)
-                local.append(Job(
-                    cluster=c, job_id=parts[0], job_name=parts[1], partition=parts[2],
-                    state=parts[3], elapsed=parts[4], nodelist=parts[5],
-                    time_left=time_left, queue_position=queue_positions.get(parts[0]),
-                    start=job_start,
-                ))
-        if sa_out is not None:
-            for line in sa_out.strip().splitlines():
-                parts = line.split("|")
-                if len(parts) < 8:
-                    continue
-                jid = parts[0]
-                if jid in seen:
-                    continue
-                # Truncate sacct's CANCELLED+by labels for cleaner display.
-                state = parts[3].split(" ")[0]
-                job_start = to_kst_iso(parts[5], source_tz)
-                job_end = to_kst_iso(parts[6], source_tz)
-                local.append(Job(
-                    cluster=c, job_id=jid, job_name=parts[1], partition=parts[2],
-                    state=state, elapsed=parts[4], nodelist=parts[7],
-                    start=job_start, end=job_end,
-                ))
+        for line in sq_out.strip().splitlines():
+            parts = line.split("|")
+            if len(parts) < 8:
+                continue
+            seen.add(parts[0])
+            time_left = parts[6] if parts[6] not in ("", "N/A") else None
+            job_start = _actual_start_for_state(parts[3], parts[7], source_tz)
+            local.append(Job(
+                cluster=c, job_id=parts[0], job_name=parts[1], partition=parts[2],
+                state=parts[3], elapsed=parts[4], nodelist=parts[5],
+                time_left=time_left, queue_position=queue_positions.get(parts[0]),
+                start=job_start,
+            ))
+        for line in sa_out.strip().splitlines():
+            parts = line.split("|")
+            if len(parts) < 8:
+                continue
+            jid = parts[0]
+            if jid in seen:
+                continue
+            # Truncate sacct's CANCELLED+by labels for cleaner display.
+            state = parts[3].split(" ")[0]
+            job_start = _actual_start_for_state(state, parts[5], source_tz)
+            job_end = to_kst_iso(parts[6], source_tz)
+            local.append(Job(
+                cluster=c, job_id=jid, job_name=parts[1], partition=parts[2],
+                state=state, elapsed=parts[4], nodelist=parts[7],
+                start=job_start, end=job_end,
+            ))
         meta_by_job_id = await read_slurm_meta_many(host, [j.job_id for j in local])
         _attach_phase_metadata(local, meta_by_job_id)
-        await _normalize_completed_eval_jobs(host, env.vars["LOG_DIR"], local, meta_by_job_id)
+        if not active_only:
+            await _normalize_completed_eval_jobs(host, env.vars["LOG_DIR"], local, meta_by_job_id)
         return local
 
     per_cluster = await asyncio.gather(*[_for_cluster(c) for c in target_clusters])
@@ -196,7 +219,7 @@ async def get_job(cluster: str, job_id: str) -> dict:
             header = lines[0].split("|")
             row = lines[1].split("|")
             d = {**dict(zip(header, row)), "cluster": cluster}
-            d["Start"] = to_kst_iso(d.get("Start"), source_tz) or ""
+            d["Start"] = _actual_start_for_state(d.get("State", ""), d.get("Start"), source_tz) or ""
             d["End"] = to_kst_iso(d.get("End"), source_tz) or ""
             await _normalize_completed_eval_record(env.ssh_alias, env.vars["LOG_DIR"], d)
             return d
@@ -212,7 +235,7 @@ async def get_job(cluster: str, job_id: str) -> dict:
         d = dict(zip(keys, parts))
         d["cluster"] = cluster
         d["Submit"] = to_kst_iso(d.get("Submit"), source_tz) or ""
-        d["Start"] = to_kst_iso(d.get("Start"), source_tz) or ""
+        d["Start"] = _actual_start_for_state(d.get("State", ""), d.get("Start"), source_tz) or ""
         d.setdefault("ExitCode", "")
         d.setdefault("End", "")
         d.setdefault("NodeList", parts[7] if len(parts) > 7 else "")

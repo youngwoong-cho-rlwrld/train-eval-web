@@ -504,8 +504,11 @@ async def get_jobs(
     end: str | None = None,
 ):
     target = [cluster] if cluster else None
-    js = await jobs.list_jobs(target, hours=hours, start=start, end=end)
-    return {"jobs": [j.model_dump() for j in js]}
+    try:
+        js = await jobs.list_jobs(target, hours=hours, start=start, end=end)
+        return {"jobs": [j.model_dump() for j in js]}
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
 
 
 @app.get("/api/jobs/{cluster}/{job_id}")
