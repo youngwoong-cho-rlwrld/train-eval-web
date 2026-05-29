@@ -88,6 +88,16 @@ async def get_cluster_partitions(name: str):
         raise HTTPException(500, str(e))
 
 
+@app.get("/api/clusters/{name}/gpu-queue", response_model=partitions.GpuQueueSnapshot)
+async def get_cluster_gpu_queue(name: str, partition: str):
+    try:
+        return await partitions.gpu_queue_snapshot(name, partition)
+    except FileNotFoundError:
+        raise HTTPException(404, f"cluster {name} not found")
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+
 @app.get("/api/mlxp/gpus", response_model=list[mlxp.MlxpNode])
 async def get_mlxp_gpus():
     try:

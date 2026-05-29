@@ -291,6 +291,29 @@ export type Partition = {
   states: Record<string, number>;
 };
 
+export type GpuQueueNode = {
+  name: string;
+  gpu_type: string | null;
+  gpu_total: number;
+  gpu_used: number;
+  state: string | null;
+  reason: string | null;
+};
+
+export type GpuQueueJob = {
+  job_id: string;
+  requested_gpus: number;
+  reason: string | null;
+  name: string | null;
+};
+
+export type GpuQueueSnapshot = {
+  cluster: string;
+  partition: string;
+  nodes: GpuQueueNode[];
+  queue: GpuQueueJob[];
+};
+
 export type JobDetails = {
   cluster: string;
   job_id: string;
