@@ -1,14 +1,17 @@
-"""Copy a job's final checkpoint to another server.
+"""Copy a job's checkpoint artifacts to another cluster.
 
 Source layouts:
 - mlxp:   <MLXP experiments dir>/<variant>/checkpoints/<job_name>/checkpoint-N
 - slurm:  $EXP_DIR/checkpoints/checkpoint-N
 
-Destination layouts: same shape as the source per cluster (no nested
-job-name dir on slurm, because the slurm body never created one).
+Destination layout:
+- explicit destination root: <root>/<run-name> when the selected source is
+  <run-name>/checkpoint-N; otherwise <root>/<source-leaf>.
+- default root: the destination cluster's configured checkpoint root.
 
 Transfer mechanism:
-- slurm → slurm: rsync over ssh (host A → host B).
+- slurm → slurm: same host uses rsync; cross-host streams a tar pipe through
+  the API host so the source cluster does not need direct SSH access to dest.
 - slurm → mlxp:  ssh tar | kubectl exec tar x on a DDN-mounted pod.
 - mlxp  → slurm: kubectl cp each model artifact to local staging, then
   rsync local staging to the dest host and atomically promote it.
@@ -34,6 +37,7 @@ from .jobs import get_job
 from .kubectl_errors import is_completed_pod_exec_error
 from .mlxp_config import get_settings
 from .mlxp_data_pod import ensure_listing_pod, invalidate_pods_cache
+from .paths import CHECKPOINT_COPY_HISTORY_REL
 from .remote_paths import expand_cluster_home, remote_path_exists
 from .ssh import ssh_run, _CM_OPTS
 from .submission_snapshot import is_mlxp_transport_error
@@ -77,7 +81,8 @@ _MODEL_ARTIFACT_EXCLUDES = (
 
 class CopyCheckpointRequest(BaseModel):
     dest_cluster: str
-    # Absolute directory on dest. Each source's basename is appended.
+    # Absolute directory on dest. Each copied checkpoint directory is created
+    # under this root.
     # None → mirrors source layout per cluster.
     dest_path_root: str | None = None
     # Explicit list of source checkpoint paths to copy. Empty → fall back to
@@ -131,7 +136,7 @@ _COPY_JOBS: dict[str, CopyJobStatus] = {}
 # Lets `cancel_copy` interrupt an in-flight transfer.
 _COPY_HANDLES: dict[str, dict] = {}
 _MLXP_STREAM_SEMAPHORE = asyncio.Semaphore(_MLXP_COPY_STREAMS)
-_COPY_HISTORY_DIR = ".train-eval-web/checkpoint-copies"
+_COPY_HISTORY_DIR = CHECKPOINT_COPY_HISTORY_REL
 
 
 def _track_proc(copy_id: str, proc: asyncio.subprocess.Process) -> None:
@@ -516,6 +521,23 @@ def _select_model_artifact_files(parent_basename: str, names: list[str]) -> list
     ]
 
 
+def _dest_leaf_for_source(src_path: str) -> str:
+    """Return the destination directory name for a selected checkpoint.
+
+    The UI selects concrete step directories (`.../<run>/checkpoint-N`), but
+    users expect copied checkpoints to be named by the owning run directory.
+    Older direct-root layouts only have `.../checkpoints/checkpoint-N`, so
+    keep the step name there because there is no run name to preserve.
+    """
+    src = Path(src_path.rstrip("/"))
+    leaf = src.name
+    if leaf.startswith("checkpoint-"):
+        parent = src.parent.name
+        if parent and parent != "checkpoints":
+            return parent
+    return leaf
+
+
 async def _run_copy(
     copy_id: str, src_cluster: str, src_job: str, dest_cluster: str,
     sources: list[str], dest_path_root: str, delete_source: bool,
@@ -526,7 +548,8 @@ async def _run_copy(
             src_path = await _resolve_model_source_path(src_cluster, src_path)
             src_path = await expand_cluster_home(src_cluster, src_path) or src_path
             leaf = Path(src_path).name
-            dest_path = f"{dest_path_root.rstrip('/')}/{leaf}"
+            dest_leaf = _dest_leaf_for_source(src_path)
+            dest_path = f"{dest_path_root.rstrip('/')}/{dest_leaf}"
             state.current_source = src_path
             state.current_dest = dest_path
             state.phase = "preparing"
@@ -551,7 +574,8 @@ async def _run_copy(
             # the du-based destination poller so it does not overwrite that
             # live counter with stale bytes from a prior killed run.
             self_reports_size = (
-                (src_cluster == "mlxp") != (dest_cluster == "mlxp")
+                ((src_cluster == "mlxp") != (dest_cluster == "mlxp"))
+                or (src_cluster != dest_cluster and "mlxp" not in {src_cluster, dest_cluster})
             )
             poll_task = None if self_reports_size else asyncio.create_task(
                 _poll_dest_size(state, dest_cluster, dest_path)
@@ -895,9 +919,14 @@ async def _mlxp_to_mlxp(copy_id: str, src: str, dest: str,
     src_leaf = Path(src).name
     dest_parent = str(Path(dest).parent)
     tar_args = _tar_artifact_args(src_leaf, include_only)
+    create_cmd = _mlxp_tar_create_cmd(
+        src_parent,
+        tar_args,
+        exclude_model_artifacts=include_only is None,
+    )
     cmd = (
         f"mkdir -p {shlex.quote(dest_parent)} && "
-        f"{_mlxp_tar_create_cmd(src_parent, tar_args)} | "
+        f"{create_cmd} | "
         f"tar x -C {shlex.quote(dest_parent)}"
     )
     settings = get_settings()
@@ -918,20 +947,52 @@ async def _slurm_to_slurm(copy_id: str, src_cluster: str, src_path: str,
                            include_only: list[str] | None = None) -> str:
     src_env = await load_cluster(src_cluster)
     dest_env = await load_cluster(dest_cluster)
-    dest_alias = shlex.quote(dest_env.ssh_alias)
     excludes = " ".join(
         f"--exclude={shlex.quote(pattern)}"
         for pattern in _MODEL_ARTIFACT_EXCLUDES
     )
-    cmd = (
-        f"mkdir -p {shlex.quote(dest_path)} >/dev/null 2>&1 && "
-        f"rsync -az {excludes} {shlex.quote(src_path)}/ "
-        f"{dest_alias}:{shlex.quote(dest_path)}/"
+    if src_env.ssh_alias == dest_env.ssh_alias:
+        cmd = (
+            f"mkdir -p {shlex.quote(dest_path)} >/dev/null 2>&1 && "
+            f"rsync -az {excludes} {shlex.quote(src_path)}/ {shlex.quote(dest_path)}/"
+        )
+        r = await ssh_run(src_env.ssh_alias, cmd, timeout=3600.0)
+        if r.returncode != 0:
+            message = r.stderr.strip() or r.stdout.strip() or "no stderr"
+            raise RuntimeError(f"rsync failed rc={r.returncode}: {message}")
+        return r.stdout
+
+    state = _COPY_JOBS.get(copy_id)
+    if state is not None:
+        state.phase = f"streaming {src_cluster} to {dest_cluster}"
+
+    src_parent = str(Path(src_path).parent.as_posix())
+    src_leaf = Path(src_path).name
+    dest_parent = str(Path(dest_path).parent.as_posix())
+    tar_args = _tar_artifact_args(src_leaf, include_only)
+    src_proc = await asyncio.create_subprocess_exec(
+        "ssh", "-o", "BatchMode=yes", *_CM_OPTS, src_env.ssh_alias,
+        _mlxp_tar_create_cmd(
+            src_parent,
+            tar_args,
+            exclude_model_artifacts=include_only is None,
+        ),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        limit=1 << 22,
     )
-    r = await ssh_run(src_env.ssh_alias, cmd, timeout=3600.0)
-    if r.returncode != 0:
-        raise RuntimeError(f"rsync failed: {r.stderr.strip() or r.stdout.strip()}")
-    return r.stdout
+    dst_proc = await asyncio.create_subprocess_exec(
+        "ssh", "-o", "BatchMode=yes", *_CM_OPTS, dest_env.ssh_alias,
+        _slurm_tar_extract_cmd(dest_parent, dest_path, src_leaf, copy_id),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        limit=1 << 22,
+    )
+    await _pump_and_check_tar_pipe(
+        copy_id, f"{src_cluster}→{dest_cluster}", src_proc, dst_proc,
+    )
+    return f"copied {src_env.ssh_alias}:{src_path} → {dest_env.ssh_alias}:{dest_path}"
 
 
 def _remote_shell_path(path: str) -> str:
@@ -944,11 +1005,19 @@ def _remote_shell_path(path: str) -> str:
     return shlex.quote(path)
 
 
-def _mlxp_tar_create_cmd(src_parent: str, tar_args: list[str]) -> str:
+def _mlxp_tar_create_cmd(
+    src_parent: str,
+    tar_args: list[str],
+    *,
+    exclude_model_artifacts: bool = True,
+) -> str:
     quoted_args = " ".join(shlex.quote(arg) for arg in tar_args)
-    excludes = " ".join(
-        f"--exclude={shlex.quote(pattern)}"
-        for pattern in _MODEL_ARTIFACT_EXCLUDES
+    excludes = (
+        " ".join(
+            f"--exclude={shlex.quote(pattern)}"
+            for pattern in _MODEL_ARTIFACT_EXCLUDES
+        )
+        if exclude_model_artifacts else ""
     )
     return f"tar c -C {shlex.quote(src_parent)} {excludes} {quoted_args}"
 
@@ -1182,7 +1251,11 @@ async def _slurm_to_mlxp(copy_id: str, src_cluster: str, src_path: str, dest_pat
         settings = get_settings()
         src_proc = await asyncio.create_subprocess_exec(
             "ssh", "-o", "BatchMode=yes", *_CM_OPTS, src_env.ssh_alias,
-            _mlxp_tar_create_cmd(src_parent, tar_args),
+            _mlxp_tar_create_cmd(
+                src_parent,
+                tar_args,
+                exclude_model_artifacts=include_only is None,
+            ),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=1 << 22,

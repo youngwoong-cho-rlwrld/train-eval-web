@@ -15,6 +15,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { RefreshButton } from "@/components/refresh-button";
 import { LoadingState } from "@/components/loading-state";
 import { ImmediateTooltip } from "@/components/immediate-tooltip";
+import { JobStateBadge } from "@/components/job-state-badge";
 
 const REFRESH_MS = 120_000;
 const AVERAGE_HELP =
@@ -170,7 +171,9 @@ function resultVariantMatchesName(variant: ResultVariant, filter: string) {
     variant.variant,
     variant.experiment ?? "",
     variant.note ?? "",
+    variant.job_state ?? "",
     variant.checkpoint ?? "",
+    variant.checkpoint_job_cluster ?? "",
     variant.checkpoint_job_name ?? "",
     variant.source ?? "",
   ].join(" ").toLowerCase().includes(needle);
@@ -201,13 +204,16 @@ function ResultCard({ variant }: { variant: ResultVariant }) {
   const evalSets = evalSetColumns(variant.tasks);
   const nRuns = variant.n_runs ?? maxExpectedRuns(variant.tasks);
   const nEpisodes = variant.n_episodes ?? maxEpisodeCount(variant.tasks);
-  const checkpointJobHref = jobDetailHref(variant.cluster, variant.checkpoint_job_id);
+  const checkpointJobHref = jobDetailHref(
+    variant.checkpoint_job_cluster ?? variant.cluster,
+    variant.checkpoint_job_id,
+  );
 
   return (
     <Card>
       <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between sm:space-y-0">
         <div className="min-w-0">
-          <CardTitle className="truncate font-mono text-base">
+          <CardTitle className="font-mono text-base">
             <ResultTitle variant={variant} />
           </CardTitle>
           <CardDescription className="mt-1">
@@ -255,7 +261,11 @@ function ResultCard({ variant }: { variant: ResultVariant }) {
           {variant.checkpoint && (
             <Meta
               label="checkpoint"
-              value={basename(variant.checkpoint)}
+              value={
+                variant.checkpoint_job_id
+                  ? `${basename(variant.checkpoint)} (${variant.checkpoint_job_id})`
+                  : basename(variant.checkpoint)
+              }
               title={variant.checkpoint_job_name ? `Open ${variant.checkpoint_job_name}` : variant.checkpoint}
               href={checkpointJobHref}
             />
@@ -278,16 +288,20 @@ function ResultCard({ variant }: { variant: ResultVariant }) {
 function ResultTitle({ variant }: { variant: ResultVariant }) {
   if (!variant.job_id) return variant.variant;
   return (
-    <Link
-      href={jobDetailHref(variant.cluster, variant.job_id)!}
-      target="_blank"
-      rel="noreferrer"
-      className="inline-flex max-w-full items-center gap-1.5 text-blue-600 hover:underline dark:text-blue-400"
-      title={variant.job_name ? `Open ${variant.job_name}` : "Open job detail"}
-    >
-      <span className="truncate">{variant.variant}</span>
-      <ExternalLink className="h-3.5 w-3.5 shrink-0" />
-    </Link>
+    <span className="inline-flex max-w-full min-w-0 items-center gap-2">
+      <Link
+        href={jobDetailHref(variant.cluster, variant.job_id)!}
+        target="_blank"
+        rel="noreferrer"
+        className="inline-flex min-w-0 items-center gap-1.5 text-blue-600 hover:underline dark:text-blue-400"
+        title={variant.job_name ? `Open ${variant.job_name}` : "Open job detail"}
+      >
+        <span className="truncate">{variant.variant}</span>
+        <span className="shrink-0">({variant.job_id})</span>
+        <ExternalLink className="h-3.5 w-3.5 shrink-0" />
+      </Link>
+      {variant.job_state && <JobStateBadge state={variant.job_state} />}
+    </span>
   );
 }
 
@@ -392,18 +406,19 @@ function ResultCellView({ cell }: { cell?: ResultCell }) {
     cell.expected_runs > 0 &&
     cell.completed_runs < cell.expected_runs;
   const episodes = totalEpisodes(cell);
+  const tooltip = cell.per_run_success_rate.length
+    ? cell.per_run_success_rate.map((v) => formatPct(v)).join(", ")
+    : "partial";
+
   return (
-    <ImmediateTooltip
-      content={cell.per_run_success_rate.length ? cell.per_run_success_rate.map((v) => formatPct(v)).join(", ") : "partial"}
-      className="inline-flex"
-    >
+    <ImmediateTooltip content={tooltip} className="inline-flex">
       <div>
-      <div className="font-mono">{formatMeanStd(cell)}</div>
-      <div className="mt-1 flex items-center gap-2 text-[11px] text-slate-500 dark:text-slate-400">
-        <span>{cell.completed_runs}{cell.expected_runs ? `/${cell.expected_runs}` : ""} runs</span>
-        {episodes != null && <span>{episodes.toLocaleString()} episodes</span>}
-        {incomplete && <Badge variant="warning" className="px-1 py-0 text-[10px]">partial</Badge>}
-      </div>
+        <div className="font-mono">{formatMeanStd(cell)}</div>
+        <div className="mt-1 flex items-center gap-2 text-[11px] text-slate-500 dark:text-slate-400">
+          <span>{cell.completed_runs}{cell.expected_runs ? `/${cell.expected_runs}` : ""} runs</span>
+          {episodes != null && <span>{episodes.toLocaleString()} episodes</span>}
+          {incomplete && <Badge variant="warning" className="px-1 py-0 text-[10px]">partial</Badge>}
+        </div>
       </div>
     </ImmediateTooltip>
   );

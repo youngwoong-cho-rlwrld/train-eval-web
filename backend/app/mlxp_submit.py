@@ -79,6 +79,34 @@ export HF_HUB_CACHE="$HF_HOME/hub"
 mkdir -p "$HF_HOME" "$HF_HUB_CACHE"
 """
 
+
+def _mlxp_isaac_assets_block(settings: MlxpSettings) -> str:
+    """Link DDN-stored ALLEX assets into the Isaac repo inside the eval image."""
+    asset_root = f"{settings.workspace_dir.rstrip('/')}/rlwrld_isaac"
+    quoted_asset_root = shlex.quote(asset_root)
+    return f"""\
+ALLEX_ASSET_ROOT={quoted_asset_root}
+if [ "$ALLEX_ASSET_ROOT" != "$ISAAC_DIR" ]; then
+    if [ ! -d "$ALLEX_ASSET_ROOT/objects" ]; then
+        echo "[mlxp] missing ALLEX objects: $ALLEX_ASSET_ROOT/objects" >&2
+        exit 1
+    fi
+    if [ ! -d "$ALLEX_ASSET_ROOT/source/allex_sim/allex_sim/assets" ]; then
+        echo "[mlxp] missing ALLEX assets: $ALLEX_ASSET_ROOT/source/allex_sim/allex_sim/assets" >&2
+        exit 1
+    fi
+    mkdir -p "$ISAAC_DIR/source/allex_sim/allex_sim"
+    rm -rf "$ISAAC_DIR/objects" "$ISAAC_DIR/source/allex_sim/allex_sim/assets"
+    ln -sfnT "$ALLEX_ASSET_ROOT/objects" "$ISAAC_DIR/objects"
+    ln -sfnT "$ALLEX_ASSET_ROOT/source/allex_sim/allex_sim/assets" "$ISAAC_DIR/source/allex_sim/allex_sim/assets"
+    echo "[mlxp] linked ALLEX assets from $ALLEX_ASSET_ROOT"
+fi
+if [ ! -e "$ISAAC_DIR/source/allex_sim/allex_sim/assets/ALLEX_simple.usd" ]; then
+    echo "[mlxp] missing ALLEX_simple.usd in $ISAAC_DIR/source/allex_sim/allex_sim/assets" >&2
+    exit 1
+fi
+"""
+
 def mlxp_training_repo_path(model: str | TrainingModel) -> str:
     resolved = model if isinstance(model, TrainingModel) else load_training_model(model)
     settings = get_settings()
@@ -389,6 +417,7 @@ def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str
         checkpoint_path=checkpoint_path,
         extra_args=req.extra_args,
         data_dir=settings.datasets_dir,
+        eval_unset_cuda_visible_devices_for_server=1,
         train_git_commit=req.train_git_commit,
         train_note=train_note,
     )
@@ -419,6 +448,7 @@ def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str
         "n_runs": req.eval_n_runs,
         "eval_sets": eval_sets,
         "overwrite_results": req.eval_overwrite_results,
+        "unset_cuda_visible_devices_for_server": 1,
     }
     return {
         "job_id": job_id,
@@ -948,6 +978,8 @@ cat > {shlex.quote(modality_target)} <<'TEW_MODALITY_EOF'
         f"export SUBMIT_RESULTS_PATH={shlex.quote(results_path)}",
         f"export SUBMIT_CONFIG_FILE={shlex.quote(config_path)}",
         f"export SUBMIT_DATA_DIR={shlex.quote(settings.datasets_dir)}",
+        f"export SUBMIT_TRAIN_NUM_GPUS={req.num_gpus}",
+        "export SUBMIT_EVAL_UNSET_CUDA_VISIBLE_DEVICES_FOR_SERVER=1",
         f"export EVAL_CHECKPOINT={shlex.quote((req.checkpoint_path or '').strip())}",
     ]
     if req.eval_num_envs_per_gpu is not None:
@@ -992,6 +1024,8 @@ cat > {shlex.quote(runtime_root)}/lib/isaac_server_runner.py <<'TEW_ISAAC_RUNNER
 {isaac_runner_text}TEW_ISAAC_RUNNER_EOF
 chmod +x {shlex.quote(runtime_root)}/lib/isaac_server_runner.py
 {modality_block}
+export ISAAC_DIR={shlex.quote(settings.isaac_dir)}
+{_mlxp_isaac_assets_block(settings)}
 export SUBMIT_TRAIN_REPO_DIR="$TRAIN_REPO_WORKTREE"
 {chr(10).join(eval_exports)}
 

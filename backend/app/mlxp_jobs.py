@@ -20,7 +20,7 @@ from typing import Any
 
 from .job_identity import parse_comment_fields
 from .jobs import Job
-from .k8s_resources import affinity_node
+from .k8s_resources import affinity_node, requested_gpus
 from .kubectl_errors import is_kubectl_transport_error
 from .mlxp_config import get_settings, owner_selector
 from .time_utils import to_kst_iso
@@ -362,6 +362,7 @@ done
         if not latest.isdigit():
             continue
         meta = meta_index.get(output_namespace, {})
+        train_meta = meta.get("train") if isinstance(meta.get("train"), dict) else {}
         try:
             start_i = int(start_e)
             end_i = int(end_e)
@@ -379,6 +380,7 @@ done
             "output_namespace": output_namespace,
             "variant": str(meta.get("variant") or variant),
             "train_note": str(meta.get("train_note") or ""),
+            "num_gpus": str(train_meta.get("num_gpus") or meta.get("num_gpus") or ""),
             "start": start_iso or "",
             "end": end_iso or "",
             "elapsed": _elapsed(start_iso, end_iso),
@@ -447,7 +449,10 @@ async def get_job(name: str) -> dict[str, Any]:
     pod = pods[0] if pods else {}
     pod_status = pod.get("status", {}) or {}
     pod_name = pod.get("metadata", {}).get("name", "")
-    node = pod.get("spec", {}).get("nodeName", "") or ""
+    pod_spec = pod.get("spec", {}) or {}
+    template_spec = (((job_data.get("spec") or {}).get("template") or {}).get("spec") or {})
+    node = pod_spec.get("nodeName", "") or ""
+    gpu_count = requested_gpus(pod_spec) or requested_gpus(template_spec)
     state = _state_from_pod_and_job(status, pod if pods else None)
     start = _actual_pod_start(state, pod if pods else None, status) or ""
     end = to_kst_iso(_end_time(status, pod if pods else None)) or ""
@@ -484,6 +489,7 @@ async def get_job(name: str) -> dict[str, Any]:
         "Elapsed": _elapsed(start, end),
         "NodeList": node or pod_name,
         "Reason": reason,
+        "GPUs": str(gpu_count) if gpu_count else "",
         "cluster": "mlxp",
         # Extra (for log streaming endpoint)
         "_pod_name": pod_name,
@@ -493,6 +499,7 @@ async def get_job(name: str) -> dict[str, Any]:
 async def cancel_job(name: str) -> None:
     if shutil.which("kubectl") is None:
         raise RuntimeError("kubectl not found on PATH")
+    settings = get_settings()
     last_error = ""
     for attempt in range(5):
         proc = await asyncio.create_subprocess_exec(
@@ -693,5 +700,6 @@ async def _archived_record(name: str) -> dict[str, Any] | None:
         "Elapsed": archived["elapsed"],
         "NodeList": "(archived)",
         "Reason": "(archived; k8s record GC'd)",
+        "GPUs": archived.get("num_gpus", ""),
         "cluster": "mlxp",
     }

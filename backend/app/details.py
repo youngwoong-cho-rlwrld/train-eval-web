@@ -130,6 +130,7 @@ class JobDetails(BaseModel):
     phase: str            # "train" | "resume" | "eval" | "unknown"
     variant: str | None
     resume_of: str | None = None
+    resubmit_action: str | None = None
     train_note: str | None = None
     state: str
     elapsed: str
@@ -516,6 +517,7 @@ async def get_details(
     return JobDetails(
         cluster=cluster, job_id=job_id, job_name=job_name,
         phase=phase, variant=variant, resume_of=slurm_meta.get("resume_of") or None,
+        resubmit_action=slurm_meta.get("resubmit_action") or None,
         train_note=slurm_meta.get("train_note") or None,
         state=state, elapsed=elapsed,
         wandb_project=job_wandb_project,
@@ -700,6 +702,7 @@ async def _mlxp_details(
     return JobDetails(
         cluster="mlxp", job_id=job_id, job_name=job_name,
         phase=phase, variant=variant, resume_of=metadata.get("resume_of") or None,
+        resubmit_action=metadata.get("resubmit_action") or None,
         train_note=train_note,
         state=state, elapsed=elapsed,
         wandb_project=job_wandb_project,

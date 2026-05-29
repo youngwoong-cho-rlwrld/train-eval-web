@@ -48,6 +48,7 @@ export type Job = {
   phase?: string | null;
   variant?: string | null;
   resume_of?: string | null;
+  resubmit_action?: string | null;
 };
 
 export type SubmitResponse = {
@@ -291,6 +292,7 @@ export type JobDetails = {
   phase: "train" | "resume" | "eval" | "unknown";
   variant: string | null;
   resume_of: string | null;
+  resubmit_action: string | null;
   train_note: string | null;
   state: string;
   elapsed: string;
@@ -369,6 +371,8 @@ export type ResultVariant = {
   cluster: string;
   job_id?: string | null;
   job_name?: string | null;
+  job_state?: string | null;
+  checkpoint_job_cluster?: string | null;
   checkpoint_job_id?: string | null;
   checkpoint_job_name?: string | null;
   variant: string;

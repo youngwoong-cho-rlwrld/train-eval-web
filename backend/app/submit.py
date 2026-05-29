@@ -65,6 +65,7 @@ class SubmitRequest(BaseModel):
     # checkpoint. This is intentionally separate from the submit-page phase.
     resume: bool = False
     resume_of: str | None = None
+    resubmit_action: Literal["resume", "retry"] | None = None
     # Slurm-only: partition name (None → fall back to cluster.env default).
     partition: str | None = None
     # MLXP-only: which k8s node to pin via nodeAffinity (each rlwrld team
@@ -393,7 +394,11 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         repo_label=training_repo_label(model),
         job_name=job_name,
         commit_dirty_changes=req.commit_dirty_changes if req.phase == "train" else False,
-        require_clean=(req.phase == "train" and not req.resume),
+        require_clean=(
+            req.phase == "train"
+            and not req.resume
+            and not (req.resume_of and req.resume_of.strip())
+        ),
         requested_commit=train_git_commit,
     )
 
@@ -612,6 +617,8 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         comment += f";output_namespace={output_namespace}"
     if req.resume_of and req.resume_of.strip():
         comment += f";resume_of={req.resume_of.strip()}"
+    if req.resubmit_action:
+        comment += f";resubmit_action={req.resubmit_action}"
     if submit_git:
         comment += ";" + comment_field_fragment(
             {
@@ -764,6 +771,11 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         + (
             f"resume_of={req.resume_of.strip()}\n"
             if req.resume_of and req.resume_of.strip()
+            else ""
+        )
+        + (
+            f"resubmit_action={req.resubmit_action}\n"
+            if req.resubmit_action
             else ""
         )
         + ("resume=true\n" if req.resume else "")

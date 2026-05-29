@@ -584,6 +584,18 @@ async def post_resume_job(cluster: str, job_id: str):
         raise HTTPException(500, str(e))
 
 
+@app.post("/api/jobs/{cluster}/{job_id}/retry", response_model=submit.SubmitResponse)
+async def post_retry_job(cluster: str, job_id: str):
+    try:
+        return await job_resume.retry_failed_job(cluster, job_id)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+
 @app.get("/api/jobs/{cluster}/{job_id}/resumes", response_model=list[jobs.Job])
 async def get_resumed_jobs(cluster: str, job_id: str):
     try:

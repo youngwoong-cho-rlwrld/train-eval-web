@@ -34,6 +34,10 @@ export function isTimeoutJobState(state?: string | null): boolean {
   return (state ?? "").toUpperCase().startsWith("TIMEOUT");
 }
 
+export function isFailedJobState(state?: string | null): boolean {
+  return /^(FAIL|OUT_OF_MEMORY|NODE_FAIL|PREEMPT)/i.test(state ?? "");
+}
+
 export function isTerminalJobState(state?: string | null): boolean {
   return /^(COMPLET|FAIL|CANCEL|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL|PREEMPT)/i.test(
     state ?? "",

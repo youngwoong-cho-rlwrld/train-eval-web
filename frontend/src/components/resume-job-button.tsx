@@ -17,6 +17,7 @@ import {
 } from "@/components/ui/dialog";
 
 type ResumePhase = "train" | "resume" | "eval" | "unknown" | "other";
+type ResumeAction = "resume" | "retry";
 
 export function ResumeJobButton({
   cluster,
@@ -24,6 +25,7 @@ export function ResumeJobButton({
   phase,
   variant,
   jobName,
+  action = "resume",
   className,
 }: {
   cluster: string;
@@ -31,6 +33,7 @@ export function ResumeJobButton({
   phase?: ResumePhase | null;
   variant?: string | null;
   jobName?: string | null;
+  action?: ResumeAction;
   className?: string;
 }) {
   const router = useRouter();
@@ -43,11 +46,11 @@ export function ResumeJobButton({
   });
   const resume = useMutation({
     mutationFn: () =>
-      api<SubmitResponse>(`/api/jobs/${cluster}/${jobId}/resume`, {
+      api<SubmitResponse>(`/api/jobs/${cluster}/${jobId}/${action}`, {
         method: "POST",
       }),
     onSuccess: (data) => {
-      toast.success(`Submitted resume job ${data.job_id} on ${cluster}`);
+      toast.success(`Submitted ${action} job ${data.job_id} on ${cluster}`);
       setOpen(false);
       qc.invalidateQueries({ queryKey: ["jobs"] });
       qc.invalidateQueries({ queryKey: ["job", cluster, jobId] });
@@ -56,7 +59,7 @@ export function ResumeJobButton({
       qc.invalidateQueries({ queryKey: ["resumed-jobs", cluster, jobId] });
       router.push(`/jobs/${cluster}/${data.job_id}`);
     },
-    onError: (err: Error) => toast.error(`Resume failed: ${err.message}`),
+    onError: (err: Error) => toast.error(`${actionLabel(action)} failed: ${err.message}`),
   });
 
   const normalizedPhase = phase === "resume" ? "train" : phase;
@@ -65,6 +68,11 @@ export function ResumeJobButton({
     : normalizedPhase === "eval"
       ? "evaluation"
       : "job";
+  const isRetry = action === "retry";
+  const title = isRetry ? "Retry failed job?" : "Resume timed-out job?";
+  const primaryLabel = isRetry ? "Retry" : "Resume";
+  const submittingLabel = isRetry ? "Retrying..." : "Resuming...";
+  const submitLabel = isRetry ? "Submit retry" : "Submit resume";
 
   return (
     <>
@@ -75,16 +83,16 @@ export function ResumeJobButton({
         onClick={() => setOpen(true)}
         disabled={resume.isPending}
       >
-        {resume.isPending ? "Resuming..." : "Resume"}
+        {resume.isPending ? submittingLabel : primaryLabel}
       </Button>
 
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent className="max-w-[min(92vw,32rem)]">
           <DialogHeader>
-            <DialogTitle>Resume timed-out job?</DialogTitle>
+            <DialogTitle>{title}</DialogTitle>
             <DialogDescription className="[overflow-wrap:anywhere]">
               This submits a new {phaseLabel} job on{" "}
-              <span className="font-mono">{cluster}</span> from timed-out job{" "}
+              <span className="font-mono">{cluster}</span> from {isRetry ? "failed" : "timed-out"} job{" "}
               <span className="font-mono">{jobId}</span>
               {variant ? (
                 <>
@@ -98,14 +106,14 @@ export function ResumeJobButton({
           <div className="space-y-2 text-sm text-slate-600 dark:text-slate-400">
             {normalizedPhase === "train" ? (
               <p>
-                Training resumes from the latest checkpoint found for this
-                experiment. New checkpoints and logs will be written by the new
-                Slurm job.
+                {isRetry
+                  ? "Training retry reuses the original submission settings and output namespace. If usable checkpoints already exist, the train script may continue from them; otherwise it starts the run again."
+                  : "Training resumes from the latest checkpoint found for this experiment. New checkpoints and logs will be written by the new Slurm job."}
               </p>
             ) : normalizedPhase === "eval" ? (
               <p>
-                Evaluation resume seeds existing eval results into the staged
-                experiment directory, skips runs that already have a
+                Evaluation {isRetry ? "retry" : "resume"} seeds existing eval
+                results into the staged experiment directory, skips runs that already have a
                 <span className="font-mono"> results.json</span>, and rewrites
                 aggregate result files as remaining runs complete.
               </p>
@@ -117,7 +125,7 @@ export function ResumeJobButton({
             )}
             <p>
               This can update staged result artifacts for the same experiment.
-              Continue only if this is the timeout you intend to resume.
+              Continue only if this is the {isRetry ? "failure" : "timeout"} you intend to {action}.
             </p>
             <div className="border-t border-slate-200 pt-3 dark:border-slate-800" />
             {jobName && (
@@ -129,7 +137,7 @@ export function ResumeJobButton({
               </p>
             )}
             <div className="grid gap-1">
-              <span>Resumed jobs:</span>
+              <span>{isRetry ? "Retry jobs:" : "Resumed jobs:"}</span>
               {resumedJobs.isLoading ? (
                 <span className="font-mono text-xs text-slate-500">loading...</span>
               ) : resumedJobs.data?.length ? (
@@ -177,11 +185,15 @@ export function ResumeJobButton({
               onClick={() => resume.mutate()}
               disabled={resume.isPending}
             >
-              {resume.isPending ? "Submitting..." : "Submit resume"}
+              {resume.isPending ? "Submitting..." : submitLabel}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
     </>
   );
+}
+
+function actionLabel(action: ResumeAction) {
+  return action === "retry" ? "Retry" : "Resume";
 }

@@ -12,6 +12,15 @@ def _is_timeout(state: str) -> bool:
     return state.upper().startswith("TIMEOUT")
 
 
+def _is_failure(state: str) -> bool:
+    return state.upper().startswith((
+        "FAIL",
+        "OUT_OF_MEMORY",
+        "NODE_FAIL",
+        "PREEMPT",
+    ))
+
+
 def _original_phase(phase: str) -> str:
     # Historical jobs may have phase=resume in their sidecar/job_name. Treat
     # those as training jobs; new submissions never use resume as a phase.
@@ -19,13 +28,30 @@ def _original_phase(phase: str) -> str:
 
 
 async def resume_timed_out_job(cluster: str, job_id: str) -> submit.SubmitResponse:
+    return await _resubmit_slurm_job(cluster, job_id, action="resume")
+
+
+async def retry_failed_job(cluster: str, job_id: str) -> submit.SubmitResponse:
+    return await _resubmit_slurm_job(cluster, job_id, action="retry")
+
+
+async def _resubmit_slurm_job(
+    cluster: str,
+    job_id: str,
+    *,
+    action: str,
+) -> submit.SubmitResponse:
+    if action not in {"resume", "retry"}:
+        raise ValueError(f"unsupported job resubmit action: {action}")
     if cluster == "mlxp":
-        raise ValueError("MLXP timed-out job resume is not supported")
+        raise ValueError(f"MLXP job {action} is not supported")
 
     record = await jobs.get_job(cluster, job_id)
     state = str(record.get("State") or "")
-    if not _is_timeout(state):
+    if action == "resume" and not _is_timeout(state):
         raise ValueError(f"job {job_id} on {cluster} is {state or 'unknown'}, not TIMEOUT")
+    if action == "retry" and not _is_failure(state):
+        raise ValueError(f"job {job_id} on {cluster} is {state or 'unknown'}, not FAILED")
 
     det = await details.get_details(cluster, job_id, include_progress=False)
     variant = det.variant
@@ -38,6 +64,7 @@ async def resume_timed_out_job(cluster: str, job_id: str) -> submit.SubmitRespon
 
     partition = str(record.get("Partition") or "").strip() or None
     job_name = det.job_name or str(record.get("JobName") or "").strip() or None
+    retrying = action == "retry"
 
     if phase == "train":
         env = await load_cluster(cluster)
@@ -62,10 +89,11 @@ async def resume_timed_out_job(cluster: str, job_id: str) -> submit.SubmitRespon
                 train_max_steps=int_meta("train_max_steps"),
                 train_save_steps=int_meta("train_save_steps"),
                 train_action_horizon=int_meta("train_action_horizon"),
-                job_name=job_name,
+                job_name=None if retrying else job_name,
                 output_namespace=(meta.get("output_namespace") or "").strip() or None,
-                resume=True,
+                resume=not retrying,
                 resume_of=job_id,
+                resubmit_action=action,
             )
         )
 
@@ -114,9 +142,10 @@ async def resume_timed_out_job(cluster: str, job_id: str) -> submit.SubmitRespon
             eval_sets=eval_sets,
             checkpoint_path=checkpoint,
             seed_eval_results_from=seed_eval_dirs,
-            job_name=job_name,
+            job_name=None if retrying else job_name,
             output_namespace=(meta.get("output_namespace") or "").strip() or None,
             resume_of=job_id,
+            resubmit_action=action,
         )
     )
 
@@ -168,6 +197,7 @@ async def list_resumed_jobs(cluster: str, job_id: str) -> list[jobs.Job]:
                     phase=meta.get("phase") or None,
                     variant=meta.get("variant") or None,
                     resume_of=meta.get("resume_of") or None,
+                    resubmit_action=meta.get("resubmit_action") or None,
                 )
             )
         except Exception:
@@ -183,6 +213,7 @@ async def list_resumed_jobs(cluster: str, job_id: str) -> list[jobs.Job]:
                     phase=meta.get("phase") or None,
                     variant=meta.get("variant") or None,
                     resume_of=meta.get("resume_of") or None,
+                    resubmit_action=meta.get("resubmit_action") or None,
                 )
             )
     return linked

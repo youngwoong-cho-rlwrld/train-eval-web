@@ -11,3 +11,7 @@ LIB_DIR = REPO_ROOT / "lib"
 
 # Cluster-side staging dir, relative to the user's $HOME on each cluster.
 CLUSTER_STAGING_REL = ".train-eval-web"
+
+# Cluster-side copy-history dir. Slurm stores this below $HOME; MLXP stores it
+# below the configured DDN experiments root.
+CHECKPOINT_COPY_HISTORY_REL = f"{CLUSTER_STAGING_REL}/checkpoint-copies"

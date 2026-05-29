@@ -28,6 +28,7 @@ import { formatDuration, parseSlurmDuration } from "@/lib/duration";
 import { formatJobTimestamp } from "@/lib/job-time";
 import {
   isCompletedJobState,
+  isFailedJobState,
   isTerminalJobState,
   isTimeoutJobState,
   isTrainJobPhase,
@@ -105,6 +106,13 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
     enabled: details.data?.phase === "eval",
     refetchInterval: isTerminalJobState(details.data?.state) ? false : REFRESH_MS,
   });
+  const resumeOf = details.data?.resume_of ?? null;
+  const sourceJob = useQuery({
+    queryKey: ["job", cluster, resumeOf],
+    queryFn: () => api<Record<string, string>>(`/api/jobs/${cluster}/${resumeOf}`),
+    enabled: Boolean(resumeOf),
+    staleTime: 60_000,
+  });
 
   const stopped = isTerminalJobState(sacct.data?.State) || isTerminalJobState(details.data?.state);
 
@@ -166,13 +174,13 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
   });
   const checkpointMissing = checkpointPathExists.data?.exists === false;
   const canResume = cluster !== "mlxp" && isTimeoutJobState(stateForActions);
+  const canRetry = cluster !== "mlxp" && isFailedJobState(stateForActions);
   const canCopy = isTrainPhase && isComplete;
   const detailsError = details.error as Error | null;
   const progressError = progress.error as Error | null;
   const metadataError = metadata.error as Error | null;
   const gpuError = gpu.error as Error | null;
   const evalRunsError = evalRuns.error as Error | null;
-  const resumeOf = details.data?.resume_of ?? null;
   const [stream, setStream] = useState<"out" | "err" | "isaac">("out");
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [copyOpen, setCopyOpen] = useState(false);
@@ -194,7 +202,7 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
             Job <span className="font-mono">{id}</span>
             {resumeOf && (
               <span className="text-base font-normal text-slate-500">
-                {" "}(resumed from{" "}
+                {" "}({resubmitSourceLabel(details.data?.resubmit_action, sourceJob.data?.State)}{" "}
                 <Link
                   href={`/jobs/${encodeURIComponent(cluster)}/${encodeURIComponent(resumeOf)}`}
                   target="_blank"
@@ -266,6 +274,16 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
               phase={phase}
               variant={details.data?.variant}
               jobName={details.data?.job_name}
+            />
+          )}
+          {canRetry && (
+            <ResumeJobButton
+              cluster={cluster}
+              jobId={id}
+              phase={phase}
+              variant={details.data?.variant}
+              jobName={details.data?.job_name}
+              action="retry"
             />
           )}
           <Button
@@ -340,7 +358,7 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
             {sacct.error && <ErrorState message={(sacct.error as Error).message} />}
             {sacct.data && (
               <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
-                {["State", "ExitCode", "Elapsed", "Start", "End", "Partition", "NodeList", "Reason"].map((k) =>
+                {["State", "ExitCode", "Elapsed", "Start", "End", "Partition", "NodeList", "GPUs", "Reason"].map((k) =>
                   sacct.data[k] ? (
                     <div key={k} className="flex flex-col">
                       <dt className="text-xs uppercase tracking-wide text-slate-500">{k}</dt>
@@ -564,6 +582,16 @@ function formatSacctValue(key: string, value: string, cluster: string) {
       <span>{formatted.short}</span>
     </ImmediateTooltip>
   );
+}
+
+function resubmitSourceLabel(action?: string | null, sourceState?: string | null) {
+  if (action === "retry" || isFailedJobState(sourceState)) {
+    return "restarted from a failed job:";
+  }
+  if (action === "resume" || isTimeoutJobState(sourceState)) {
+    return "resumed from a timeout job:";
+  }
+  return "resubmitted from job:";
 }
 
 function GpuUsageSection({

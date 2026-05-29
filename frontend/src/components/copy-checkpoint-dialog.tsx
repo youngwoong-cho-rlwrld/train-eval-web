@@ -118,8 +118,8 @@ export function CopyCheckpointDialog({
           <DialogDescription>
             Copies the selected <code>checkpoint-N</code> dirs from{" "}
             <span className="font-mono">{cluster}</span> to another cluster.
-            Slurm to slurm uses rsync; mlxp to slurm stages model artifacts
-            with kubectl cp, then rsyncs them to the destination.
+            Selected step dirs are copied under the owning run name when one
+            exists.
           </DialogDescription>
         </DialogHeader>
 
@@ -188,7 +188,7 @@ export function CopyCheckpointDialog({
             <Input
               value={destPathRoot}
               onChange={(e) => setDestPathRoot(e.target.value)}
-              placeholder="/abs/dir (each checkpoint-N is created under it)"
+              placeholder="/abs/dir (each selected checkpoint is created under it)"
               className="min-w-0 font-mono text-xs"
             />
           </div>

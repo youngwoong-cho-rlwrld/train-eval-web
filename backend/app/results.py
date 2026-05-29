@@ -12,7 +12,9 @@ from pydantic import BaseModel, Field
 
 from . import variants
 from .clusters import load_cluster, list_clusters
-from .paths import CLUSTER_STAGING_REL
+from .mlxp_config import get_settings as get_mlxp_settings
+from .mlxp_data_pod import ensure_listing_pod
+from .paths import CHECKPOINT_COPY_HISTORY_REL, CLUSTER_STAGING_REL
 from .ssh import ssh_run
 
 
@@ -39,6 +41,8 @@ class ResultVariant(BaseModel):
     cluster: str
     job_id: str | None = None
     job_name: str | None = None
+    job_state: str | None = None
+    checkpoint_job_cluster: str | None = None
     checkpoint_job_id: str | None = None
     checkpoint_job_name: str | None = None
     variant: str
@@ -68,14 +72,15 @@ class ResultsResponse(BaseModel):
 async def list_results(cluster: str | None = None) -> ResultsResponse:
     target_clusters = [cluster] if cluster else list_clusters()
     payload = await _variant_payload()
+    checkpoint_links = await _checkpoint_link_payload()
 
     async def _one(c: str) -> tuple[list[ResultVariant], ClusterResultError | None]:
         try:
             if c == "mlxp":
-                raw = await _read_mlxp_results(payload)
+                raw = await _read_mlxp_results(payload, checkpoint_links)
                 return [ResultVariant.model_validate(x) for x in raw], None
             env = await load_cluster(c)
-            raw = await _read_cluster_results(env.ssh_alias, c, payload)
+            raw = await _read_cluster_results(env.ssh_alias, c, payload, checkpoint_links)
             return [ResultVariant.model_validate(x) for x in raw], None
         except Exception as e:
             return [], ClusterResultError(cluster=c, error=str(e))
@@ -88,8 +93,142 @@ async def list_results(cluster: str | None = None) -> ResultsResponse:
         if err:
             errors.append(err)
 
+    await _attach_mlxp_result_states(out)
     out.sort(key=lambda r: (r.cluster, r.model_version or "", r.variant))
     return ResultsResponse(clusters=target_clusters, variants=out, errors=errors)
+
+
+async def _attach_mlxp_result_states(rows: list[ResultVariant]) -> None:
+    mlxp_rows = [r for r in rows if r.cluster == "mlxp" and r.job_id and not r.job_state]
+    if not mlxp_rows:
+        return
+    try:
+        from . import mlxp_jobs
+        jobs = await mlxp_jobs.list_jobs()
+    except Exception:
+        return
+    state_by_id = {j.job_id: j.state for j in jobs}
+    for row in mlxp_rows:
+        state = state_by_id.get(row.job_id or "")
+        if state:
+            row.job_state = state
+
+
+async def _checkpoint_link_payload() -> list[dict[str, Any]]:
+    """Return copied-checkpoint aliases for result-card training links.
+
+    Results are scanned per destination cluster, but a checkpoint can be copied
+    from another cluster before evaluation. Copy history is written by source
+    job, so we collect it once in the API process and pass the aliases into
+    each remote scanner.
+    """
+
+    async def _one(cluster_name: str) -> list[dict[str, Any]]:
+        try:
+            if cluster_name == "mlxp":
+                return await _mlxp_copy_history_records()
+            env = await load_cluster(cluster_name)
+            return await _slurm_copy_history_records(env.ssh_alias)
+        except Exception:
+            return []
+
+    groups = await asyncio.gather(*(_one(c) for c in list_clusters()))
+    links: list[dict[str, Any]] = []
+    seen: set[tuple[str, str | None, str | None]] = set()
+    for records in groups:
+        for record in records:
+            info = _copy_record_job_info(record)
+            if not info:
+                continue
+            for key in _copy_record_checkpoint_keys(record):
+                dedupe_key = (key, info.get("cluster"), info.get("job_id"))
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                links.append({"key": key, "info": info})
+    return links
+
+
+async def _slurm_copy_history_records(host: str) -> list[dict[str, Any]]:
+    path = f"$HOME/{CHECKPOINT_COPY_HISTORY_REL}/*.jsonl"
+    r = await ssh_run(host, f"cat {path} 2>/dev/null || true", timeout=15.0)
+    if r.returncode != 0:
+        return []
+    return _parse_jsonl_records(r.stdout)
+
+
+async def _mlxp_copy_history_records() -> list[dict[str, Any]]:
+    settings = get_mlxp_settings()
+    pod = await ensure_listing_pod()
+    hist_dir = shlex.quote(f"{settings.experiments_dir}/{CHECKPOINT_COPY_HISTORY_REL}")
+    proc = await asyncio.create_subprocess_exec(
+        "kubectl", "exec", "-n", settings.namespace, pod, "--",
+        "bash", "-lc", f"cat {hist_dir}/*.jsonl 2>/dev/null || true",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+    if proc.returncode != 0:
+        return []
+    return _parse_jsonl_records(stdout.decode(errors="replace"))
+
+
+def _parse_jsonl_records(text: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict):
+            rows.append(item)
+    return rows
+
+
+def _copy_record_job_info(record: dict[str, Any]) -> dict[str, Any] | None:
+    source_cluster = str(record.get("source_cluster") or "").strip()
+    source_job = str(record.get("source_job") or "").strip()
+    if not source_cluster or not source_job:
+        return None
+    return {
+        "cluster": source_cluster,
+        "job_id": source_job,
+        "job_name": _checkpoint_leaf(record.get("source_path")) or source_job,
+    }
+
+
+def _copy_record_checkpoint_keys(record: dict[str, Any]) -> list[str]:
+    keys: list[str] = []
+    for field in ("dest_path", "source_path"):
+        path = str(record.get(field) or "").strip()
+        if not path:
+            continue
+        keys.append(path)
+        leaf = _checkpoint_leaf(path)
+        if leaf:
+            keys.append(leaf)
+        parent = _checkpoint_parent_if_step(path)
+        if parent:
+            keys.extend([parent, _checkpoint_leaf(parent)])
+    return [k for k in dict.fromkeys(k for k in keys if k)]
+
+
+def _checkpoint_leaf(path: Any) -> str | None:
+    path = str(path or "").rstrip("/")
+    if not path:
+        return None
+    return path.rsplit("/", 1)[-1]
+
+
+def _checkpoint_parent_if_step(path: str) -> str | None:
+    path = path.rstrip("/")
+    leaf = _checkpoint_leaf(path)
+    if not leaf or not leaf.startswith("checkpoint-") or "/" not in path:
+        return None
+    return path.rsplit("/", 1)[0]
 
 
 async def _variant_payload() -> list[dict[str, Any]]:
@@ -155,11 +294,18 @@ def _int_or_none(value: Any) -> int | None:
         return None
 
 
-async def _read_cluster_results(host: str, cluster: str, payload: list[dict[str, Any]]) -> list[dict[str, Any]]:
+async def _read_cluster_results(
+    host: str,
+    cluster: str,
+    payload: list[dict[str, Any]],
+    checkpoint_links: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     payload_b64 = base64.b64encode(json.dumps(payload).encode()).decode()
+    checkpoint_links_b64 = base64.b64encode(json.dumps(checkpoint_links).encode()).decode()
     rel = shlex.quote(CLUSTER_STAGING_REL)
     cmd = (
         f"RESULTS_PAYLOAD_B64={shlex.quote(payload_b64)} "
+        f"RESULTS_CHECKPOINT_LINKS_B64={shlex.quote(checkpoint_links_b64)} "
         f"RESULTS_CLUSTER={shlex.quote(cluster)} "
         f"RESULTS_STAGING_REL={rel} "
         "python3 - <<'PY'\n"
@@ -175,15 +321,17 @@ async def _read_cluster_results(host: str, cluster: str, payload: list[dict[str,
         raise RuntimeError(f"could not parse results from {cluster}: {e}: {r.stdout[:500]}")
 
 
-async def _read_mlxp_results(payload: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    from .mlxp_config import get_settings
-    from .mlxp_data_pod import ensure_listing_pod
-
-    settings = get_settings()
+async def _read_mlxp_results(
+    payload: list[dict[str, Any]],
+    checkpoint_links: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    settings = get_mlxp_settings()
     pod = await ensure_listing_pod()
     payload_b64 = base64.b64encode(json.dumps(payload).encode()).decode()
+    checkpoint_links_b64 = base64.b64encode(json.dumps(checkpoint_links).encode()).decode()
     cmd = (
         f"RESULTS_PAYLOAD_B64={shlex.quote(payload_b64)} "
+        f"RESULTS_CHECKPOINT_LINKS_B64={shlex.quote(checkpoint_links_b64)} "
         "RESULTS_CLUSTER=mlxp "
         f"RESULTS_EXPERIMENTS_ROOT={shlex.quote(settings.experiments_dir)} "
         "python3 - <<'PY'\n"
@@ -214,10 +362,14 @@ import base64
 import json
 import os
 import statistics
+import subprocess
 from pathlib import Path
 
 
 payload = json.loads(base64.b64decode(os.environ["RESULTS_PAYLOAD_B64"]).decode())
+checkpoint_links = json.loads(
+    base64.b64decode(os.environ.get("RESULTS_CHECKPOINT_LINKS_B64", "W10=")).decode()
+)
 cluster = os.environ["RESULTS_CLUSTER"]
 staging_rel = os.environ.get("RESULTS_STAGING_REL", ".train-eval-web")
 experiments_root = Path(os.environ["RESULTS_EXPERIMENTS_ROOT"]) if os.environ.get("RESULTS_EXPERIMENTS_ROOT") else Path.home() / staging_rel / "experiments"
@@ -411,20 +563,23 @@ def add_job_name_index(index, info):
         index[job_name] = info
 
 
-def add_checkpoint_index_entry(index, key, info):
+def add_checkpoint_index_entry(index, key, info, *, overwrite=True):
     key = path_key(key)
     if not key:
         return
-    index[key] = info
+    if overwrite or key not in index:
+        index[key] = info
     leaf = Path(key).name
-    if leaf:
+    if leaf and (overwrite or leaf not in index):
         index[leaf] = info
 
 
 def job_info_from_meta(job_id, meta):
     return {
+        "cluster": meta.get("cluster") or cluster,
         "job_id": str(job_id),
         "job_name": meta.get("job_name") or str(job_id),
+        "job_state": meta.get("state"),
         "train_note": meta.get("train_note"),
     }
 
@@ -493,6 +648,72 @@ def load_result_job_index():
     return path_index, name_index, checkpoint_index
 
 
+def iter_unique_job_infos(*indexes):
+    seen = set()
+    for index in indexes:
+        for info in index.values():
+            ident = id(info)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            yield info
+
+
+def slurm_states(job_ids):
+    job_ids = [str(j) for j in dict.fromkeys(job_ids) if str(j).strip()]
+    if not job_ids:
+        return {}
+    joined = ",".join(job_ids)
+    out = {}
+
+    def run(args):
+        try:
+            return subprocess.run(
+                args,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=10,
+            ).stdout
+        except Exception:
+            return ""
+
+    for line in run(["sacct", "-X", "-j", joined, "-P", "-n", "-o", "JobID,State"]).splitlines():
+        parts = line.split("|")
+        if len(parts) >= 2 and parts[0] and parts[1]:
+            out[parts[0]] = parts[1].split(" ", 1)[0]
+
+    # Prefer squeue for active jobs because it is fresher than sacct.
+    for line in run(["squeue", "-h", "-j", joined, "-o", "%i|%T"]).splitlines():
+        parts = line.split("|")
+        if len(parts) >= 2 and parts[0] and parts[1]:
+            out[parts[0]] = parts[1]
+    return out
+
+
+def add_current_job_states(path_index, name_index):
+    infos = list(iter_unique_job_infos(path_index, name_index))
+    states = slurm_states(info.get("job_id") for info in infos)
+    for info in infos:
+        state = states.get(str(info.get("job_id")))
+        if state:
+            info["job_state"] = state
+
+
+def add_copied_checkpoint_indexes(checkpoint_index):
+    for item in checkpoint_links or []:
+        if not isinstance(item, dict):
+            continue
+        info = item.get("info")
+        key = item.get("key")
+        if not isinstance(info, dict) or not key:
+            continue
+        if not info.get("cluster") or not info.get("job_id"):
+            continue
+        add_checkpoint_index_entry(checkpoint_index, key, info, overwrite=False)
+
+
 def result_job_info(eval_root, top_path, job_name=None):
     for candidate in (top_path, eval_root):
         info = job_path_index.get(path_key(candidate))
@@ -510,6 +731,7 @@ def apply_job_info(result, info):
         return
     result["job_id"] = info.get("job_id")
     result["job_name"] = info.get("job_name")
+    result["job_state"] = info.get("job_state")
     train_note = str(info.get("train_note") or "").strip()
     if train_note:
         result["note"] = train_note
@@ -534,8 +756,14 @@ def apply_checkpoint_job_info(result):
     info = checkpoint_job_info(result.get("checkpoint"))
     if not info:
         return
+    result["checkpoint_job_cluster"] = info.get("cluster")
     result["checkpoint_job_id"] = info.get("job_id")
     result["checkpoint_job_name"] = info.get("job_name")
+
+
+def finalize_result(result):
+    apply_checkpoint_job_info(result)
+    return result
 
 
 def run_path_key(path):
@@ -577,6 +805,8 @@ def build_variant_from_root(meta, eval_root, top_path):
         "cluster": cluster,
         "job_id": None,
         "job_name": None,
+        "job_state": None,
+        "checkpoint_job_cluster": None,
         "checkpoint_job_id": None,
         "checkpoint_job_name": None,
         "variant": variant,
@@ -643,8 +873,7 @@ def build_variant_from_root(meta, eval_root, top_path):
     if not eval_root.exists():
         if aggregate_tasks:
             result["tasks"] = aggregate_tasks
-            apply_checkpoint_job_info(result)
-            return result
+            return finalize_result(result)
         return None
 
     if len(configured_tasks) > 1:
@@ -674,12 +903,10 @@ def build_variant_from_root(meta, eval_root, top_path):
 
     if result["tasks"]:
         result["source"] = str(eval_root)
-        apply_checkpoint_job_info(result)
-        return result
+        return finalize_result(result)
     if aggregate_tasks:
         result["tasks"] = aggregate_tasks
-        apply_checkpoint_job_info(result)
-        return result
+        return finalize_result(result)
     return None
 
 
@@ -714,6 +941,8 @@ def build_variant(meta):
 
 rows = []
 job_path_index, job_name_index, checkpoint_index = load_result_job_index()
+add_current_job_states(job_path_index, job_name_index)
+add_copied_checkpoint_indexes(checkpoint_index)
 for meta in payload:
     rows.extend(build_variant(meta))
 print(json.dumps(rows))

@@ -22,6 +22,7 @@ import { formatJobTimestamp, parseJobTimestampMs } from "@/lib/job-time";
 import {
   isActiveJobState,
   isCompletedJobState,
+  isFailedJobState,
   isTimeoutJobState,
   isTrainJobPhase,
   jobPhase,
@@ -368,7 +369,7 @@ function JobTable({
                   </Link>
                   {j.resume_of && (
                     <span className="ml-1 text-xs text-slate-500">
-                      (resumed from{" "}
+                      ({resubmitSourceLabel(j.resubmit_action)}{" "}
                       <Link
                         href={`/jobs/${encodeURIComponent(j.cluster)}/${encodeURIComponent(j.resume_of)}`}
                         target="_blank"
@@ -424,10 +425,20 @@ function JobTable({
                           className="h-7 px-2 text-xs"
                         />
                       )}
+                      {canRetryJob(j) && (
+                        <ResumeJobButton
+                          cluster={j.cluster}
+                          jobId={j.job_id}
+                          phase={phase}
+                          jobName={j.job_name}
+                          action="retry"
+                          className="h-7 px-2 text-xs"
+                        />
+                      )}
                       {canCopyCheckpoint(j, phase) && (
                         <CopyCheckpointShortcut job={j} />
                       )}
-                      {!canResumeJob(j) && !canCopyCheckpoint(j, phase) && (
+                      {!canResumeJob(j) && !canRetryJob(j) && !canCopyCheckpoint(j, phase) && (
                         <span className="text-slate-400">—</span>
                       )}
                     </div>
@@ -607,6 +618,16 @@ function PhaseBadge({ phase }: { phase: JobPhase }) {
 
 function canResumeJob(job: Job): boolean {
   return job.cluster !== "mlxp" && isTimeoutJobState(job.state);
+}
+
+function canRetryJob(job: Job): boolean {
+  return job.cluster !== "mlxp" && isFailedJobState(job.state);
+}
+
+function resubmitSourceLabel(action?: string | null) {
+  if (action === "retry") return "restarted from a failed job:";
+  if (action === "resume") return "resumed from a timeout job:";
+  return "resubmitted from job:";
 }
 
 function canCopyCheckpoint(job: Job, phase: JobPhase): boolean {

@@ -1,6 +1,7 @@
 """Slurm job listing + status + cancel."""
 
 import asyncio
+import re
 import shlex
 
 from pydantic import BaseModel
@@ -29,6 +30,7 @@ class Job(BaseModel):
     phase: str | None = None
     variant: str | None = None
     resume_of: str | None = None
+    resubmit_action: str | None = None
 
 
 _SQUEUE_FMT = "%i|%j|%P|%T|%M|%R|%L|%S"
@@ -194,10 +196,71 @@ def _attach_phase_metadata(rows: list[Job], meta_by_job_id: dict[str, dict[str, 
         job.phase = None if phase == "unknown" else phase
         job.variant = variant
         job.resume_of = meta.get("resume_of") or None
+        job.resubmit_action = meta.get("resubmit_action") or None
 
 
-_SACCT_FMT = "JobID,JobName,Partition,State,ExitCode,Start,End,Elapsed,NodeList,Reason"
-_SQUEUE_DETAIL_FMT = "%i|%j|%P|%T|%V|%S|%M|%R"
+_SACCT_DETAIL_FMT = "JobID,JobName,Partition,State,ExitCode,Start,End,Elapsed,NodeList,Reason"
+_SACCT_GPU_DETAIL_FMT = f"{_SACCT_DETAIL_FMT},AllocTRES,ReqTRES"
+_SQUEUE_DETAIL_FMT = "%i|%j|%P|%T|%V|%S|%M|%N|%R|%b"
+
+
+def _gpu_count_from_tres(value: str | None) -> str | None:
+    if not value or value in {"N/A", "(null)", "None"}:
+        return None
+    for part in re.split(r"[, ]+", value):
+        if "gpu" not in part:
+            continue
+        if "=" in part:
+            name, raw = part.rsplit("=", 1)
+            if "gpu" in name:
+                try:
+                    return str(int(raw))
+                except ValueError:
+                    continue
+        pieces = part.split(":")
+        if pieces and "gpu" in pieces[0]:
+            try:
+                return str(int(pieces[-1]))
+            except ValueError:
+                continue
+    return None
+
+
+def _gpu_count_from_meta(meta: dict[str, str]) -> str | None:
+    for key in ("eval_num_gpus", "train_num_gpus", "num_gpus"):
+        value = (meta.get(key) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _attach_gpu_count(record: dict[str, str], meta: dict[str, str] | None = None) -> None:
+    gpu_count = (
+        _gpu_count_from_tres(record.get("AllocTRES"))
+        or _gpu_count_from_tres(record.get("ReqTRES"))
+        or _gpu_count_from_tres(record.get("TresPerNode"))
+        or _gpu_count_from_meta(meta or {})
+    )
+    if gpu_count:
+        record["GPUs"] = gpu_count
+
+
+async def _sacct_job_record(host: str, cluster: str, job_id: str) -> dict[str, str] | None:
+    for fmt in (_SACCT_GPU_DETAIL_FMT, _SACCT_DETAIL_FMT):
+        r = await ssh_run(
+            host,
+            f'sacct -j {shlex.quote(job_id)} -X --parsable2 --format={fmt}',
+            timeout=15.0,
+        )
+        if r.returncode != 0:
+            continue
+        lines = r.stdout.strip().splitlines()
+        if len(lines) < 2:
+            continue
+        header = lines[0].split("|")
+        row = lines[1].split("|")
+        return {**dict(zip(header, row)), "cluster": cluster}
+    return None
 
 
 async def get_job(cluster: str, job_id: str) -> dict:
@@ -206,40 +269,40 @@ async def get_job(cluster: str, job_id: str) -> dict:
         from . import mlxp_jobs
         return await mlxp_jobs.get_job(job_id)
     env = await load_cluster(cluster)
-    source_tz_task = asyncio.create_task(scheduler_timezone(env.ssh_alias))
-    r = await ssh_run(
-        env.ssh_alias,
-        f'sacct -j {job_id} -X --parsable2 --format={_SACCT_FMT}',
-        timeout=15.0,
+    host = env.ssh_alias
+    source_tz, meta, d = await asyncio.gather(
+        scheduler_timezone(host),
+        read_slurm_meta(host, job_id),
+        _sacct_job_record(host, cluster, job_id),
     )
-    source_tz = await source_tz_task
-    if r.returncode == 0:
-        lines = r.stdout.strip().splitlines()
-        if len(lines) >= 2:
-            header = lines[0].split("|")
-            row = lines[1].split("|")
-            d = {**dict(zip(header, row)), "cluster": cluster}
-            d["Start"] = _actual_start_for_state(d.get("State", ""), d.get("Start"), source_tz) or ""
-            d["End"] = to_kst_iso(d.get("End"), source_tz) or ""
-            await _normalize_completed_eval_record(env.ssh_alias, env.vars["LOG_DIR"], d)
-            return d
+    if d:
+        d["Start"] = _actual_start_for_state(d.get("State", ""), d.get("Start"), source_tz) or ""
+        d["End"] = to_kst_iso(d.get("End"), source_tz) or ""
+        _attach_gpu_count(d, meta)
+        await _normalize_completed_eval_record(host, env.vars["LOG_DIR"], d, meta)
+        return d
 
     # Fall back to squeue for jobs that don't have an sacct record yet.
-    sq = await ssh_run(env.ssh_alias,
-                       f'squeue -j {job_id} -h -o "{_SQUEUE_DETAIL_FMT}"',
-                       timeout=15.0)
+    sq = await ssh_run(
+        host,
+        f'squeue -j {shlex.quote(job_id)} -h -o "{_SQUEUE_DETAIL_FMT}"',
+        timeout=15.0,
+    )
     if sq.returncode == 0 and sq.stdout.strip():
         parts = sq.stdout.strip().split("|")
-        # parts: JobID|JobName|Partition|State|SubmitTime|StartTime|Elapsed|Reason
-        keys = ["JobID", "JobName", "Partition", "State", "Submit", "Start", "Elapsed", "Reason"]
+        # parts: JobID|JobName|Partition|State|SubmitTime|StartTime|Elapsed|NodeList|Reason|TresPerNode
+        keys = [
+            "JobID", "JobName", "Partition", "State", "Submit", "Start",
+            "Elapsed", "NodeList", "Reason", "TresPerNode",
+        ]
         d = dict(zip(keys, parts))
         d["cluster"] = cluster
         d["Submit"] = to_kst_iso(d.get("Submit"), source_tz) or ""
         d["Start"] = _actual_start_for_state(d.get("State", ""), d.get("Start"), source_tz) or ""
         d.setdefault("ExitCode", "")
         d.setdefault("End", "")
-        d.setdefault("NodeList", parts[7] if len(parts) > 7 else "")
-        await _normalize_completed_eval_record(env.ssh_alias, env.vars["LOG_DIR"], d)
+        _attach_gpu_count(d, meta)
+        await _normalize_completed_eval_record(host, env.vars["LOG_DIR"], d, meta)
         return d
 
     raise FileNotFoundError(f"no job record for {job_id} on {cluster}")
@@ -299,14 +362,16 @@ async def _normalize_completed_eval_jobs(
     await asyncio.gather(*(_one(j) for j in rows), return_exceptions=True)
 
 
-async def _normalize_completed_eval_record(host: str, log_dir: str, record: dict) -> None:
+async def _normalize_completed_eval_record(
+    host: str,
+    log_dir: str,
+    record: dict,
+    meta: dict[str, str] | None = None,
+) -> None:
     state = str(record.get("State") or "")
     if not _terminal_non_completed(state):
         return
-    try:
-        meta = await read_slurm_meta(host, str(record.get("JobID") or ""))
-    except Exception:
-        meta = {}
+    meta = meta or {}
     phase, variant = resolve_phase_and_variant(str(record.get("JobName") or ""), record)
     if phase != "eval" or not variant:
         p, v = phase_variant_from_meta(meta)
