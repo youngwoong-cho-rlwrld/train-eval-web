@@ -219,6 +219,12 @@ export type EvalRun = {
   path: string;
 };
 
+export type TrainingJobRef = {
+  cluster: string;
+  job_id: string;
+  job_name: string | null;
+};
+
 export type Dataset = {
   name: string;
   path: string;
@@ -293,6 +299,7 @@ export type JobDetails = {
   variant: string | null;
   resume_of: string | null;
   resubmit_action: string | null;
+  training_job: TrainingJobRef | null;
   train_note: string | null;
   state: string;
   elapsed: string;

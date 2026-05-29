@@ -241,6 +241,26 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
                   {details.data.train_note}
                 </div>
               )}
+              {isEval && details.data.training_job && (
+                <div className="flex items-center gap-1.5 text-sm text-slate-600 dark:text-slate-400">
+                  <span>Training job:</span>
+                  <Link
+                    href={`/jobs/${encodeURIComponent(details.data.training_job.cluster)}/${encodeURIComponent(details.data.training_job.job_id)}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1 font-mono text-blue-600 hover:underline dark:text-blue-400"
+                    title={details.data.training_job.job_name ?? undefined}
+                  >
+                    {details.data.training_job.cluster}/{details.data.training_job.job_id}
+                    <ExternalLink className="h-3 w-3" />
+                  </Link>
+                  {details.data.training_job.job_name && (
+                    <span className="truncate font-mono text-xs text-slate-500">
+                      {details.data.training_job.job_name}
+                    </span>
+                  )}
+                </div>
+              )}
             </div>
           )}
         </div>

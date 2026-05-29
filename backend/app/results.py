@@ -11,10 +11,11 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from . import variants
+from .checkpoint_links import checkpoint_copy_links as _checkpoint_link_payload
 from .clusters import load_cluster, list_clusters
 from .mlxp_config import get_settings as get_mlxp_settings
 from .mlxp_data_pod import ensure_listing_pod
-from .paths import CHECKPOINT_COPY_HISTORY_REL, CLUSTER_STAGING_REL
+from .paths import CLUSTER_STAGING_REL
 from .ssh import ssh_run
 
 
@@ -112,123 +113,6 @@ async def _attach_mlxp_result_states(rows: list[ResultVariant]) -> None:
         state = state_by_id.get(row.job_id or "")
         if state:
             row.job_state = state
-
-
-async def _checkpoint_link_payload() -> list[dict[str, Any]]:
-    """Return copied-checkpoint aliases for result-card training links.
-
-    Results are scanned per destination cluster, but a checkpoint can be copied
-    from another cluster before evaluation. Copy history is written by source
-    job, so we collect it once in the API process and pass the aliases into
-    each remote scanner.
-    """
-
-    async def _one(cluster_name: str) -> list[dict[str, Any]]:
-        try:
-            if cluster_name == "mlxp":
-                return await _mlxp_copy_history_records()
-            env = await load_cluster(cluster_name)
-            return await _slurm_copy_history_records(env.ssh_alias)
-        except Exception:
-            return []
-
-    groups = await asyncio.gather(*(_one(c) for c in list_clusters()))
-    links: list[dict[str, Any]] = []
-    seen: set[tuple[str, str | None, str | None]] = set()
-    for records in groups:
-        for record in records:
-            info = _copy_record_job_info(record)
-            if not info:
-                continue
-            for key in _copy_record_checkpoint_keys(record):
-                dedupe_key = (key, info.get("cluster"), info.get("job_id"))
-                if dedupe_key in seen:
-                    continue
-                seen.add(dedupe_key)
-                links.append({"key": key, "info": info})
-    return links
-
-
-async def _slurm_copy_history_records(host: str) -> list[dict[str, Any]]:
-    path = f"$HOME/{CHECKPOINT_COPY_HISTORY_REL}/*.jsonl"
-    r = await ssh_run(host, f"cat {path} 2>/dev/null || true", timeout=15.0)
-    if r.returncode != 0:
-        return []
-    return _parse_jsonl_records(r.stdout)
-
-
-async def _mlxp_copy_history_records() -> list[dict[str, Any]]:
-    settings = get_mlxp_settings()
-    pod = await ensure_listing_pod()
-    hist_dir = shlex.quote(f"{settings.experiments_dir}/{CHECKPOINT_COPY_HISTORY_REL}")
-    proc = await asyncio.create_subprocess_exec(
-        "kubectl", "exec", "-n", settings.namespace, pod, "--",
-        "bash", "-lc", f"cat {hist_dir}/*.jsonl 2>/dev/null || true",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
-    if proc.returncode != 0:
-        return []
-    return _parse_jsonl_records(stdout.decode(errors="replace"))
-
-
-def _parse_jsonl_records(text: str) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(item, dict):
-            rows.append(item)
-    return rows
-
-
-def _copy_record_job_info(record: dict[str, Any]) -> dict[str, Any] | None:
-    source_cluster = str(record.get("source_cluster") or "").strip()
-    source_job = str(record.get("source_job") or "").strip()
-    if not source_cluster or not source_job:
-        return None
-    return {
-        "cluster": source_cluster,
-        "job_id": source_job,
-        "job_name": _checkpoint_leaf(record.get("source_path")) or source_job,
-    }
-
-
-def _copy_record_checkpoint_keys(record: dict[str, Any]) -> list[str]:
-    keys: list[str] = []
-    for field in ("dest_path", "source_path"):
-        path = str(record.get(field) or "").strip()
-        if not path:
-            continue
-        keys.append(path)
-        leaf = _checkpoint_leaf(path)
-        if leaf:
-            keys.append(leaf)
-        parent = _checkpoint_parent_if_step(path)
-        if parent:
-            keys.extend([parent, _checkpoint_leaf(parent)])
-    return [k for k in dict.fromkeys(k for k in keys if k)]
-
-
-def _checkpoint_leaf(path: Any) -> str | None:
-    path = str(path or "").rstrip("/")
-    if not path:
-        return None
-    return path.rsplit("/", 1)[-1]
-
-
-def _checkpoint_parent_if_step(path: str) -> str | None:
-    path = path.rstrip("/")
-    leaf = _checkpoint_leaf(path)
-    if not leaf or not leaf.startswith("checkpoint-") or "/" not in path:
-        return None
-    return path.rsplit("/", 1)[0]
 
 
 async def _variant_payload() -> list[dict[str, Any]]:

@@ -16,6 +16,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
 from pydantic import BaseModel, Field
 
+from .checkpoint_links import find_training_job_for_checkpoint
 from .clusters import load_cluster
 from .data_interface import DataInterfaceSummary, summarize_data_interface_text
 from .eval_completion import (
@@ -123,6 +124,12 @@ class EvalRun(BaseModel):
     path: str
 
 
+class TrainingJobRef(BaseModel):
+    cluster: str
+    job_id: str
+    job_name: str | None = None
+
+
 class JobDetails(BaseModel):
     cluster: str
     job_id: str
@@ -131,6 +138,7 @@ class JobDetails(BaseModel):
     variant: str | None
     resume_of: str | None = None
     resubmit_action: str | None = None
+    training_job: TrainingJobRef | None = None
     train_note: str | None = None
     state: str
     elapsed: str
@@ -302,6 +310,7 @@ async def get_details(
     include_data_interface: bool = False,
     include_eval_runs: bool = False,
     include_progress: bool = True,
+    include_training_link: bool = True,
 ) -> JobDetails:
     if cluster != "mlxp":
         env = await load_cluster(cluster)
@@ -333,6 +342,7 @@ async def get_details(
             include_data_interface=include_data_interface,
             include_eval_runs=include_eval_runs,
             include_progress=include_progress,
+            include_training_link=include_training_link,
             pod_name=sacct.get("_pod_name") or None,
             node=sacct.get("NodeList") or None,
             job_comment=sacct.get("JobComment") or None,
@@ -479,6 +489,11 @@ async def get_details(
         eval_dir=eval_dir,
         isaac_logs_glob=isaac_logs_glob,
     )
+    training_job_task = (
+        asyncio.create_task(find_training_job_for_checkpoint(cluster, eval_checkpoint))
+        if include_training_link and phase == "eval" and eval_checkpoint
+        else None
+    )
     config_snapshot = None
     data_interface = None
     if include_config or include_data_interface:
@@ -513,11 +528,14 @@ async def get_details(
     eval_runs = await eval_runs_task if eval_runs_task else []
     if include_progress:
         _reconcile_eval_progress_from_runs(progress, eval_runs)
+    training_job_data = await training_job_task if training_job_task else None
+    training_job = TrainingJobRef.model_validate(training_job_data) if training_job_data else None
 
     return JobDetails(
         cluster=cluster, job_id=job_id, job_name=job_name,
         phase=phase, variant=variant, resume_of=slurm_meta.get("resume_of") or None,
         resubmit_action=slurm_meta.get("resubmit_action") or None,
+        training_job=training_job,
         train_note=slurm_meta.get("train_note") or None,
         state=state, elapsed=elapsed,
         wandb_project=job_wandb_project,
@@ -535,6 +553,7 @@ async def get_metadata(cluster: str, job_id: str) -> JobMetadataPayload:
         include_config=True,
         include_data_interface=True,
         include_progress=False,
+        include_training_link=False,
     )
     return JobMetadataPayload(
         wandb_project=det.wandb_project,
@@ -548,6 +567,7 @@ async def get_progress(cluster: str, job_id: str) -> JobProgressPayload:
         cluster,
         job_id,
         include_progress=True,
+        include_training_link=False,
     )
     return JobProgressPayload(
         cluster=det.cluster,
@@ -566,6 +586,7 @@ async def get_gpu(cluster: str, job_id: str) -> JobGpuPayload:
         job_id,
         include_gpu=True,
         include_progress=False,
+        include_training_link=False,
     )
     return JobGpuPayload(gpu=det.gpu)
 
@@ -576,6 +597,7 @@ async def get_eval_runs(cluster: str, job_id: str) -> JobEvalRunsPayload:
         job_id,
         include_eval_runs=True,
         include_progress=False,
+        include_training_link=False,
     )
     return JobEvalRunsPayload(eval_runs=det.eval_runs)
 
@@ -621,6 +643,7 @@ async def _mlxp_details(
     include_data_interface: bool = False,
     include_eval_runs: bool = False,
     include_progress: bool = True,
+    include_training_link: bool = True,
     pod_name: str | None = None,
     node: str | None = None,
     job_comment: str | None = None,
@@ -664,6 +687,11 @@ async def _mlxp_details(
     )
     if phase == "eval":
         paths.eval_checkpoint = metadata.get("checkpoint_path") or None
+    training_job_task = (
+        asyncio.create_task(find_training_job_for_checkpoint("mlxp", paths.eval_checkpoint))
+        if include_training_link and phase == "eval" and paths.eval_checkpoint
+        else None
+    )
     config_snapshot = None
     data_interface = None
     if include_config or include_data_interface:
@@ -698,11 +726,14 @@ async def _mlxp_details(
         if include_eval_runs and phase == "eval" and paths.eval_dir
         else []
     )
+    training_job_data = await training_job_task if training_job_task else None
+    training_job = TrainingJobRef.model_validate(training_job_data) if training_job_data else None
 
     return JobDetails(
         cluster="mlxp", job_id=job_id, job_name=job_name,
         phase=phase, variant=variant, resume_of=metadata.get("resume_of") or None,
         resubmit_action=metadata.get("resubmit_action") or None,
+        training_job=training_job,
         train_note=train_note,
         state=state, elapsed=elapsed,
         wandb_project=job_wandb_project,
