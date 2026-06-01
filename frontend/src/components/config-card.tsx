@@ -51,6 +51,7 @@ export function ConfigCard({
   flagEditors,
   extraFlagRows = [],
   showCheckpointPathRow = true,
+  showEffectiveConfigPathRows = true,
   loading = false,
   error,
   className,
@@ -79,6 +80,7 @@ export function ConfigCard({
   flagEditors?: Record<string, FlagEditor>;
   extraFlagRows?: ExtraFlagRow[];
   showCheckpointPathRow?: boolean;
+  showEffectiveConfigPathRows?: boolean;
   loading?: boolean;
   error?: Error | null;
   className?: string;
@@ -96,7 +98,8 @@ export function ConfigCard({
   const configPath = variantName
     ? `configs/experiments/${variantName}/config.sh`
     : null;
-  const shownConfigPath = effectiveConfigPath || configPath;
+  const shownEffectiveConfigPath = showEffectiveConfigPathRows ? effectiveConfigPath : null;
+  const shownConfigPath = shownEffectiveConfigPath || configPath;
   const shownFlags = resolveShownFlags({
     override: flagsOverride,
     loaded: flags.data?.flags,
@@ -128,17 +131,17 @@ export function ConfigCard({
           <div className="divide-y divide-slate-100 dark:divide-slate-900">
             {shownConfigPath && (
               <ConfigPathRow
-                label={effectiveConfigPath ? "effective config.sh" : "config.sh"}
+                label={shownEffectiveConfigPath ? "effective config.sh" : "config.sh"}
                 value={shownConfigPath}
                 labelHelp={
-                  effectiveConfigPath
+                  shownEffectiveConfigPath
                     ? "The config.sh that will be used for this submission after applying UI overrides."
                     : undefined
                 }
-                valueTooltip={effectiveConfigPath ? shownConfigPath : undefined}
+                valueTooltip={shownEffectiveConfigPath ? shownConfigPath : undefined}
               />
             )}
-            {effectiveConfigPath && configPath && (
+            {shownEffectiveConfigPath && configPath && (
               <ConfigPathRow
                 label="source config.sh"
                 value={configPath}

@@ -1236,6 +1236,7 @@ export default function SubmitPage() {
                 flagEditors={flagEditors}
                 extraFlagRows={extraFlagRows}
                 showCheckpointPathRow={false}
+                showEffectiveConfigPathRows={false}
                 loading={variant.isLoading}
                 error={variantError}
               />

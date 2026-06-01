@@ -89,8 +89,10 @@ async def get_cluster_partitions(name: str):
 
 
 @app.get("/api/clusters/{name}/gpu-queue", response_model=partitions.GpuQueueSnapshot)
-async def get_cluster_gpu_queue(name: str, partition: str):
+async def get_cluster_gpu_queue(name: str, partition: str, job_id: str | None = None):
     try:
+        if name == "mlxp":
+            return await mlxp.gpu_queue_snapshot(job_id=job_id)
         return await partitions.gpu_queue_snapshot(name, partition)
     except FileNotFoundError:
         raise HTTPException(404, f"cluster {name} not found")

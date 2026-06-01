@@ -147,6 +147,33 @@ def resolve_train_note(requested_note: str | None, variant) -> str:
     return note
 
 
+def slurm_comment_metadata(
+    *,
+    phase: str,
+    variant: str,
+    model_id: str,
+    output_namespace: str | None = None,
+    resume_of: str | None = None,
+    resubmit_action: str | None = None,
+) -> str:
+    """Small scheduler Comment fallback.
+
+    Full submission metadata lives in the per-job sidecar after sbatch
+    succeeds. Slurm's Comment field has a tighter controller-side limit, so
+    keep it short enough for resubmits where paths already have long names.
+    """
+    return comment_field_fragment(
+        {
+            "phase": phase,
+            "variant": variant,
+            "model_id": model_id,
+            "output_namespace": output_namespace,
+            "resume_of": (resume_of or "").strip() or None,
+            "resubmit_action": resubmit_action,
+        }
+    )
+
+
 def normalize_eval_sets(eval_sets: list[str] | None) -> list[str] | None:
     if eval_sets is None:
         return None
@@ -605,54 +632,18 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     body_path = f"$HOME/{CLUSTER_STAGING_REL}/lib/{body_script}"
     repo_root_remote = f"$HOME/{CLUSTER_STAGING_REL}"
 
-    # Persist phase+variant in sacct's Comment field so the details page can
-    # recover them even when the user picked a custom job_name that doesn't
-    # match the unified regex.
-    comment = (
-        f"phase={req.phase};variant={req.variant};"
-        f"model_id={model.id};submit_train_repo_dir={training_repo};"
-        f"wandb_project={submitted_wandb_project}"
+    # Persist only identity/link metadata in sacct's Comment field so the
+    # details page can recover custom job names even if the sidecar is missing.
+    # Full paths and git fields are written to the sidecar below; keeping them
+    # out of --comment avoids Slurm's "parameter too long" rejection on resume.
+    comment = slurm_comment_metadata(
+        phase=req.phase,
+        variant=req.variant,
+        model_id=model.id,
+        output_namespace=output_namespace,
+        resume_of=req.resume_of,
+        resubmit_action=req.resubmit_action,
     )
-    if output_namespace:
-        comment += f";output_namespace={output_namespace}"
-    if req.resume_of and req.resume_of.strip():
-        comment += f";resume_of={req.resume_of.strip()}"
-    if req.resubmit_action:
-        comment += f";resubmit_action={req.resubmit_action}"
-    if submit_git:
-        comment += ";" + comment_field_fragment(
-            {
-                "submit_git_repo_path": submit_git.repo_path,
-                "submit_git_repo_label": submit_git.repo_label,
-                "submit_git_branch": submit_git.branch,
-                "submit_git_commit": submit_git.commit,
-                "submit_git_commit_subject": submit_git.commit_subject,
-            }
-        )
-    if req.phase == "train":
-        comment += (
-            f";train_num_gpus={train_settings.num_gpus}"
-            f";train_max_steps={train_settings.max_steps}"
-            f";train_save_steps={train_settings.save_steps}"
-        )
-        if train_action_horizon is not None:
-            comment += f";train_action_horizon={train_action_horizon}"
-        if snapshot_modality_path:
-            comment += f";train_modality_config={snapshot_modality_path}"
-        if req.train_global_batch_size is not None:
-            comment += f";train_global_batch_size={req.train_global_batch_size}"
-        if snapshot_path:
-            comment += f";config_snapshot_path={snapshot_path}"
-        if checkpoint_dir:
-            comment += f";checkpoint_dir={checkpoint_dir}"
-    else:
-        comment += f";eval_num_gpus={train_settings.num_gpus}"
-        if eval_dir:
-            comment += f";eval_dir={eval_dir}"
-        if results_path:
-            comment += f";results_path={results_path}"
-        if eval_checkpoint:
-            comment += f";checkpoint_path={eval_checkpoint}"
 
     sbatch_parts = [
         "/opt/slurm/bin/sbatch",

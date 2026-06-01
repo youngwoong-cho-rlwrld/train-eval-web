@@ -14,13 +14,18 @@ Conventions:
 import asyncio
 import json
 import shlex
-import shutil
 from datetime import datetime, timezone
 from typing import Any
 
 from .job_identity import parse_comment_fields
 from .jobs import Job
-from .k8s_resources import affinity_node, requested_gpus
+from .k8s_resources import (
+    affinity_node,
+    ensure_kubectl,
+    kubectl_json,
+    parse_k8s_time,
+    requested_gpus,
+)
 from .kubectl_errors import is_kubectl_transport_error
 from .mlxp_config import get_settings, owner_selector
 from .time_utils import to_kst_iso
@@ -30,28 +35,6 @@ def _path_leaf(path: str | None) -> str | None:
     if not path:
         return None
     return path.rstrip("/").rsplit("/", 1)[-1] or None
-
-
-async def _kubectl_json(*args: str, timeout: float = 20.0) -> dict[str, Any]:
-    if shutil.which("kubectl") is None:
-        raise RuntimeError("kubectl not found on PATH")
-    proc = await asyncio.create_subprocess_exec(
-        "kubectl", *args, "-o", "json",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        raise RuntimeError(f"kubectl {' '.join(args)} timed out after {timeout:g}s")
-    if proc.returncode != 0:
-        raise RuntimeError(f"kubectl {' '.join(args)} failed: {stderr.decode(errors='replace').strip()}")
-    try:
-        return json.loads(stdout.decode())
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"kubectl {' '.join(args)} returned invalid JSON: {exc}") from exc
 
 
 def _state_from_pod_and_job(job_status: dict, pod: dict | None) -> str:
@@ -82,35 +65,22 @@ def _state_from_pod_and_job(job_status: dict, pod: dict | None) -> str:
 def _elapsed(start: str | None, end: str | None) -> str:
     if not start:
         return "0:00"
-    try:
-        s = datetime.fromisoformat(start.replace("Z", "+00:00"))
-    except ValueError:
+    s = parse_k8s_time(start)
+    if s is None:
         return "0:00"
     e = datetime.now(timezone.utc)
     if end:
-        try:
-            e = datetime.fromisoformat(end.replace("Z", "+00:00"))
-        except ValueError:
-            pass
+        e = parse_k8s_time(end) or e
     delta = int((e - s).total_seconds())
     h, rem = divmod(delta, 3600)
     m, sec = divmod(rem, 60)
     return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
 
-def _parse_k8s_time(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-
 def _latest_k8s_time(values: list[str | None]) -> str | None:
     latest: tuple[datetime, str] | None = None
     for value in values:
-        parsed = _parse_k8s_time(value)
+        parsed = parse_k8s_time(value)
         if parsed is None or value is None:
             continue
         if latest is None or parsed > latest[0]:
@@ -183,12 +153,8 @@ def _is_active_state(state: str) -> bool:
 
 
 def _time_bound(value: str | None) -> float | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return None
+    parsed = parse_k8s_time(value)
+    return parsed.timestamp() if parsed else None
 
 
 def _job_in_range(job: Job, start: str | None, end: str | None) -> bool:
@@ -208,13 +174,13 @@ async def _list_live_jobs() -> tuple[list[Job], set[str]]:
     from .job_identity import parse_comment_metadata, parse_phase_and_variant
 
     settings = get_settings()
-    data = await _kubectl_json(
+    data = await kubectl_json(
         "get", "jobs", "-n", settings.namespace, "-l", owner_selector(settings)
     )
 
     # We need pod-level info too (nodeName + start time of the actual pod, not the Job).
     pods_by_job: dict[str, dict] = {}
-    pod_data = await _kubectl_json(
+    pod_data = await kubectl_json(
         "get", "pods", "-n", settings.namespace, "-l", owner_selector(settings)
     )
     for p in pod_data.get("items", []):
@@ -272,7 +238,7 @@ def _pending_queue_positions(pods_by_job: dict[str, dict]) -> dict[str, int]:
         metadata = pod.get("metadata") or {}
         spec = pod.get("spec") or {}
         node = spec.get("nodeName") or affinity_node(spec)
-        created = _parse_k8s_time(metadata.get("creationTimestamp")) or max_time
+        created = parse_k8s_time(metadata.get("creationTimestamp")) or max_time
         pending.append((job_id, node, created, metadata.get("name") or job_id))
 
     pending.sort(key=lambda item: (item[2], item[3]))
@@ -437,14 +403,14 @@ async def get_job(name: str) -> dict[str, Any]:
     """
     settings = get_settings()
     try:
-        job_data = await _kubectl_json("get", "job", name, "-n", settings.namespace)
+        job_data = await kubectl_json("get", "job", name, "-n", settings.namespace)
     except RuntimeError:
         archived = await _archived_record(name)
         if archived:
             return archived
         raise FileNotFoundError(f"mlxp job not found: {name}")
     status = job_data.get("status", {}) or {}
-    pod_data = await _kubectl_json("get", "pods", "-n", settings.namespace, "-l", f"job-name={name}")
+    pod_data = await kubectl_json("get", "pods", "-n", settings.namespace, "-l", f"job-name={name}")
     pods = pod_data.get("items", [])
     pod = pods[0] if pods else {}
     pod_status = pod.get("status", {}) or {}
@@ -497,8 +463,7 @@ async def get_job(name: str) -> dict[str, Any]:
 
 
 async def cancel_job(name: str) -> None:
-    if shutil.which("kubectl") is None:
-        raise RuntimeError("kubectl not found on PATH")
+    ensure_kubectl()
     settings = get_settings()
     last_error = ""
     for attempt in range(5):
@@ -542,7 +507,7 @@ def _kubectl_not_found(message: str) -> bool:
 async def _job_deleted(name: str) -> bool:
     settings = get_settings()
     try:
-        await _kubectl_json("get", "job", name, "-n", settings.namespace, timeout=10.0)
+        await kubectl_json("get", "job", name, "-n", settings.namespace, timeout=10.0)
     except RuntimeError as e:
         message = str(e)
         if _kubectl_not_found(message):
@@ -560,10 +525,9 @@ async def tail_logs(job_name: str, follow: bool = True, start_line: int = 1):
     record has been GC'd we fall back to the on-DDN log file the body
     script left at `<exp_dir>/checkpoints/logs/training_rank0.log`.
     """
-    if shutil.which("kubectl") is None:
-        raise RuntimeError("kubectl not found on PATH")
+    ensure_kubectl()
     settings = get_settings()
-    pod_data = await _kubectl_json("get", "pods", "-n", settings.namespace, "-l", f"job-name={job_name}")
+    pod_data = await kubectl_json("get", "pods", "-n", settings.namespace, "-l", f"job-name={job_name}")
     pods = pod_data.get("items", [])
     if not pods:
         async for line in _tail_archived_log(job_name, start_line=start_line):
