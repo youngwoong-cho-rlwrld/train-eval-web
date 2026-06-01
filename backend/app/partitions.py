@@ -1,9 +1,8 @@
-"""Partition listing + schedulable node/GPU availability via `sinfo`.
+"""Partition listing + schedulable node/GPU availability via Slurm.
 
-The monitor should only label GPUs as available when Slurm reports the node as
-plain `idle`. Cloud/power/health-check states such as `idle~`, `idle#`, or
-`down#` are useful context, but they are not capacity a newly submitted job can
-reliably use right now.
+The monitor counts available GPUs from Slurm's per-node TRES allocation
+(`CfgTRES - AllocTRES`) on usable nodes. Fully idle nodes are still tracked
+separately as node availability.
 """
 
 import asyncio
@@ -64,6 +63,20 @@ def _is_schedulable_idle(state: str, reason: str) -> bool:
     return state == "idle" and reason.strip() in {"", "none"}
 
 
+def _is_schedulable_free_gpu_state(state: str, reason: str) -> bool:
+    normalized = state.strip().lower()
+    tokens = {t for t in re.split(r"[^a-z0-9]+", normalized) if t}
+    if not tokens:
+        return False
+    blocked = {"down", "drain", "drained", "fail", "failing", "maint", "maintenance"}
+    powered_off = {"powering_down", "poweringdown", "powered_down", "powereddown", "planned"}
+    if tokens & blocked or tokens & powered_off:
+        return False
+    if "mixed" in tokens:
+        return True
+    return tokens == {"idle"} and reason.strip().lower() in {"", "none"}
+
+
 def _gpus_per_node(gres: str) -> int:
     m = _GPU_PER_NODE_RE.search(gres)
     return int(m.group(1)) if m else 0
@@ -113,14 +126,24 @@ async def list_partitions(cluster: str) -> list[PartitionInfo]:
     sinfo_task = asyncio.create_task(
         ssh_run(env.ssh_alias, "sinfo -N -h -o '%P|%N|%t|%G|%E'", timeout=15.0)
     )
-    squeue_task = asyncio.create_task(
-        ssh_run(env.ssh_alias, "squeue -h -t PD -o '%P|%D|%b'", timeout=15.0)
+    node_task = asyncio.create_task(
+        ssh_run(env.ssh_alias, "scontrol show node -o", timeout=15.0)
     )
-    r, queue_r = await asyncio.gather(sinfo_task, squeue_task)
+    squeue_task = asyncio.create_task(
+        ssh_run(env.ssh_alias, "squeue -h -t PD -o '%i|%P|%D|%b'", timeout=15.0)
+    )
+    job_task = asyncio.create_task(
+        ssh_run(env.ssh_alias, "scontrol show job -o", timeout=20.0)
+    )
+    r, node_r, queue_r, job_r = await asyncio.gather(sinfo_task, node_task, squeue_task, job_task)
     if r.returncode != 0:
         raise RuntimeError(f"sinfo failed: {r.stderr}")
+    if node_r.returncode != 0:
+        raise RuntimeError(f"scontrol show node failed: {node_r.stderr or node_r.stdout}")
     if queue_r.returncode != 0:
         raise RuntimeError(f"squeue failed: {queue_r.stderr}")
+    if job_r.returncode != 0:
+        raise RuntimeError(f"scontrol show job failed: {job_r.stderr or job_r.stdout}")
 
     # Each row: PARTITION | NODE | STATE | GRES | REASON.
     rows: list[tuple[str, str, str, str]] = []
@@ -152,28 +175,66 @@ async def list_partitions(cluster: str) -> list[PartitionInfo]:
         d["gpu_total"] += gpn
         if _is_schedulable_idle(state, reason):
             d["idle_nodes"] += 1
-            d["gpu_idle"] += gpn
 
-    # Each pending squeue row: PARTITION | NODE_COUNT | TRES_PER_NODE.
-    # Count only jobs that request GPUs; CPU-only pending jobs are not useful
-    # signal in the GPU monitor.
-    for line in queue_r.stdout.splitlines():
-        parts = line.split("|", 2)
-        if len(parts) != 3:
+    for line in node_r.stdout.splitlines():
+        fields = _scontrol_fields(line)
+        node_partitions = {
+            _clean_partition_name(p.strip(), defaults)
+            for p in (fields.get("Partitions") or "").split(",")
+            if p.strip()
+        }
+        if not node_partitions:
             continue
-        name = _clean_partition_name(parts[0], defaults)
-        if not name:
+        total = _gpu_tres_value(fields.get("CfgTRES") or "") or _gpus_per_node(fields.get("Gres") or "")
+        if total <= 0:
+            continue
+        used = _gpu_tres_value(fields.get("AllocTRES") or "")
+        free = max(0, total - max(0, used))
+        if free <= 0:
+            continue
+        if not _is_schedulable_free_gpu_state(fields.get("State") or "", fields.get("Reason") or ""):
+            continue
+        for name in node_partitions:
+            if name:
+                per_part[name]["gpu_idle"] += free
+
+    job_fields_by_id: dict[str, dict[str, str]] = {}
+    for line in job_r.stdout.splitlines():
+        fields = _scontrol_fields(line)
+        if fields.get("JobState") != "PENDING":
+            continue
+        for key in _job_index_keys(fields):
+            job_fields_by_id[key] = fields
+
+    # Each pending squeue row: JOB_ID | PARTITION | NODE_COUNT | TRES_PER_NODE.
+    # Prefer scontrol ReqTRES because some jobs use TresPerJob/--gres, where
+    # squeue's TRES_PER_NODE column is N/A even though the job requests GPUs.
+    for line in queue_r.stdout.splitlines():
+        parts = line.split("|", 3)
+        if len(parts) != 4:
+            continue
+        job_id = parts[0].strip()
+        names = [
+            name
+            for raw_name in parts[1].split(",")
+            if (name := _clean_partition_name(raw_name, defaults))
+        ]
+        if not names:
             continue
         try:
-            node_count = max(1, int(parts[1]))
+            node_count = max(1, int(parts[2]))
         except ValueError:
             node_count = 1
-        requested_gpus = _gpus_per_node(parts[2]) * node_count
+        fields = job_fields_by_id.get(job_id, {})
+        requested_gpus = _gpu_tres_value(fields.get("ReqTRES") or "")
+        if requested_gpus <= 0:
+            requested_gpus = _gpus_per_node(parts[3]) * node_count
         if requested_gpus <= 0:
             continue
-        d = per_part[name]
-        d["queued_jobs"] += 1
-        d["queued_gpus"] += requested_gpus
+        for name in names:
+            d = per_part[name]
+            d["queued_jobs"] += 1
+            d["queued_gpus"] += requested_gpus
 
     def is_bg(name: str) -> bool:
         return name == "background" or name.endswith("_background")
@@ -253,7 +314,8 @@ async def gpu_queue_snapshot(cluster: str, partition: str) -> GpuQueueSnapshot:
     job_fields_by_id: dict[str, dict[str, str]] = {}
     for line in job_r.stdout.splitlines():
         fields = _scontrol_fields(line)
-        if fields.get("Partition") != partition or fields.get("JobState") != "PENDING":
+        partitions = {p.strip() for p in (fields.get("Partition") or "").split(",") if p.strip()}
+        if partition not in partitions or fields.get("JobState") != "PENDING":
             continue
         for key in _job_index_keys(fields):
             job_fields_by_id[key] = fields

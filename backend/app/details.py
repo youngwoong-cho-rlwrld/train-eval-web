@@ -616,7 +616,7 @@ def _reconcile_eval_progress_from_runs(progress: Progress, eval_runs: list[EvalR
     if episode_total <= 0:
         if progress.total_runs:
             progress.percent = round(100.0 * progress.completed_runs / progress.total_runs, 1)
-            progress.current_label = f"{progress.completed_runs}/{progress.total_runs} runs"
+            progress.current_label = f"{progress.completed_runs}/{progress.total_runs} result files"
         return
 
     current_step = max(progress.current_step or 0, episode_total)
@@ -624,7 +624,7 @@ def _reconcile_eval_progress_from_runs(progress: Progress, eval_runs: list[EvalR
         progress.current_step = min(current_step, progress.max_steps)
         progress.percent = round(100.0 * progress.current_step / progress.max_steps, 1)
         progress.current_label = (
-            f"{progress.completed_runs}/{progress.total_runs} runs · "
+            f"{progress.completed_runs}/{progress.total_runs} result files · "
             f"{progress.current_step}/{progress.max_steps} episodes"
             if progress.total_runs
             else f"{progress.current_step}/{progress.max_steps} episodes"
@@ -1606,10 +1606,13 @@ async def _mlxp_eval_progress(
     if n_eps > 0 and progress.max_steps:
         progress.current_step = min(completed * n_eps, progress.max_steps)
         progress.percent = round(100.0 * progress.current_step / progress.max_steps, 1)
-        progress.current_label = f"{completed}/{total} runs · {progress.current_step}/{progress.max_steps} episodes"
+        progress.current_label = (
+            f"{completed}/{total} result files · "
+            f"{progress.current_step}/{progress.max_steps} episodes"
+        )
     else:
         progress.percent = round(100.0 * completed / total, 1)
-        progress.current_label = f"{completed}/{total} runs"
+        progress.current_label = f"{completed}/{total} result files"
     return progress
 
 
@@ -1927,42 +1930,26 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
         env = await load_cluster(cluster)
         host = env.ssh_alias
         completed = 0
-        active_eps = 0
         job_completed_runs = 0
-        job_log_dir = (slurm_meta or {}).get("job_log_dir") if slurm_meta else None
 
         # One remote probe is materially faster than several serial SSH calls on
-        # SKT. It returns: completed result files, stdout episode count, stdout
-        # completed-run count, and server-log episode fallback.
+        # SKT. It returns: completed result files, stdout episode-completion
+        # count for this job, stdout completed-run count for this job, and
+        # saved per-episode video artifacts across the eval dir. The video
+        # count covers active runs whose Python stdout is still buffered.
         eval_dir_expr = _remote_path_expr(eval_dir)
         log_dir_q = shlex.quote(env.vars["LOG_DIR"])
         job_id_q = shlex.quote(job_id)
-        job_logs_expr = _remote_path_expr(
-            job_log_dir or f"{eval_dir.rsplit('/', 1)[0]}/logs/{job_id}"
-        )
         probe_cmd = (
             f"eval_dir={eval_dir_expr}; "
             f"log_dir={log_dir_q}; "
             f"job_id={job_id_q}; "
-            f"job_logs={job_logs_expr}; "
             'completed=$(find "$eval_dir" -type f -name results.json 2>/dev/null | wc -l); '
+            "video_eps=$(find \"$eval_dir\" -type f -path '*/videos/ep*.mp4' 2>/dev/null | wc -l); "
             'pattern="$log_dir"/*_"$job_id".out; '
             "stdout_eps=$(grep -h '^Episode .* completed' $pattern 2>/dev/null | wc -l); "
             "stdout_runs=$(grep -h '^Results saved to:' $pattern 2>/dev/null | wc -l); "
-            "server_eps=0; "
-            "if [ -d \"$job_logs\" ]; then "
-            "for f in \"$job_logs\"/server_*.log; do "
-            "[ -f \"$f\" ] || continue; "
-            "envs=$(grep -m1 'Num envs:' \"$f\" 2>/dev/null | sed -E 's/.*Num envs: ([0-9]+).*/\\1/'); "
-            "case \"$envs\" in ''|*[!0-9]*) envs=1 ;; esac; "
-            "c=$(grep -c 'Resetting environment with seed:' \"$f\" 2>/dev/null); "
-            "case \"$c\" in ''|*[!0-9]*) c=0 ;; esac; "
-            "if [ \"$c\" -gt 0 ]; then c=$((c - 1)); fi; "
-            f"if [ \"$c\" -gt {n_eps} ]; then c={n_eps}; fi; "
-            "server_eps=$((server_eps + c * envs)); "
-            "done; "
-            "fi; "
-            "printf '%s %s %s %s\\n' \"$completed\" \"$stdout_eps\" \"$stdout_runs\" \"$server_eps\""
+            "printf '%s %s %s %s\\n' \"$completed\" \"$stdout_eps\" \"$stdout_runs\" \"$video_eps\""
         )
         r = await ssh_run(host, probe_cmd, timeout=12.0)
         if r.returncode != 0:
@@ -1972,9 +1959,9 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
             if len(parts) != 4:
                 raise ValueError(f"expected 4 counters, got {len(parts)}")
             completed = int(parts[0])
-            active_eps = int(parts[1])
+            stdout_eps = int(parts[1])
             job_completed_runs = int(parts[2])
-            active_eps = max(active_eps, int(parts[3]))
+            video_eps = int(parts[3])
         except ValueError as exc:
             raise RuntimeError(f"invalid eval progress probe output: {r.stdout.strip()!r}") from exc
         progress.completed_runs = completed
@@ -1985,16 +1972,19 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
         if n_eps > 0:
             # Promote eval into the unified step-based shape so the frontend
             # ETA + progress bar work the same way as training:
-            #   current_step = completed_runs · N_EPISODES + incomplete episodes in this job
+            #   current_step = completed result files · N_EPISODES
+            #                + incomplete episodes from this job
             #   max_steps    = total_runs    · N_EPISODES
             progress.max_steps = total * n_eps
-            active_incomplete_eps = min(n_eps, max(0, active_eps - job_completed_runs * n_eps))
-            current = completed * n_eps + active_incomplete_eps
+            completed_steps = completed * n_eps
+            stdout_incomplete_eps = min(n_eps, max(0, stdout_eps - job_completed_runs * n_eps))
+            stdout_current = completed_steps + stdout_incomplete_eps
+            current = max(completed_steps, stdout_current, video_eps)
             progress.current_step = min(current, progress.max_steps)
             progress.percent = round(100.0 * progress.current_step / progress.max_steps, 1)
             episode_label = f"{progress.current_step}/{progress.max_steps} episodes"
-            progress.current_label = f"{completed}/{total} runs · {episode_label}"
+            progress.current_label = f"{completed}/{total} result files · {episode_label}"
         else:
             progress.percent = round(100.0 * completed / total, 1)
-            progress.current_label = f"{completed}/{total} runs"
+            progress.current_label = f"{completed}/{total} result files"
     return progress

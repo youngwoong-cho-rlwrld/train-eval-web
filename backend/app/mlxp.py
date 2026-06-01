@@ -88,7 +88,10 @@ async def list_nodes() -> list[MlxpNode]:
     return out
 
 
-async def gpu_queue_snapshot(job_id: str | None = None) -> GpuQueueSnapshot:
+async def gpu_queue_snapshot(
+    job_id: str | None = None,
+    node: str | None = None,
+) -> GpuQueueSnapshot:
     settings = get_settings()
     pods_task = asyncio.create_task(kubectl_json("get", "pod", "-n", settings.namespace))
     jobs_task = asyncio.create_task(kubectl_json("get", "job", "-n", settings.namespace))
@@ -100,19 +103,19 @@ async def gpu_queue_snapshot(job_id: str | None = None) -> GpuQueueSnapshot:
     current_node: str | None = None
     max_time = datetime.max.replace(tzinfo=timezone.utc)
 
-    for pod, phase, node, gpu_count in _gpu_pod_rows(pods_data, settings.gpu_node_prefix):
+    for pod, phase, pod_node, gpu_count in _gpu_pod_rows(pods_data, settings.gpu_node_prefix):
         metadata = pod.get("metadata") or {}
         pod_job = pod_job_id(pod)
         if not pod_job:
             continue
 
-        if phase == "Running" and node:
-            used[node] += gpu_count
+        if phase == "Running" and pod_node:
+            used[pod_node] += gpu_count
         elif phase == "Pending":
             created = parse_k8s_time(metadata.get("creationTimestamp")) or max_time
             pending.append((
                 pod_job,
-                node,
+                pod_node,
                 created,
                 metadata.get("name") or pod_job,
                 gpu_count,
@@ -120,11 +123,12 @@ async def gpu_queue_snapshot(job_id: str | None = None) -> GpuQueueSnapshot:
                 job_names.get(pod_job),
             ))
         if job_id and pod_job == job_id:
-            current_node = node
+            current_node = pod_node
 
-    if current_node:
-        pending = [item for item in pending if item[1] == current_node]
-        node_names = {current_node}
+    scoped_node = current_node or (node.strip() if node else None)
+    if scoped_node:
+        pending = [item for item in pending if item[1] == scoped_node]
+        node_names = {scoped_node}
     else:
         node_names = set(used)
         node_names.update(node for _, node, *_ in pending if node)

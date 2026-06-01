@@ -64,13 +64,14 @@ export default function JobsPage() {
   const refreshAll = () => {
     qc.invalidateQueries({ queryKey: ["jobs"] });
     qc.invalidateQueries({ queryKey: ["job-progress"] });
+    qc.invalidateQueries({ queryKey: ["gpu-queue"] });
   };
 
   const isFetching =
     useIsFetching({
       predicate: (q) => {
         const k = q.queryKey[0];
-        return k === "jobs" || k === "job-progress";
+        return k === "jobs" || k === "job-progress" || k === "gpu-queue";
       },
     }) > 0;
 
@@ -576,7 +577,7 @@ function activeProgressLabel(
     return `${progress.current_step}/${progress.max_steps} episodes`;
   }
   if (details?.phase === "eval" && progress?.current_label) {
-    return progress.current_label.replace(/^\d+\/\d+ runs\s*·\s*/, "");
+    return progress.current_label.replace(/^\d+\/\d+ (?:runs|result files)\s*·\s*/, "");
   }
   return progress?.current_label ?? null;
 }

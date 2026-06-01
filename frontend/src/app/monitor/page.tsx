@@ -1,15 +1,21 @@
 "use client";
 
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useIsFetching, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, type MlxpNode, type Partition } from "@/lib/api";
+import { api, type GpuQueueSnapshot, type MlxpNode, type Partition } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { RefreshButton } from "@/components/refresh-button";
 import { useMyMlxpNode } from "@/hooks/use-my-mlxp-node";
 import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state";
+import { GpuQueueTooltipContent } from "@/components/gpu-queue-visualization";
+import { cn } from "@/lib/utils";
 
 const REFRESH_MS = 60_000;
+const TOOLTIP_VIEWPORT_GAP = 12;
+const TOOLTIP_OFFSET = 8;
 
 export default function MonitorPage() {
   const qc = useQueryClient();
@@ -25,13 +31,14 @@ export default function MonitorPage() {
     qc.invalidateQueries({ queryKey: ["clusters"] });
     for (const c of slurm) qc.invalidateQueries({ queryKey: ["partitions", c] });
     qc.invalidateQueries({ queryKey: ["mlxp-gpus"] });
+    qc.invalidateQueries({ queryKey: ["gpu-queue"] });
   };
 
   const isFetching =
     useIsFetching({
       predicate: (q) => {
         const k = q.queryKey[0];
-        return k === "clusters" || k === "partitions" || k === "mlxp-gpus";
+        return k === "clusters" || k === "partitions" || k === "mlxp-gpus" || k === "gpu-queue";
       },
     }) > 0;
 
@@ -132,7 +139,11 @@ function SlurmClusterPanel({ cluster }: { cluster: string }) {
               </thead>
               <tbody>
                 {ps.map((p) => (
-                  <tr key={p.name} className="border-b border-slate-100 last:border-0 dark:border-slate-900">
+                  <QueueTooltipRow
+                    key={p.name}
+                    cluster={cluster}
+                    partition={p.name}
+                  >
                     <td className="py-2 pr-4 font-mono text-xs">
                       {p.name}
                       {p.is_default && <Badge variant="secondary" className="ml-1 text-[10px]">default</Badge>}
@@ -156,7 +167,7 @@ function SlurmClusterPanel({ cluster }: { cluster: string }) {
                         </span>
                       ))}
                     </td>
-                  </tr>
+                  </QueueTooltipRow>
                 ))}
               </tbody>
             </table>
@@ -232,7 +243,12 @@ function MlxpPanel() {
               </thead>
               <tbody>
                 {nodes.map((n) => (
-                  <tr key={n.name} className="border-b border-slate-100 last:border-0 dark:border-slate-900">
+                  <QueueTooltipRow
+                    key={n.name}
+                    cluster="mlxp"
+                    partition="mlxp"
+                    node={n.name}
+                  >
                     <td className="py-2 pr-4 font-mono text-xs">
                       {n.name}
                       {n.name === yoursNode && <Badge variant="default" className="ml-1 text-[10px]">yours</Badge>}
@@ -246,7 +262,7 @@ function MlxpPanel() {
                     <td className="py-2 pr-4 font-mono text-xs">
                       <QueueLabel queuedGpus={n.queued_gpus} queuedJobs={n.queued_jobs} />
                     </td>
-                  </tr>
+                  </QueueTooltipRow>
                 ))}
               </tbody>
             </table>
@@ -272,5 +288,120 @@ function QueueLabel({
       <span className="text-amber-600 dark:text-amber-400">{queuedGpus}</span>
       <span className="text-slate-400"> GPU / {queuedJobs} {queuedJobs === 1 ? "job" : "jobs"}</span>
     </span>
+  );
+}
+
+function QueueTooltipRow({
+  cluster,
+  partition,
+  node,
+  children,
+}: {
+  cluster: string;
+  partition: string;
+  node?: string;
+  children: React.ReactNode;
+}) {
+  const triggerRef = useRef<HTMLTableRowElement>(null);
+  const tooltipRef = useRef<HTMLSpanElement>(null);
+  const [visible, setVisible] = useState(false);
+
+  const updatePosition = useCallback(() => {
+    const trigger = triggerRef.current;
+    const tooltip = tooltipRef.current;
+    if (!trigger || !tooltip) return;
+
+    const triggerRect = trigger.getBoundingClientRect();
+    const tooltipRect = tooltip.getBoundingClientRect();
+    const tooltipWidth = tooltipRect.width || 0;
+    const tooltipHeight = tooltipRect.height || 0;
+    const centeredLeft = triggerRect.left + triggerRect.width / 2 - tooltipWidth / 2;
+    const left = Math.min(
+      Math.max(TOOLTIP_VIEWPORT_GAP, centeredLeft),
+      Math.max(TOOLTIP_VIEWPORT_GAP, window.innerWidth - tooltipWidth - TOOLTIP_VIEWPORT_GAP),
+    );
+    const top = Math.min(
+      triggerRect.bottom + TOOLTIP_OFFSET,
+      window.innerHeight - tooltipHeight - TOOLTIP_VIEWPORT_GAP,
+    );
+
+    tooltip.style.left = `${left}px`;
+    tooltip.style.top = `${top}px`;
+  }, []);
+
+  useLayoutEffect(() => {
+    if (visible) updatePosition();
+  }, [visible, updatePosition]);
+
+  useEffect(() => {
+    if (!visible) return;
+    window.addEventListener("resize", updatePosition);
+    window.addEventListener("scroll", updatePosition, true);
+    return () => {
+      window.removeEventListener("resize", updatePosition);
+      window.removeEventListener("scroll", updatePosition, true);
+    };
+  }, [visible, updatePosition]);
+
+  return (
+    <tr
+      ref={triggerRef}
+      tabIndex={0}
+      className={cn(
+        "border-b border-slate-100 last:border-0 dark:border-slate-900",
+        "cursor-help hover:bg-slate-50 focus-visible:bg-slate-50 focus-visible:outline-none dark:hover:bg-slate-900/40 dark:focus-visible:bg-slate-900/40",
+      )}
+      onMouseEnter={() => setVisible(true)}
+      onMouseLeave={() => setVisible(false)}
+      onFocus={() => setVisible(true)}
+      onBlur={() => setVisible(false)}
+    >
+      {children}
+      {visible && typeof document !== "undefined"
+        ? createPortal(
+            <span
+              ref={tooltipRef}
+              role="tooltip"
+              className="pointer-events-none fixed z-[1000] w-max max-w-[min(32rem,calc(100vw-2rem))] whitespace-normal rounded-md border border-slate-200 bg-white px-3 py-2 text-xs font-normal leading-snug text-slate-700 shadow-lg [overflow-wrap:anywhere] dark:border-slate-800 dark:bg-slate-950 dark:text-slate-200"
+              style={{ left: TOOLTIP_VIEWPORT_GAP, top: TOOLTIP_VIEWPORT_GAP }}
+            >
+              <MonitorQueueTooltip cluster={cluster} partition={partition} node={node} />
+            </span>,
+            document.body,
+          )
+        : null}
+    </tr>
+  );
+}
+
+function MonitorQueueTooltip({
+  cluster,
+  partition,
+  node,
+}: {
+  cluster: string;
+  partition: string;
+  node?: string;
+}) {
+  const qs = new URLSearchParams({ partition });
+  if (node) qs.set("node", node);
+  const queue = useQuery({
+    queryKey: ["gpu-queue", cluster, partition, node ?? null],
+    queryFn: () =>
+      api<GpuQueueSnapshot>(
+        `/api/clusters/${encodeURIComponent(cluster)}/gpu-queue?${qs}`,
+      ),
+    staleTime: 15_000,
+    refetchInterval: REFRESH_MS,
+    retry: false,
+  });
+
+  return (
+    <GpuQueueTooltipContent
+      snapshot={queue.data}
+      loading={queue.isLoading}
+      fetching={queue.isFetching}
+      error={queue.error as Error | null}
+    />
   );
 }
