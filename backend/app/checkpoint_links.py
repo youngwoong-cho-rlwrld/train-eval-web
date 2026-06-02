@@ -23,10 +23,14 @@ def checkpoint_leaf(path: Any) -> str | None:
     return path.rsplit("/", 1)[-1]
 
 
+def is_checkpoint_step_leaf(name: Any) -> bool:
+    return str(name or "").startswith("checkpoint-")
+
+
 def checkpoint_parent_if_step(path: Any) -> str | None:
     path = str(path or "").rstrip("/")
     leaf = checkpoint_leaf(path)
-    if not leaf or not leaf.startswith("checkpoint-") or "/" not in path:
+    if not leaf or not is_checkpoint_step_leaf(leaf) or "/" not in path:
         return None
     return path.rsplit("/", 1)[0]
 
@@ -37,11 +41,11 @@ def checkpoint_lookup_keys(path: Any) -> list[str]:
         return []
     keys = [path]
     leaf = checkpoint_leaf(path)
-    if leaf:
-        keys.append(leaf)
     parent = checkpoint_parent_if_step(path)
     if parent:
         keys.extend([parent, checkpoint_leaf(parent) or ""])
+    elif leaf:
+        keys.append(leaf)
     return [k for k in dict.fromkeys(k for k in keys if k)]
 
 
@@ -311,6 +315,10 @@ def path_key(value):
     return s.rstrip("/")
 
 
+def is_checkpoint_step_leaf(name):
+    return str(name or "").startswith("checkpoint-")
+
+
 def add_checkpoint_index_entry(index, key, info, *, overwrite=True):
     key = path_key(key)
     if not key:
@@ -318,7 +326,7 @@ def add_checkpoint_index_entry(index, key, info, *, overwrite=True):
     if overwrite or key not in index:
         index[key] = info
     leaf = Path(key).name
-    if leaf and (overwrite or leaf not in index):
+    if leaf and not is_checkpoint_step_leaf(leaf) and (overwrite or leaf not in index):
         index[leaf] = info
 
 
@@ -382,10 +390,12 @@ def checkpoint_job_info(checkpoint, checkpoint_index):
     if not checkpoint:
         return None
     path = Path(checkpoint)
-    candidates = [checkpoint, path.name]
-    if path.name.startswith("checkpoint-"):
+    candidates = [checkpoint]
+    if is_checkpoint_step_leaf(path.name):
         parent = path.parent
         candidates.extend([str(parent), parent.name])
+    else:
+        candidates.append(path.name)
     for candidate in candidates:
         info = checkpoint_index.get(path_key(candidate) or candidate)
         if info:

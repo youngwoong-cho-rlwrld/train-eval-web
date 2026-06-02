@@ -204,6 +204,8 @@ function ResultCard({ variant }: { variant: ResultVariant }) {
   const evalSets = evalSetColumns(variant.tasks);
   const nRuns = variant.n_runs ?? maxExpectedRuns(variant.tasks);
   const nEpisodes = variant.n_episodes ?? maxEpisodeCount(variant.tasks);
+  const checkpointName = variant.checkpoint ? checkpointDisplayName(variant.checkpoint) : null;
+  const checkpointLabel = checkpointName ?? variant.checkpoint ?? "";
   const checkpointJobHref = jobDetailHref(
     variant.checkpoint_job_cluster ?? variant.cluster,
     variant.checkpoint_job_id,
@@ -263,8 +265,8 @@ function ResultCard({ variant }: { variant: ResultVariant }) {
               label="checkpoint"
               value={
                 variant.checkpoint_job_id
-                  ? `${basename(variant.checkpoint)} (${variant.checkpoint_job_id})`
-                  : basename(variant.checkpoint)
+                  ? `${checkpointLabel} (${variant.checkpoint_job_id})`
+                  : checkpointLabel
               }
               title={variant.checkpoint_job_name ? `Open ${variant.checkpoint_job_name}` : variant.checkpoint}
               href={checkpointJobHref}
@@ -477,6 +479,13 @@ function displayTaskName(task: ResultTask) {
 function basename(path: string) {
   const parts = path.split("/").filter(Boolean);
   return parts[parts.length - 1] ?? path;
+}
+
+function checkpointDisplayName(path: string) {
+  const parts = path.split("/").filter(Boolean);
+  const leaf = parts[parts.length - 1] ?? path;
+  if (!leaf.startsWith("checkpoint-")) return leaf;
+  return parts[parts.length - 2] ?? leaf;
 }
 
 function resultTableTsv(variant: ResultVariant, evalSets: string[]) {

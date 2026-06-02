@@ -432,6 +432,10 @@ def path_key(value):
     return s.rstrip("/")
 
 
+def is_checkpoint_step_leaf(name):
+    return str(name or "").startswith("checkpoint-")
+
+
 def add_job_index_entry(index, key, info):
     key = path_key(key)
     if not key:
@@ -454,7 +458,7 @@ def add_checkpoint_index_entry(index, key, info, *, overwrite=True):
     if overwrite or key not in index:
         index[key] = info
     leaf = Path(key).name
-    if leaf and (overwrite or leaf not in index):
+    if leaf and not is_checkpoint_step_leaf(leaf) and (overwrite or leaf not in index):
         index[leaf] = info
 
 
@@ -625,10 +629,13 @@ def checkpoint_job_info(checkpoint):
     checkpoint = path_key(checkpoint)
     if not checkpoint:
         return None
-    candidates = [checkpoint, Path(checkpoint).name]
-    parent = Path(checkpoint).parent
-    if Path(checkpoint).name.startswith("checkpoint-"):
+    path = Path(checkpoint)
+    candidates = [checkpoint]
+    if is_checkpoint_step_leaf(path.name):
+        parent = path.parent
         candidates.extend([str(parent), parent.name])
+    else:
+        candidates.append(path.name)
     for candidate in candidates:
         info = checkpoint_index.get(path_key(candidate) or candidate)
         if info:
