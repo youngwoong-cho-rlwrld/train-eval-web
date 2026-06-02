@@ -212,33 +212,23 @@ async def _kubectl_exec_text(
     raise RuntimeError(last_error)
 
 async def list_checkpoints(cluster: str, job_id: str) -> list[CheckpointEntry]:
-    """One entry per run folder.
-
-    MLXP runs nest under `<variant>/checkpoints/<job_name>/checkpoint-N`.
-    Slurm jobs may use either `<variant>/checkpoints/checkpoint-N` or a
-    one-level nested launcher directory. We surface every `checkpoint-N`.
-    """
+    """Return checkpoint steps owned by the clicked training job."""
     if cluster == "mlxp":
-        sacct = await get_job(cluster, job_id)
-        _, variant = resolve_phase_and_variant(sacct.get("JobName") or job_id, sacct)
-        if not variant:
+        det = await get_details(cluster, job_id, include_progress=False)
+        if not det.variant or not det.paths.ckpt_dir:
             return []
         pod = await ensure_listing_pod()
-        # Emit one row for each per-job checkpoint dir. Also include the
-        # historical direct-root layout used by older MLXP jobs.
-        experiments_root = shlex.quote(get_settings().experiments_dir)
-        quoted_variant = shlex.quote(variant)
+        checkpoint_dir = shlex.quote(det.paths.ckpt_dir)
         script = (
             r"""
 shopt -s nullglob
-root=__EXPERIMENTS_ROOT__/__VARIANT__/checkpoints
-for d in "$root"/ "$root"/*/ "$root"/*/*/; do
-    matches=( "$d"checkpoint-* )
-    [ ${#matches[@]} -eq 0 ] && continue
-    latest=$(for m in "${matches[@]}"; do basename "$m" | sed 's:^checkpoint-::'; done | sort -n | tail -1)
-    printf '%s|%s\n' "${d%/}" "$latest"
+root=__CHECKPOINT_DIR__
+for m in "$root"/checkpoint-*; do
+    step=$(basename "$m" | sed 's:^checkpoint-::')
+    [[ "$step" =~ ^[0-9]+$ ]] || continue
+    printf '%s|%s\n' "$m" "$step"
 done
-""".replace("__EXPERIMENTS_ROOT__", experiments_root).replace("__VARIANT__", quoted_variant))
+""".replace("__CHECKPOINT_DIR__", checkpoint_dir))
         out_text = await _kubectl_exec_text(pod, "bash", "-c", script)
         result: list[CheckpointEntry] = []
         for line in out_text.splitlines():
@@ -246,36 +236,31 @@ done
             if len(parts) != 2 or not parts[1].isdigit():
                 continue
             path, step = parts
-            job_name = path.rsplit("/", 1)[-1]
+            job_name = det.paths.ckpt_dir.rstrip("/").rsplit("/", 1)[-1]
             if job_name == "checkpoints":
-                job_name = sacct.get("JobName") or job_id
+                job_name = det.job_name or job_id
             result.append(CheckpointEntry(
                 path=path, job_name=job_name, step=int(step),
             ))
         return _dedupe_checkpoints(result)
 
-    # slurm — prefer the exact path resolved for this job, then probe both
-    # known roots for the normalized variant. Include one-level nested
-    # checkpoint layouts used by newer launchers.
+    # Slurm jobs record a concrete checkpoint directory in their sidecar. When
+    # a legacy job only resolves to the shared `<variant>/checkpoints` root,
+    # list the direct-root checkpoints and job-name-prefixed nested dirs only.
     env = await load_cluster(cluster)
     det = await get_details(cluster, job_id, include_progress=False)
-    variant = det.variant
-    if not variant:
+    if not det.paths.ckpt_dir:
         return []
-    roots = [
-        det.paths.ckpt_dir,
-        f"$HOME/train-eval-scripts/experiments/{variant}/checkpoints",
-        f"$HOME/.train-eval-web/experiments/{variant}/checkpoints",
-    ]
-    deduped_roots = list(dict.fromkeys(r for r in roots if r))
 
     def path_expr(path: str) -> str:
         return path if path.startswith("$HOME/") else shlex.quote(path)
 
-    cmds = " ; ".join(
-        f"ls -d {path_expr(r)}/checkpoint-* {path_expr(r)}/*/checkpoint-* 2>/dev/null"
-        for r in deduped_roots
-    )
+    root = det.paths.ckpt_dir.rstrip("/")
+    root_expr = path_expr(root)
+    cmds = f"ls -d {root_expr}/checkpoint-* 2>/dev/null"
+    if root.endswith("/checkpoints"):
+        job_glob = shlex.quote(det.job_name) + "*"
+        cmds += f" ; ls -d {root_expr}/{job_glob}/checkpoint-* 2>/dev/null"
     r = await ssh_run(env.ssh_alias, cmds, timeout=15.0)
     return _parse_paths(r.stdout, nested=False, fallback_job=job_id)
 
