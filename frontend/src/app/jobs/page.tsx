@@ -339,7 +339,7 @@ function JobTable({
       <table className="w-full text-sm">
         <thead className="border-b border-slate-200 text-left text-xs uppercase tracking-wide text-slate-500 dark:border-slate-800">
           <tr>
-            <Th>Job ID</Th>
+            <Th className="min-w-[18rem]">Job ID</Th>
             <Th>Phase</Th>
             <Th>State</Th>
             {showProgress && <Th>Progress</Th>}
@@ -360,26 +360,20 @@ function JobTable({
             const phase = normalizeJobPhase(j.phase) ?? jobPhase(j.job_name);
             return (
               <tr key={`${j.cluster}-${j.job_id}`} className="border-b border-slate-100 last:border-0 hover:bg-slate-50 dark:border-slate-900 dark:hover:bg-slate-900/40">
-                <td className="py-2 pr-4 font-mono">
-                  <Link
-                    href={`/jobs/${j.cluster}/${j.job_id}`}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="text-blue-600 hover:underline"
-                  >
-                    {j.job_id}
-                  </Link>
+                <td className="min-w-[18rem] py-2 pr-4 font-mono">
+                  <div className="flex items-center gap-1">
+                    <JobIdLink cluster={j.cluster} jobId={j.job_id} />
+                    <CopyButton value={j.job_id} title="Copy job ID" />
+                  </div>
                   {j.resume_of && (
-                    <span className="ml-1 text-xs text-slate-500">
+                    <span className="ml-1 block whitespace-nowrap text-xs text-slate-500">
                       ({resubmitSourceLabel(j.resubmit_action)}{" "}
-                      <Link
-                        href={`/jobs/${encodeURIComponent(j.cluster)}/${encodeURIComponent(j.resume_of)}`}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-blue-600 hover:underline dark:text-blue-400"
-                      >
-                        {j.resume_of}
-                      </Link>
+                      <JobIdLink
+                        cluster={j.cluster}
+                        jobId={j.resume_of}
+                        fixedWidth={false}
+                        className="dark:text-blue-400"
+                      />
                       )
                     </span>
                   )}
@@ -615,6 +609,40 @@ function Timestamp({ iso, cluster }: { iso?: string | null; cluster: string }) {
   );
 }
 
+function JobIdLink({
+  cluster,
+  jobId,
+  className = "",
+  fixedWidth = true,
+}: {
+  cluster: string;
+  jobId: string;
+  className?: string;
+  fixedWidth?: boolean;
+}) {
+  const widthClass = fixedWidth ? "inline-block min-w-[23ch]" : "inline";
+  return (
+    <ImmediateTooltip content={jobId} className="min-w-0">
+      <Link
+        href={`/jobs/${encodeURIComponent(cluster)}/${encodeURIComponent(jobId)}`}
+        target="_blank"
+        rel="noreferrer"
+        className={`${widthClass} whitespace-nowrap text-blue-600 hover:underline ${className}`}
+      >
+        {shortJobId(jobId)}
+      </Link>
+    </ImmediateTooltip>
+  );
+}
+
+function shortJobId(jobId: string): string {
+  const maxDisplayLength = 20;
+  const ellipsis = "...";
+  return jobId.length > maxDisplayLength
+    ? `${jobId.slice(0, maxDisplayLength - ellipsis.length)}${ellipsis}`
+    : jobId;
+}
+
 function PhaseBadge({ phase }: { phase: JobPhase }) {
   if (isTrainJobPhase(phase)) return <Badge variant="default">{phase}</Badge>;
   if (phase === "eval") return <Badge variant="outline">eval</Badge>;
@@ -631,7 +659,7 @@ function canRetryJob(job: Job): boolean {
 
 function resubmitSourceLabel(action?: string | null) {
   if (action === "retry") return "restarted from a failed job:";
-  if (action === "resume") return "resumed from a timeout job:";
+  if (action === "resume") return "resumed from:";
   return "resubmitted from job:";
 }
 
@@ -665,8 +693,8 @@ function compareJobIdDesc(a: string, b: string): number {
   return b.localeCompare(a, undefined, { numeric: true, sensitivity: "base" });
 }
 
-function Th({ children }: { children: React.ReactNode }) {
-  return <th className="py-2 pr-4 font-medium whitespace-nowrap">{children}</th>;
+function Th({ children, className }: { children: React.ReactNode; className?: string }) {
+  return <th className={`py-2 pr-4 font-medium whitespace-nowrap ${className ?? ""}`}>{children}</th>;
 }
 function Td({ children, className }: { children: React.ReactNode; className?: string }) {
   return <td className={`py-2 pr-4 ${className ?? ""}`}>{children}</td>;

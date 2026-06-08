@@ -14,13 +14,13 @@ Different from slurm:
 """
 
 import asyncio
+import hashlib
 import io
 import re
 import shlex
 import shutil
 import tarfile
 import time
-import uuid
 from pathlib import Path
 from typing import Literal
 
@@ -69,6 +69,27 @@ _GPU_RESOURCES = {
     4: ("56",  "880Gi"),
     8: ("100", "1500Gi"),
 }
+
+_K8S_NAME_RE = re.compile(r"[^a-z0-9-]+")
+
+
+def _k8s_name_segment(value: str) -> str:
+    segment = _K8S_NAME_RE.sub("-", value.lower()).strip("-")
+    segment = re.sub(r"-{2,}", "-", segment)
+    return segment or "job"
+
+
+def _mlxp_job_id(settings: MlxpSettings, job_name: str) -> str:
+    """Kubernetes metadata.name following the MLXP guide:
+    `<user>-<job-name>`, with DNS-label sanitation and 63-char max length."""
+    prefix = _k8s_name_segment(settings.user)
+    body = _k8s_name_segment(job_name)
+    name = f"{prefix}-{body}"
+    if len(name) <= 63:
+        return name
+    digest = hashlib.sha1(name.encode()).hexdigest()[:8]
+    keep = 63 - len(digest) - 1
+    return f"{name[:keep].rstrip('-')}-{digest}"
 
 
 def _hf_cache_exports(settings: MlxpSettings) -> str:
@@ -208,12 +229,12 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
         and req.global_batch_size % req.num_gpus != 0
     ):
         raise ValueError("global_batch_size must be divisible by num_gpus for n1.5 training")
-    # job_id is the k8s Job resource name — 6-char alpha-leading so it's
-    # DNS-safe and URL-short. job_name is the display name carried as an
-    # annotation; same shape as slurm's job_name.
+    # job_id is the k8s Job resource name. MLXP's guide requires
+    # `<user>-<job-name>`; job_name stays as the display name carried in
+    # annotations with the same shape as slurm's job_name.
     from .submit import resolve_job_name, resolve_train_note
-    job_id = "m" + uuid.uuid4().hex[:5]
     job_name = resolve_job_name(req.job_name, req.phase, req.variant)
+    job_id = _mlxp_job_id(settings, job_name)
     train_note = resolve_train_note(req.train_note, variant)
     req.output_namespace = validate_output_namespace(
         req.output_namespace or make_output_namespace(job_name, req.variant)
@@ -480,6 +501,10 @@ def _ensure_trailing_newline(text: str) -> str:
     return text if text.endswith("\n") else text + "\n"
 
 
+def _shell_words(args: list[str]) -> str:
+    return " ".join(shlex.quote(arg) for arg in args)
+
+
 def _mlxp_worktree_path(snapshot: dict) -> str:
     settings = get_settings()
     job_id = snapshot.get("job_id")
@@ -679,8 +704,8 @@ def _render_body_script(
     batch_size = variant.vars.get("TRAIN_BATCH_SIZE", "64")
     if family == "n1.5" and req.global_batch_size is not None:
         batch_size = str(req.global_batch_size // req.num_gpus)
-    train_extra = " ".join(variant.arrays.get("TRAIN_EXTRA_ARGS") or [])
-    user_extra = " ".join(req.extra_args)
+    train_extra = _shell_words(variant.arrays.get("TRAIN_EXTRA_ARGS") or [])
+    user_extra = _shell_words(req.extra_args)
 
     output_namespace = req.output_namespace or _path_slug(job_name)
     ckpt_dir = f"{settings.experiments_dir}/{variant.name}/checkpoints/{output_namespace}"
