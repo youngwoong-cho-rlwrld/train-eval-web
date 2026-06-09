@@ -24,6 +24,7 @@ from .job_identity import comment_field_fragment
 from .output_namespace import make_output_namespace, validate_output_namespace
 from .partitions import is_background_partition
 from .paths import CLUSTER_STAGING_REL, CONFIGS_DIR, LIB_DIR
+from .resource_presets import slurm_resources_for
 from .ssh import rsync_to, ssh_run
 from .submission_snapshot import (
     apply_dataset_override,
@@ -373,6 +374,12 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     ) if req.phase == "train" else None
     train_git_commit = resolve_train_git_commit(req, variant)
     gpus = str(train_settings.num_gpus)
+    slurm_resources = slurm_resources_for(
+        cluster=req.cluster,
+        partition=partition,
+        phase=req.phase,
+        num_gpus=train_settings.num_gpus,
+    )
 
     # Unified shape across slurm + MLXP. The cluster/partition are shown in
     # table columns; the job name carries phase, variant, and timestamp.
@@ -647,6 +654,8 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         f"--partition={shlex.quote(partition)}",
         "--nodes=1",
         f"--gpus-per-node={shlex.quote(gpus)}",
+        f"--cpus-per-task={slurm_resources.cpus_per_task}",
+        f"--mem={shlex.quote(slurm_resources.memory)}",
         f"--time={shlex.quote(walltime)}",
         f"--output={log_dir}/{job_name}_%j.out",
         f"--error={log_dir}/{job_name}_%j.err",
