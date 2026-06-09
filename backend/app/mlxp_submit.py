@@ -927,7 +927,7 @@ uv run $UV_RUN_ARGS torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/la
     --max-steps {max_steps} \\
     --save-steps {save_steps} \\
     --save-total-limit 5 \\
-    --dataloader-num-workers 8 \\
+    --dataloader-num-workers 16 \\
     --experiment-name "{output_namespace}" \\
     --use-wandb \\
     --wandb-project {wandb_project} \\

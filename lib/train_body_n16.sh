@@ -119,7 +119,7 @@ uv run torchrun --nproc_per_node="$TRAIN_NUM_GPUS" --master-port "$MASTER_PORT" 
     --max-steps "$MAX_STEPS" \
     --save-steps "$SAVE_STEPS" \
     --save-total-limit 5 \
-    --dataloader-num-workers 8 \
+    --dataloader-num-workers 16 \
     --experiment-name "$OUTPUT_NAMESPACE" \
     --use-wandb \
     --wandb-project "$WANDB_PROJECT" \

@@ -82,7 +82,7 @@ def _train_n16(v: Variant) -> list[tuple[str, str]]:
         ("--max-steps", v.vars.get("MAX_STEPS", "")),
         ("--save-steps", v.vars.get("SAVE_STEPS", "")),
         ("--save-total-limit", "5"),
-        ("--dataloader-num-workers", "8"),
+        ("--dataloader-num-workers", "16"),
         ("--experiment-name", "<output-namespace>"),
         ("--use-wandb", ""),
         ("--color-jitter-params", "brightness 0.2 contrast 0.2 saturation 0.2 hue 0.1"),
