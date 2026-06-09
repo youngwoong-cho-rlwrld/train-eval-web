@@ -6,14 +6,13 @@ actually emit for a given variant. If you change lib/train_body*.sh,
 update the corresponding builder here.
 """
 
-from typing import Any
 
 from .training_models import resolve_training_model
 from .variants import Variant
 from .wandb_config import get_project
 
 
-def flags_for(variant: Variant, cluster: str, phase: str) -> list[tuple[str, str]]:
+def flags_for(variant: Variant, phase: str) -> list[tuple[str, str]]:
     """Return [(flag, value), ...] for the variant's entrypoint.
 
     Pseudo-values like `<job-name>` mark fields the submitter fills in at
@@ -22,20 +21,20 @@ def flags_for(variant: Variant, cluster: str, phase: str) -> list[tuple[str, str
     model = resolve_training_model(variant).flags_profile
     if phase in ("train", "resume"):
         if model == "n1.6":
-            return _train_n16(variant, cluster)
+            return _train_n16(variant)
         if model == "n1.5":
-            return _train_n15(variant, cluster)
+            return _train_n15(variant)
     if phase == "eval":
         if model == "n1.6":
-            return _eval_n16(variant, cluster)
+            return _eval_n16(variant)
         if model == "n1.5":
-            return _eval_n15(variant, cluster)
+            return _eval_n15(variant)
     return []
 
 
 # ── train ─────────────────────────────────────────────────────────────
 
-def _train_n15(v: Variant, cluster: str) -> list[tuple[str, str]]:
+def _train_n15(v: Variant) -> list[tuple[str, str]]:
     """scripts/gr00t_finetune.py — N1.5 training, called from train_body.sh."""
     return [
         ("--num-gpus", v.vars.get("TRAIN_NUM_GPUS", "")),
@@ -57,7 +56,7 @@ def _train_n15(v: Variant, cluster: str) -> list[tuple[str, str]]:
     ]
 
 
-def _train_n16(v: Variant, cluster: str) -> list[tuple[str, str]]:
+def _train_n16(v: Variant) -> list[tuple[str, str]]:
     """gr00t/experiment/launch_finetune.py — N1.6 training."""
     global_batch = v.vars.get("TRAIN_GLOBAL_BATCH_SIZE") or v.vars.get("GLOBAL_BATCH_SIZE") or ""
     if not global_batch:
@@ -95,7 +94,7 @@ def _train_n16(v: Variant, cluster: str) -> list[tuple[str, str]]:
 
 # ── eval ─────────────────────────────────────────────────────────────
 
-def _eval_n15(v: Variant, cluster: str) -> list[tuple[str, str]]:
+def _eval_n15(v: Variant) -> list[tuple[str, str]]:
     """Mirror lib/eval_body.sh — gr00t inference + isaac client run."""
     return [
         ("--task-name", v.vars.get("TASK_NAME", "")),
@@ -109,5 +108,5 @@ def _eval_n15(v: Variant, cluster: str) -> list[tuple[str, str]]:
     ]
 
 
-def _eval_n16(v: Variant, cluster: str) -> list[tuple[str, str]]:
-    return _eval_n15(v, cluster)
+def _eval_n16(v: Variant) -> list[tuple[str, str]]:
+    return _eval_n15(v)

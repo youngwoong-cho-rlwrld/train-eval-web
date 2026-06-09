@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .job_identity import parse_comment_fields
-from .jobs import Job
+from .jobs import ACTIVE_STATES, Job
 from .k8s_resources import (
     affinity_node,
     ensure_kubectl,
@@ -28,6 +28,7 @@ from .k8s_resources import (
 )
 from .kubectl_errors import is_kubectl_transport_error
 from .mlxp_config import get_settings, owner_selector
+from .paths import CHECKPOINT_COPY_HISTORY_REL
 from .time_utils import to_kst_iso
 
 
@@ -80,8 +81,10 @@ def _elapsed(start: str | None, end: str | None) -> str:
 def _latest_k8s_time(values: list[str | None]) -> str | None:
     latest: tuple[datetime, str] | None = None
     for value in values:
+        if not value:
+            continue
         parsed = parse_k8s_time(value)
-        if parsed is None or value is None:
+        if parsed is None:
             continue
         if latest is None or parsed > latest[0]:
             latest = (parsed, value)
@@ -130,13 +133,11 @@ async def list_jobs(
     end: str | None = None,
     active_only: bool = False,
 ) -> list[Job]:
-    """All MLXP jobs we know about: live k8s Jobs + archived runs derived
-    from DDN checkpoint directories.
+    """All MLXP jobs we know about: live k8s Jobs + archived training runs.
 
     k8s Jobs are GC'd 30 min after completion (`ttlSecondsAfterFinished`),
-    so a Jobs page opened later wouldn't show them. We fall back to listing
-    `<exp_dir>/checkpoints/<job-name>` on DDN — every completed training
-    run leaves one of those behind for the lifetime of the checkpoints.
+    so a Jobs page opened later wouldn't show them. We rebuild completed
+    training rows from submit metadata plus durable artifact evidence.
     """
     live, seen = await _list_live_jobs()
     if active_only:
@@ -149,7 +150,7 @@ async def list_jobs(
 
 
 def _is_active_state(state: str) -> bool:
-    return state.upper() in {"RUNNING", "PENDING", "COMPLETING", "CONFIGURING", "SUSPENDED"}
+    return state.upper() in ACTIVE_STATES
 
 
 def _time_bound(value: str | None) -> float | None:
@@ -279,7 +280,6 @@ async def _list_archived_jobs(seen: set[str]) -> list[Job]:
 
 
 async def _list_archived_runs() -> list[dict[str, str]]:
-    import asyncio
     from .mlxp_data_pod import ensure_listing_pod
 
     try:
@@ -287,64 +287,41 @@ async def _list_archived_runs() -> list[dict[str, str]]:
     except Exception:
         return []
 
-    settings = get_settings()
-    meta_index = await _archived_metadata_index(pod)
-    experiments_root = shlex.quote(settings.experiments_dir)
-    # One liner per run: <variant>|<output_namespace>|<latest_step>|<start_epoch>|<end_epoch>
-    # NOTE: array glob with nullglob, not `ls $glob` — `ls` with zero-arg
-    # falls back to listing `.` which used to slip past the empty check and
-    # produced fake rows (`experiment_cfg`, `logs`, `runs`) in the table.
-    script = r"""
-shopt -s nullglob
-for d in __EXPERIMENTS_ROOT__/*/checkpoints/ __EXPERIMENTS_ROOT__/*/checkpoints/*/ __EXPERIMENTS_ROOT__/*/checkpoints/*/*/; do
-    matches=( "$d"checkpoint-* )
-    [ ${#matches[@]} -eq 0 ] && continue
-    output_namespace=$(basename "$d")
-    rel="${d#__EXPERIMENTS_ROOT__/}"
-    variant="${rel%%/*}"
-    [ "$output_namespace" = "checkpoints" ] && output_namespace="$variant"
-    latest=$(for m in "${matches[@]}"; do basename "$m" | sed 's:^checkpoint-::'; done | sort -n | tail -1)
-    start_epoch=$(stat -c %Y "$d" 2>/dev/null || echo 0)
-    end_epoch=$(stat -c %Y "$d"checkpoint-$latest 2>/dev/null || echo "$start_epoch")
-    printf '%s|%s|%s|%s|%s\n' "$variant" "$output_namespace" "$latest" "$start_epoch" "$end_epoch"
-done
-""".replace("__EXPERIMENTS_ROOT__", experiments_root)
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "kubectl", "exec", "-n", settings.namespace, pod, "--", "bash", "-c", script,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20.0)
-    except Exception:
-        return []
-
     out: list[dict[str, str]] = []
-    for line in stdout.decode(errors="replace").splitlines():
-        parts = line.split("|")
-        if len(parts) != 5:
+    metas, artifacts, copies = await asyncio.gather(
+        _archived_metadata_records(pod),
+        _archived_artifact_index(pod),
+        _copy_history_index(pod),
+    )
+
+    for meta in metas:
+        if str(meta.get("phase") or "").strip() != "train":
             continue
-        variant, output_namespace, latest, start_e, end_e = parts
-        if not latest.isdigit():
+        output_namespace = str(
+            meta.get("output_namespace")
+            or _path_leaf(str(meta.get("checkpoint_dir") or ""))
+            or ""
+        ).strip()
+        if not output_namespace:
             continue
-        meta = meta_index.get(output_namespace, {})
+
+        keys = _archived_identity_keys(meta, output_namespace)
+        artifact = next((artifacts[k] for k in keys if k in artifacts), None)
+        copy_record = next((copies[k] for k in keys if k in copies), None)
+        if not _has_completed_artifact(artifact, copy_record):
+            continue
+
         train_meta = meta.get("train") if isinstance(meta.get("train"), dict) else {}
-        try:
-            start_i = int(start_e)
-            end_i = int(end_e)
-            if end_i < start_i:
-                start_i, end_i = end_i, start_i
-            start_iso = to_kst_iso(datetime.fromtimestamp(start_i, tz=timezone.utc).isoformat())
-            end_iso = to_kst_iso(datetime.fromtimestamp(end_i, tz=timezone.utc).isoformat())
-        except ValueError:
-            continue
+        start_iso = _metadata_start_time(meta, artifact)
+        end_iso = _archived_end_time(meta, artifact, copy_record)
         job_id = str(meta.get("job_id") or output_namespace)
         job_name = str(meta.get("job_name") or output_namespace)
+        artifact_variant = str((artifact or {}).get("variant") or "")
         out.append({
             "job_id": job_id,
             "job_name": job_name,
             "output_namespace": output_namespace,
-            "variant": str(meta.get("variant") or variant),
+            "variant": str(meta.get("variant") or artifact_variant),
             "train_note": str(meta.get("train_note") or ""),
             "num_gpus": str(train_meta.get("num_gpus") or meta.get("num_gpus") or ""),
             "start": start_iso or "",
@@ -354,7 +331,69 @@ done
     return out
 
 
-async def _archived_metadata_index(pod: str) -> dict[str, dict[str, Any]]:
+def _epoch_to_kst(value: Any) -> str | None:
+    try:
+        epoch = float(value)
+    except (TypeError, ValueError):
+        return None
+    if epoch <= 0:
+        return None
+    return to_kst_iso(datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat())
+
+
+def _float_or_zero(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _metadata_start_time(meta: dict[str, Any], artifact: dict[str, Any] | None) -> str | None:
+    created = str(meta.get("created_at") or "").strip()
+    if created:
+        return to_kst_iso(created)
+    if artifact:
+        return _epoch_to_kst(artifact.get("start_epoch"))
+    return None
+
+
+def _archived_end_time(
+    meta: dict[str, Any],
+    artifact: dict[str, Any] | None,
+    copy_record: dict[str, Any] | None,
+) -> str | None:
+    if artifact:
+        end = _epoch_to_kst(artifact.get("end_epoch"))
+        if end:
+            return end
+    if copy_record:
+        copied = _epoch_to_kst(copy_record.get("copied_at"))
+        if copied:
+            return copied
+    created = str(meta.get("created_at") or "").strip()
+    return to_kst_iso(created) if created else None
+
+
+def _archived_identity_keys(meta: dict[str, Any], output_namespace: str) -> list[str]:
+    keys = [
+        output_namespace,
+        str(meta.get("job_id") or ""),
+        str(meta.get("job_name") or ""),
+        _path_leaf(str(meta.get("checkpoint_dir") or "")) or "",
+    ]
+    return [k for k in dict.fromkeys(k.strip() for k in keys if k and k.strip())]
+
+
+def _has_completed_artifact(
+    artifact: dict[str, Any] | None,
+    copy_record: dict[str, Any] | None,
+) -> bool:
+    if artifact and (artifact.get("has_checkpoint_subdir") or artifact.get("has_final_model")):
+        return True
+    return bool(copy_record and copy_record.get("dest_exists") is True)
+
+
+async def _archived_metadata_records(pod: str) -> list[dict[str, Any]]:
     settings = get_settings()
     experiments_root = shlex.quote(settings.experiments_dir)
     script = r"""
@@ -373,9 +412,9 @@ done
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20.0)
     except Exception:
-        return {}
+        return []
 
-    index: dict[str, dict[str, Any]] = {}
+    records: list[dict[str, Any]] = []
     for chunk in stdout.decode(errors="replace").split("\x1e"):
         if not chunk.strip():
             continue
@@ -384,14 +423,112 @@ done
             meta = json.loads(body)
         except json.JSONDecodeError:
             continue
-        keys = {
-            str(meta.get("output_namespace") or ""),
-            str(meta.get("job_id") or ""),
-            _path_leaf(str(meta.get("checkpoint_dir") or "")) or "",
+        if isinstance(meta, dict):
+            records.append(meta)
+    return records
+
+
+async def _archived_artifact_index(pod: str) -> dict[str, dict[str, Any]]:
+    settings = get_settings()
+    experiments_root = shlex.quote(settings.experiments_dir)
+    script = r"""
+shopt -s nullglob
+for d in __EXPERIMENTS_ROOT__/*/checkpoints/ __EXPERIMENTS_ROOT__/*/checkpoints/*/ __EXPERIMENTS_ROOT__/*/checkpoints/*/*/; do
+    output_namespace=$(basename "$d")
+    rel="${d#__EXPERIMENTS_ROOT__/}"
+    variant="${rel%%/*}"
+    [ "$output_namespace" = "checkpoints" ] && output_namespace="$variant"
+
+    matches=( "$d"checkpoint-* )
+    latest=""
+    has_checkpoint=0
+    end_path="$d"
+    if [ ${#matches[@]} -gt 0 ]; then
+        has_checkpoint=1
+        latest=$(for m in "${matches[@]}"; do basename "$m" | sed 's:^checkpoint-::'; done | sort -n | tail -1)
+        end_path="${d}checkpoint-${latest}"
+    fi
+
+    has_final=0
+    if [ -f "${d}model.safetensors.index.json" ] || compgen -G "${d}model-*.safetensors" >/dev/null; then
+        has_final=1
+        if [ "$has_checkpoint" = 0 ] && [ -f "${d}model.safetensors.index.json" ]; then
+            end_path="${d}model.safetensors.index.json"
+        fi
+    fi
+    [ "$has_checkpoint" = 0 ] && [ "$has_final" = 0 ] && continue
+
+    start_epoch=$(stat -c %Y "$d" 2>/dev/null || echo 0)
+    end_epoch=$(stat -c %Y "$end_path" 2>/dev/null || echo "$start_epoch")
+    printf '%s|%s|%s|%s|%s|%s\n' "$variant" "$output_namespace" "$has_checkpoint" "$has_final" "$start_epoch" "$end_epoch"
+done
+""".replace("__EXPERIMENTS_ROOT__", experiments_root)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "kubectl", "exec", "-n", settings.namespace, pod, "--", "bash", "-c", script,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20.0)
+    except Exception:
+        return {}
+
+    index: dict[str, dict[str, Any]] = {}
+    for line in stdout.decode(errors="replace").splitlines():
+        parts = line.split("|")
+        if len(parts) != 6:
+            continue
+        variant, output_namespace, has_checkpoint, has_final, start_e, end_e = parts
+        if not output_namespace:
+            continue
+        record = {
+            "variant": variant,
+            "output_namespace": output_namespace,
+            "has_checkpoint_subdir": has_checkpoint == "1",
+            "has_final_model": has_final == "1",
+            "start_epoch": start_e,
+            "end_epoch": end_e,
         }
+        index[output_namespace] = record
+    return index
+
+
+async def _copy_history_index(pod: str) -> dict[str, dict[str, Any]]:
+    settings = get_settings()
+    hist_dir = shlex.quote(f"{settings.experiments_dir}/{CHECKPOINT_COPY_HISTORY_REL}")
+    script = f"cat {hist_dir}/*.jsonl 2>/dev/null || true"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "kubectl", "exec", "-n", settings.namespace, pod, "--", "bash", "-c", script,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+    except Exception:
+        return {}
+
+    index: dict[str, dict[str, Any]] = {}
+    for line in stdout.decode(errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict) or record.get("dest_exists") is not True:
+            continue
+        keys = [
+            str(record.get("source_job") or ""),
+            _path_leaf(str(record.get("source_path") or "")) or "",
+            _path_leaf(str(record.get("dest_path") or "")) or "",
+        ]
         for key in keys:
-            if key:
-                index[key] = meta
+            if not key:
+                continue
+            previous = index.get(key)
+            if not previous or _float_or_zero(record.get("copied_at")) > _float_or_zero(previous.get("copied_at")):
+                index[key] = record
     return index
 
 
@@ -569,17 +706,27 @@ async def _tail_archived_log(job_name: str, start_line: int = 1):
 
     record = await _archived_record(job_name)
     variant = None
+    output_namespace = None
     if record:
-        _, variant = parse_comment_metadata(record.get("JobComment") or "")
+        comment = record.get("JobComment") or ""
+        _, variant = parse_comment_metadata(comment)
+        output_namespace = parse_comment_fields(comment).get("output_namespace")
     if not variant:
         _, variant = parse_phase_and_variant(job_name)
     if not variant:
         return
     settings = get_settings()
+    checkpoint_log_names = [x for x in dict.fromkeys([output_namespace, job_name]) if x]
     log_paths = [
-        f"{settings.experiments_dir}/{variant}/checkpoints/{job_name}/logs/training.log",
+        *[
+            f"{settings.experiments_dir}/{variant}/checkpoints/{name}/logs/training.log"
+            for name in checkpoint_log_names
+        ],
         f"{settings.experiments_dir}/{variant}/checkpoints/logs/training_rank0.log",
-        f"{settings.experiments_dir}/{variant}/logs/{job_name}/eval.log",
+        *[
+            f"{settings.experiments_dir}/{variant}/logs/{name}/eval.log"
+            for name in checkpoint_log_names
+        ],
     ]
     try:
         pod = await ensure_listing_pod()

@@ -16,6 +16,11 @@ from .clusters import load_cluster
 from .ssh import ssh_run
 
 
+def is_background_partition(name: str) -> bool:
+    """Preemptible partitions (auto-add --requeue at submit time)."""
+    return name == "background" or name.endswith("_background")
+
+
 _GPU_PER_NODE_RE = re.compile(r"gpu(?::[A-Za-z0-9_-]+)?:(\d+)")
 _GPU_TYPE_RE = re.compile(r"gpu:([A-Za-z0-9_-]+):\d+")
 _GPU_TRES_RE = re.compile(r"(?:^|,)gres/gpu=(\d+)(?:,|$)")
@@ -236,9 +241,6 @@ async def list_partitions(cluster: str) -> list[PartitionInfo]:
             d["queued_jobs"] += 1
             d["queued_gpus"] += requested_gpus
 
-    def is_bg(name: str) -> bool:
-        return name == "background" or name.endswith("_background")
-
     out = []
     for name in sorted(per_part):
         d = per_part[name]
@@ -246,7 +248,7 @@ async def list_partitions(cluster: str) -> list[PartitionInfo]:
         out.append(PartitionInfo(
             name=name,
             is_default=is_default,
-            is_background=is_bg(name),
+            is_background=is_background_partition(name),
             total_nodes=d["total_nodes"],
             idle_nodes=d["idle_nodes"],
             gpu_total=d["gpu_total"],

@@ -11,13 +11,13 @@ function keyFor(cluster: string) {
   return `${PREFIX}:${cluster}`;
 }
 
-function defaultFor(cluster: string, defaultDir?: string) {
+function defaultFor(defaultDir?: string) {
   return defaultDir || SLURM_DEFAULT;
 }
 
 function storedFor(cluster: string, defaultDir?: string) {
-  if (typeof window === "undefined") return defaultFor(cluster, defaultDir);
-  return localStorage.getItem(keyFor(cluster)) || defaultFor(cluster, defaultDir);
+  if (typeof window === "undefined") return defaultFor(defaultDir);
+  return localStorage.getItem(keyFor(cluster)) || defaultFor(defaultDir);
 }
 
 /** localStorage-backed value for "where should the dataset picker look on
@@ -38,7 +38,7 @@ export function useDatasetDir(cluster: string, defaultDir?: string): [string, (v
     };
     const onStorage = (e: StorageEvent) => {
       if (e.key === keyFor(cluster) && e.newValue) {
-        setLocal((prev) => ({ ...prev, [cluster]: e.newValue ?? defaultFor(cluster, defaultDir) }));
+        setLocal((prev) => ({ ...prev, [cluster]: e.newValue ?? defaultFor(defaultDir) }));
       }
     };
     window.addEventListener(EVENT, onCustom);

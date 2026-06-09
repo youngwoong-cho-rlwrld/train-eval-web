@@ -22,6 +22,7 @@ from .clusters import load_cluster
 from .data_interface import rewrite_action_horizon
 from .job_identity import comment_field_fragment
 from .output_namespace import make_output_namespace, validate_output_namespace
+from .partitions import is_background_partition
 from .paths import CLUSTER_STAGING_REL, CONFIGS_DIR, LIB_DIR
 from .ssh import rsync_to, ssh_run
 from .submission_snapshot import (
@@ -47,11 +48,6 @@ from .train_overrides import resolve_train_action_horizon as resolve_action_hori
 from .variants import load_variant
 from .variant_values import variant_int
 from .wandb_config import get_project as wandb_project
-
-
-def _is_background_partition(name: str) -> bool:
-    """Preemptible partitions (auto-add --requeue at submit time)."""
-    return name == "background" or name.endswith("_background")
 
 
 class SubmitRequest(BaseModel):
@@ -362,7 +358,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
 
     partition = req.partition or cluster.vars["PARTITION"]
     sbatch_flags: list[str] = []
-    if _is_background_partition(partition):
+    if is_background_partition(partition):
         sbatch_flags.append("--requeue")
     exclude_nodes = (cluster.vars.get("SBATCH_EXCLUDE") or cluster.vars.get("SLURM_EXCLUDE_NODES") or "").strip()
     if exclude_nodes:

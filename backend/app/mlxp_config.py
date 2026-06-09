@@ -150,10 +150,6 @@ def get_settings() -> MlxpSettings:
     return MlxpSettings.model_validate(data)
 
 
-def save_settings(settings: MlxpSettings) -> MlxpSettings:
-    return save_user(settings.user)
-
-
 def save_user(user: str) -> MlxpSettings:
     _SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
     _SETTINGS_FILE.write_text(json.dumps({"user": user}, indent=2) + "\n")
@@ -168,29 +164,3 @@ def labels(settings: MlxpSettings | None = None) -> dict[str, str]:
 def owner_selector(settings: MlxpSettings | None = None) -> str:
     s = settings or get_settings()
     return f"owner={s.owner_label},tool={s.tool_label}"
-
-
-# Compatibility constants for old call sites. New code should call
-# get_settings() so Settings-page changes take effect without a backend restart.
-_CURRENT = get_settings()
-MLXP_USER = _CURRENT.user
-NAMESPACE = _CURRENT.namespace
-OWNER_LABEL = _CURRENT.owner_label
-TOOL_LABEL = _CURRENT.tool_label
-DEFAULT_NODE = _CURRENT.default_node
-GPU_NODE_PREFIX = _CURRENT.gpu_node_prefix
-GPU_TYPE = _CURRENT.gpu_type
-GPUS_PER_NODE = _CURRENT.gpus_per_node
-DDN_MOUNT = _CURRENT.ddn_mount
-DDN_USER_HOME = _CURRENT.ddn_user_home
-DATASETS_DIR = _CURRENT.datasets_dir
-EXPERIMENTS_DIR = _CURRENT.experiments_dir
-HF_HOME = _CURRENT.hf_home
-WORKSPACE_DIR = _CURRENT.workspace_dir
-ISAAC_DIR = _CURRENT.isaac_dir
-DATA_POD_NAME = _CURRENT.data_pod_name
-DDN_PVC = _CURRENT.ddn_pvc
-IMAGE = _CURRENT.image
-IMAGE_PULL_SECRET = _CURRENT.image_pull_secret
-ZONE = _CURRENT.zone
-WANDB_SECRET = _CURRENT.wandb_secret

@@ -94,7 +94,6 @@ export type ExperimentFileVersion = {
 
 export type ExperimentFiles = {
   variant: string;
-  model_family: string;
   config: ExperimentFile;
   second_file: ExperimentFile;
   versions: ExperimentFileVersion[];

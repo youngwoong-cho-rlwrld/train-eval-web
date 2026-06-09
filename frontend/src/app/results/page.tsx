@@ -16,6 +16,9 @@ import { RefreshButton } from "@/components/refresh-button";
 import { LoadingState } from "@/components/loading-state";
 import { ImmediateTooltip } from "@/components/immediate-tooltip";
 import { JobStateBadge } from "@/components/job-state-badge";
+import { Th } from "@/components/table";
+import { jobDetailHref } from "@/lib/job-links";
+import { formatPct } from "@/lib/format";
 
 const REFRESH_MS = 120_000;
 const AVERAGE_HELP =
@@ -318,11 +321,6 @@ function resultVariantKey(variant: ResultVariant) {
   ].filter(Boolean).join(":");
 }
 
-function jobDetailHref(cluster: string, jobId?: string | null) {
-  if (!jobId) return undefined;
-  return `/jobs/${encodeURIComponent(cluster)}/${encodeURIComponent(jobId)}`;
-}
-
 function CopyResultTableButton({
   variant,
   evalSets,
@@ -543,10 +541,6 @@ function formatMeanStd(cell: ResultCell) {
   return `${formatPct(cell.mean_success_rate)} ± ${formatPct(cell.std_success_rate ?? 0)}`;
 }
 
-function formatPct(value: number) {
-  return `${(value * 100).toFixed(2)}%`;
-}
-
 function totalEpisodes(cell: ResultCell) {
   const total = cell.episode_counts.reduce<number>((sum, v) => sum + (v ?? 0), 0);
   return total > 0 ? total : null;
@@ -576,6 +570,3 @@ function episodeWeightedAverage(cells: ResultCell[]) {
   return null;
 }
 
-function Th({ children }: { children: React.ReactNode }) {
-  return <th className="py-2 pr-4 font-medium whitespace-nowrap">{children}</th>;
-}

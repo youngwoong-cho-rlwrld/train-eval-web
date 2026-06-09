@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { api, type Job, type SubmitResponse } from "@/lib/api";
+import { jobDetailHref } from "@/lib/job-links";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -145,7 +146,7 @@ export function ResumeJobButton({
                   {resumedJobs.data.map((job) => (
                     <li key={`${job.cluster}-${job.job_id}`} className="min-w-0 text-xs">
                       <Link
-                        href={`/jobs/${encodeURIComponent(job.cluster)}/${encodeURIComponent(job.job_id)}`}
+                        href={jobDetailHref(job.cluster, job.job_id)!}
                         target="_blank"
                         rel="noreferrer"
                         className="font-mono text-blue-600 hover:underline dark:text-blue-400"

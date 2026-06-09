@@ -56,5 +56,9 @@ function CheckpointPath({
 
 function formatCopyTime(seconds: number) {
   if (!Number.isFinite(seconds)) return "";
-  return new Date(seconds * 1000).toLocaleString();
+  // Match the Asia/Seoul convention used for all other job timestamps
+  // (see lib/job-time.ts) rather than the viewer's local timezone.
+  return new Date(seconds * 1000).toLocaleString(undefined, {
+    timeZone: "Asia/Seoul",
+  });
 }

@@ -38,8 +38,8 @@ from .kubectl_errors import is_completed_pod_exec_error
 from .mlxp_config import get_settings
 from .mlxp_data_pod import ensure_listing_pod, invalidate_pods_cache
 from .paths import CHECKPOINT_COPY_HISTORY_REL
-from .remote_paths import expand_cluster_home, remote_path_exists
-from .ssh import ssh_run, _CM_OPTS
+from .remote_paths import expand_cluster_home, remote_path_exists, remote_shell_path
+from .ssh import ssh_run, _CM_OPTS, rsync_ssh_transport
 from .submission_snapshot import is_mlxp_transport_error
 
 
@@ -352,7 +352,7 @@ async def _read_copy_history(cluster: str, job_id: str) -> list[CheckpointCopyRe
         _, path = _slurm_history_paths(job_id)
         r = await ssh_run(
             env.ssh_alias,
-            f"cat {_remote_shell_path(path)} 2>/dev/null || true",
+            f"cat {remote_shell_path(path)} 2>/dev/null || true",
             timeout=15.0,
         )
         out = r.stdout
@@ -387,8 +387,8 @@ async def _append_copy_history(cluster: str, job_id: str, record: CheckpointCopy
     r = await ssh_run(
         env.ssh_alias,
         (
-            f"mkdir -p {_remote_shell_path(hist_dir)} && "
-            f"printf %s {shlex.quote(line)} >> {_remote_shell_path(path)}"
+            f"mkdir -p {remote_shell_path(hist_dir)} && "
+            f"printf %s {shlex.quote(line)} >> {remote_shell_path(path)}"
         ),
         timeout=15.0,
     )
@@ -980,16 +980,6 @@ async def _slurm_to_slurm(copy_id: str, src_cluster: str, src_path: str,
     return f"copied {src_env.ssh_alias}:{src_path} → {dest_env.ssh_alias}:{dest_path}"
 
 
-def _remote_shell_path(path: str) -> str:
-    """Quote a remote path while preserving an intentional leading $HOME."""
-    if path == "$HOME":
-        return "$HOME"
-    if path.startswith("$HOME/"):
-        rest = path[len("$HOME/"):]
-        return "$HOME/" + shlex.quote(rest)
-    return shlex.quote(path)
-
-
 def _mlxp_tar_create_cmd(
     src_parent: str,
     tar_args: list[str],
@@ -1014,8 +1004,8 @@ def _slurm_tar_extract_cmd(dest_parent: str, dest_path: str, leaf: str, copy_id:
     path, especially because retries may follow immediately.
     """
     tmp_template = f".{leaf}.copy-{copy_id}.XXXXXX"
-    dest_parent_q = _remote_shell_path(dest_parent)
-    dest_path_q = _remote_shell_path(dest_path)
+    dest_parent_q = remote_shell_path(dest_parent)
+    dest_path_q = remote_shell_path(dest_path)
     leaf_q = shlex.quote(leaf)
     return (
         f"mkdir -p {dest_parent_q} && "
@@ -1062,7 +1052,7 @@ async def _create_remote_checkpoint_staging(
     src_leaf: str,
     copy_id: str,
 ) -> str:
-    dest_parent_q = _remote_shell_path(dest_parent)
+    dest_parent_q = remote_shell_path(dest_parent)
     tmp_template = f".{src_leaf}.copy-{copy_id}.XXXXXX"
     mktemp = await ssh_run(
         dest_alias,
@@ -1095,7 +1085,7 @@ async def _rsync_local_checkpoint_to_remote(
     remote_tmp: str,
     src_leaf: str,
 ) -> None:
-    ssh_e = "ssh -o BatchMode=yes " + " ".join(_CM_OPTS)
+    ssh_e = rsync_ssh_transport()
     rsync_args = [
         "rsync", "-az", "--delete", "--partial", "-e", ssh_e,
         f"{local_leaf}/",
@@ -1118,7 +1108,7 @@ async def _promote_remote_checkpoint(
 ) -> None:
     leaf_q = shlex.quote(src_leaf)
     remote_tmp_q = shlex.quote(remote_tmp)
-    dest_path_q = _remote_shell_path(dest_path)
+    dest_path_q = remote_shell_path(dest_path)
     promote = await ssh_run(
         dest_alias,
         (

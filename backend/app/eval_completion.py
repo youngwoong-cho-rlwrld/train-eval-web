@@ -7,10 +7,14 @@ from .ssh import ssh_run
 from .variants import Variant, load_variant
 
 
+def eval_total(eval_sets: list[str], n_runs: int, tasks: list[str]) -> int:
+    return max(len(tasks) * len(eval_sets) * n_runs, 0)
+
+
 async def expected_eval_runs(variant: str, overrides: dict[str, str] | None = None) -> int:
     v = await load_variant(variant)
     eval_sets, n_runs, _, tasks = eval_shape(v, overrides)
-    return max(len(tasks) * len(eval_sets) * n_runs, 0)
+    return eval_total(eval_sets, n_runs, tasks)
 
 
 def eval_shape(

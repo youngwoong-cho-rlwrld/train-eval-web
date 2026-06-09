@@ -23,3 +23,6 @@ configs/experiments/*/.versions/**
 .DS_Store
 *.bak
 *.bak.*
+
+# OMC tooling state (oh-my-claudecode session/state files)
+.omc/

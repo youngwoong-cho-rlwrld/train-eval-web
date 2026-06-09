@@ -31,7 +31,7 @@ export default function ExperimentsPage() {
               {variants.data.map((v) => (
                 <li key={v} className="py-2">
                   <Link
-                    href={`/experiments/${v}`}
+                    href={`/experiments/${encodeURIComponent(v)}`}
                     className="font-mono text-sm text-blue-600 hover:underline"
                   >
                     {v}

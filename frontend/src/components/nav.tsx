@@ -2,17 +2,8 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Activity, Cpu, FileCog, Send, Settings, Trophy } from "lucide-react";
 import { cn } from "@/lib/utils";
-
-const items = [
-  { href: "/submit", label: "Submit", icon: Send },
-  { href: "/jobs", label: "Jobs", icon: Activity },
-  { href: "/monitor", label: "GPU monitor", icon: Cpu },
-  { href: "/experiments", label: "Experiments", icon: FileCog },
-  { href: "/results", label: "Results", icon: Trophy },
-  { href: "/settings", label: "Settings", icon: Settings },
-] as const;
+import { navRoutes } from "@/lib/nav-routes";
 
 export function Nav() {
   const pathname = usePathname();
@@ -22,7 +13,7 @@ export function Nav() {
         train-eval-web
       </Link>
       <nav className="flex flex-col gap-1">
-        {items.map(({ href, label, icon: Icon }) => {
+        {navRoutes.map(({ href, label, icon: Icon }) => {
           const active = pathname === href || pathname.startsWith(href + "/");
           return (
             <Link

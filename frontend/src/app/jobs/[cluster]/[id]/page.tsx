@@ -24,8 +24,10 @@ import {
   type JobProgress,
   type PathExistence,
 } from "@/lib/api";
-import { formatDuration, parseSlurmDuration } from "@/lib/duration";
 import { formatJobTimestamp } from "@/lib/job-time";
+import { jobDetailHref } from "@/lib/job-links";
+import { stepEta } from "@/lib/job-progress";
+import { formatPct } from "@/lib/format";
 import {
   isCompletedJobState,
   isFailedJobState,
@@ -53,6 +55,7 @@ import { RefreshButton } from "@/components/refresh-button";
 import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state";
 import { JobStateBadge } from "@/components/job-state-badge";
 import { ImmediateTooltip } from "@/components/immediate-tooltip";
+import { Th } from "@/components/table";
 
 const REFRESH_MS = 60_000;
 const LOG_PAGE_SIZE = 100;
@@ -125,7 +128,6 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
     qc.invalidateQueries({ queryKey: ["job-eval-runs", cluster, id] });
     qc.invalidateQueries({ queryKey: ["job-flags", cluster, id] });
     qc.invalidateQueries({ queryKey: ["checkpoint-copies", cluster, id] });
-    qc.invalidateQueries({ queryKey: ["variant"] });
   };
 
   const isFetching =
@@ -204,7 +206,7 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
               <span className="text-base font-normal text-slate-500">
                 {" "}({resubmitSourceLabel(details.data?.resubmit_action, sourceJob.data?.State)}{" "}
                 <Link
-                  href={`/jobs/${encodeURIComponent(cluster)}/${encodeURIComponent(resumeOf)}`}
+                  href={jobDetailHref(cluster, resumeOf)!}
                   target="_blank"
                   rel="noreferrer"
                   className="font-mono text-blue-600 hover:underline dark:text-blue-400"
@@ -245,7 +247,7 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
                 <div className="flex items-center gap-1.5 text-sm text-slate-600 dark:text-slate-400">
                   <span>Training job:</span>
                   <Link
-                    href={`/jobs/${encodeURIComponent(details.data.training_job.cluster)}/${encodeURIComponent(details.data.training_job.job_id)}`}
+                    href={jobDetailHref(details.data.training_job.cluster, details.data.training_job.job_id)!}
                     target="_blank"
                     rel="noreferrer"
                     className="inline-flex items-center gap-1 font-mono text-blue-600 hover:underline dark:text-blue-400"
@@ -722,17 +724,9 @@ function ProgressCard({
 
   // ETA from elapsed × steps-remaining / current-step. Same linear model the
   // /jobs table uses.
-  let etaLabel: string | null = null;
-  let etaTitle = "";
-  if (!isComplete && p?.current_step && p.max_steps && p.current_step < p.max_steps && elapsed) {
-    const elapsedSec = parseSlurmDuration(elapsed);
-    if (elapsedSec > 0) {
-      const etaSec = (elapsedSec * (p.max_steps - p.current_step)) / p.current_step;
-      etaLabel = formatDuration(etaSec);
-      const unit = phase === "eval" ? "episode" : "step";
-      etaTitle = `Estimated from aggregate ${unit} throughput`;
-    }
-  }
+  const eta = isComplete
+    ? null
+    : stepEta(elapsed, p?.current_step, p?.max_steps, phase);
 
   // Training jobs deserve a tidy "step N/N" at completion even if the live
   // current_label decayed; eval/other phases already carry a meaningful
@@ -794,10 +788,10 @@ function ProgressCard({
                     style={{ width: `${Math.max(0, Math.min(100, effectivePercent))}%` }}
                   />
                 </div>
-                {etaLabel && (
-                  <ImmediateTooltip content={etaTitle}>
+                {eta && (
+                  <ImmediateTooltip content={eta.etaTitle}>
                     <div className="mt-2 text-xs text-slate-500">
-                      ~{etaLabel} left
+                      ~{eta.etaLabel} left
                     </div>
                   </ImmediateTooltip>
                 )}
@@ -1018,27 +1012,21 @@ function EvalRunRow({ row, showTask }: { row: EvalRun; showTask: boolean }) {
 }
 
 function formatEvalRunSuccess(row: EvalRun) {
-  const rate = row.success_rate == null ? null : `${(row.success_rate * 100).toFixed(2)}%`;
+  const rate = row.success_rate == null ? null : formatPct(row.success_rate);
   if (row.success_count != null && row.total_episodes != null) {
     return `${row.success_count}/${row.total_episodes}${rate ? ` (${rate})` : ""}`;
   }
   return rate ?? <span className="text-slate-400">—</span>;
 }
 
-function Th({ children }: { children: React.ReactNode }) {
-  return <th className="py-2 pr-4 font-medium whitespace-nowrap">{children}</th>;
-}
-
 function LogStream({
   cluster,
   jobId,
   stream,
-  enabled = true,
 }: {
   cluster: string;
   jobId: string;
   stream: "out" | "err" | "isaac";
-  enabled?: boolean;
 }) {
   const [visibleLines, setVisibleLines] = useState<string[]>([]);
   const [receivedCount, setReceivedCount] = useState(0);
@@ -1086,7 +1074,6 @@ function LogStream({
     visibleStartRef.current = 0;
     visibleEndRef.current = 0;
     stickToBottomRef.current = true;
-    if (!enabled) return;
 
     function scheduleFlush() {
       if (frameRef.current !== null) return;
@@ -1116,7 +1103,7 @@ function LogStream({
         frameRef.current = null;
       }
     };
-  }, [cluster, jobId, stream, enabled, flushReceivedLines]);
+  }, [cluster, jobId, stream, flushReceivedLines]);
 
   useEffect(() => {
     const el = preRef.current;
@@ -1151,9 +1138,8 @@ function LogStream({
     }
   }
 
-  const logText = !enabled
-    ? "(logs unavailable - k8s pod has been garbage-collected)"
-    : receivedCount === 0
+  const logText =
+    receivedCount === 0
       ? "(waiting for log lines...)"
       : [
           hiddenOlderCount > 0

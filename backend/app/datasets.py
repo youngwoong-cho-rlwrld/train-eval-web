@@ -16,8 +16,6 @@ frontend persists it in localStorage). When omitted we fall back to
 """
 
 import asyncio
-import shutil
-from typing import Any
 
 from pydantic import BaseModel
 

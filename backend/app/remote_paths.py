@@ -15,6 +15,32 @@ from .ssh import ssh_run
 PathKind = Literal["dir", "file"]
 _REMOTE_HOME_CACHE: dict[str, str] = {}
 
+# Leading shell tokens that denote the remote $HOME, and the same tokens as
+# path prefixes. Shared by the home-token helpers below.
+_HOME_TOKENS = ("$HOME", "${HOME}", "~")
+_HOME_PREFIXES = ("$HOME/", "${HOME}/", "~/")
+
+
+async def _kubectl_bash_lc(script: str, timeout: float) -> tuple[int, str, str]:
+    """Run `bash -lc <script>` in the MLXP listing pod via kubectl exec.
+
+    Returns (returncode, decoded stdout, decoded stderr). Shared by remote_home
+    and _remote_path_probe so the kubectl-exec plumbing lives in one place.
+    """
+    settings = get_mlxp_settings()
+    pod = await ensure_listing_pod()
+    proc = await asyncio.create_subprocess_exec(
+        "kubectl", "exec", "-n", settings.namespace, pod, "--", "bash", "-lc", script,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    return (
+        proc.returncode or 0,
+        stdout.decode(errors="replace"),
+        stderr.decode(errors="replace"),
+    )
+
 
 async def remote_home(cluster: str) -> str | None:
     """Return the remote shell's HOME for a cluster."""
@@ -24,24 +50,9 @@ async def remote_home(cluster: str) -> str | None:
 
     try:
         if cluster == "mlxp":
-            settings = get_mlxp_settings()
-            pod = await ensure_listing_pod()
-            proc = await asyncio.create_subprocess_exec(
-                "kubectl",
-                "exec",
-                "-n",
-                settings.namespace,
-                pod,
-                "--",
-                "bash",
-                "-lc",
-                'printf "%s" "$HOME"',
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
-            home = stdout.decode(errors="replace").strip()
-            if proc.returncode == 0 and home.startswith("/"):
+            rc, out, _err = await _kubectl_bash_lc('printf "%s" "$HOME"', 10.0)
+            home = out.strip()
+            if rc == 0 and home.startswith("/"):
                 _REMOTE_HOME_CACHE[cluster] = home.rstrip("/")
                 return _REMOTE_HOME_CACHE[cluster]
             return None
@@ -63,9 +74,9 @@ def expand_home_path(path: str | None, home: str | None) -> str | None:
     if not path or not home:
         return path
     home = home.rstrip("/")
-    if path in {"$HOME", "${HOME}", "~"}:
+    if path in _HOME_TOKENS:
         return home
-    for prefix in ("$HOME/", "${HOME}/", "~/"):
+    for prefix in _HOME_PREFIXES:
         if path.startswith(prefix):
             return f"{home}/{path[len(prefix):]}"
     return path
@@ -105,25 +116,10 @@ async def _remote_path_probe(
     timeout: float,
 ) -> str:
     if cluster == "mlxp":
-        settings = get_mlxp_settings()
-        pod = await ensure_listing_pod()
-        proc = await asyncio.create_subprocess_exec(
-            "kubectl",
-            "exec",
-            "-n",
-            settings.namespace,
-            pod,
-            "--",
-            "bash",
-            "-lc",
-            script,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        if proc.returncode != 0:
-            raise RuntimeError(stderr.decode(errors="replace").strip() or f"path probe failed: {path}")
-        return stdout.decode(errors="replace").strip()
+        rc, out, err = await _kubectl_bash_lc(script, timeout)
+        if rc != 0:
+            raise RuntimeError(err.strip() or f"path probe failed: {path}")
+        return out.strip()
 
     env = await load_cluster(cluster)
     r = await ssh_run(env.ssh_alias, script, timeout=timeout)
@@ -133,20 +129,20 @@ async def _remote_path_probe(
 
 
 def _exists_script(path: str) -> str:
-    p = _remote_shell_path(path)
+    p = remote_shell_path(path)
     return f"if [ -e {p} ]; then echo 1; else echo 0; fi"
 
 
 def _kind_script(path: str) -> str:
-    p = _remote_shell_path(path)
+    p = remote_shell_path(path)
     return f"if [ -d {p} ]; then echo dir; elif [ -f {p} ]; then echo file; else echo none; fi"
 
 
-def _remote_shell_path(path: str) -> str:
+def remote_shell_path(path: str) -> str:
     """Quote a remote path while preserving a leading shell HOME token."""
-    if path in {"$HOME", "${HOME}", "~"}:
+    if path in _HOME_TOKENS:
         return '"$HOME"'
-    for prefix in ("$HOME/", "${HOME}/", "~/"):
+    for prefix in _HOME_PREFIXES:
         if path.startswith(prefix):
             return '"$HOME"/' + shlex.quote(path[len(prefix):])
     return shlex.quote(path)
@@ -155,4 +151,4 @@ def _remote_shell_path(path: str) -> str:
 def _has_home_token(path: str | None) -> bool:
     if not path:
         return False
-    return path in {"$HOME", "${HOME}", "~"} or path.startswith(("$HOME/", "${HOME}/", "~/"))
+    return path in _HOME_TOKENS or path.startswith(_HOME_PREFIXES)

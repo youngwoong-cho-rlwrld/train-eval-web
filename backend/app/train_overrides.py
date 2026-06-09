@@ -9,6 +9,7 @@ from .training_models import (
     TrainingModel,
     rewrites_modality_action_horizon,
 )
+from .variant_values import variant_int_opt
 
 
 def resolve_train_action_horizon(
@@ -51,10 +52,4 @@ def resolve_train_action_horizon(
 
 
 def _variant_action_horizon(variant: Any) -> int | None:
-    raw = (getattr(variant, "vars", {}) or {}).get("TRAIN_ACTION_HORIZON", "").strip()
-    if not raw:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        raise ValueError(f"variant {variant.name}: TRAIN_ACTION_HORIZON must be an integer")
+    return variant_int_opt(variant, "TRAIN_ACTION_HORIZON")

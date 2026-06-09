@@ -24,6 +24,32 @@ import {
 } from "@/components/ui/select";
 import { ImmediateTooltip } from "@/components/immediate-tooltip";
 
+/** Shared option markup for the dataset <Select> pickers: dataset name plus an
+ *  optional resolution and episode count. */
+function DatasetOptionLabel({
+  dataset: d,
+  showEpisodes = false,
+}: {
+  dataset: Dataset;
+  showEpisodes?: boolean;
+}) {
+  return (
+    <>
+      <span className="font-mono text-xs">{d.name}</span>
+      {d.height && d.width && (
+        <span className="ml-2 text-[10px] text-slate-500">
+          {d.height}×{d.width}
+        </span>
+      )}
+      {showEpisodes && d.episodes !== null && (
+        <span className="ml-1 text-[10px] text-slate-500">
+          · {d.episodes} ep
+        </span>
+      )}
+    </>
+  );
+}
+
 export type DatasetFieldProps = {
   variant: Variant;
   datasets: Dataset[];
@@ -219,17 +245,7 @@ function SingleDatasetPicker({
         <SelectContent>
           {datasets.map((d) => (
             <SelectItem key={d.name} value={d.name}>
-              <span className="font-mono text-xs">{d.name}</span>
-              {d.height && d.width && (
-                <span className="ml-2 text-[10px] text-slate-500">
-                  {d.height}×{d.width}
-                </span>
-              )}
-              {d.episodes !== null && (
-                <span className="ml-1 text-[10px] text-slate-500">
-                  · {d.episodes} ep
-                </span>
-              )}
+              <DatasetOptionLabel dataset={d} showEpisodes />
             </SelectItem>
           ))}
         </SelectContent>
@@ -274,12 +290,7 @@ function NamesOnlyPicker({
               <SelectContent>
                 {datasets.map((d) => (
                   <SelectItem key={d.name} value={d.name}>
-                    <span className="font-mono text-xs">{d.name}</span>
-                    {d.height && d.width && (
-                      <span className="ml-2 text-[10px] text-slate-500">
-                        {d.height}×{d.width}
-                      </span>
-                    )}
+                    <DatasetOptionLabel dataset={d} />
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -347,12 +358,7 @@ function NameCfgWeightPicker({
                 <SelectContent>
                   {datasets.map((d) => (
                     <SelectItem key={d.name} value={d.name}>
-                      <span className="font-mono text-xs">{d.name}</span>
-                      {d.height && d.width && (
-                        <span className="ml-2 text-[10px] text-slate-500">
-                          {d.height}×{d.width}
-                        </span>
-                      )}
+                      <DatasetOptionLabel dataset={d} />
                     </SelectItem>
                   ))}
                 </SelectContent>

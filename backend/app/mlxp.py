@@ -137,12 +137,12 @@ async def gpu_queue_snapshot(
 
     queue = [
         GpuQueueJob(
-            job_id=pod_job_id,
+            job_id=queued_job_id,
             requested_gpus=gpu_count,
             reason=reason,
             name=display_name or pod_name,
         )
-        for pod_job_id, _, _, pod_name, gpu_count, reason, display_name in sorted(
+        for queued_job_id, _, _, pod_name, gpu_count, reason, display_name in sorted(
             pending,
             key=lambda item: (item[2], item[3]),
         )

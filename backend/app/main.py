@@ -217,7 +217,7 @@ async def get_variant_flags(name: str, cluster: str, phase: str = "train"):
         v = await variants.load_variant(name)
     except FileNotFoundError:
         raise HTTPException(404, f"variant {name} not found")
-    out = flags.flags_for(v, cluster, phase)
+    out = flags.flags_for(v, phase)
     return {"flags": [{"flag": f, "value": val} for f, val in out]}
 
 
@@ -438,7 +438,7 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
             raise ValueError(f"unsupported phase: {req.phase}")
 
         effective_variant = await variants.parse_variant_text(req.variant, text)
-        out = flags.flags_for(effective_variant, req.cluster, req.phase)
+        out = flags.flags_for(effective_variant, req.phase)
         return {
             "path": path,
             "model_id": model.id,
@@ -756,7 +756,7 @@ async def get_job_flags(cluster: str, job_id: str):
             v = await variants.load_variant(det.variant)
     except FileNotFoundError:
         return {"flags": []}
-    out = flags.flags_for(v, cluster, det.phase)
+    out = flags.flags_for(v, det.phase)
     submitted_extra_args = det.config_snapshot.extra_args if det.config_snapshot else []
     if submitted_extra_args:
         idx = 0

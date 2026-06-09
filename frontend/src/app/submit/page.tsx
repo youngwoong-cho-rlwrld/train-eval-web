@@ -240,8 +240,7 @@ export default function SubmitPage() {
     enabled: !!cluster && cluster !== "mlxp",
   });
   const isSlurm = cluster !== "mlxp";
-  const submitPhase: Phase = phase;
-  const checkpointScope = `${cluster}:${variantName}:${submitPhase}`;
+  const checkpointScope = `${cluster}:${variantName}:${phase}`;
   const trainNoteScope = `${checkpointScope}:train-note`;
   const evalConfigScope = `${checkpointScope}:eval-config`;
   const trainConfigScope = `${checkpointScope}:train-config`;
@@ -284,8 +283,8 @@ export default function SubmitPage() {
       : checkpointExists.data.exists && checkpointExists.data.kind === "dir";
 
   const defaultJobName = useMemo(
-    () => buildDefaultJobName(submitPhase, variantName),
-    [submitPhase, variantName],
+    () => buildDefaultJobName(phase, variantName),
+    [phase, variantName],
   );
   const shownJobName = jobNameTouched ? jobName : defaultJobName;
   const trainNoteDefault = variant.data?.vars.TRAIN_NOTE ?? "";
@@ -425,7 +424,7 @@ export default function SubmitPage() {
   const trainModel =
     variant.data?.vars.MODEL_VERSION ??
     (trainModelId === "physixel" ? "n1.6" : trainModelId);
-  const wantsTrainConfig = submitPhase === "train" && !!variantName;
+  const wantsTrainConfig = phase === "train" && !!variantName;
   const wantsGpuConfig = !!variantName;
   const wantsGitCommitConfig = !!variantName;
   const trainActionHorizonEnabled = wantsTrainConfig && trainModel === "n1.6";
@@ -497,7 +496,7 @@ export default function SubmitPage() {
   const selectedPartition = partitions.data?.find((p) => p.name === selectedPartitionName);
   const variantError = variant.error as Error | null;
   const submittedTrainGlobalBatchSize =
-    submitPhase === "train"
+    phase === "train"
       ? trainModel === "n1.5"
         ? trainBatchSizeParsed * trainNumGpusParsed
         : trainBatchSizeParsed
@@ -524,7 +523,7 @@ export default function SubmitPage() {
     return {
       cluster,
       variant: variantName,
-      phase: submitPhase,
+      phase: phase,
       train_note: submittedTrainNote,
       partition: isSlurm ? selectedPartitionName : null,
       node: isSlurm ? null : mlxpNode,
@@ -534,11 +533,11 @@ export default function SubmitPage() {
         singleDataset,
         multiDatasets,
       }),
-      extra_args: submitPhase === "eval" && !isSlurm ? [] : splitArgs(extraArgs),
+      extra_args: phase === "eval" && !isSlurm ? [] : splitArgs(extraArgs),
       train_num_gpus: wantsGpuConfig ? trainNumGpusParsed : null,
       train_global_batch_size: submittedTrainGlobalBatchSize,
-      train_max_steps: submitPhase === "train" ? trainMaxStepsParsed : null,
-      train_save_steps: submitPhase === "train" ? trainSaveStepsParsed : null,
+      train_max_steps: phase === "train" ? trainMaxStepsParsed : null,
+      train_save_steps: phase === "train" ? trainSaveStepsParsed : null,
       train_action_horizon: submittedTrainActionHorizon,
       train_git_commit: submittedGitCommit,
       eval_num_envs_per_gpu: null,
@@ -569,7 +568,7 @@ export default function SubmitPage() {
       "submit-config-preview",
       cluster,
       variantName,
-      submitPhase,
+      phase,
       selectedPartitionName,
       mlxpNode,
       datasetTouched,
@@ -599,7 +598,16 @@ export default function SubmitPage() {
     placeholderData: keepPreviousData,
     retry: false,
   });
-  const displayedConfigPreview = configPreview.data ?? null;
+  // Only surface the preview when the query is actually applicable to the
+  // current inputs. `placeholderData: keepPreviousData` otherwise keeps the
+  // previous phase's preview around while the eval preview is disabled (it
+  // requires a checkpoint), which made the flag table show stale *train* flags
+  // until a checkpoint was entered. Falling back to null lets ConfigCard render
+  // the live per-phase flags, so the flag set stays stable before/after the
+  // checkpoint is set.
+  const displayedConfigPreview = configPreviewEnabled
+    ? (configPreview.data ?? null)
+    : null;
   const jobGitStatus = useQuery({
     queryKey: ["submit-git-status", cluster, variantName, submittedGitCommit],
     queryFn: () => {
@@ -651,7 +659,7 @@ export default function SubmitPage() {
   });
   const jobGitStatusFetchError = jobGitStatus.error as Error | null;
   const modelRepoError =
-    configPreview.data?.model_repo_error ?? jobGitStatus.data?.error ?? null;
+    displayedConfigPreview?.model_repo_error ?? jobGitStatus.data?.error ?? null;
   const modelRepoMessage =
     jobGitStatusFetchError ? "Git status will be checked again when submitting." : null;
   const selectedGitCommitValue =
@@ -675,7 +683,7 @@ export default function SubmitPage() {
   });
 
   async function handleSubmitClick() {
-    if (submitPhase !== "train") {
+    if (phase !== "train") {
       submit.mutate({ commitDirtyChanges: false });
       return;
     }
@@ -945,7 +953,7 @@ export default function SubmitPage() {
       });
     }
   }
-  if (submitPhase === "eval" && wantsGpuConfig) {
+  if (phase === "eval" && wantsGpuConfig) {
     extraFlagRows.push({
       key: "eval-num-gpus",
       flag: "TRAIN_NUM_GPUS",
@@ -1216,10 +1224,10 @@ export default function SubmitPage() {
             <>
               <ConfigCard
                 variantName={selectedVariantName}
-                flagsUrl={`/api/variants/${variantName}/flags?cluster=${cluster}&phase=${submitPhase}`}
-                queryKey={["variant-flags", variantName, cluster, submitPhase]}
+                flagsUrl={`/api/variants/${variantName}/flags?cluster=${cluster}&phase=${phase}`}
+                queryKey={["variant-flags", variantName, cluster, phase]}
                 cluster={cluster}
-                phase={submitPhase}
+                phase={phase}
                 checkpointOverride={wantsCheckpoint ? checkpointPath : null}
                 checkpointOverrideExists={checkpointExistsValue}
                 effectiveConfigText={displayedConfigPreview?.text ?? null}

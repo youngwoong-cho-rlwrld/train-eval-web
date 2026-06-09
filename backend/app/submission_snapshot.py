@@ -76,13 +76,6 @@ def _coerce_model(model: str | TrainingModel) -> TrainingModel:
     return model if isinstance(model, TrainingModel) else load_training_model(model)
 
 
-def training_repo_var(model: str | TrainingModel) -> str:
-    resolved = _coerce_model(model)
-    if not resolved.slurm_repo_var:
-        raise ValueError(f"model {resolved.id} missing SLURM_REPO_VAR")
-    return resolved.slurm_repo_var
-
-
 def training_repo_label(model: str | TrainingModel) -> str:
     return _coerce_model(model).label
 

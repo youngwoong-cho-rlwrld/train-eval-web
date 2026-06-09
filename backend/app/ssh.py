@@ -86,6 +86,11 @@ async def _ssh_run_once(
     )
 
 
+def rsync_ssh_transport() -> str:
+    """The `-e` transport string for rsync, reusing the multiplexed ssh master."""
+    return "ssh -o BatchMode=yes " + " ".join(_CM_OPTS)
+
+
 async def rsync_to(
     host: str,
     local_path: str,
@@ -97,7 +102,7 @@ async def rsync_to(
 ) -> SSHResult:
     """rsync local_path to host:remote_path. Creates parent dirs."""
     # Reuse the multiplexed ssh master rather than negotiating a new session.
-    ssh_e = "ssh -o BatchMode=yes " + " ".join(_CM_OPTS)
+    ssh_e = rsync_ssh_transport()
     args = ["rsync", "-az", "-e", ssh_e]
     if delete:
         args.append("--delete")

@@ -3,6 +3,7 @@
 import asyncio
 import re
 import shlex
+from datetime import timezone
 
 from pydantic import BaseModel
 
@@ -35,10 +36,10 @@ class Job(BaseModel):
 
 _SQUEUE_FMT = "%i|%j|%P|%T|%M|%R|%L|%S"
 _SACCT_LIST_FMT = "JobID,JobName,Partition,State,Elapsed,Start,End,NodeList"
-_ACTIVE_STATES = {"RUNNING", "PENDING", "COMPLETING", "CONFIGURING", "SUSPENDED"}
+ACTIVE_STATES = {"RUNNING", "PENDING", "COMPLETING", "CONFIGURING", "SUSPENDED"}
 
 
-def _actual_start_for_state(state: str, value: str | None, source_tz=None) -> str | None:
+def _actual_start_for_state(state: str, value: str | None, source_tz: timezone | None = None) -> str | None:
     # In squeue, %S is the actual start for running jobs, but for pending jobs
     # Slurm may report an estimated future start time. The UI's "Started"
     # field should stay empty until a job has actually started.
@@ -321,7 +322,7 @@ async def cancel_job(cluster: str, job_id: str) -> None:
 
 def _terminal_non_completed(state: str) -> bool:
     upper = state.upper()
-    if upper in _ACTIVE_STATES or upper.startswith("COMPLET"):
+    if upper in ACTIVE_STATES or upper.startswith("COMPLET"):
         return False
     return upper.startswith((
         "FAIL",

@@ -22,7 +22,9 @@ from .data_interface import DataInterfaceSummary, summarize_data_interface_text
 from .eval_completion import (
     eval_job_completed,
     eval_shape,
+    eval_total,
     exp_dir_rel_candidates,
+    remote_path_expr,
 )
 from .job_identity import (
     parse_comment_metadata,
@@ -150,10 +152,6 @@ class JobDetails(BaseModel):
     config_snapshot: ConfigSnapshot | None = None
     data_interface: DataInterfaceSummary | None = None
     eval_runs: list[EvalRun] = Field(default_factory=list)
-
-
-def _metadata_fields(text: str | None) -> dict[str, str]:
-    return parse_comment_fields(text)
 
 
 def _snapshot_wandb_project(text: str | None) -> str | None:
@@ -652,7 +650,7 @@ async def _mlxp_details(
     """MLXP runs train via `kubectl apply` on a pod. All paths live on DDN."""
     settings = get_settings()
     exp_dir = f"{settings.experiments_dir}/{variant}" if variant else settings.experiments_dir
-    metadata = _metadata_fields(job_comment)
+    metadata = parse_comment_fields(job_comment)
     train_note = train_note or metadata.get("train_note") or None
     if not train_note and not include_progress:
         train_note = await _mlxp_train_note_from_metadata(metadata)
@@ -1188,7 +1186,7 @@ print(json.dumps(rows))
 
 async def _slurm_eval_runs(host: str, eval_dir: str) -> list[EvalRun]:
     cmd = (
-        f"EVAL_DIR={_remote_path_expr(eval_dir)} "
+        f"EVAL_DIR={remote_path_expr(eval_dir)} "
         "python3 - <<'PY'\n"
         + _EVAL_RUNS_SCRIPT
         + "\nPY"
@@ -1204,10 +1202,6 @@ async def _slurm_eval_runs(host: str, eval_dir: str) -> list[EvalRun]:
     except json.JSONDecodeError:
         return []
     return [EvalRun.model_validate(item) for item in raw]
-
-
-def _remote_path_expr(path: str) -> str:
-    return path if path.startswith("$HOME/") else shlex.quote(path)
 
 
 async def _mlxp_eval_runs(eval_dir: str) -> list[EvalRun]:
@@ -1567,7 +1561,7 @@ async def _mlxp_eval_progress(
         eval_sets, n_runs, n_eps, tasks = eval_shape(v, metadata)
     except Exception:
         return progress
-    total = max(len(tasks) * len(eval_sets) * n_runs, 0)
+    total = eval_total(eval_sets, n_runs, tasks)
     progress.total_runs = total or None
     if total <= 0:
         return progress
@@ -1921,7 +1915,7 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
             n_runs = _meta_int(slurm_meta or {}, "eval_n_runs") or 0
             n_eps = _meta_int(slurm_meta or {}, "eval_n_episodes") or 0
             tasks = []
-        total = max(len(tasks) * len(eval_sets) * n_runs, 0)
+        total = eval_total(eval_sets, n_runs, tasks)
         progress.total_runs = total or None
 
         if not (eval_dir and total > 0):
@@ -1937,7 +1931,7 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
         # count for this job, stdout completed-run count for this job, and
         # saved per-episode video artifacts across the eval dir. The video
         # count covers active runs whose Python stdout is still buffered.
-        eval_dir_expr = _remote_path_expr(eval_dir)
+        eval_dir_expr = remote_path_expr(eval_dir)
         log_dir_q = shlex.quote(env.vars["LOG_DIR"])
         job_id_q = shlex.quote(job_id)
         probe_cmd = (

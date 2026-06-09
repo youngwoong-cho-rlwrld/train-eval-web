@@ -18,8 +18,10 @@ import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state
 import { JobStateBadge } from "@/components/job-state-badge";
 import { ImmediateTooltip } from "@/components/immediate-tooltip";
 import { PendingQueueLabel, pendingQueuePositionLabel } from "@/components/pending-queue-label";
-import { formatDuration, parseSlurmDuration } from "@/lib/duration";
 import { formatJobTimestamp, parseJobTimestampMs } from "@/lib/job-time";
+import { jobDetailHref } from "@/lib/job-links";
+import { stepEta } from "@/lib/job-progress";
+import { Th } from "@/components/table";
 import {
   isActiveJobState,
   isCompletedJobState,
@@ -339,7 +341,7 @@ function JobTable({
       <table className="w-full text-sm">
         <thead className="border-b border-slate-200 text-left text-xs uppercase tracking-wide text-slate-500 dark:border-slate-800">
           <tr>
-            <Th className="min-w-[18rem]">Job ID</Th>
+            <Th>Job ID</Th>
             <Th>Phase</Th>
             <Th>State</Th>
             {showProgress && <Th>Progress</Th>}
@@ -360,7 +362,7 @@ function JobTable({
             const phase = normalizeJobPhase(j.phase) ?? jobPhase(j.job_name);
             return (
               <tr key={`${j.cluster}-${j.job_id}`} className="border-b border-slate-100 last:border-0 hover:bg-slate-50 dark:border-slate-900 dark:hover:bg-slate-900/40">
-                <td className="min-w-[18rem] py-2 pr-4 font-mono">
+                <td className="py-2 pr-4 font-mono">
                   <div className="flex items-center gap-1">
                     <JobIdLink cluster={j.cluster} jobId={j.job_id} />
                     <CopyButton value={j.job_id} title="Copy job ID" />
@@ -526,17 +528,7 @@ function ActiveProgressCell({ job }: { job: Job }) {
 
   const effectivePercent = Math.max(0, Math.min(100, percent ?? 0));
   const label = activeProgressLabel(d, p) ?? `${effectivePercent.toFixed(1)}%`;
-  let etaLabel: string | null = null;
-  let etaTitle = "";
-  if (p?.current_step && p.max_steps && p.current_step < p.max_steps && d) {
-    const elapsedSec = parseSlurmDuration(d.elapsed);
-    if (elapsedSec > 0) {
-      const etaSec = (elapsedSec * (p.max_steps - p.current_step)) / p.current_step;
-      etaLabel = formatDuration(etaSec);
-      const unit = d.phase === "eval" ? "episode" : "step";
-      etaTitle = `Estimated from aggregate ${unit} throughput`;
-    }
-  }
+  const eta = stepEta(d?.elapsed, p?.current_step, p?.max_steps, d?.phase);
 
   return (
     <div className="space-y-1.5">
@@ -546,9 +538,9 @@ function ActiveProgressCell({ job }: { job: Job }) {
         </span>
         <span className="shrink-0 whitespace-nowrap font-mono text-slate-500">
           {effectivePercent.toFixed(1)}%
-          {etaLabel && (
-            <ImmediateTooltip content={etaTitle}>
-              <span> · ~{etaLabel}</span>
+          {eta && (
+            <ImmediateTooltip content={eta.etaTitle}>
+              <span> · ~{eta.etaLabel}</span>
             </ImmediateTooltip>
           )}
         </span>
@@ -624,7 +616,7 @@ function JobIdLink({
   return (
     <ImmediateTooltip content={jobId} className="min-w-0">
       <Link
-        href={`/jobs/${encodeURIComponent(cluster)}/${encodeURIComponent(jobId)}`}
+        href={jobDetailHref(cluster, jobId)!}
         target="_blank"
         rel="noreferrer"
         className={`${widthClass} whitespace-nowrap text-blue-600 hover:underline ${className}`}
@@ -636,11 +628,17 @@ function JobIdLink({
 }
 
 function shortJobId(jobId: string): string {
-  const maxDisplayLength = 20;
-  const ellipsis = "...";
-  return jobId.length > maxDisplayLength
-    ? `${jobId.slice(0, maxDisplayLength - ellipsis.length)}${ellipsis}`
-    : jobId;
+  // MLXP job IDs are `<user>-<job-name>`, so they share a long common prefix
+  // (e.g. `youngwoong-train-…`). Truncating from the end would collapse every
+  // row to the same prefix and drop the distinguishing tail, so keep both ends
+  // and elide the middle instead.
+  const maxDisplayLength = 22;
+  if (jobId.length <= maxDisplayLength) return jobId;
+  const ellipsis = "…";
+  const keep = maxDisplayLength - ellipsis.length;
+  const head = Math.ceil(keep / 2);
+  const tail = keep - head;
+  return `${jobId.slice(0, head)}${ellipsis}${jobId.slice(jobId.length - tail)}`;
 }
 
 function PhaseBadge({ phase }: { phase: JobPhase }) {
@@ -693,9 +691,6 @@ function compareJobIdDesc(a: string, b: string): number {
   return b.localeCompare(a, undefined, { numeric: true, sensitivity: "base" });
 }
 
-function Th({ children, className }: { children: React.ReactNode; className?: string }) {
-  return <th className={`py-2 pr-4 font-medium whitespace-nowrap ${className ?? ""}`}>{children}</th>;
-}
 function Td({ children, className }: { children: React.ReactNode; className?: string }) {
   return <td className={`py-2 pr-4 ${className ?? ""}`}>{children}</td>;
 }

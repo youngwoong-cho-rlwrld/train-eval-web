@@ -13,7 +13,6 @@ import re
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 import yaml
 from pydantic import BaseModel

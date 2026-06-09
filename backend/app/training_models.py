@@ -40,14 +40,6 @@ class TrainingModel:
             return self.eval_body_script, self.eval_walltime
         raise ValueError(f"unsupported phase: {phase}")
 
-    @property
-    def rewrites_modality_action_horizon(self) -> bool:
-        return self.action_horizon_mode in {"modality", "modality_and_cli"}
-
-    @property
-    def passes_action_horizon_cli(self) -> bool:
-        return self.action_horizon_mode in {"cli", "modality_and_cli"}
-
 
 def model_id_for_variant(variant: Any) -> str:
     vars = getattr(variant, "vars", {}) or {}
