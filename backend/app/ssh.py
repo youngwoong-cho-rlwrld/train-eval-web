@@ -47,11 +47,21 @@ _CM_FAILURE_MARKERS = (
 )
 
 
-async def ssh_run(host: str, cmd: str, timeout: float = 60.0) -> SSHResult:
-    """Run `cmd` on `host` over ssh and return its output."""
-    result = await _ssh_run_once(host, cmd, timeout=timeout, use_control_master=True)
+async def ssh_run(
+    host: str,
+    cmd: str,
+    timeout: float = 60.0,
+    input_text: str | None = None,
+) -> SSHResult:
+    """Run `cmd` on `host` over ssh and return its output.
+
+    `input_text` is fed to the remote command's stdin. Use it for large
+    program/data blobs: the command string itself travels in the remote
+    shell's argv, which Linux caps at 128KiB per argument.
+    """
+    result = await _ssh_run_once(host, cmd, timeout=timeout, use_control_master=True, input_text=input_text)
     if result.returncode == 255 and any(marker in result.stderr for marker in _CM_FAILURE_MARKERS):
-        return await _ssh_run_once(host, cmd, timeout=timeout, use_control_master=False)
+        return await _ssh_run_once(host, cmd, timeout=timeout, use_control_master=False, input_text=input_text)
     return result
 
 
@@ -61,6 +71,7 @@ async def _ssh_run_once(
     *,
     timeout: float,
     use_control_master: bool,
+    input_text: str | None = None,
 ) -> SSHResult:
     opts = _CM_OPTS if use_control_master else ()
     proc = await asyncio.create_subprocess_exec(
@@ -70,11 +81,15 @@ async def _ssh_run_once(
         *opts,
         host,
         _SLURM_PATH_PREFIX + cmd,
+        stdin=asyncio.subprocess.PIPE if input_text is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input_text.encode() if input_text is not None else None),
+            timeout=timeout,
+        )
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()

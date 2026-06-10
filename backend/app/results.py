@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import shlex
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -180,25 +179,31 @@ def _int_or_none(value: Any) -> int | None:
         return None
 
 
+def _remote_program(env_vars: dict[str, str]) -> str:
+    """Env setup + scan script, fed to a remote `python3 -` over stdin."""
+    lines = ["import os"]
+    for key, value in env_vars.items():
+        lines.append(f"os.environ[{key!r}] = {value!r}")
+    return "\n".join(lines) + "\n" + _REMOTE_SCRIPT
+
+
 async def _read_cluster_results(
     host: str,
     cluster: str,
     payload: list[dict[str, Any]],
     checkpoint_links: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    payload_b64 = base64.b64encode(json.dumps(payload).encode()).decode()
-    checkpoint_links_b64 = base64.b64encode(json.dumps(checkpoint_links).encode()).decode()
-    rel = shlex.quote(CLUSTER_STAGING_REL)
-    cmd = (
-        f"RESULTS_PAYLOAD_B64={shlex.quote(payload_b64)} "
-        f"RESULTS_CHECKPOINT_LINKS_B64={shlex.quote(checkpoint_links_b64)} "
-        f"RESULTS_CLUSTER={shlex.quote(cluster)} "
-        f"RESULTS_STAGING_REL={rel} "
-        "python3 - <<'PY'\n"
-        + _REMOTE_SCRIPT
-        + "\nPY"
+    # The whole program (env setup + script + payload) travels over stdin:
+    # in argv it would hit Linux's 128KiB per-argument cap as results grow.
+    program = _remote_program(
+        {
+            "RESULTS_PAYLOAD_B64": base64.b64encode(json.dumps(payload).encode()).decode(),
+            "RESULTS_CHECKPOINT_LINKS_B64": base64.b64encode(json.dumps(checkpoint_links).encode()).decode(),
+            "RESULTS_CLUSTER": cluster,
+            "RESULTS_STAGING_REL": CLUSTER_STAGING_REL,
+        }
     )
-    r = await ssh_run(host, cmd, timeout=45.0)
+    r = await ssh_run(host, "python3 -", timeout=45.0, input_text=program)
     if r.returncode != 0:
         raise RuntimeError((r.stderr or r.stdout).strip() or f"ssh command failed on {cluster}")
     try:
@@ -213,23 +218,21 @@ async def _read_mlxp_results(
 ) -> list[dict[str, Any]]:
     settings = get_mlxp_settings()
     pod = await ensure_listing_pod()
-    payload_b64 = base64.b64encode(json.dumps(payload).encode()).decode()
-    checkpoint_links_b64 = base64.b64encode(json.dumps(checkpoint_links).encode()).decode()
-    cmd = (
-        f"RESULTS_PAYLOAD_B64={shlex.quote(payload_b64)} "
-        f"RESULTS_CHECKPOINT_LINKS_B64={shlex.quote(checkpoint_links_b64)} "
-        "RESULTS_CLUSTER=mlxp "
-        f"RESULTS_EXPERIMENTS_ROOT={shlex.quote(settings.experiments_dir)} "
-        "python3 - <<'PY'\n"
-        + _REMOTE_SCRIPT
-        + "\nPY"
+    program = _remote_program(
+        {
+            "RESULTS_PAYLOAD_B64": base64.b64encode(json.dumps(payload).encode()).decode(),
+            "RESULTS_CHECKPOINT_LINKS_B64": base64.b64encode(json.dumps(checkpoint_links).encode()).decode(),
+            "RESULTS_CLUSTER": "mlxp",
+            "RESULTS_EXPERIMENTS_ROOT": settings.experiments_dir,
+        }
     )
     proc = await asyncio.create_subprocess_exec(
-        "kubectl", "exec", "-n", settings.namespace, pod, "--", "bash", "-lc", cmd,
+        "kubectl", "exec", "-i", "-n", settings.namespace, pod, "--", "python3", "-",
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=45.0)
+    stdout, stderr = await asyncio.wait_for(proc.communicate(program.encode()), timeout=45.0)
     if proc.returncode != 0:
         raise RuntimeError(
             stderr.decode(errors="replace").strip()
@@ -249,8 +252,14 @@ import json
 import os
 import statistics
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+
+# Network filesystems (FSx Lustre on skt) charge a round trip per metadata
+# or read op; overlapping them in threads is what makes the scan fast. The
+# pool is only ever used from the main thread, never from its own workers.
+_IO_POOL = ThreadPoolExecutor(max_workers=16)
 
 payload = json.loads(base64.b64decode(os.environ["RESULTS_PAYLOAD_B64"]).decode())
 checkpoint_links = json.loads(
@@ -279,9 +288,34 @@ def float_or_none(value):
         return None
 
 
+_json_cache = {}
+
+
+def _load_json_outcome(path):
+    try:
+        with open(path) as f:
+            return (True, json.load(f))
+    except Exception as e:
+        return (False, e)
+
+
 def read_json(path):
-    with open(path) as f:
-        return json.load(f)
+    key = str(path)
+    outcome = _json_cache.get(key)
+    if outcome is None:
+        outcome = _load_json_outcome(key)
+        _json_cache[key] = outcome
+    ok, value = outcome
+    if not ok:
+        raise value
+    return value
+
+
+def prefetch_json(paths):
+    fresh = [str(p) for p in paths]
+    fresh = [p for p in fresh if p not in _json_cache]
+    for path, outcome in zip(fresh, _IO_POOL.map(_load_json_outcome, fresh)):
+        _json_cache[path] = outcome
 
 
 def eval_set_key(eval_sets):
@@ -347,8 +381,96 @@ def cells_from_aggregate(eval_sets_obj, expected_runs, configured_eval_sets, sou
     return cells
 
 
-def scan_eval_sets(root, configured_eval_sets):
-    found = [p.name for p in root.iterdir() if p.is_dir()] if root.is_dir() else []
+class DirNode:
+    __slots__ = ("path", "name", "children", "has_results", "results_mtime")
+
+    def __init__(self, path, name):
+        self.path = path
+        self.name = name
+        self.children = {}
+        self.has_results = False
+        self.results_mtime = None
+
+
+def build_tree(root):
+    """Single-pass scandir snapshot of an eval_results tree.
+
+    Every consumer below used to re-walk the same tree with its own
+    recursive glob (completion mtime, run metadata, per-task cells, plus
+    the per-variant legacy pass); on metadata-slow filesystems (FSx
+    Lustre) those repeated walks dominated the whole fetch. `videos/`
+    run-artifact dirs are listed but not descended into, and symlinked
+    dirs are listed but not followed (matching pathlib `**` semantics).
+    """
+    root = Path(root)
+    if not root.is_dir():
+        return None
+    top = DirNode(str(root), root.name)
+    level = [top]
+    while level:
+        next_level = []
+        for node, entries in zip(level, _IO_POOL.map(_scan_dir, [n.path for n in level])):
+            for name, path, is_dir, descend, mtime in entries:
+                if is_dir:
+                    child = DirNode(path, name)
+                    node.children[name] = child
+                    if descend and name != "videos":
+                        next_level.append(child)
+                else:
+                    node.has_results = True
+                    node.results_mtime = mtime
+        level = next_level
+    return top
+
+
+def _scan_dir(path):
+    out = []
+    try:
+        with os.scandir(path) as it:
+            for entry in it:
+                try:
+                    is_real_dir = entry.is_dir(follow_symlinks=False)
+                    if is_real_dir or entry.is_dir():
+                        out.append((entry.name, entry.path, True, is_real_dir, None))
+                    elif entry.name == "results.json" and entry.is_file():
+                        try:
+                            mtime = entry.stat().st_mtime
+                        except OSError:
+                            mtime = None
+                        out.append((entry.name, entry.path, False, False, mtime))
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return out
+
+
+def iter_result_json_paths(root_node):
+    out = []
+    stack = [root_node]
+    while stack:
+        node = stack.pop()
+        if node.has_results:
+            out.append(os.path.join(node.path, "results.json"))
+        stack.extend(node.children.values())
+    return out
+
+
+def iter_run_result_nodes(root_node):
+    """Nodes matching `**/run_*/results.json` strictly below root_node."""
+    out = []
+    stack = [root_node]
+    while stack:
+        node = stack.pop()
+        for child in node.children.values():
+            if child.name.startswith("run_") and child.has_results:
+                out.append(child)
+            stack.append(child)
+    return out
+
+
+def scan_eval_sets(node, configured_eval_sets):
+    found = list(node.children) if node is not None else []
     ordered = []
     for eval_set in configured_eval_sets or []:
         if eval_set in found:
@@ -357,25 +479,34 @@ def scan_eval_sets(root, configured_eval_sets):
     return ordered
 
 
-def cells_from_runs(task_root, configured_eval_sets, expected_runs):
+def cells_from_runs(task_node, configured_eval_sets, expected_runs):
     cells = []
-    for eval_set in scan_eval_sets(task_root, configured_eval_sets):
-        eval_root = task_root / eval_set
+    if task_node is None:
+        return cells
+    for eval_set in scan_eval_sets(task_node, configured_eval_sets):
+        eval_node = task_node.children[eval_set]
+        run_nodes = sorted(
+            (c for c in eval_node.children.values() if c.name.startswith("run_")),
+            key=lambda n: run_name_key(n.name),
+        )
         vals = []
-        partial_episode_counts = []
-        for path in sorted(eval_root.glob("run_*/results.json"), key=run_path_key):
+        completed = set()
+        for node in run_nodes:
+            if not node.has_results:
+                continue
             try:
-                rate, success_count, total = rate_from_run(read_json(path))
+                rate, success_count, total = rate_from_run(read_json(os.path.join(node.path, "results.json")))
             except Exception:
                 continue
             if rate is not None:
-                vals.append((rate, success_count, total, str(path)))
-        completed_run_dirs = {Path(v[3]).parent for v in vals}
-        for run_dir in sorted(eval_root.glob("run_*"), key=run_path_key):
-            if run_dir in completed_run_dirs:
+                vals.append((rate, success_count, total))
+                completed.add(node.name)
+        partial_episode_counts = []
+        for node in run_nodes:
+            if node.name in completed:
                 continue
             try:
-                count = sum(1 for _ in (run_dir / "videos").glob("ep*.mp4"))
+                count = sum(1 for _ in Path(node.path, "videos").glob("ep*.mp4"))
             except Exception:
                 count = 0
             if count > 0:
@@ -387,18 +518,20 @@ def cells_from_runs(task_root, configured_eval_sets, expected_runs):
             [v[1] for v in vals] + [None for _ in partial_episode_counts],
             [v[2] for v in vals] + partial_episode_counts,
             expected_runs,
-            str(eval_root),
+            eval_node.path,
         )
         if cell:
             cells.append(cell)
     return cells
 
 
-def metadata_from_runs(task_roots):
-    for task_root in task_roots:
-        for path in sorted(task_root.glob("**/run_*/results.json"), key=lambda p: str(p)):
+def metadata_from_runs(task_nodes):
+    for task_node in task_nodes:
+        if task_node is None:
+            continue
+        for node in sorted(iter_run_result_nodes(task_node), key=lambda n: n.path):
             try:
-                data = read_json(path)
+                data = read_json(os.path.join(node.path, "results.json"))
             except Exception:
                 continue
             config = data.get("config") or {}
@@ -499,16 +632,22 @@ def add_job_indexes(path_index, name_index, checkpoint_index, info, meta):
         add_eval_job_indexes(path_index, name_index, info, meta)
 
 
-def parse_sidecar_meta(path):
-    out = {}
+def _read_text_or_none(path):
     try:
-        for line in path.read_text().splitlines():
-            if "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            out[k.strip()] = v.strip()
+        return Path(path).read_text()
     except Exception:
-        return {}
+        return None
+
+
+def parse_sidecar_meta_text(text):
+    out = {}
+    if text is None:
+        return out
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip()
     return out
 
 
@@ -528,12 +667,14 @@ def load_result_job_index():
 
     job_meta_root = Path.home() / staging_rel / "jobs"
     job_meta_paths = sorted(job_meta_root.glob("*.meta"), key=job_meta_sort_key) if job_meta_root.exists() else []
-    for path in job_meta_paths:
-        meta = parse_sidecar_meta(path)
+    texts = list(_IO_POOL.map(_read_text_or_none, job_meta_paths))
+    for path, text in zip(job_meta_paths, texts):
+        meta = parse_sidecar_meta_text(text)
         info = job_info_from_meta(path.stem, meta)
         add_job_indexes(path_index, name_index, checkpoint_index, info, meta)
 
     snapshot_meta_paths = sorted(experiments_root.glob("*/config_*.meta.json")) if experiments_root.exists() else []
+    prefetch_json(snapshot_meta_paths)
     for path in snapshot_meta_paths:
         try:
             meta = read_json(path)
@@ -668,28 +809,23 @@ def finalize_result(result):
     return result
 
 
-def run_path_key(path):
-    name = path.name if path.is_dir() else path.parent.name
+def run_name_key(name):
+    # Numeric-aware ordering of run_<N> directory names.
     try:
         return (0, int(name.rsplit("_", 1)[-1]))
     except Exception:
         return (1, name)
 
 
-def newest_result_mtime(eval_root, top_path):
+def newest_result_mtime(eval_node, top_mtime):
     """Completion time: newest mtime among the aggregate and per-run results.json."""
     times = []
-    if top_path.exists():
-        try:
-            times.append(top_path.stat().st_mtime)
-        except OSError:
-            pass
-    if eval_root.exists():
-        for path in eval_root.glob("**/run_*/results.json"):
-            try:
-                times.append(path.stat().st_mtime)
-            except OSError:
-                pass
+    if top_mtime is not None:
+        times.append(top_mtime)
+    if eval_node is not None:
+        for node in iter_run_result_nodes(eval_node):
+            if node.results_mtime is not None:
+                times.append(node.results_mtime)
     return max(times) if times else None
 
 
@@ -707,14 +843,14 @@ def instruction_for(short, configured_tasks, fallback=None):
     return fallback
 
 
-def build_variant_from_root(meta, eval_root, top_path):
+def build_variant_from_root(meta, eval_node, eval_root, top_path, top_exists, top_mtime):
     variant = meta["variant"]
     configured_tasks = meta.get("tasks") or []
     configured_eval_sets = meta.get("eval_sets") or []
     expected_runs = int_or_none(meta.get("n_runs"))
     top = None
     aggregate_tasks = []
-    if top_path.exists():
+    if top_exists:
         try:
             top = read_json(top_path)
         except Exception:
@@ -737,8 +873,8 @@ def build_variant_from_root(meta, eval_root, top_path):
         "n_runs": expected_runs,
         "num_envs_per_gpu": None,
         "total_num_envs": None,
-        "source": str(top_path) if top_path.exists() else str(eval_root),
-        "completed_at": newest_result_mtime(eval_root, top_path),
+        "source": str(top_path) if top_exists else str(eval_root),
+        "completed_at": newest_result_mtime(eval_node, top_mtime),
         "tasks": [],
     }
     job_info = result_job_info(eval_root, top_path)
@@ -790,7 +926,7 @@ def build_variant_from_root(meta, eval_root, top_path):
                     "eval_sets": cells,
                 })
 
-    if not eval_root.exists():
+    if eval_node is None:
         if aggregate_tasks:
             result["tasks"] = aggregate_tasks
             return finalize_result(result)
@@ -798,12 +934,12 @@ def build_variant_from_root(meta, eval_root, top_path):
 
     if len(configured_tasks) > 1:
         tasks = configured_tasks
-        task_roots = [eval_root / (task.get("short") or variant) for task in tasks]
+        task_nodes = [eval_node.children.get(task.get("short") or variant) for task in tasks]
     else:
         tasks = configured_tasks or [{"short": variant, "task_name": variant, "instruction": None}]
-        task_roots = [eval_root]
+        task_nodes = [eval_node]
 
-    fallback_meta = metadata_from_runs(task_roots)
+    fallback_meta = metadata_from_runs(task_nodes)
     if fallback_meta.get("checkpoint") and not result["checkpoint"]:
         result["checkpoint"] = fallback_meta["checkpoint"]
     if fallback_meta.get("n_episodes") and not result["n_episodes"]:
@@ -811,8 +947,8 @@ def build_variant_from_root(meta, eval_root, top_path):
 
     for task in tasks:
         short = task.get("short") or variant
-        task_root = eval_root / short if len(tasks) > 1 else eval_root
-        cells = cells_from_runs(task_root, configured_eval_sets, expected_runs)
+        task_node = eval_node.children.get(short) if len(tasks) > 1 else eval_node
+        cells = cells_from_runs(task_node, configured_eval_sets, expected_runs)
         if cells:
             result["tasks"].append({
                 "task": short,
@@ -837,20 +973,35 @@ def build_variant(meta):
         return []
 
     eval_root = exp_dir / "eval_results"
+    tree = build_tree(eval_root)
+    if tree is not None:
+        prefetch_json(iter_result_json_paths(tree))
     rows = []
 
     # New layout: one immutable output namespace per eval submission:
     #   <variant>/eval_results/<output_namespace>/results.json
-    if eval_root.exists():
-        for run_root in sorted(p for p in eval_root.iterdir() if p.is_dir()):
-            top_path = run_root / "results.json"
-            item = build_variant_from_root(meta, run_root, top_path)
+    if tree is not None:
+        for name in sorted(tree.children):
+            node = tree.children[name]
+            run_root = eval_root / name
+            item = build_variant_from_root(
+                meta, node, run_root, run_root / "results.json",
+                node.has_results, node.results_mtime,
+            )
             if item:
                 rows.append(item)
 
     # Legacy layout: all eval runs directly under <variant>/eval_results and
     # aggregate at <variant>/results.json.
-    legacy_item = build_variant_from_root(meta, eval_root, exp_dir / "results.json")
+    legacy_top = exp_dir / "results.json"
+    legacy_exists = legacy_top.exists()
+    legacy_mtime = None
+    if legacy_exists:
+        try:
+            legacy_mtime = legacy_top.stat().st_mtime
+        except OSError:
+            pass
+    legacy_item = build_variant_from_root(meta, tree, eval_root, legacy_top, legacy_exists, legacy_mtime)
     if legacy_item:
         legacy_source = legacy_item.get("source") or ""
         duplicate_new_source = "/eval_results/" in legacy_source and legacy_source.endswith("/results.json")
