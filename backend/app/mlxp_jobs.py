@@ -447,6 +447,12 @@ for d in __EXPERIMENTS_ROOT__/*/checkpoints/ __EXPERIMENTS_ROOT__/*/checkpoints/
         has_checkpoint=1
         latest=$(for m in "${matches[@]}"; do basename "$m" | sed 's:^checkpoint-::'; done | sort -n | tail -1)
         end_path="${d}checkpoint-${latest}"
+        # Prefer a file written once at the final save: the step DIRECTORY's
+        # mtime moves whenever children change (e.g. trainer-state cleanup
+        # deleting optimizer files), which made old runs look freshly ended.
+        if [ -f "${end_path}/model.safetensors.index.json" ]; then
+            end_path="${end_path}/model.safetensors.index.json"
+        fi
     fi
 
     has_final=0
