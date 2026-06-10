@@ -361,11 +361,20 @@ def parse_sidecar_meta(path):
     return out
 
 
+def job_meta_sort_key(path):
+    # Numeric-aware order: jobs sharing an output namespace (resume chains)
+    # collide in the last-writer-wins index, so the newest job id must be
+    # processed last. Lexicographic order gets this wrong across digit
+    # counts ("100034" < "94097").
+    stem = path.stem
+    return (0, int(stem)) if stem.isdigit() else (1, stem)
+
+
 def load_checkpoint_index():
     checkpoint_index = {}
 
     job_meta_root = Path.home() / staging_rel / "jobs"
-    job_meta_paths = sorted(job_meta_root.glob("*.meta")) if job_meta_root.exists() else []
+    job_meta_paths = sorted(job_meta_root.glob("*.meta"), key=job_meta_sort_key) if job_meta_root.exists() else []
     for path in job_meta_paths:
         meta = parse_sidecar_meta(path)
         info = job_info_from_meta(path.stem, meta)

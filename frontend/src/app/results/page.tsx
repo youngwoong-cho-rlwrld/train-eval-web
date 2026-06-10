@@ -1,9 +1,9 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import Link from "next/link";
-import { useIsFetching, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertCircle, Check, CircleHelp, Copy, Database, ExternalLink, Trophy } from "lucide-react";
+import { keepPreviousData, useIsFetching, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+import { AlertCircle, Check, ChevronDown, ChevronRight, CircleHelp, Copy, Database, ExternalLink } from "lucide-react";
 import { toast } from "sonner";
 import { api, type ResultCell, type ResultsResponse, type ResultTask, type ResultVariant } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
@@ -16,6 +16,7 @@ import { RefreshButton } from "@/components/refresh-button";
 import { LoadingState } from "@/components/loading-state";
 import { ImmediateTooltip } from "@/components/immediate-tooltip";
 import { JobStateBadge } from "@/components/job-state-badge";
+import { isActiveJobState } from "@/lib/job-status";
 import { Th } from "@/components/table";
 import { jobDetailHref } from "@/lib/job-links";
 import { formatPct } from "@/lib/format";
@@ -28,21 +29,26 @@ export default function ResultsPage() {
   const qc = useQueryClient();
   const [cluster, setCluster] = useState("all");
   const [nameFilter, setNameFilter] = useState("");
+  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
 
   const clustersQuery = useQuery({
     queryKey: ["clusters"],
     queryFn: () => api<{ clusters: string[] }>("/api/clusters").then((d) => d.clusters),
     staleTime: 5 * 60_000,
   });
-  const clusterOptions = (clustersQuery.data ?? []).filter((c) => c !== "mlxp");
+  const clusterNames = clustersQuery.data ?? [];
+  const clusterOptions = clusterNames.filter((c) => c !== "mlxp");
 
-  const resultsQuery = useQuery({
-    queryKey: ["results", cluster],
-    queryFn: () =>
-      api<ResultsResponse>(
-        cluster === "all" ? "/api/results" : `/api/results?cluster=${encodeURIComponent(cluster)}`,
-      ),
-    refetchInterval: REFRESH_MS,
+  // One query per cluster so each cluster's results render as soon as its
+  // probe returns, instead of first paint waiting on the slowest cluster.
+  // The cluster dropdown filters the merged data client-side.
+  const resultQueries = useQueries({
+    queries: clusterNames.map((c) => ({
+      queryKey: ["results", c],
+      queryFn: () => api<ResultsResponse>(`/api/results?cluster=${encodeURIComponent(c)}`),
+      refetchInterval: REFRESH_MS,
+      placeholderData: keepPreviousData,
+    })),
   });
 
   const isFetching =
@@ -50,24 +56,33 @@ export default function ResultsPage() {
       predicate: (q) => q.queryKey[0] === "results" || q.queryKey[0] === "clusters",
     }) > 0;
 
-  const allVariants = useMemo(() => resultsQuery.data?.variants ?? [], [resultsQuery.data?.variants]);
-  const variants = useMemo(
-    () => allVariants.filter((variant) => resultVariantMatchesName(variant, nameFilter)),
-    [allVariants, nameFilter],
+  const anyLoaded = resultQueries.some((q) => q.data !== undefined);
+  const probing = clusterNames.filter((_, i) => resultQueries[i]?.isLoading);
+  const initialLoading =
+    clustersQuery.isLoading || (clusterNames.length > 0 && !anyLoaded && probing.length > 0);
+
+  const queryErrors = clusterNames.flatMap((c, i) => {
+    const error = resultQueries[i]?.error;
+    return error ? [{ cluster: c, error: (error as Error).message }] : [];
+  });
+  const backendErrors = resultQueries.flatMap((q) => q.data?.errors ?? []);
+
+  const allVariants = resultQueries.flatMap((q) => q.data?.variants ?? []);
+  const variants = allVariants.filter(
+    (variant) =>
+      (cluster === "all" || variant.cluster === cluster) &&
+      resultVariantMatchesName(variant, nameFilter),
   );
-  const { singleTask, multiTask, taskCount, evalCellCount } = useMemo(() => {
-    const singleTask = variants.filter((v) => v.tasks.length <= 1);
-    const multiTask = variants.filter((v) => v.tasks.length > 1);
-    return {
-      singleTask,
-      multiTask,
-      taskCount: variants.reduce((sum, v) => sum + v.tasks.length, 0),
-      evalCellCount: variants.reduce(
-        (sum, v) => sum + v.tasks.reduce((inner, t) => inner + t.eval_sets.length, 0),
-        0,
-      ),
-    };
-  }, [variants]);
+  const taskCount = variants.reduce((sum, v) => sum + v.tasks.length, 0);
+  const evalCellCount = variants.reduce(
+    (sum, v) => sum + v.tasks.reduce((inner, t) => inner + t.eval_sets.length, 0),
+    0,
+  );
+
+  const groups = groupByExperiment(variants);
+  // A narrow name filter means the user is hunting something specific —
+  // open the few matching groups so their tables are visible immediately.
+  const autoOpen = nameFilter.trim().length > 0 && groups.length <= 2;
 
   const refresh = () => {
     qc.invalidateQueries({ queryKey: ["results"] });
@@ -80,11 +95,16 @@ export default function ResultsPage() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Results</h1>
           <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-slate-500 dark:text-slate-400">
-            <span>{variants.length} experiments</span>
+            <span>{groups.length} experiments</span>
+            <span className="text-slate-300 dark:text-slate-700">/</span>
+            <span>{variants.length} results</span>
             <span className="text-slate-300 dark:text-slate-700">/</span>
             <span>{taskCount} tasks</span>
             <span className="text-slate-300 dark:text-slate-700">/</span>
             <span>{evalCellCount} eval-set summaries</span>
+            {anyLoaded && probing.length > 0 && (
+              <span className="text-xs text-slate-400">probing {probing.join(", ")}…</span>
+            )}
           </div>
         </div>
         <div className="flex flex-wrap items-end justify-end gap-3">
@@ -115,14 +135,14 @@ export default function ResultsPage() {
         </div>
       </div>
 
-      {resultsQuery.error && (
-        <ErrorBanner message={(resultsQuery.error as Error).message} />
-      )}
-      {resultsQuery.data?.errors.map((err) => (
+      {queryErrors.map((err) => (
+        <ErrorBanner key={`query-${err.cluster}`} message={`${err.cluster}: ${err.error}`} />
+      ))}
+      {backendErrors.map((err) => (
         <ErrorBanner key={err.cluster} message={`${err.cluster}: ${err.error}`} />
       ))}
 
-      {resultsQuery.isLoading && (
+      {initialLoading && (
         <Card className="mt-8">
           <CardContent className="py-8">
             <LoadingState label="Loading results..." rows={5} />
@@ -130,29 +150,40 @@ export default function ResultsPage() {
         </Card>
       )}
 
-      {!resultsQuery.isLoading && allVariants.length === 0 && !resultsQuery.error && (
+      {!initialLoading && anyLoaded && probing.length === 0 && allVariants.length === 0 && (
         <Card className="mt-8">
           <CardContent className="flex items-center gap-3 py-8 text-sm text-slate-500">
             <Database className="h-4 w-4" />
-            No eval result artifacts found for the selected cluster.
+            No eval result artifacts found.
           </CardContent>
         </Card>
       )}
 
-      {!resultsQuery.isLoading && allVariants.length > 0 && variants.length === 0 && !resultsQuery.error && (
+      {!initialLoading && allVariants.length > 0 && variants.length === 0 && (
         <Card className="mt-8">
           <CardContent className="flex items-center gap-3 py-8 text-sm text-slate-500">
             <Database className="h-4 w-4" />
-            No results match this name filter.
+            No results match the current name/cluster filter.
           </CardContent>
         </Card>
       )}
 
-      {multiTask.length > 0 && (
-        <ResultSection title="Multitask" variants={multiTask} />
-      )}
-      {singleTask.length > 0 && (
-        <ResultSection title="Single Task" variants={singleTask} />
+      {groups.length > 0 && (
+        <div className="mt-8 space-y-3">
+          {groups.map((group) => (
+            <ExperimentGroup
+              key={group.name}
+              group={group}
+              expanded={openGroups[group.name] ?? autoOpen}
+              onToggle={() =>
+                setOpenGroups((prev) => ({
+                  ...prev,
+                  [group.name]: !(prev[group.name] ?? autoOpen),
+                }))
+              }
+            />
+          ))}
+        </div>
       )}
     </div>
   );
@@ -170,40 +201,158 @@ function ErrorBanner({ message }: { message: string }) {
 function resultVariantMatchesName(variant: ResultVariant, filter: string) {
   const needle = filter.trim().toLowerCase();
   if (!needle) return true;
-  return [
-    variant.variant,
-    variant.experiment ?? "",
-    variant.note ?? "",
-    variant.job_state ?? "",
-    variant.checkpoint ?? "",
-    variant.checkpoint_job_cluster ?? "",
-    variant.checkpoint_job_name ?? "",
-    variant.source ?? "",
-  ].join(" ").toLowerCase().includes(needle);
+  return variant.variant.toLowerCase().includes(needle);
 }
 
-function ResultSection({ title, variants }: { title: string; variants: ResultVariant[] }) {
+type ResultGroup = {
+  name: string;
+  members: ResultVariant[];
+  latest: number;
+};
+
+function groupByExperiment(variants: ResultVariant[]): ResultGroup[] {
+  const byName = new Map<string, ResultVariant[]>();
+  for (const variant of variants) {
+    const name = variant.variant || "(unknown experiment)";
+    const members = byName.get(name);
+    if (members) members.push(variant);
+    else byName.set(name, [variant]);
+  }
+  return [...byName.entries()]
+    .map(([name, members]) => {
+      const sorted = [...members].sort((a, b) => resultRecency(b) - resultRecency(a));
+      return { name, members: sorted, latest: resultRecency(sorted[0]) };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
+}
+
+// Best-effort recency: prefer the eval completion time reported by the
+// backend, then the YYYYMMDD_HHMMSS stamp jobs carry in their names or
+// namespaces (epoch ms), falling back to the numeric job id. Epoch values
+// dwarf job ids, so stamped results always sort above unstamped ones.
+function resultRecency(variant: ResultVariant): number {
+  if (variant.completed_at != null) return variant.completed_at * 1000;
+  for (const text of [variant.job_name, variant.experiment, variant.source]) {
+    const m = text?.match(/(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/);
+    if (m) {
+      const ts = Date.parse(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}`);
+      if (!Number.isNaN(ts)) return ts;
+    }
+  }
+  const id = Number(variant.job_id);
+  return Number.isFinite(id) ? id : 0;
+}
+
+function formatCompletedAt(seconds: number): string {
+  return new Intl.DateTimeFormat(undefined, {
+    timeZone: "Asia/Seoul",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(new Date(seconds * 1000));
+}
+
+function formatGroupRecency(ts: number): string | null {
+  if (ts < 1e12) return null; // job-id fallback, not a real timestamp
+  return new Intl.DateTimeFormat(undefined, {
+    timeZone: "Asia/Seoul",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(new Date(ts));
+}
+
+function ExperimentGroup({
+  group,
+  expanded,
+  onToggle,
+}: {
+  group: ResultGroup;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const clusters = [...new Set(group.members.map((m) => m.cluster))];
+  const modelVersions = [
+    ...new Set(group.members.map((m) => m.model_version).filter((v): v is string => !!v)),
+  ];
+  const kinds = [...new Set(group.members.map((m) => (m.tasks.length > 1 ? "multitask" : "single")))];
+  const latest = formatGroupRecency(group.latest);
+
+  // Per-state counts across this group's results ("CANCELLED by N" → "CANCELLED"
+  // so they aggregate). Results whose eval job is unknown carry no state badge;
+  // they remain covered by the total result count.
+  const stateCounts = new Map<string, number>();
+  for (const m of group.members) {
+    const state = (m.job_state ?? "").split(" ")[0].toUpperCase();
+    if (!state) continue;
+    stateCounts.set(state, (stateCounts.get(state) ?? 0) + 1);
+  }
+  const states = [...stateCounts.entries()].sort(
+    (a, b) =>
+      Number(isActiveJobState(b[0])) - Number(isActiveJobState(a[0])) ||
+      a[0].localeCompare(b[0]),
+  );
+
   return (
-    <section className="mt-8">
-      <div className="mb-3 flex items-center gap-2">
-        <Trophy className="h-4 w-4 text-slate-500" />
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-          {title}
-        </h2>
-      </div>
-      <div className="space-y-5">
-        {variants.map((variant) => (
-          <ResultCard
-            key={resultVariantKey(variant)}
-            variant={variant}
-          />
-        ))}
-      </div>
+    <section className="overflow-hidden rounded-lg border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-950">
+      <button
+        type="button"
+        onClick={onToggle}
+        className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left transition-colors hover:bg-slate-50 dark:hover:bg-slate-900"
+      >
+        <span className="flex min-w-0 items-center gap-2">
+          {expanded ? (
+            <ChevronDown className="h-4 w-4 shrink-0 text-slate-400" />
+          ) : (
+            <ChevronRight className="h-4 w-4 shrink-0 text-slate-400" />
+          )}
+          <span className="truncate font-mono text-sm font-medium">{group.name}</span>
+          {states.map(([state, count]) => (
+            <span key={state} className="inline-flex shrink-0 items-center gap-0.5">
+              <JobStateBadge state={state} />
+              {count > 1 && <span className="text-[10px] text-slate-500">×{count}</span>}
+            </span>
+          ))}
+        </span>
+        <span className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+          {modelVersions.map((mv) => (
+            <Badge key={mv} variant="secondary">{mv}</Badge>
+          ))}
+          {kinds.map((kind) => (
+            <Badge key={kind} variant={kind === "multitask" ? "default" : "outline"}>
+              {kind}
+            </Badge>
+          ))}
+          {clusters.map((c) => (
+            <Badge key={c} variant="outline">{c}</Badge>
+          ))}
+          <span className="text-xs text-slate-500">
+            {group.members.length} result{group.members.length === 1 ? "" : "s"}
+          </span>
+          {latest && <span className="text-xs text-slate-400">latest {latest}</span>}
+        </span>
+      </button>
+      {expanded && (
+        <div className="divide-y divide-slate-200 border-t border-slate-200 dark:divide-slate-800 dark:border-slate-800">
+          {group.members.map((variant) => (
+            <ResultCard
+              key={resultVariantKey(variant)}
+              variant={variant}
+              className="rounded-none border-0 shadow-none"
+            />
+          ))}
+        </div>
+      )}
     </section>
   );
 }
 
-function ResultCard({ variant }: { variant: ResultVariant }) {
+function ResultCard({ variant, className }: { variant: ResultVariant; className?: string }) {
   const evalSets = evalSetColumns(variant.tasks);
   const nRuns = variant.n_runs ?? maxExpectedRuns(variant.tasks);
   const nEpisodes = variant.n_episodes ?? maxEpisodeCount(variant.tasks);
@@ -215,12 +364,17 @@ function ResultCard({ variant }: { variant: ResultVariant }) {
   );
 
   return (
-    <Card>
+    <Card className={className}>
       <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between sm:space-y-0">
         <div className="min-w-0">
           <CardTitle className="font-mono text-base">
             <ResultTitle variant={variant} />
           </CardTitle>
+          {variant.completed_at != null && (
+            <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+              completed {formatCompletedAt(variant.completed_at)}
+            </div>
+          )}
           <CardDescription className="mt-1">
             {variant.note || "eval results"}
           </CardDescription>
@@ -305,7 +459,9 @@ function ResultTitle({ variant }: { variant: ResultVariant }) {
         <span className="shrink-0">({variant.job_id})</span>
         <ExternalLink className="h-3.5 w-3.5 shrink-0" />
       </Link>
-      {variant.job_state && <JobStateBadge state={variant.job_state} />}
+      {variant.job_state && (
+        <JobStateBadge state={variant.job_state.split(" ")[0].toUpperCase()} />
+      )}
     </span>
   );
 }
@@ -486,13 +642,19 @@ function checkpointDisplayName(path: string) {
   return parts[parts.length - 2] ?? leaf;
 }
 
+function resultTableTitle(variant: ResultVariant) {
+  return variant.job_id ? `${variant.variant} (${variant.job_id})` : variant.variant;
+}
+
 function resultTableTsv(variant: ResultVariant, evalSets: string[]) {
-  return resultTableRows(variant, evalSets).map((row) => row.map(tsvCell).join("\t")).join("\n");
+  const table = resultTableRows(variant, evalSets).map((row) => row.map(tsvCell).join("\t")).join("\n");
+  return `${tsvCell(resultTableTitle(variant))}\n${table}`;
 }
 
 function resultTableHtml(variant: ResultVariant, evalSets: string[]) {
   const [header, ...body] = resultTableRows(variant, evalSets);
   return [
+    `<p><strong>${htmlCell(resultTableTitle(variant))}</strong></p>`,
     '<table border="1" cellspacing="0" cellpadding="4">',
     "<thead>",
     `<tr>${header.map((value) => `<th>${htmlCell(value)}</th>`).join("")}</tr>`,

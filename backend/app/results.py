@@ -56,6 +56,8 @@ class ResultVariant(BaseModel):
     num_envs_per_gpu: int | None = None
     total_num_envs: int | None = None
     source: str | None = None
+    # Epoch seconds of the newest results.json mtime — when the eval finished.
+    completed_at: float | None = None
     tasks: list[ResultTask] = Field(default_factory=list)
 
 
@@ -510,13 +512,22 @@ def parse_sidecar_meta(path):
     return out
 
 
+def job_meta_sort_key(path):
+    # Numeric-aware order: jobs sharing a results namespace (resume chains)
+    # collide in the last-writer-wins index, so the newest job id must be
+    # processed last. Lexicographic order gets this wrong across digit
+    # counts ("100034" < "94097").
+    stem = path.stem
+    return (0, int(stem)) if stem.isdigit() else (1, stem)
+
+
 def load_result_job_index():
     path_index = {}
     name_index = {}
     checkpoint_index = {}
 
     job_meta_root = Path.home() / staging_rel / "jobs"
-    job_meta_paths = sorted(job_meta_root.glob("*.meta")) if job_meta_root.exists() else []
+    job_meta_paths = sorted(job_meta_root.glob("*.meta"), key=job_meta_sort_key) if job_meta_root.exists() else []
     for path in job_meta_paths:
         meta = parse_sidecar_meta(path)
         info = job_info_from_meta(path.stem, meta)
@@ -665,6 +676,23 @@ def run_path_key(path):
         return (1, name)
 
 
+def newest_result_mtime(eval_root, top_path):
+    """Completion time: newest mtime among the aggregate and per-run results.json."""
+    times = []
+    if top_path.exists():
+        try:
+            times.append(top_path.stat().st_mtime)
+        except OSError:
+            pass
+    if eval_root.exists():
+        for path in eval_root.glob("**/run_*/results.json"):
+            try:
+                times.append(path.stat().st_mtime)
+            except OSError:
+                pass
+    return max(times) if times else None
+
+
 def task_name_for(short, configured_tasks, fallback=None):
     for task in configured_tasks:
         if task.get("short") == short:
@@ -710,6 +738,7 @@ def build_variant_from_root(meta, eval_root, top_path):
         "num_envs_per_gpu": None,
         "total_num_envs": None,
         "source": str(top_path) if top_path.exists() else str(eval_root),
+        "completed_at": newest_result_mtime(eval_root, top_path),
         "tasks": [],
     }
     job_info = result_job_info(eval_root, top_path)

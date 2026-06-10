@@ -414,6 +414,7 @@ export type ResultVariant = {
   num_envs_per_gpu?: number | null;
   total_num_envs?: number | null;
   source?: string | null;
+  completed_at?: number | null;
   tasks: ResultTask[];
 };
 
