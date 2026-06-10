@@ -66,17 +66,17 @@ async def _resubmit_slurm_job(
     job_name = det.job_name or str(record.get("JobName") or "").strip() or None
     retrying = action == "retry"
 
+    env = await load_cluster(cluster)
+    meta = await read_slurm_meta(env.ssh_alias, job_id)
+
+    def int_meta(key: str) -> int | None:
+        try:
+            raw = (meta.get(key) or "").strip()
+            return int(raw) if raw else None
+        except ValueError:
+            return None
+
     if phase == "train":
-        env = await load_cluster(cluster)
-        meta = await read_slurm_meta(env.ssh_alias, job_id)
-
-        def int_meta(key: str) -> int | None:
-            try:
-                raw = (meta.get(key) or "").strip()
-                return int(raw) if raw else None
-            except ValueError:
-                return None
-
         return await submit.submit(
             submit.SubmitRequest(
                 cluster=cluster,
@@ -102,8 +102,6 @@ async def _resubmit_slurm_job(
         raise ValueError(f"cannot resume eval job {job_id}: checkpoint is unknown")
 
     seed_eval_dirs = [det.paths.eval_dir] if det.paths.eval_dir else []
-    env = await load_cluster(cluster)
-    meta = await read_slurm_meta(env.ssh_alias, job_id)
     eval_num_envs = (meta.get("eval_num_envs_per_gpu") or meta.get("eval_parallel_sims_per_gpu") or "").strip()
     try:
         eval_num_envs_per_gpu = int(eval_num_envs) if eval_num_envs else None
@@ -111,14 +109,8 @@ async def _resubmit_slurm_job(
         eval_num_envs_per_gpu = None
     if eval_num_envs_per_gpu and eval_num_envs_per_gpu > submit.MAX_EVAL_NUM_ENVS_PER_GPU:
         eval_num_envs_per_gpu = submit.MAX_EVAL_NUM_ENVS_PER_GPU
-    try:
-        eval_n_episodes = int(meta.get("eval_n_episodes", "").strip()) if meta.get("eval_n_episodes") else None
-    except ValueError:
-        eval_n_episodes = None
-    try:
-        eval_n_runs = int(meta.get("eval_n_runs", "").strip()) if meta.get("eval_n_runs") else None
-    except ValueError:
-        eval_n_runs = None
+    eval_n_episodes = int_meta("eval_n_episodes")
+    eval_n_runs = int_meta("eval_n_runs")
     eval_sets = [s for s in (meta.get("eval_sets") or "").split() if s] or None
     resume_of = (meta.get("resume_of") or "").strip()
     if resume_of and resume_of != job_id:
@@ -136,6 +128,7 @@ async def _resubmit_slurm_job(
             phase="eval",
             train_note=(meta.get("train_note") or "").strip() or None,
             partition=partition,
+            train_num_gpus=int_meta("eval_num_gpus"),
             eval_num_envs_per_gpu=eval_num_envs_per_gpu,
             eval_n_episodes=eval_n_episodes,
             eval_n_runs=eval_n_runs,
