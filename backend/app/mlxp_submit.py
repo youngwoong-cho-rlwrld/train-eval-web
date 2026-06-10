@@ -792,6 +792,18 @@ torchrun --nproc_per_node={req.num_gpus} scripts/gr00t_finetune.py \\
     --run_name "{variant.name}" \\
     --seed 42 \\
     $RESUME_FLAG {train_extra} {user_extra}
+
+# Training complete — strip resume-only trainer state from each step dir,
+# keeping the same deployable core files the checkpoint-copy feature keeps.
+if [ -d "{ckpt_dir}/checkpoint-{max_steps}" ]; then
+    echo "[mlxp] removing resume-only trainer state under {ckpt_dir}"
+    for step_dir in "{ckpt_dir}"/checkpoint-*/; do
+        [ -d "$step_dir" ] || continue
+        rm -rf "$step_dir"global_step* "$step_dir"optimizer* "$step_dir"scheduler.pt \\
+               "$step_dir"rng_state_*.pth "$step_dir"trainer_state.json \\
+               "$step_dir"latest "$step_dir"zero_to_fp32.py || true
+    done
+fi
 """
 
 
@@ -932,6 +944,18 @@ uv run $UV_RUN_ARGS torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/la
     --use-wandb \\
     --wandb-project {wandb_project} \\
     $RESUME_FLAG{action_horizon_arg} {train_extra} {user_extra}
+
+# Training complete — strip resume-only trainer state from each step dir,
+# keeping the same deployable core files the checkpoint-copy feature keeps.
+if [ -d "{ckpt_dir}/checkpoint-{max_steps}" ]; then
+    echo "[mlxp] removing resume-only trainer state under {ckpt_dir}"
+    for step_dir in "{ckpt_dir}"/checkpoint-*/; do
+        [ -d "$step_dir" ] || continue
+        rm -rf "$step_dir"global_step* "$step_dir"optimizer* "$step_dir"scheduler.pt \\
+               "$step_dir"rng_state_*.pth "$step_dir"trainer_state.json \\
+               "$step_dir"latest "$step_dir"zero_to_fp32.py || true
+    done
+fi
 """
 
 

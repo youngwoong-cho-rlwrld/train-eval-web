@@ -121,6 +121,7 @@ fi
 
 if [ -d "$CKPT_DIR/checkpoint-${MAX_STEPS}" ]; then
     log "Final checkpoint already exists at $CKPT_DIR/checkpoint-${MAX_STEPS} — skipping training."
+    cleanup_trainer_state "$CKPT_DIR" "$MAX_STEPS"
     exit 0
 fi
 
@@ -151,3 +152,4 @@ $([[ "$RESUME_FLAG" == "True" ]] && echo "--resume ") \
     "${TRAIN_EXTRA_ARGS[@]}"
 
 log "Training completed."
+cleanup_trainer_state "$CKPT_DIR" "$MAX_STEPS"

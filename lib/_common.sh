@@ -62,6 +62,33 @@ append_submit_extra_train_args() {
     fi
 }
 
+# Once training has fully completed (checkpoint-<max_steps> exists), strip
+# resume-only trainer state from every checkpoint-step dir, leaving the same
+# deployable "core" files the checkpoint-copy feature keeps: model shards +
+# index, config.json, experiment_cfg/, processor/statistics/embodiment files.
+# Incomplete runs are left untouched — --resume needs this state to continue.
+cleanup_trainer_state() {
+    local run_dir="$1"
+    local max_steps="$2"
+    if [ ! -d "$run_dir/checkpoint-$max_steps" ]; then
+        log "Trainer-state cleanup skipped: $run_dir/checkpoint-$max_steps not found"
+        return 0
+    fi
+    log "Training complete — removing resume-only trainer state under $run_dir"
+    local step_dir
+    for step_dir in "$run_dir"/checkpoint-*/; do
+        [ -d "$step_dir" ] || continue
+        rm -rf "$step_dir"global_step* \
+               "$step_dir"optimizer* \
+               "$step_dir"scheduler.pt \
+               "$step_dir"rng_state_*.pth \
+               "$step_dir"trainer_state.json \
+               "$step_dir"latest \
+               "$step_dir"zero_to_fp32.py || true
+    done
+    log "Trainer-state cleanup done."
+}
+
 pin_training_repo_dir() {
     local repo_src="$1"
     local commit="${2:-}"

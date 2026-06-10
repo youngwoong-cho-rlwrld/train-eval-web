@@ -89,6 +89,7 @@ fi
 
 if [ -d "$RUN_CKPT_DIR/checkpoint-${MAX_STEPS}" ]; then
     log "Final checkpoint already exists at $RUN_CKPT_DIR/checkpoint-${MAX_STEPS} — skipping training."
+    cleanup_trainer_state "$RUN_CKPT_DIR" "$MAX_STEPS"
     exit 0
 fi
 
@@ -128,3 +129,4 @@ uv run torchrun --nproc_per_node="$TRAIN_NUM_GPUS" --master-port "$MASTER_PORT" 
     "${TRAIN_EXTRA_ARGS[@]}"
 
 log "Training completed."
+cleanup_trainer_state "$RUN_CKPT_DIR" "$MAX_STEPS"
