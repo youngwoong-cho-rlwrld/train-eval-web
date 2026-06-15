@@ -3,7 +3,6 @@
 import { useState } from "react";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import type { MlxpNode } from "@/lib/api";
-import { Badge } from "@/components/ui/badge";
 import {
   Card,
   CardContent,
@@ -12,13 +11,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 
-export function MlxpCard({
-  nodes,
-  yoursNode,
-}: {
-  nodes: MlxpNode[];
-  yoursNode: string;
-}) {
+export function MlxpCard({ nodes }: { nodes: MlxpNode[] }) {
   const [open, setOpen] = useState(true);
   const available = nodes.reduce((s, n) => s + n.gpu_free, 0);
   const total = nodes.reduce((s, n) => s + n.gpu_total, 0);
@@ -47,7 +40,7 @@ export function MlxpCard({
           </span>
         </div>
         <CardDescription>
-          {nodes[0]?.gpu_type ?? "GPU"} nodes · your node: <code>{yoursNode || "—"}</code>
+          {nodes[0]?.gpu_type ?? "GPU"} nodes
         </CardDescription>
       </CardHeader>
       {open && (
@@ -60,11 +53,6 @@ export function MlxpCard({
               >
                 <div className="min-w-0 flex-1 truncate font-mono">
                   {n.name}
-                  {n.name === yoursNode && (
-                    <Badge variant="default" className="ml-1 text-[10px]">
-                      yours
-                    </Badge>
-                  )}
                 </div>
                 <div className="shrink-0 font-mono">
                   <span

@@ -1,11 +1,14 @@
 """Resume timed-out jobs from their original train/eval intent."""
 
+import re
 import shlex
+from datetime import datetime
 
 from . import details, jobs, submit
 from .clusters import load_cluster
 from .slurm_meta import read_slurm_meta, read_slurm_meta_many
 from .ssh import ssh_run
+from .variants import load_variant
 
 
 def _is_timeout(state: str) -> bool:
@@ -25,6 +28,25 @@ def _original_phase(phase: str) -> str:
     # Historical jobs may have phase=resume in their sidecar/job_name. Treat
     # those as training jobs; new submissions never use resume as a phase.
     return "train" if phase == "resume" else phase
+
+
+_TIMESTAMP_SUFFIX = re.compile(r"_\d{8}_\d{6}$")
+
+
+def _retry_job_name(original: str | None) -> str | None:
+    """Re-stamp the original job name instead of regenerating it.
+
+    Regenerating a default name drops any prefix the original submission
+    carried; kakao's slurmctld rejects job names shorter than 50 chars, so
+    keep the original name and only refresh its trailing timestamp.
+    """
+    name = (original or "").strip()
+    if not name:
+        return None
+    stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
+    if _TIMESTAMP_SUFFIX.search(name):
+        return _TIMESTAMP_SUFFIX.sub(f"_{stamp}", name)
+    return f"{name}_{stamp}"
 
 
 async def resume_timed_out_job(cluster: str, job_id: str) -> submit.SubmitResponse:
@@ -57,6 +79,14 @@ async def _resubmit_slurm_job(
     variant = det.variant
     if not variant:
         raise ValueError(f"cannot resume job {job_id}: variant is unknown")
+    try:
+        await load_variant(variant)
+    except FileNotFoundError:
+        raise ValueError(
+            f"cannot {action} job {job_id}: experiment '{variant}' no longer exists "
+            "locally (renamed or deleted since this job ran). Submit a new job for "
+            "the current experiment from the Submit page instead."
+        )
 
     phase = _original_phase(det.phase)
     if phase not in ("train", "eval"):
@@ -89,7 +119,7 @@ async def _resubmit_slurm_job(
                 train_max_steps=int_meta("train_max_steps"),
                 train_save_steps=int_meta("train_save_steps"),
                 train_action_horizon=int_meta("train_action_horizon"),
-                job_name=None if retrying else job_name,
+                job_name=_retry_job_name(job_name) if retrying else job_name,
                 output_namespace=(meta.get("output_namespace") or "").strip() or None,
                 resume=not retrying,
                 resume_of=job_id,
@@ -135,7 +165,7 @@ async def _resubmit_slurm_job(
             eval_sets=eval_sets,
             checkpoint_path=checkpoint,
             seed_eval_results_from=seed_eval_dirs,
-            job_name=None if retrying else job_name,
+            job_name=_retry_job_name(job_name) if retrying else job_name,
             output_namespace=(meta.get("output_namespace") or "").strip() or None,
             resume_of=job_id,
             resubmit_action=action,

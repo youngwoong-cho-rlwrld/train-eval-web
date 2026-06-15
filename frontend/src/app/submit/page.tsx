@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import {
   keepPreviousData,
   useMutation,
@@ -161,6 +161,8 @@ export default function SubmitPage() {
 
   const [cluster, setCluster] = useState<string>("kakao");
   const [variantName, setVariantName] = useState<string>("");
+  const [variantFilter, setVariantFilter] = useState("");
+  const variantFilterRef = useRef<HTMLInputElement>(null);
   const [phase, setPhase] = useState<Phase>("train");
   const [partition, setPartition] = useState<string>("");
   const mlxpSettings = useQuery({
@@ -169,6 +171,7 @@ export default function SubmitPage() {
   });
   // Persisted across sessions + synced across pages via useMyMlxpNode.
   const [mlxpNode, setMlxpNode] = useMyMlxpNode(mlxpSettings.data?.default_node ?? "");
+  const [mlxpJobClass, setMlxpJobClass] = useState<"dedicated" | "normal" | "background">("normal");
   const [extraArgs, setExtraArgs] = useState<string>("");
   const [evalOverwriteResults, setEvalOverwriteResults] = useState<boolean>(false);
   const [evalConfigEdit, setEvalConfigEdit] = useState<EvalConfigEdit | null>(null);
@@ -221,6 +224,12 @@ export default function SubmitPage() {
     queryFn: () =>
       api<{ variants: string[] }>("/api/variants").then((d) => d.variants),
   });
+  // Substring filter for the experiment dropdown. The selected experiment
+  // always stays in the list so the trigger label keeps rendering while open.
+  const variantFilterNeedle = variantFilter.trim().toLowerCase();
+  const filteredVariantNames = (variantNames.data ?? []).filter(
+    (v) => v === variantName || v.toLowerCase().includes(variantFilterNeedle),
+  );
   const variant = useQuery({
     queryKey: ["variant", variantName],
     queryFn: () =>
@@ -526,7 +535,8 @@ export default function SubmitPage() {
       phase: phase,
       train_note: submittedTrainNote,
       partition: isSlurm ? selectedPartitionName : null,
-      node: isSlurm ? null : mlxpNode,
+      node: isSlurm || mlxpJobClass !== "dedicated" ? null : mlxpNode,
+      job_class: isSlurm ? null : mlxpJobClass,
       dataset_override: resolveDatasetOverride({
         touched: datasetTouched,
         variant: variant.data,
@@ -716,7 +726,7 @@ export default function SubmitPage() {
   const canSubmit =
     !!variantName &&
     trainNoteValid &&
-    (isSlurm ? !!selectedPartitionName : !!mlxpNode) &&
+    (isSlurm ? !!selectedPartitionName : mlxpJobClass !== "dedicated" || !!mlxpNode) &&
     (!wantsCheckpoint ||
       (!!trimmedCkpt &&
         checkpointExistsValue !== false &&
@@ -1038,7 +1048,9 @@ export default function SubmitPage() {
       ? "Submitting..."
       : isSlurm
         ? `Submit ${phase} -> ${cluster}/${selectedPartitionName || "?"}`
-        : `Submit ${phase} -> mlxp/${mlxpNode}/${trainNumGpus || "?"}x${selectedMlxpGpuType}`;
+        : mlxpJobClass === "dedicated"
+          ? `Submit ${phase} -> mlxp/${mlxpNode}/${trainNumGpus || "?"}x${selectedMlxpGpuType}`
+          : `Submit ${phase} -> mlxp/${mlxpJobClass} queue/${trainNumGpus || "?"}x${selectedMlxpGpuType}`;
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8 lg:py-12">
@@ -1079,16 +1091,47 @@ export default function SubmitPage() {
               </Field>
 
               <Field label="Experiment">
-                <Select value={variantName} onValueChange={changeVariantName}>
+                <Select
+                  value={variantName}
+                  onValueChange={changeVariantName}
+                  onOpenChange={(open) => {
+                    if (!open) {
+                      setVariantFilter("");
+                      return;
+                    }
+                    // Radix focuses the selected item right after open; queue
+                    // our focus behind that so the filter box wins.
+                    setTimeout(() => variantFilterRef.current?.focus(), 0);
+                  }}
+                >
                   <SelectTrigger>
                     <SelectValue placeholder="select an experiment..." />
                   </SelectTrigger>
                   <SelectContent>
-                    {variantNames.data?.map((v) => (
+                    <div className="pb-1">
+                      <Input
+                        ref={variantFilterRef}
+                        value={variantFilter}
+                        onChange={(e) => setVariantFilter(e.target.value)}
+                        onKeyDown={(e) => {
+                          // Type in the box instead of triggering the Select's
+                          // item typeahead; still let Escape close the menu.
+                          if (e.key !== "Escape") e.stopPropagation();
+                        }}
+                        placeholder="filter experiments..."
+                        className="h-8 border-0 font-mono text-xs shadow-none focus-visible:ring-0"
+                      />
+                    </div>
+                    {filteredVariantNames.map((v) => (
                       <SelectItem key={v} value={v}>
                         {v}
                       </SelectItem>
                     ))}
+                    {filteredVariantNames.length === 0 && (
+                      <div className="px-3 py-2 text-sm text-slate-500">
+                        no experiments match
+                      </div>
+                    )}
                   </SelectContent>
                 </Select>
                 {variantNames.isLoading && <LoadingState label="Loading experiments..." rows={1} />}
@@ -1143,6 +1186,39 @@ export default function SubmitPage() {
                   {partitions.error && <ErrorState message={(partitions.error as Error).message} />}
                 </Field>
               ) : (
+                <>
+                  <Field label="Job class">
+                    <Select
+                      value={mlxpJobClass}
+                      onValueChange={(v) =>
+                        setMlxpJobClass(v as "dedicated" | "normal" | "background")
+                      }
+                    >
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="dedicated">dedicated</SelectItem>
+                        <SelectItem value="normal">normal</SelectItem>
+                        <SelectItem value="background">background</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <p className="text-xs text-slate-500">
+                      {mlxpJobClass === "dedicated" ? (
+                        <>
+                          Pins the selected node with top priority (hostname{" "}
+                          <code>In</code> affinity + <code>mlxp/job-class</code> label).
+                        </>
+                      ) : (
+                        <>
+                          Queue job: placed on any free GPU in the zone. May be
+                          suspended for higher classes and auto-resumes (~5 min
+                          cycle); training continues from the latest checkpoint.
+                        </>
+                      )}
+                    </p>
+                  </Field>
+                  {mlxpJobClass === "dedicated" && (
                 <Field label="Node">
                   <Select value={mlxpNode} onValueChange={setMlxpNode}>
                     <SelectTrigger>
@@ -1170,6 +1246,8 @@ export default function SubmitPage() {
                     Your selection is saved locally for next time.
                   </p>
                 </Field>
+                  )}
+                </>
               )}
 
               <JobNameField
@@ -1308,11 +1386,11 @@ export default function SubmitPage() {
           )}
           {!isSlurm && (
             mlxp.data ? (
-              <MlxpCard nodes={mlxp.data} yoursNode={mlxpNode} />
+              <MlxpCard nodes={mlxp.data} />
             ) : (
               <AsideStatusCard
                 title="MLXP (Naver, k8s)"
-                description={`your node: ${mlxpNode || "-"}`}
+                description="GPU availability"
                 loading={mlxp.isLoading}
                 error={mlxp.error as Error | null}
               />

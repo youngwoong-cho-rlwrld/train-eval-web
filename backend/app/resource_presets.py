@@ -27,13 +27,6 @@ _SKT_L40S_GPU_TRAIN: dict[int, SlurmResources] = {
     4: SlurmResources(cpus_per_task=44, memory="350G"),
 }
 
-_KAKAO_RLWRLD_TRAIN: dict[int, SlurmResources] = {
-    1: SlurmResources(cpus_per_task=16, memory="180G"),
-    2: SlurmResources(cpus_per_task=32, memory="360G"),
-    4: SlurmResources(cpus_per_task=64, memory="720G"),
-    8: SlurmResources(cpus_per_task=120, memory="1300G"),
-}
-
 _SLURM_TRAIN_FALLBACK = SlurmResources(cpus_per_task=16, memory="180G")
 _SLURM_EVAL_DEFAULT = SlurmResources(cpus_per_task=4, memory="40G")
 
@@ -44,16 +37,24 @@ def slurm_resources_for(
     partition: str,
     phase: Literal["train", "eval"],
     num_gpus: int,
-) -> SlurmResources:
+) -> SlurmResources | None:
+    """Resource request for the sbatch command, or None to send no flags.
+
+    kakao's slurmctld rejects an explicit --cpus-per-task ("파티션 기본값
+    (DefCpuPerGPU)이 자동 적용됩니다") and derives CPU/memory from the
+    partition's per-GPU defaults, so kakao submissions must not carry
+    resource flags at all.
+    """
+    cluster_key = cluster.strip().lower()
+    if cluster_key == "kakao":
+        return None
+
     if phase == "eval":
         return _SLURM_EVAL_DEFAULT
 
-    cluster_key = cluster.strip().lower()
     partition_key = partition.strip().lower()
     if cluster_key == "skt" and partition_key == "rlwrld-gpu":
         return _SKT_RLWRLD_GPU_TRAIN.get(num_gpus, _SLURM_TRAIN_FALLBACK)
     if cluster_key == "skt" and partition_key == "l40s-gpu":
         return _SKT_L40S_GPU_TRAIN.get(num_gpus, _SLURM_TRAIN_FALLBACK)
-    if cluster_key == "kakao" and partition_key == "rlwrld":
-        return _KAKAO_RLWRLD_TRAIN.get(num_gpus, _SLURM_TRAIN_FALLBACK)
     return _SLURM_TRAIN_FALLBACK

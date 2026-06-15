@@ -38,7 +38,7 @@ def _path_leaf(path: str | None) -> str | None:
     return path.rstrip("/").rsplit("/", 1)[-1] or None
 
 
-def _state_from_pod_and_job(job_status: dict, pod: dict | None) -> str:
+def _state_from_pod_and_job(job_status: dict, pod: dict | None, *, suspended: bool = False) -> str:
     """Derive a slurm-like state. Pod phase is authoritative when a pod
     exists: k8s Job's `status.active` counts both Pending and Running pods,
     so it shows 1 even when the pod is unscheduled — bad for the UI.
@@ -60,6 +60,10 @@ def _state_from_pod_and_job(job_status: dict, pod: dict | None) -> str:
         return "COMPLETED"
     if failed > 0:
         return "FAILED"
+    if suspended:
+        # Queue job yielded to a higher class (or awaiting admission); the
+        # scheduler auto-resumes it when capacity frees up.
+        return "SUSPENDED"
     return "PENDING"
 
 
@@ -210,7 +214,9 @@ async def _list_live_jobs() -> tuple[list[Job], set[str]]:
             phase, variant = parse_phase_and_variant(job_name)
         status = j.get("status", {}) or {}
         pod = pods_by_job.get(job_id)
-        state = _state_from_pod_and_job(status, pod)
+        state = _state_from_pod_and_job(
+            status, pod, suspended=bool((j.get("spec") or {}).get("suspend")),
+        )
         start = _actual_pod_start(state, pod, status)
         end = to_kst_iso(_end_time(status, pod))
         elapsed = _elapsed(start, end)
@@ -562,7 +568,11 @@ async def get_job(name: str) -> dict[str, Any]:
     template_spec = (((job_data.get("spec") or {}).get("template") or {}).get("spec") or {})
     node = pod_spec.get("nodeName", "") or ""
     gpu_count = requested_gpus(pod_spec) or requested_gpus(template_spec)
-    state = _state_from_pod_and_job(status, pod if pods else None)
+    state = _state_from_pod_and_job(
+        status,
+        pod if pods else None,
+        suspended=bool((job_data.get("spec") or {}).get("suspend")),
+    )
     start = _actual_pod_start(state, pod if pods else None, status) or ""
     end = to_kst_iso(_end_time(status, pod if pods else None)) or ""
 

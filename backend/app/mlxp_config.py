@@ -29,7 +29,7 @@ def _defaults_for(user: str | None = None) -> dict[str, Any]:
         "namespace": "p-rlwrld",
         "owner_label": u,
         "tool_label": "train-eval-web",
-        "default_node": "h200-03-w-3c55",
+        "default_node": "",
         "gpu_node_prefix": "h200-",
         "gpu_type": "H200",
         "gpus_per_node": 8,
@@ -54,7 +54,9 @@ class MlxpSettings(BaseModel):
     namespace: str = Field(min_length=1)
     owner_label: str = Field(min_length=1)
     tool_label: str = Field(min_length=1)
-    default_node: str = Field(min_length=1)
+    # Optional legacy pin; queue-class scheduling made a per-user default
+    # node obsolete. Kept for back-compat with saved TRAIN_EVAL_MLXP_NODE.
+    default_node: str = ""
     gpu_node_prefix: str = ""
     gpu_type: str = "GPU"
     gpus_per_node: int = Field(default=8, ge=1)

@@ -31,15 +31,8 @@ spec:
   - name: ddn
     persistentVolumeClaim:
       claimName: {settings.ddn_pvc}
-  affinity:
-    nodeAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        nodeSelectorTerms:
-        - matchExpressions:
-          - key: kubernetes.io/hostname
-            operator: In
-            values:
-            - {settings.default_node}
+  nodeSelector:
+    mlx.navercorp.com/zone: {settings.zone}
   containers:
   - name: main
     image: {settings.image}

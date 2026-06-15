@@ -6,9 +6,7 @@ import { useIsFetching, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type GpuQueueSnapshot, type MlxpNode, type Partition } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { RefreshButton } from "@/components/refresh-button";
-import { useMyMlxpNode } from "@/hooks/use-my-mlxp-node";
 import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state";
 import { GpuQueueTooltipContent } from "@/components/gpu-queue-visualization";
 import { cn } from "@/lib/utils";
@@ -186,8 +184,6 @@ function MlxpPanel() {
     retry: false,
   });
   const nodes = q.data ?? [];
-  // Same source of truth as the /submit page's Node picker.
-  const [yoursNode, setYoursNode] = useMyMlxpNode();
   const available = nodes.reduce((s, n) => s + n.gpu_free, 0);
   const total = nodes.reduce((s, n) => s + n.gpu_total, 0);
   const queued = nodes.reduce((s, n) => s + n.queued_gpus, 0);
@@ -205,25 +201,6 @@ function MlxpPanel() {
             <span className="text-slate-400"> GPU queued</span>
           </span>
         </div>
-        <CardDescription className="flex items-center gap-2">
-          <span>your node:</span>
-          <Select value={yoursNode} onValueChange={setYoursNode}>
-            <SelectTrigger className="h-7 w-auto min-w-[200px] gap-1 px-2 text-xs">
-              <SelectValue placeholder="select…" />
-            </SelectTrigger>
-            <SelectContent>
-              {nodes.map((n) => (
-                <SelectItem key={n.name} value={n.name}>
-                  <span className="font-mono">{n.name}</span>
-                  <span className={`ml-2 text-[10px] ${n.gpu_free > 0 ? "text-green-600 dark:text-green-400" : "text-slate-500"}`}>
-                    {n.gpu_free}/{n.gpu_total} available
-                  </span>
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <span className="text-slate-400">(persists across sessions + syncs with the Submit page)</span>
-        </CardDescription>
       </CardHeader>
       <CardContent>
         {q.isLoading && <LoadingState label="Loading MLXP GPUs..." rows={3} />}
@@ -251,7 +228,6 @@ function MlxpPanel() {
                   >
                     <td className="py-2 pr-4 font-mono text-xs">
                       {n.name}
-                      {n.name === yoursNode && <Badge variant="default" className="ml-1 text-[10px]">yours</Badge>}
                     </td>
                     <td className="py-2 pr-4 font-mono text-xs">
                       <span className={n.gpu_free > 0 ? "text-green-600 dark:text-green-400" : "text-slate-500"}>

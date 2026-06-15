@@ -485,6 +485,7 @@ async def post_submit(req: submit.SubmitRequest):
                 action_horizon=req.train_action_horizon if req.phase == "train" else None,
                 train_git_commit=req.train_git_commit,
                 node=req.node,
+                job_class=req.job_class or "normal",
                 dataset_override=req.dataset_override,
                 extra_args=req.extra_args,
                 eval_num_envs_per_gpu=req.eval_num_envs_per_gpu or req.eval_parallel_sims_per_gpu,

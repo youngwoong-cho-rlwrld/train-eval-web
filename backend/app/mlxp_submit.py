@@ -151,8 +151,12 @@ class MlxpSubmitRequest(BaseModel):
     action_horizon: int | None = Field(default=None, ge=1)
     train_git_commit: str | None = None
     # The k8s node to pin via nodeAffinity. Leave None to fall back to the
-    # configured default node.
+    # configured default node. Only used for job_class=dedicated.
     node: str | None = None
+    # MLXP scheduling class (metadata.labels."mlxp/job-class"). dedicated pins
+    # the node via hostname-In affinity and keeps priority on it; normal and
+    # background go to the queue (no node pinning, preemptible + auto-resume).
+    job_class: Literal["dedicated", "normal", "background"] = "normal"
     dataset_override: str | list[str] | None = None
     extra_args: list[str] = Field(default_factory=list)
     wandb_secret: str | None = None
@@ -249,7 +253,13 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
         requested_commit=req.train_git_commit,
     )
 
-    node = req.node or settings.default_node
+    if req.job_class == "dedicated":
+        node = req.node or settings.default_node
+        if not (node or "").strip():
+            raise ValueError("job_class=dedicated requires a node (request or settings default)")
+    else:
+        # Queue classes leave placement to the MLXP scheduler — never pin.
+        node = ""
     if req.phase == "eval":
         snapshot = _build_eval_snapshot_payload(
             variant=variant,
@@ -289,6 +299,7 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
         mem,
         req.wandb_secret or settings.wandb_secret,
         node,
+        req.job_class,
         _job_comment(req, variant, snapshot),
         train_note,
         settings,
@@ -1139,15 +1150,37 @@ def _job_comment(req: MlxpSubmitRequest, variant, snapshot: dict) -> str:
 
 
 def _render_job_yaml(job_id: str, job_name: str, body: str, num_gpus: int, cpu: str, mem: str,
-                     wandb_secret: str, node: str, comment: str, train_note: str,
+                     wandb_secret: str, node: str, job_class: str, comment: str, train_note: str,
                      settings: MlxpSettings) -> dict:
+    # Per the MLXP guideline: dedicated requires the job-class label AND a
+    # hostname-In affinity; queue classes (normal/background) must not pin a
+    # node and instead constrain to the team zone via nodeSelector.
+    if job_class == "dedicated":
+        placement: dict = {
+            "affinity": {
+                "nodeAffinity": {
+                    "requiredDuringSchedulingIgnoredDuringExecution": {
+                        "nodeSelectorTerms": [{
+                            "matchExpressions": [{
+                                "key": "kubernetes.io/hostname",
+                                "operator": "In",
+                                "values": [node],
+                            }],
+                        }],
+                    },
+                },
+            },
+        }
+    else:
+        placement = {"nodeSelector": {"mlx.navercorp.com/zone": settings.zone}}
+    job_labels = {**labels(settings), "mlxp/job-class": job_class}
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
         "metadata": {
             "name": job_id,
             "namespace": settings.namespace,
-            "labels": labels(settings),
+            "labels": job_labels,
             # display-name carries the human-readable {phase}_{variant}_{ts}
             # with underscores — invalid in k8s resource names but fine here.
             # comment mirrors slurm's sacct Comment field so the details page
@@ -1164,7 +1197,7 @@ def _render_job_yaml(job_id: str, job_name: str, body: str, num_gpus: int, cpu: 
             "backoffLimit": 0,
             "template": {
                 "metadata": {
-                    "labels": labels(settings),
+                    "labels": job_labels,
                     "annotations": {
                         "mlx.navercorp.com/zone": settings.zone,
                         "sidecar.istio.io/inject": "false",
@@ -1177,19 +1210,7 @@ def _render_job_yaml(job_id: str, job_name: str, body: str, num_gpus: int, cpu: 
                         {"name": "ddn", "persistentVolumeClaim": {"claimName": settings.ddn_pvc}},
                         {"name": "dshm", "emptyDir": {"medium": "Memory", "sizeLimit": "256Gi"}},
                     ],
-                    "affinity": {
-                        "nodeAffinity": {
-                            "requiredDuringSchedulingIgnoredDuringExecution": {
-                                "nodeSelectorTerms": [{
-                                    "matchExpressions": [{
-                                        "key": "kubernetes.io/hostname",
-                                        "operator": "In",
-                                        "values": [node],
-                                    }],
-                                }],
-                            },
-                        },
-                    },
+                    **placement,
                     "containers": [{
                         "name": "main",
                         "image": settings.image,

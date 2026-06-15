@@ -69,6 +69,8 @@ class SubmitRequest(BaseModel):
     # member is assigned a specific GPU node in the GPU Resource Schedule
     # sheet). None falls back to the saved MLXP settings default.
     node: str | None = None
+    # MLXP-only: scheduling class (mlxp/job-class label). None → dedicated.
+    job_class: Literal["dedicated", "normal", "background"] | None = None
     # Per-submit dataset override. Two shapes accepted:
     #   - single string  → replaces DATASET_NAME in single-task variants
     #   - list of "name|cfg|weight" entries → replaces DATASETS array
@@ -654,8 +656,14 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         f"--partition={shlex.quote(partition)}",
         "--nodes=1",
         f"--gpus-per-node={shlex.quote(gpus)}",
-        f"--cpus-per-task={slurm_resources.cpus_per_task}",
-        f"--mem={shlex.quote(slurm_resources.memory)}",
+        *(
+            [
+                f"--cpus-per-task={slurm_resources.cpus_per_task}",
+                f"--mem={shlex.quote(slurm_resources.memory)}",
+            ]
+            if slurm_resources is not None
+            else []
+        ),
         f"--time={shlex.quote(walltime)}",
         f"--output={log_dir}/{job_name}_%j.out",
         f"--error={log_dir}/{job_name}_%j.err",

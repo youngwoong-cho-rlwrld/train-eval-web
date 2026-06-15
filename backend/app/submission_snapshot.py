@@ -561,23 +561,7 @@ async def _mlxp_git_run_with_pod(cmd: str, timeout: float) -> tuple[int, str, st
                     "persistentVolumeClaim": {"claimName": settings.ddn_pvc},
                 }
             ],
-            "affinity": {
-                "nodeAffinity": {
-                    "requiredDuringSchedulingIgnoredDuringExecution": {
-                        "nodeSelectorTerms": [
-                            {
-                                "matchExpressions": [
-                                    {
-                                        "key": "kubernetes.io/hostname",
-                                        "operator": "In",
-                                        "values": [settings.default_node],
-                                    }
-                                ]
-                            }
-                        ]
-                    }
-                }
-            },
+            "nodeSelector": {"mlx.navercorp.com/zone": settings.zone},
             "containers": [
                 {
                     "name": "main",
