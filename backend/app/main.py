@@ -1,6 +1,7 @@
 """FastAPI entrypoint."""
 
 import asyncio
+import os
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,9 +37,17 @@ from .wandb_config import get_project as wandb_project
 
 
 app = FastAPI(title="train-eval-web")
+# Browser origins allowed to call the API. Defaults to the local dev frontend;
+# override with TRAIN_EVAL_CORS_ORIGINS (comma-separated) when the frontend is
+# served from another host, e.g. a remote deployment at http://<host>:3000.
+_cors_origins = [
+    o.strip()
+    for o in os.environ.get("TRAIN_EVAL_CORS_ORIGINS", "http://localhost:3000").split(",")
+    if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
