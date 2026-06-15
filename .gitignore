@@ -1,7 +1,9 @@
+# Python bytecode (backend, scripts, anywhere)
+__pycache__/
+*.pyc
+
 # Backend
 backend/.venv/
-backend/__pycache__/
-backend/**/__pycache__/
 backend/*.db
 backend/.env
 
