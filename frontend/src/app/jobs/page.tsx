@@ -368,7 +368,7 @@ function JobTable({
                     <CopyButton value={j.job_id} title="Copy job ID" />
                   </div>
                   {j.resume_of && (
-                    <span className="ml-1 block whitespace-nowrap text-xs text-slate-500">
+                    <span className="ml-1 block max-w-[26ch] text-xs text-slate-500">
                       ({resubmitSourceLabel(j.resubmit_action)}{" "}
                       <JobIdLink
                         cluster={j.cluster}
