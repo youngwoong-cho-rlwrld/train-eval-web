@@ -3,7 +3,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import { keepPreviousData, useIsFetching, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertCircle, Check, ChevronDown, ChevronRight, CircleHelp, Copy, Database, ExternalLink } from "lucide-react";
+import { AlertCircle, Check, ChevronDown, ChevronRight, CircleHelp, Copy, Database, ExternalLink, Table2 } from "lucide-react";
 import { toast } from "sonner";
 import { api, type ResultCell, type ResultsResponse, type ResultTask, type ResultVariant } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
@@ -24,6 +24,18 @@ import { formatPct } from "@/lib/format";
 const REFRESH_MS = 120_000;
 const AVERAGE_HELP =
   "Ave is total successes divided by total episodes across all displayed eval sets for this task. It is computed from per-run eval_results/**/run_*/results.json files, not the top-level aggregate results.json.";
+
+// The standalone results-sheet-viewer runs on :3001 alongside this app, so
+// default to the same host on that port (works on localhost and the deployed
+// tailnet host alike). Override with NEXT_PUBLIC_RESULTS_VIEWER_URL.
+function resultsViewerUrl(): string {
+  const override = process.env.NEXT_PUBLIC_RESULTS_VIEWER_URL;
+  if (override) return override;
+  if (typeof window !== "undefined") {
+    return `${window.location.protocol}//${window.location.hostname}:3001`;
+  }
+  return "http://localhost:3001";
+}
 
 export default function ResultsPage() {
   const qc = useQueryClient();
@@ -131,6 +143,16 @@ export default function ResultsPage() {
               ))}
             </SelectContent>
           </Select>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-8 gap-1.5"
+            onClick={() => window.open(resultsViewerUrl(), "_blank", "noopener,noreferrer")}
+          >
+            <Table2 className="h-4 w-4" />
+            Table View
+          </Button>
           <RefreshButton isFetching={isFetching} onRefresh={refresh} intervalMs={REFRESH_MS} />
         </div>
       </div>
