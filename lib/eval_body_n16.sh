@@ -191,7 +191,11 @@ if ! [[ "$EVAL_SIM_START_STAGGER_SECONDS" =~ ^[0-9]+$ ]]; then
     exit 1
 fi
 if [ -z "${EVAL_SERVER_READY_TIMEOUT_SECONDS:-}" ]; then
-    EVAL_SERVER_READY_TIMEOUT_SECONDS=$((240 + EVAL_PARALLEL_WORKERS * EVAL_SIM_START_STAGGER_SECONDS))
+    # Cold Isaac kit/shader caches on freshly provisioned nodes (skt dy-*)
+    # routinely push server startup past 280s, especially when several jobs
+    # cold-start against the shared filesystem at once. Crashed servers are
+    # detected separately, so a generous deadline only delays true hangs.
+    EVAL_SERVER_READY_TIMEOUT_SECONDS=$((900 + EVAL_PARALLEL_WORKERS * EVAL_SIM_START_STAGGER_SECONDS))
 fi
 if ! [[ "$EVAL_SERVER_READY_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || [ "$EVAL_SERVER_READY_TIMEOUT_SECONDS" -lt 1 ]; then
     log "ERROR: EVAL_SERVER_READY_TIMEOUT_SECONDS must be a positive integer, got '$EVAL_SERVER_READY_TIMEOUT_SECONDS'"
