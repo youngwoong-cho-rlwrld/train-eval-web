@@ -20,6 +20,7 @@ import { isActiveJobState } from "@/lib/job-status";
 import { Th } from "@/components/table";
 import { jobDetailHref } from "@/lib/job-links";
 import { formatPct } from "@/lib/format";
+import { copyRich } from "@/lib/clipboard";
 
 const REFRESH_MS = 120_000;
 const AVERAGE_HELP =
@@ -537,18 +538,8 @@ function CopyResultTableButton({
 
 async function writeResultTableToClipboard(variant: ResultVariant, evalSets: string[]) {
   const tsv = resultTableTsv(variant, evalSets);
-  if (!("ClipboardItem" in window) || !navigator.clipboard.write) {
-    await navigator.clipboard.writeText(tsv);
-    return;
-  }
-
   const html = resultTableHtml(variant, evalSets);
-  await navigator.clipboard.write([
-    new ClipboardItem({
-      "text/html": new Blob([html], { type: "text/html" }),
-      "text/plain": new Blob([tsv], { type: "text/plain" }),
-    }),
-  ]);
+  await copyRich(html, tsv);
 }
 
 function ResultRow({ task, evalSets }: { task: ResultTask; evalSets: string[] }) {

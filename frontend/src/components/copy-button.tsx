@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { Check, Copy } from "lucide-react";
 import { ImmediateTooltip } from "@/components/immediate-tooltip";
+import { copyText } from "@/lib/clipboard";
 
 export function CopyButton({ value, title = "Copy" }: { value: string; title?: string }) {
   const [copied, setCopied] = useState(false);
@@ -10,12 +11,16 @@ export function CopyButton({ value, title = "Copy" }: { value: string; title?: s
     <ImmediateTooltip content={title}>
       <button
         aria-label={title}
-        onClick={(e) => {
+        onClick={async (e) => {
           e.preventDefault();
           e.stopPropagation();
-          navigator.clipboard.writeText(value);
-          setCopied(true);
-          setTimeout(() => setCopied(false), 1500);
+          try {
+            await copyText(value);
+            setCopied(true);
+            setTimeout(() => setCopied(false), 1500);
+          } catch {
+            // clipboard unavailable; leave the icon unchanged
+          }
         }}
         className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-slate-800"
       >
