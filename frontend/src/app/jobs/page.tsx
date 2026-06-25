@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { Loader2 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { keepPreviousData, useIsFetching, useQueries, useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
 import { api, type Job, type JobProgress, type Progress } from "@/lib/api";
@@ -261,6 +262,12 @@ export default function JobsPage() {
             >
               Apply
             </Button>
+            {recentMerged.probing.length > 0 && (
+              <span className="flex h-8 items-center gap-1.5 text-xs text-slate-400">
+                <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-slate-400" />
+                loading {recentMerged.probing.join(", ")}…
+              </span>
+            )}
           </div>
           {recentMerged.initialLoading && <LoadingState label="Loading recent jobs..." rows={4} />}
           {recentMerged.errors.map((e) => (
@@ -273,9 +280,6 @@ export default function JobsPage() {
             <EmptyState message="No jobs match these filters." />
           )}
           {filteredFinished.length > 0 && <JobTable rows={filteredFinished} />}
-          {!recentMerged.initialLoading && recentMerged.probing.length > 0 && (
-            <p className="mt-2 text-xs text-slate-400">loading {recentMerged.probing.join(", ")}…</p>
-          )}
         </CardContent>
       </Card>
     </div>
