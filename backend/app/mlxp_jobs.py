@@ -146,7 +146,16 @@ async def list_jobs(
     live, seen = await _list_live_jobs()
     if active_only:
         return [j for j in live if _is_active_state(j.state)]
-    archived = await _list_archived_jobs(seen=seen)
+    # Date-bound the (expensive) DDN archived scan: only walk runs whose
+    # artifact mtime is at/after the window start, minus a 1-day margin. That
+    # mtime is exactly what _job_in_range filters on, so this can't drop an
+    # in-window run while turning a ~60s full walk into a ~3s pruned one.
+    since_epoch: int | None = None
+    if start:
+        st = _time_bound(start)
+        if st is not None:
+            since_epoch = int(st) - 86400
+    archived = await _list_archived_jobs(seen=seen, since_epoch=since_epoch)
     rows = live + archived
     if not start and not end:
         return rows
@@ -262,10 +271,10 @@ def _pending_queue_positions(pods_by_job: dict[str, dict]) -> dict[str, int]:
     return positions
 
 
-async def _list_archived_jobs(seen: set[str]) -> list[Job]:
+async def _list_archived_jobs(seen: set[str], since_epoch: int | None = None) -> list[Job]:
     """Scan DDN for completed runs whose k8s Job has been GC'd."""
     out: list[Job] = []
-    for run in await _list_archived_runs():
+    for run in await _list_archived_runs(since_epoch):
         identities = {run["job_id"], run["job_name"], run["output_namespace"]}
         if identities & seen:
             continue
@@ -285,7 +294,7 @@ async def _list_archived_jobs(seen: set[str]) -> list[Job]:
     return out
 
 
-async def _list_archived_runs() -> list[dict[str, str]]:
+async def _list_archived_runs(since_epoch: int | None = None) -> list[dict[str, str]]:
     from .mlxp_data_pod import ensure_listing_pod
 
     try:
@@ -296,7 +305,7 @@ async def _list_archived_runs() -> list[dict[str, str]]:
     out: list[dict[str, str]] = []
     metas, artifacts, copies = await asyncio.gather(
         _archived_metadata_records(pod),
-        _archived_artifact_index(pod),
+        _archived_artifact_index(pod, since_epoch),
         _copy_history_index(pod),
     )
 
@@ -434,12 +443,19 @@ done
     return records
 
 
-async def _archived_artifact_index(pod: str) -> dict[str, dict[str, Any]]:
+async def _archived_artifact_index(pod: str, since_epoch: int | None = None) -> dict[str, dict[str, Any]]:
     settings = get_settings()
     experiments_root = shlex.quote(settings.experiments_dir)
+    # The per-dir body costs several NFS round-trips, so it dominates the walk
+    # (~60s over all runs). When a window start is known we list only checkpoint
+    # dirs modified at/after it via `find -newermt` and run the body on those;
+    # otherwise we fall back to the full glob. The body itself is unchanged.
     script = r"""
+SINCE_EPOCH='__SINCE_EPOCH__'
 shopt -s nullglob
-for d in __EXPERIMENTS_ROOT__/*/checkpoints/ __EXPERIMENTS_ROOT__/*/checkpoints/*/ __EXPERIMENTS_ROOT__/*/checkpoints/*/*/; do
+emit() {
+    local d="$1" output_namespace rel variant latest has_checkpoint end_path has_final start_epoch end_epoch
+    local matches
     output_namespace=$(basename "$d")
     rel="${d#__EXPERIMENTS_ROOT__/}"
     variant="${rel%%/*}"
@@ -468,13 +484,18 @@ for d in __EXPERIMENTS_ROOT__/*/checkpoints/ __EXPERIMENTS_ROOT__/*/checkpoints/
             end_path="${d}model.safetensors.index.json"
         fi
     fi
-    [ "$has_checkpoint" = 0 ] && [ "$has_final" = 0 ] && continue
+    [ "$has_checkpoint" = 0 ] && [ "$has_final" = 0 ] && return
 
     start_epoch=$(stat -c %Y "$d" 2>/dev/null || echo 0)
     end_epoch=$(stat -c %Y "$end_path" 2>/dev/null || echo "$start_epoch")
     printf '%s|%s|%s|%s|%s|%s\n' "$variant" "$output_namespace" "$has_checkpoint" "$has_final" "$start_epoch" "$end_epoch"
-done
-""".replace("__EXPERIMENTS_ROOT__", experiments_root)
+}
+if [ -n "$SINCE_EPOCH" ]; then
+    while IFS= read -r d; do emit "$d"; done < <(find __EXPERIMENTS_ROOT__ -mindepth 2 -maxdepth 4 -type d \( -name checkpoints -o -path '*/checkpoints/*' \) -newermt "@$SINCE_EPOCH" -printf '%p/\n' 2>/dev/null)
+else
+    for d in __EXPERIMENTS_ROOT__/*/checkpoints/ __EXPERIMENTS_ROOT__/*/checkpoints/*/ __EXPERIMENTS_ROOT__/*/checkpoints/*/*/; do emit "$d"; done
+fi
+""".replace("__EXPERIMENTS_ROOT__", experiments_root).replace("__SINCE_EPOCH__", str(since_epoch) if since_epoch is not None else "")
     try:
         proc = await asyncio.create_subprocess_exec(
             "kubectl", "exec", "-n", settings.namespace, pod, "--", "bash", "-c", script,
