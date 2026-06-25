@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useMemo, useState } from "react";
-import { useIsFetching, useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useIsFetching, useQueries, useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
 import { api, type Job, type JobProgress, type Progress } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -35,6 +35,26 @@ import {
 
 const REFRESH_MS = 60_000;
 
+type ClusterJobError = { cluster: string; error: string };
+
+// Merge per-cluster job queries: jobs as they arrive, initial-loading only
+// until at least one cluster responds, per-cluster errors, and which clusters
+// are still in flight (the MLXP archived scan is slow, so it streams in last).
+function mergeJobQueries(
+  queries: UseQueryResult<Job[]>[],
+  clusterNames: string[],
+  clustersLoading: boolean,
+): { jobs: Job[]; initialLoading: boolean; errors: ClusterJobError[]; probing: string[] } {
+  const jobs = queries.flatMap((q) => q.data ?? []);
+  const anyLoaded = queries.some((q) => q.data !== undefined);
+  const initialLoading = clustersLoading || (clusterNames.length > 0 && !anyLoaded);
+  const errors = clusterNames.flatMap((c, i) =>
+    queries[i]?.error ? [{ cluster: c, error: (queries[i].error as Error).message }] : [],
+  );
+  const probing = clusterNames.filter((_, i) => queries[i]?.isLoading);
+  return { jobs, initialLoading, errors, probing };
+}
+
 export default function JobsPage() {
   const qc = useQueryClient();
   const [draftHistoryRange, setDraftHistoryRange] = useState(() => defaultHistoryRange());
@@ -50,18 +70,35 @@ export default function JobsPage() {
     draftHistoryRange.startDate !== appliedHistoryRange.startDate ||
     draftHistoryRange.endDate !== appliedHistoryRange.endDate;
 
-  const activeJobs = useQuery({
-    queryKey: ["jobs", "active"],
-    queryFn: () =>
-      api<{ jobs: Job[] }>("/api/jobs?hours=0").then((d) => d.jobs),
-    refetchInterval: REFRESH_MS,
+  const clustersQuery = useQuery({
+    queryKey: ["clusters"],
+    queryFn: () => api<{ clusters: string[] }>("/api/clusters").then((d) => d.clusters),
+    staleTime: 5 * 60_000,
   });
-  const recentJobs = useQuery({
-    queryKey: ["jobs", "recent", historyQuery],
-    queryFn: () =>
-      api<{ jobs: Job[] }>(`/api/jobs?${historyQuery}`).then((d) => d.jobs),
-    refetchInterval: REFRESH_MS,
+  const clusterNames = clustersQuery.data ?? [];
+
+  // One query per cluster so the slow MLXP archived-runs scan can't block the
+  // fast slurm clusters; each section renders as clusters respond.
+  const activeQueries = useQueries({
+    queries: clusterNames.map((c) => ({
+      queryKey: ["jobs", "active", c],
+      queryFn: () =>
+        api<{ jobs: Job[] }>(`/api/jobs?cluster=${encodeURIComponent(c)}&hours=0`).then((d) => d.jobs),
+      refetchInterval: REFRESH_MS,
+      placeholderData: keepPreviousData,
+    })),
   });
+  const recentQueries = useQueries({
+    queries: clusterNames.map((c) => ({
+      queryKey: ["jobs", "recent", c, historyQuery],
+      queryFn: () =>
+        api<{ jobs: Job[] }>(`/api/jobs?cluster=${encodeURIComponent(c)}&${historyQuery}`).then((d) => d.jobs),
+      refetchInterval: REFRESH_MS,
+      placeholderData: keepPreviousData,
+    })),
+  });
+  const activeMerged = mergeJobQueries(activeQueries, clusterNames, clustersQuery.isLoading);
+  const recentMerged = mergeJobQueries(recentQueries, clusterNames, clustersQuery.isLoading);
 
   const refreshAll = () => {
     qc.invalidateQueries({ queryKey: ["jobs"] });
@@ -78,15 +115,15 @@ export default function JobsPage() {
     }) > 0;
 
   const active = useMemo(() => {
-    return (activeJobs.data ?? [])
+    return activeMerged.jobs
       .filter((j) => isActiveJobState(j.state))
       .sort((a, b) => compareActiveDesc(a, b));
-  }, [activeJobs.data]);
+  }, [activeMerged.jobs]);
   const finished = useMemo(() => {
-    return (recentJobs.data ?? [])
+    return recentMerged.jobs
       .filter((j) => !isActiveJobState(j.state))
       .sort((a, b) => compareEndedDesc(a, b));
-  }, [recentJobs.data]);
+  }, [recentMerged.jobs]);
   const recentStateOptions = useMemo(() => {
     const values = new Set(finished.map((j) => normalizeStateFilterValue(j.state)));
     return Array.from(values).sort();
@@ -120,12 +157,17 @@ export default function JobsPage() {
           <CardDescription>{active.length} {active.length === 1 ? "job" : "jobs"} in queue or running.</CardDescription>
         </CardHeader>
         <CardContent>
-          {activeJobs.isLoading && <LoadingState label="Loading active jobs..." rows={4} />}
-          {activeJobs.error && <ErrorState message={(activeJobs.error as Error).message} />}
-          {!activeJobs.isLoading && !activeJobs.error && active.length === 0 && (
+          {activeMerged.initialLoading && <LoadingState label="Loading active jobs..." rows={4} />}
+          {activeMerged.errors.map((e) => (
+            <ErrorState key={`active-${e.cluster}`} message={`${e.cluster}: ${e.error}`} />
+          ))}
+          {!activeMerged.initialLoading && activeMerged.probing.length === 0 && active.length === 0 && (
             <EmptyState message="No active jobs." />
           )}
           {active.length > 0 && <JobTable rows={active} showProgress showActions={false} />}
+          {!activeMerged.initialLoading && activeMerged.probing.length > 0 && (
+            <p className="mt-2 text-xs text-slate-400">loading {activeMerged.probing.join(", ")}…</p>
+          )}
         </CardContent>
       </Card>
 
@@ -220,15 +262,20 @@ export default function JobsPage() {
               Apply
             </Button>
           </div>
-          {recentJobs.isLoading && <LoadingState label="Loading recent jobs..." rows={4} />}
-          {recentJobs.error && <ErrorState message={(recentJobs.error as Error).message} />}
-          {!recentJobs.isLoading && !recentJobs.error && finished.length === 0 && (
+          {recentMerged.initialLoading && <LoadingState label="Loading recent jobs..." rows={4} />}
+          {recentMerged.errors.map((e) => (
+            <ErrorState key={`recent-${e.cluster}`} message={`${e.cluster}: ${e.error}`} />
+          ))}
+          {!recentMerged.initialLoading && recentMerged.probing.length === 0 && finished.length === 0 && (
             <EmptyState message="Nothing in this window." />
           )}
-          {!recentJobs.isLoading && !recentJobs.error && finished.length > 0 && filteredFinished.length === 0 && (
+          {!recentMerged.initialLoading && finished.length > 0 && filteredFinished.length === 0 && (
             <EmptyState message="No jobs match these filters." />
           )}
           {filteredFinished.length > 0 && <JobTable rows={filteredFinished} />}
+          {!recentMerged.initialLoading && recentMerged.probing.length > 0 && (
+            <p className="mt-2 text-xs text-slate-400">loading {recentMerged.probing.join(", ")}…</p>
+          )}
         </CardContent>
       </Card>
     </div>
