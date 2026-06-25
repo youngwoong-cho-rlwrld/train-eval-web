@@ -115,9 +115,6 @@ export default function ResultsPage() {
             <span>{taskCount} tasks</span>
             <span className="text-slate-300 dark:text-slate-700">/</span>
             <span>{evalCellCount} eval-set summaries</span>
-            {anyLoaded && probing.length > 0 && (
-              <span className="text-xs text-slate-400">probing {probing.join(", ")}…</span>
-            )}
           </div>
         </div>
         <div className="flex flex-wrap items-end justify-end gap-3">
@@ -154,6 +151,11 @@ export default function ResultsPage() {
             <Table2 className="h-4 w-4" />
             Table View
           </Button>
+          {probing.length > 0 && (
+            <span className="flex h-8 items-center text-xs text-slate-400">
+              loading {probing.join(", ")}…
+            </span>
+          )}
           <RefreshButton isFetching={isFetching} onRefresh={refresh} intervalMs={REFRESH_MS} />
         </div>
       </div>
