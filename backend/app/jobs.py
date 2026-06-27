@@ -146,6 +146,7 @@ async def list_jobs(
 
         local: list[Job] = []
         seen: set[str] = set()
+        by_id: dict[str, Job] = {}
         for line in sq_out.strip().splitlines():
             parts = line.split("|")
             if len(parts) < 8:
@@ -153,23 +154,37 @@ async def list_jobs(
             seen.add(parts[0])
             time_left = parts[6] if parts[6] not in ("", "N/A") else None
             job_start = _actual_start_for_state(parts[3], parts[7], source_tz)
-            local.append(Job(
+            job = Job(
                 cluster=c, job_id=parts[0], job_name=parts[1], partition=parts[2],
                 state=parts[3], elapsed=parts[4], nodelist=parts[5],
                 time_left=time_left, queue_position=queue_positions.get(parts[0]),
                 start=job_start,
-            ))
+            )
+            local.append(job)
+            by_id[parts[0]] = job
         for line in sa_out.strip().splitlines():
             parts = line.split("|")
             if len(parts) < 8:
                 continue
             jid = parts[0]
-            if jid in seen:
-                continue
             # Truncate sacct's CANCELLED+by labels for cleaner display.
             state = parts[3].split(" ")[0]
             job_start = _actual_start_for_state(state, parts[5], source_tz)
             job_end = to_kst_iso(parts[6], source_tz)
+            if jid in seen:
+                # squeue lingers in COMPLETING during a job's epilog/cleanup;
+                # sacct already holds the real terminal outcome (e.g. PREEMPTED),
+                # which the sacct-first detail view shows too. Overlay it so the
+                # list and detail agree instead of the table looking "completed".
+                existing = by_id.get(jid)
+                if (
+                    existing is not None
+                    and existing.state.upper() == "COMPLETING"
+                    and (state.upper() == "COMPLETED" or _terminal_non_completed(state))
+                ):
+                    existing.state = state
+                    existing.end = job_end
+                continue
             local.append(Job(
                 cluster=c, job_id=jid, job_name=parts[1], partition=parts[2],
                 state=state, elapsed=parts[4], nodelist=parts[7],
