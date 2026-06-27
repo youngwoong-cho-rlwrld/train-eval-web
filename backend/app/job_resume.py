@@ -132,7 +132,7 @@ async def _resubmit_slurm_job(
         raise ValueError(f"cannot resume eval job {job_id}: checkpoint is unknown")
 
     seed_eval_dirs = [det.paths.eval_dir] if det.paths.eval_dir else []
-    eval_num_envs = (meta.get("eval_num_envs_per_gpu") or meta.get("eval_parallel_sims_per_gpu") or "").strip()
+    eval_num_envs = (meta.get("eval_num_envs_per_gpu") or "").strip()
     try:
         eval_num_envs_per_gpu = int(eval_num_envs) if eval_num_envs else None
     except ValueError:

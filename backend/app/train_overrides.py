@@ -53,3 +53,9 @@ def resolve_train_action_horizon(
 
 def _variant_action_horizon(variant: Any) -> int | None:
     return variant_int_opt(variant, "TRAIN_ACTION_HORIZON")
+
+
+def validate_global_batch_divisible(model_family: str, global_batch_size: int | None, num_gpus: int) -> None:
+    """n1.5 training requires the global batch size to divide evenly across GPUs."""
+    if model_family == "n1.5" and global_batch_size is not None and num_gpus and global_batch_size % num_gpus != 0:
+        raise ValueError("global_batch_size must be divisible by num_gpus for n1.5 training")

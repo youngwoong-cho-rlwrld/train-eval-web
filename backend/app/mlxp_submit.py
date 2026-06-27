@@ -55,7 +55,7 @@ from .training_models import (
     resolve_training_model,
     rewrites_modality_action_horizon,
 )
-from .train_overrides import resolve_train_action_horizon
+from .train_overrides import resolve_train_action_horizon, validate_global_batch_divisible
 from .variant_values import variant_int
 from .wandb_config import get_project as _wandb_project
 from .variants import load_variant
@@ -226,13 +226,8 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
             action_horizon_mode=action_horizon_mode,
             requested=req.action_horizon,
         )
-    if (
-        req.phase == "train"
-        and req.global_batch_size is not None
-        and model.family == "n1.5"
-        and req.global_batch_size % req.num_gpus != 0
-    ):
-        raise ValueError("global_batch_size must be divisible by num_gpus for n1.5 training")
+    if req.phase == "train":
+        validate_global_batch_divisible(model.family, req.global_batch_size, req.num_gpus)
     # job_id is the k8s Job resource name. MLXP's guide requires
     # `<user>-<job-name>`; job_name stays as the display name carried in
     # annotations with the same shape as slurm's job_name.
@@ -329,11 +324,20 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
                             node: str, submit_git, model: TrainingModel,
                             settings: MlxpSettings, train_note: str,
                             action_horizon_mode: str) -> dict:
-    train_num_gpus = req.num_gpus
-    train_max_steps = req.max_steps or variant_int(variant, "MAX_STEPS", 30000)
-    train_save_steps = req.save_steps or variant_int(variant, "SAVE_STEPS", 1000)
-    per_gpu_batch = int(variant.vars.get("TRAIN_BATCH_SIZE", "64"))
-    train_global_batch_size = req.global_batch_size or per_gpu_batch * train_num_gpus
+    from .submit import resolve_train_settings
+
+    train_settings = resolve_train_settings(
+        variant,
+        model.family,
+        num_gpus_override=req.num_gpus,
+        global_batch_override=req.global_batch_size,
+        max_steps_override=req.max_steps,
+        save_steps_override=req.save_steps,
+    )
+    train_num_gpus = train_settings.num_gpus
+    train_max_steps = train_settings.max_steps
+    train_save_steps = train_settings.save_steps
+    train_global_batch_size = train_settings.global_batch_size
     suffix = req.output_namespace or f"{snapshot_suffix(job_name)}_{job_id}"
     exp_dir = f"{settings.experiments_dir}/{variant.name}"
     path = f"{exp_dir}/config_{suffix}.sh"

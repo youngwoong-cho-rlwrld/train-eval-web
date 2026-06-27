@@ -385,7 +385,14 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
 
         path: str | None = None
         if req.phase == "train":
-            train_settings = submit.resolve_train_settings(req, variant, model.family)
+            train_settings = submit.resolve_train_settings(
+                variant,
+                model.family,
+                num_gpus_override=req.train_num_gpus,
+                global_batch_override=req.train_global_batch_size,
+                max_steps_override=req.train_max_steps,
+                save_steps_override=req.train_save_steps,
+            )
             train_action_horizon = submit.resolve_train_action_horizon(
                 req,
                 variant,
@@ -430,7 +437,14 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
                 git=None,
             )
         elif req.phase == "eval":
-            train_settings = submit.resolve_train_settings(req, variant, model.family)
+            train_settings = submit.resolve_train_settings(
+                variant,
+                model.family,
+                num_gpus_override=req.train_num_gpus,
+                global_batch_override=req.train_global_batch_size,
+                max_steps_override=req.train_max_steps,
+                save_steps_override=req.train_save_steps,
+            )
             checkpoint_path = submit.require_eval_checkpoint_path(req)
             eval_sets = submit.normalize_eval_sets(req.eval_sets)
             train_git_commit = submit.resolve_train_git_commit(req, variant)
@@ -510,7 +524,7 @@ async def post_submit(req: submit.SubmitRequest):
                 job_class=req.job_class or "normal",
                 dataset_override=req.dataset_override,
                 extra_args=req.extra_args,
-                eval_num_envs_per_gpu=req.eval_num_envs_per_gpu or req.eval_parallel_sims_per_gpu,
+                eval_num_envs_per_gpu=req.eval_num_envs_per_gpu,
                 eval_n_episodes=req.eval_n_episodes,
                 eval_n_runs=req.eval_n_runs,
                 eval_sets=req.eval_sets,
@@ -796,7 +810,6 @@ async def get_job_flags(cluster: str, job_id: str):
         meta = await read_slurm_meta(env.ssh_alias, job_id)
         envs_override = (
             meta.get("eval_num_envs_per_gpu")
-            or meta.get("eval_parallel_sims_per_gpu")
             or ""
         ).strip()
         try:

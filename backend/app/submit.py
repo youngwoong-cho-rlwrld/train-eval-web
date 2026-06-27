@@ -45,7 +45,10 @@ from .training_models import (
     resolve_training_model,
     rewrites_modality_action_horizon,
 )
-from .train_overrides import resolve_train_action_horizon as resolve_action_horizon_override
+from .train_overrides import (
+    resolve_train_action_horizon as resolve_action_horizon_override,
+    validate_global_batch_divisible,
+)
 from .variants import load_variant
 from .variant_values import variant_int
 from .wandb_config import get_project as wandb_project
@@ -91,8 +94,6 @@ class SubmitRequest(BaseModel):
     train_git_commit: str | None = None
     # Eval-only: override Isaac's native vectorized env count per GPU.
     eval_num_envs_per_gpu: int | None = Field(default=None, ge=1)
-    # Legacy request field accepted from older frontends/resume metadata.
-    eval_parallel_sims_per_gpu: int | None = Field(default=None, ge=1)
     # Eval-only: per-submission overrides for eval_allex.py and eval matrix.
     eval_n_episodes: int | None = Field(default=None, ge=1)
     eval_n_runs: int | None = Field(default=None, ge=1)
@@ -208,12 +209,14 @@ class TrainSettings:
     save_steps: int
 
 
-def resolve_train_settings(req: SubmitRequest, variant, model_family: str) -> TrainSettings:
+def resolve_train_settings(variant, model_family: str, *, num_gpus_override: int | None,
+                           global_batch_override: int | None, max_steps_override: int | None,
+                           save_steps_override: int | None) -> TrainSettings:
     """Resolve train-time override values exactly once for submit and preview."""
-    train_num_gpus = req.train_num_gpus or variant_int(variant, "TRAIN_NUM_GPUS", 2)
-    train_max_steps = req.train_max_steps or variant_int(variant, "MAX_STEPS", 30000)
-    train_save_steps = req.train_save_steps or variant_int(variant, "SAVE_STEPS", 1000)
-    train_global_batch_size = req.train_global_batch_size
+    train_num_gpus = num_gpus_override or variant_int(variant, "TRAIN_NUM_GPUS", 2)
+    train_max_steps = max_steps_override or variant_int(variant, "MAX_STEPS", 30000)
+    train_save_steps = save_steps_override or variant_int(variant, "SAVE_STEPS", 1000)
+    train_global_batch_size = global_batch_override
 
     if train_global_batch_size is None:
         for key in ("TRAIN_GLOBAL_BATCH_SIZE", "GLOBAL_BATCH_SIZE"):
@@ -227,12 +230,7 @@ def resolve_train_settings(req: SubmitRequest, variant, model_family: str) -> Tr
         if train_global_batch_size is None:
             train_global_batch_size = variant_int(variant, "TRAIN_BATCH_SIZE", 64) * train_num_gpus
 
-    if (
-        req.train_global_batch_size is not None
-        and model_family == "n1.5"
-        and req.train_global_batch_size % train_num_gpus != 0
-    ):
-        raise ValueError("train_global_batch_size must be divisible by train_num_gpus for n1.5 training")
+    validate_global_batch_divisible(model_family, train_global_batch_size, train_num_gpus)
 
     return TrainSettings(
         num_gpus=train_num_gpus,
@@ -322,7 +320,7 @@ async def _rsync_text(host: str, text: str, remote_rel: str) -> None:
 async def submit(req: SubmitRequest) -> SubmitResponse:
     if req.resume and req.phase != "train":
         raise ValueError("resume=true is only valid for phase=train")
-    eval_num_envs_per_gpu = req.eval_num_envs_per_gpu or req.eval_parallel_sims_per_gpu
+    eval_num_envs_per_gpu = req.eval_num_envs_per_gpu
     eval_sets = normalize_eval_sets(req.eval_sets)
     eval_checkpoint = require_eval_checkpoint_path(req) if req.phase == "eval" else None
     if req.phase != "eval" and any((
@@ -376,7 +374,14 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     if exclude_nodes:
         sbatch_flags.append(f"--exclude={shlex.quote(exclude_nodes)}")
 
-    train_settings = resolve_train_settings(req, variant, model.family)
+    train_settings = resolve_train_settings(
+        variant,
+        model.family,
+        num_gpus_override=req.train_num_gpus,
+        global_batch_override=req.train_global_batch_size,
+        max_steps_override=req.train_max_steps,
+        save_steps_override=req.train_save_steps,
+    )
     train_action_horizon = resolve_train_action_horizon(
         req,
         variant,
