@@ -4,7 +4,7 @@ import Link from "next/link";
 import { Loader2 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { keepPreviousData, useIsFetching, useQueries, useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
-import { api, type Job, type JobProgress, type Progress } from "@/lib/api";
+import { api, type Job, type JobProgress } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -21,7 +21,7 @@ import { ImmediateTooltip } from "@/components/immediate-tooltip";
 import { PendingQueueLabel, pendingQueuePositionLabel } from "@/components/pending-queue-label";
 import { formatJobTimestamp, parseJobTimestampMs } from "@/lib/job-time";
 import { jobDetailHref } from "@/lib/job-links";
-import { stepEta } from "@/lib/job-progress";
+import { activeProgressLabel, stepEta } from "@/lib/job-progress";
 import { Th } from "@/components/table";
 import {
   isActiveJobState,
@@ -572,13 +572,13 @@ function ActiveProgressCell({ job }: { job: Job }) {
   if (!showBar) {
     return (
       <span className="text-xs text-slate-500">
-        {activeProgressLabel(d, p) ?? "waiting for progress"}
+        {activeProgressLabel(d?.phase, p) ?? "waiting for progress"}
       </span>
     );
   }
 
   const effectivePercent = Math.max(0, Math.min(100, percent ?? 0));
-  const label = activeProgressLabel(d, p) ?? `${effectivePercent.toFixed(1)}%`;
+  const label = activeProgressLabel(d?.phase, p) ?? `${effectivePercent.toFixed(1)}%`;
   const eta = stepEta(d?.elapsed, p?.current_step, p?.max_steps, d?.phase);
 
   return (
@@ -604,19 +604,6 @@ function ActiveProgressCell({ job }: { job: Job }) {
       </div>
     </div>
   );
-}
-
-function activeProgressLabel(
-  details: JobProgress | undefined,
-  progress: Progress | undefined,
-) {
-  if (details?.phase === "eval" && progress?.current_step != null && progress.max_steps != null) {
-    return `${progress.current_step}/${progress.max_steps} episodes`;
-  }
-  if (details?.phase === "eval" && progress?.current_label) {
-    return progress.current_label.replace(/^\d+\/\d+ (?:runs|result files)\s*·\s*/, "");
-  }
-  return progress?.current_label ?? null;
 }
 
 function CopyCheckpointShortcut({ job }: { job: Job }) {

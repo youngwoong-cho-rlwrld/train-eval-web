@@ -64,6 +64,7 @@ import {
 } from "@/components/config-card";
 import { useDatasetDir } from "@/hooks/use-dataset-dir";
 import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state";
+import { evalHarness, resolveModel } from "@/lib/variant-model";
 
 type Phase = "train" | "eval";
 type EvalConfigEdit = {
@@ -275,7 +276,7 @@ export default function SubmitPage() {
     enabled: !isSlurm,
   });
   const wantsCheckpoint = phase === "eval" && !!variantName;
-  const isDexjoco = variant.data?.vars.EVAL_HARNESS === "dexjoco";
+  const isDexjoco = evalHarness(variant.data?.vars) === "dexjoco";
   const dexjocoTasks = useQuery({
     queryKey: ["dexjoco-tasks", cluster],
     queryFn: () =>
@@ -374,8 +375,7 @@ export default function SubmitPage() {
   const trainConfigDefaults = useMemo<TrainConfigValues>(() => {
     const vars = variant.data?.vars;
     const numGpus = vars?.TRAIN_NUM_GPUS ?? "2";
-    const modelId = vars?.MODEL_ID ?? vars?.MODEL_VERSION ?? "n1.5";
-    const model = vars?.MODEL_VERSION ?? (modelId === "physixel" ? "n1.6" : modelId);
+    const { model } = resolveModel(vars);
     const perGpuBatch = vars?.TRAIN_BATCH_SIZE ?? "";
     const globalBatch =
       vars?.TRAIN_GLOBAL_BATCH_SIZE ?? vars?.GLOBAL_BATCH_SIZE ?? "";
@@ -447,11 +447,7 @@ export default function SubmitPage() {
     10,
   );
   const isPositiveInteger = (value: string) => /^[1-9]\d*$/.test(value.trim());
-  const trainModelId =
-    variant.data?.vars.MODEL_ID ?? variant.data?.vars.MODEL_VERSION ?? "n1.5";
-  const trainModel =
-    variant.data?.vars.MODEL_VERSION ??
-    (trainModelId === "physixel" ? "n1.6" : trainModelId);
+  const { model: trainModel } = resolveModel(variant.data?.vars);
   const wantsTrainConfig = phase === "train" && !!variantName;
   const wantsGpuConfig = !!variantName;
   const wantsGitCommitConfig = !!variantName;

@@ -945,7 +945,7 @@ function EvalRunsCard({
         {!isLoading && error && <ErrorState message={error.message} />}
         {!isLoading && !error && !d && <EmptyState message="Eval runs unavailable." />}
         {!isLoading && !error && d && rows.length === 0 && (
-          <EmptyState message="No per-run result files found yet." />
+          <EmptyState message="No per-run results found yet." />
         )}
         {!isLoading && !error && rows.length > 0 && (
           <div className="overflow-x-auto">
@@ -965,7 +965,7 @@ function EvalRunsCard({
                   <Th>Run</Th>
                   <Th>Seed</Th>
                   <Th>Success</Th>
-                  <Th>Result file</Th>
+                  <Th>Result</Th>
                 </tr>
               </thead>
               <tbody>
