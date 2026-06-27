@@ -26,6 +26,7 @@ from .eval_completion import (
     exp_dir_rel_candidates,
     remote_path_expr,
 )
+from .eval_harness import harness_for, harness_for_name
 from .job_identity import (
     parse_comment_metadata,
     parse_comment_fields,
@@ -1910,11 +1911,13 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
         try:
             v = await load_variant(variant)
             eval_sets, n_runs, n_eps, tasks = eval_shape(v, slurm_meta)
+            harness = harness_for(v)
         except FileNotFoundError:
             eval_sets = [s for s in ((slurm_meta or {}).get("eval_sets") or "").split() if s]
             n_runs = _meta_int(slurm_meta or {}, "eval_n_runs") or 0
             n_eps = _meta_int(slurm_meta or {}, "eval_n_episodes") or 0
             tasks = []
+            harness = harness_for_name((slurm_meta or {}).get("eval_harness"))
         total = eval_total(eval_sets, n_runs, tasks)
         progress.total_runs = total or None
 
@@ -1923,67 +1926,36 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
 
         env = await load_cluster(cluster)
         host = env.ssh_alias
-        completed = 0
-        job_completed_runs = 0
 
-        # One remote probe is materially faster than several serial SSH calls on
-        # SKT. It returns: completed result files, stdout episode-completion
-        # count for this job, stdout completed-run count for this job, saved
-        # per-episode video artifacts across the eval dir, and finished DexJoCo
-        # episode dirs. The video count covers active Isaac runs whose Python
-        # stdout is still buffered; the DexJoCo count is the only live signal
-        # for openpi/dexjoco evals, which write one episode_NN_<success|failure>
-        # dir per finished episode (episode_NN_temp is the in-flight one) and
-        # only emit results.json / "Results saved to:" once the whole run ends.
-        eval_dir_expr = remote_path_expr(eval_dir)
-        log_dir_q = shlex.quote(env.vars["LOG_DIR"])
-        job_id_q = shlex.quote(job_id)
-        probe_cmd = (
-            f"eval_dir={eval_dir_expr}; "
-            f"log_dir={log_dir_q}; "
-            f"job_id={job_id_q}; "
-            'completed=$(find "$eval_dir" -type f -name results.json 2>/dev/null | wc -l); '
-            "video_eps=$(find \"$eval_dir\" -type f -path '*/videos/ep*.mp4' 2>/dev/null | wc -l); "
-            "dexjoco_eps=$(find \"$eval_dir\" -type d 2>/dev/null | grep -cE '/episode_[0-9]+_(success|failure)$'); "
-            'pattern="$log_dir"/*_"$job_id".out; '
-            "stdout_eps=$(grep -h '^Episode .* completed' $pattern 2>/dev/null | wc -l); "
-            "stdout_runs=$(grep -h '^Results saved to:' $pattern 2>/dev/null | wc -l); "
-            "printf '%s %s %s %s %s\\n' \"$completed\" \"$stdout_eps\" \"$stdout_runs\" \"$video_eps\" \"$dexjoco_eps\""
+        # Each harness probes its OWN live signal in one SSH round-trip and
+        # returns (finished-run count, current episode count). Isaac reads its
+        # client stdout markers + buffered video artifacts; DexJoCo counts
+        # finished episode_NN_<success|failure> dirs. The step-shape promotion
+        # below is shared — no cross-harness signal mixing.
+        probe_cmd = harness.progress_probe(
+            eval_dir_expr=remote_path_expr(eval_dir),
+            log_dir_q=shlex.quote(env.vars["LOG_DIR"]),
+            job_id_q=shlex.quote(job_id),
         )
         r = await ssh_run(host, probe_cmd, timeout=12.0)
         if r.returncode != 0:
             raise RuntimeError((r.stderr or r.stdout or "eval progress probe failed").strip())
         try:
-            parts = r.stdout.strip().split()
-            if len(parts) != 5:
-                raise ValueError(f"expected 5 counters, got {len(parts)}")
-            completed = int(parts[0])
-            stdout_eps = int(parts[1])
-            job_completed_runs = int(parts[2])
-            video_eps = int(parts[3])
-            dexjoco_eps = int(parts[4])
+            completed, current_eps = harness.parse_progress(r.stdout, n_eps=n_eps)
         except ValueError as exc:
-            raise RuntimeError(f"invalid eval progress probe output: {r.stdout.strip()!r}") from exc
+            raise RuntimeError(str(exc)) from exc
         progress.completed_runs = completed
 
-        # Episode counter inside this job. Prefer client stdout because native
-        # Isaac vectorization can complete multiple environments per server
-        # reset; server reset counts are only a fallback.
         if n_eps > 0:
-            # Promote eval into the unified step-based shape so the frontend
-            # ETA + progress bar work the same way as training:
-            #   current_step = completed result files · N_EPISODES
-            #                + incomplete episodes from this job
-            #   max_steps    = total_runs    · N_EPISODES
+            # Unified step shape so the frontend ETA + bar match training:
+            #   max_steps = total_runs · N_EPISODES; current_step = live episodes.
             progress.max_steps = total * n_eps
-            completed_steps = completed * n_eps
-            stdout_incomplete_eps = min(n_eps, max(0, stdout_eps - job_completed_runs * n_eps))
-            stdout_current = completed_steps + stdout_incomplete_eps
-            current = max(completed_steps, stdout_current, video_eps, dexjoco_eps)
-            progress.current_step = min(current, progress.max_steps)
+            progress.current_step = min(current_eps, progress.max_steps)
             progress.percent = round(100.0 * progress.current_step / progress.max_steps, 1)
-            episode_label = f"{progress.current_step}/{progress.max_steps} episodes"
-            progress.current_label = f"{completed}/{total} result files · {episode_label}"
+            progress.current_label = (
+                f"{completed}/{total} result files · "
+                f"{progress.current_step}/{progress.max_steps} episodes"
+            )
         else:
             progress.percent = round(100.0 * completed / total, 1)
             progress.current_label = f"{completed}/{total} result files"
