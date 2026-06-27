@@ -7,6 +7,7 @@ update the corresponding builder here.
 """
 
 
+from .eval_harness import harness_for
 from .training_models import resolve_training_model
 from .variants import Variant
 from .wandb_config import get_project
@@ -18,19 +19,14 @@ def flags_for(variant: Variant, phase: str) -> list[tuple[str, str]]:
     Pseudo-values like `<job-name>` mark fields the submitter fills in at
     submit time rather than reading from the variant.
     """
-    model = resolve_training_model(variant).flags_profile
     if phase in ("train", "resume"):
+        model = resolve_training_model(variant).flags_profile
         if model == "n1.6":
             return _train_n16(variant)
         if model == "n1.5":
             return _train_n15(variant)
     if phase == "eval":
-        if variant.vars.get("EVAL_HARNESS") == "dexjoco":
-            return _eval_dexjoco(variant)
-        if model == "n1.6":
-            return _eval_n16(variant)
-        if model == "n1.5":
-            return _eval_n15(variant)
+        return harness_for(variant).eval_flags(variant)
     return []
 
 
@@ -92,36 +88,3 @@ def _train_n16(v: Variant) -> list[tuple[str, str]]:
     out.append(("--wandb-project", get_project()))
     out.extend((a, "") for a in (v.arrays.get("TRAIN_EXTRA_ARGS") or []))
     return out
-
-
-# ── eval ─────────────────────────────────────────────────────────────
-
-def _eval_n15(v: Variant) -> list[tuple[str, str]]:
-    """Mirror lib/eval_body.sh — gr00t inference + isaac client run."""
-    return [
-        ("--task-name", v.vars.get("TASK_NAME", "")),
-        ("--instruction", v.vars.get("INSTRUCTION", "")),
-        ("--n-episodes", v.vars.get("N_EPISODES", "")),
-        ("--n-runs", v.vars.get("N_RUNS", "")),
-        ("EVAL_NUM_ENVS_PER_GPU", "1"),
-        ("--execution-horizon", v.vars.get("EXECUTION_HORIZON", "")),
-        ("--max-episode-steps", v.vars.get("MAX_EPISODE_STEPS", "")),
-        ("(eval_sets)", " ".join(v.arrays.get("EVAL_SETS") or [])),
-    ]
-
-
-def _eval_n16(v: Variant) -> list[tuple[str, str]]:
-    return _eval_n15(v)
-
-
-def _eval_dexjoco(v: Variant) -> list[tuple[str, str]]:
-    """Mirror lib/eval_body_dexjoco.sh — dexjoco-openpi-eval client run."""
-    return [
-        ("--task", v.vars.get("DEXJOCO_TASK", "")),
-        ("--server", v.vars.get("DEXJOCO_SERVER_TYPE", "groot")),
-        ("(families)", " ".join(v.arrays.get("EVAL_SETS") or [])),
-        ("--episodes", v.vars.get("N_EPISODES", "")),
-        ("--n-runs", v.vars.get("N_RUNS", "")),
-        ("--seed", v.vars.get("EVAL_BASE_SEED", "")),
-        ("--checkpoint", "<eval-checkpoint>"),
-    ]

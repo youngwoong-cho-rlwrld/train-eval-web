@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 from . import cluster_settings
 from .clusters import load_cluster
 from .data_interface import rewrite_action_horizon
+from .eval_harness import harness_for
 from .job_identity import comment_field_fragment
 from .output_namespace import make_output_namespace, validate_output_namespace
 from .partitions import is_background_partition
@@ -353,12 +354,8 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     variant = await load_variant(req.variant)
     train_note = resolve_train_note(req.train_note, variant)
 
-    if (
-        req.phase == "eval"
-        and variant.vars.get("EVAL_HARNESS") == "dexjoco"
-        and not (req.dexjoco_task and req.dexjoco_task.strip())
-    ):
-        raise ValueError("dexjoco_task is required for DexJoCo evals")
+    if req.phase == "eval":
+        harness_for(variant).validate_submit(req)
 
     # ── Resolve partition + model + body script + walltime ──
     model = resolve_training_model(variant)
