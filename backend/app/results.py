@@ -85,7 +85,9 @@ async def list_results(cluster: str | None = None) -> ResultsResponse:
             raw = await _read_cluster_results(env.ssh_alias, c, payload, checkpoint_links)
             return [ResultVariant.model_validate(x) for x in raw], None
         except Exception as e:
-            return [], ClusterResultError(cluster=c, error=str(e))
+            # asyncio.TimeoutError (and some others) stringify to "" — fall back
+            # to the type name so the UI never shows a blank error.
+            return [], ClusterResultError(cluster=c, error=str(e) or type(e).__name__)
 
     groups = await asyncio.gather(*(_one(c) for c in target_clusters))
     out: list[ResultVariant] = []
@@ -187,6 +189,13 @@ def _remote_program(env_vars: dict[str, str]) -> str:
     return "\n".join(lines) + "\n" + _REMOTE_SCRIPT
 
 
+# Result scans walk every experiment dir over the cluster's network filesystem;
+# on slow mounts (e.g. skt /fsx) the single-pass threaded scan can take well
+# over a minute. The Results page fetches per cluster, so a generous ceiling
+# here only delays the one slow column rather than the whole page.
+_SCAN_TIMEOUT = 180.0
+
+
 async def _read_cluster_results(
     host: str,
     cluster: str,
@@ -203,7 +212,7 @@ async def _read_cluster_results(
             "RESULTS_STAGING_REL": CLUSTER_STAGING_REL,
         }
     )
-    r = await ssh_run(host, "python3 -", timeout=45.0, input_text=program)
+    r = await ssh_run(host, "python3 -", timeout=_SCAN_TIMEOUT, input_text=program)
     if r.returncode != 0:
         raise RuntimeError((r.stderr or r.stdout).strip() or f"ssh command failed on {cluster}")
     try:
@@ -232,7 +241,7 @@ async def _read_mlxp_results(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(program.encode()), timeout=45.0)
+    stdout, stderr = await asyncio.wait_for(proc.communicate(program.encode()), timeout=_SCAN_TIMEOUT)
     if proc.returncode != 0:
         raise RuntimeError(
             stderr.decode(errors="replace").strip()
