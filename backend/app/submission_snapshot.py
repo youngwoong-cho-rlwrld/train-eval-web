@@ -944,6 +944,7 @@ def render_eval_config_preview(
     eval_unset_cuda_visible_devices_for_server: int | None = None,
     train_git_commit: str | None = None,
     train_note: str | None = None,
+    dexjoco_task: str | None = None,
 ) -> str:
     text = _apply_submission_config_overrides(
         base_config,
@@ -951,6 +952,8 @@ def render_eval_config_preview(
         train_note=train_note,
         data_dir=data_dir,
     )
+    if dexjoco_task is not None and dexjoco_task.strip():
+        text = _set_scalar(text, "DEXJOCO_TASK", dexjoco_task.strip())
     if train_git_commit is not None:
         text = _set_scalar(text, "TRAIN_GIT_COMMIT", train_git_commit)
     if train_num_gpus is not None:

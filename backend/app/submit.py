@@ -101,6 +101,8 @@ class SubmitRequest(BaseModel):
     # Eval-only: absolute path to the checkpoint dir on the cluster.
     # Eval submissions must provide this explicitly.
     checkpoint_path: str | None = None
+    # Eval-only: DexJoCo task (yaml stem / env_name) chosen via the task picker.
+    dexjoco_task: str | None = None
     # Internal eval resume: remote eval_results dir from the timed-out job.
     # Seed the staged eval_results before sbatch so completed runs are skipped.
     seed_eval_results_from: str | list[str] | None = None
@@ -353,6 +355,13 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     variant = await load_variant(req.variant)
     train_note = resolve_train_note(req.train_note, variant)
 
+    if (
+        req.phase == "eval"
+        and variant.vars.get("EVAL_HARNESS") == "dexjoco"
+        and not (req.dexjoco_task and req.dexjoco_task.strip())
+    ):
+        raise ValueError("dexjoco_task is required for DexJoCo evals")
+
     # ── Resolve partition + model + body script + walltime ──
     model = resolve_training_model(variant)
     action_horizon_mode = action_horizon_mode_for_variant(model, variant)
@@ -516,6 +525,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             train_num_gpus=train_settings.num_gpus,
             train_git_commit=train_git_commit,
             train_note=train_note,
+            dexjoco_task=req.dexjoco_task,
         )
         snapshot_meta_text = metadata_json(snapshot_metadata(
             job_name=job_name,
@@ -730,6 +740,10 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         + (
             f",EVAL_CHECKPOINT={shlex.quote(eval_checkpoint)}"
             if req.phase == "eval" and eval_checkpoint else ""
+        )
+        + (
+            f",SUBMIT_DEXJOCO_TASK={shlex.quote(req.dexjoco_task)}"
+            if req.phase == "eval" and req.dexjoco_task else ""
         ),
         *sbatch_flags,
         *([] if req.phase == "train" else [shlex.quote(a) for a in req.extra_args]),

@@ -15,6 +15,7 @@ from . import (
     data_interface,
     datasets,
     details,
+    dexjoco,
     flags,
     job_resume,
     jobs,
@@ -164,6 +165,18 @@ async def get_cluster_datasets(name: str, path: str | None = None):
         return await datasets.list_datasets(name, path)
     except FileNotFoundError:
         raise HTTPException(404, f"cluster {name} not found")
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
+
+
+@app.get("/api/dexjoco/tasks", response_model=dexjoco.DexjocoTasks)
+async def get_dexjoco_tasks(cluster: str):
+    if cluster not in clusters.list_clusters():
+        raise HTTPException(404, f"cluster {cluster} not found")
+    try:
+        return await dexjoco.list_dexjoco_tasks(cluster)
+    except FileNotFoundError:
+        raise HTTPException(404, f"cluster {cluster} not found")
     except RuntimeError as e:
         raise HTTPException(503, str(e))
 

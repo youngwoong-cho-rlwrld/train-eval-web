@@ -233,6 +233,11 @@ export type Dataset = {
   codec: string | null;
 };
 
+export type DexjocoTasks = {
+  families: Array<{ family: string; tasks: string[] }>;
+  tasks: string[];
+};
+
 export type MlxpNode = {
   name: string;
   gpu_used: number;

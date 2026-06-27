@@ -17,6 +17,7 @@ import {
   type DataInterfaceSummary,
   type Partition,
   type Dataset,
+  type DexjocoTasks,
   type MlxpNode,
   type MlxpSettings,
   type GitStatus,
@@ -70,6 +71,7 @@ type EvalConfigEdit = {
   nEpisodes: string;
   nRuns: string;
   evalSets: string;
+  dexjocoTask: string;
 };
 type TrainConfigEdit = {
   scope: string;
@@ -273,6 +275,16 @@ export default function SubmitPage() {
     enabled: !isSlurm,
   });
   const wantsCheckpoint = phase === "eval" && !!variantName;
+  const isDexjoco = variant.data?.vars.EVAL_HARNESS === "dexjoco";
+  const dexjocoTasks = useQuery({
+    queryKey: ["dexjoco-tasks", cluster],
+    queryFn: () =>
+      api<DexjocoTasks>(
+        `/api/dexjoco/tasks?cluster=${encodeURIComponent(cluster)}`,
+      ),
+    enabled: isDexjoco && !!cluster,
+    retry: false,
+  });
   const activeCheckpointEdit =
     checkpointEdit?.scope === checkpointScope ? checkpointEdit : null;
   const checkpointPath = activeCheckpointEdit ? activeCheckpointEdit.value : "";
@@ -308,6 +320,7 @@ export default function SubmitPage() {
       nEpisodes: variant.data?.vars.N_EPISODES ?? "",
       nRuns: variant.data?.vars.N_RUNS ?? "",
       evalSets: formatEvalSetsInput(variant.data?.arrays.EVAL_SETS ?? []),
+      dexjocoTask: variant.data?.vars.DEXJOCO_TASK ?? "",
     }),
     [variant.data],
   );
@@ -322,6 +335,11 @@ export default function SubmitPage() {
   const evalSetsText = activeEvalConfigEdit
     ? activeEvalConfigEdit.evalSets
     : evalConfigDefaults.evalSets;
+  const dexjocoTask = activeEvalConfigEdit
+    ? activeEvalConfigEdit.dexjocoTask
+    : evalConfigDefaults.dexjocoTask;
+  const dexjocoTaskValid =
+    !(wantsCheckpoint && isDexjoco) || dexjocoTask.trim().length > 0;
   const evalSetValues = parseEvalSetsInput(evalSetsText);
   const evalSetOptions = variant.data?.arrays.EVAL_SETS ?? [];
   const evalNEpisodesTrimmed = evalNEpisodes.trim();
@@ -349,6 +367,7 @@ export default function SubmitPage() {
       nEpisodes: evalConfigDefaults.nEpisodes,
       nRuns: evalConfigDefaults.nRuns,
       evalSets: evalConfigDefaults.evalSets,
+      dexjocoTask: evalConfigDefaults.dexjocoTask,
     };
     setEvalConfigEdit({ ...base, ...patch, scope: evalConfigScope });
   };
@@ -555,6 +574,8 @@ export default function SubmitPage() {
       eval_n_runs: wantsCheckpoint ? evalNRunsParsed : null,
       eval_sets: wantsCheckpoint ? evalSetValues : null,
       eval_overwrite_results: wantsCheckpoint ? evalOverwriteResults : false,
+      dexjoco_task:
+        wantsCheckpoint && isDexjoco ? dexjocoTask.trim() || null : null,
       checkpoint_path: wantsCheckpoint ? trimmedCkpt : null,
       job_name: shownJobName.trim() || null,
       commit_dirty_changes: commitDirtyChanges,
@@ -572,7 +593,8 @@ export default function SubmitPage() {
         checkpointExistsValue === true &&
         evalNEpisodesValid &&
         evalNRunsValid &&
-        evalSetsValid));
+        evalSetsValid &&
+        dexjocoTaskValid));
   const configPreview = useQuery({
     queryKey: [
       "submit-config-preview",
@@ -595,6 +617,7 @@ export default function SubmitPage() {
       evalNEpisodes,
       evalNRuns,
       evalSetValues,
+      dexjocoTask,
       evalOverwriteResults,
       checkpointPath,
       shownJobName,
@@ -732,7 +755,8 @@ export default function SubmitPage() {
         checkpointExistsValue !== false &&
         evalNEpisodesValid &&
         evalNRunsValid &&
-        evalSetsValid)) &&
+        evalSetsValid &&
+        dexjocoTaskValid)) &&
     trainConfigValid &&
     !modelRepoError &&
     !configPreview.error &&
@@ -876,6 +900,46 @@ export default function SubmitPage() {
         ),
       }
     : undefined;
+  const dexjocoTaskOptions = dexjocoTasks.data?.tasks ?? [];
+  const dexjocoTaskError = dexjocoTasks.error as Error | null;
+  const dexjocoTaskEditor: FlagEditor | undefined =
+    wantsCheckpoint && isDexjoco
+      ? {
+          wide: true,
+          content: (
+            <div className="space-y-2">
+              <Select
+                value={dexjocoTask}
+                onValueChange={(value) =>
+                  updateEvalConfig({ dexjocoTask: value })
+                }
+              >
+                <SelectTrigger className="gap-2">
+                  <SelectValue placeholder="select a task..." />
+                  {dexjocoTasks.isFetching && (
+                    <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-slate-400" />
+                  )}
+                </SelectTrigger>
+                <SelectContent>
+                  {dexjocoTaskOptions.map((task) => (
+                    <SelectItem key={task} value={task}>
+                      <span className="font-mono text-xs">{task}</span>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {dexjocoTaskError && (
+                <ErrorState message={dexjocoTaskError.message} />
+              )}
+              {!dexjocoTaskValid && (
+                <p className="text-xs text-red-600 dark:text-red-400">
+                  Choose a DexJoCo task.
+                </p>
+              )}
+            </div>
+          ),
+        }
+      : undefined;
   const flagEditors: Record<string, FlagEditor> = {};
   if (datasetEditor) {
     flagEditors["--dataset-path"] = datasetEditor;
@@ -996,6 +1060,14 @@ export default function SubmitPage() {
         "(required)",
       editor: checkpointEditor,
     });
+    if (isDexjoco && dexjocoTaskEditor) {
+      extraFlagRows.push({
+        key: "dexjoco-task",
+        flag: "DEXJOCO_TASK",
+        value: dexjocoTask.trim() || "(required)",
+        editor: dexjocoTaskEditor,
+      });
+    }
     extraFlagRows.push({
       key: "overwrite-results",
       flag: "overwrite results",
@@ -1038,7 +1110,8 @@ export default function SubmitPage() {
         checkpointExistsValue === true &&
         evalNEpisodesValid &&
         evalNRunsValid &&
-        evalSetsValid));
+        evalSetsValid &&
+        dexjocoTaskValid));
   const selectedMlxpGpuType =
     mlxp.data?.find((n) => n.name === mlxpNode)?.gpu_type ||
     mlxpSettings.data?.gpu_type ||

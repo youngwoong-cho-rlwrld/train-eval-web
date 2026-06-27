@@ -25,6 +25,8 @@ def flags_for(variant: Variant, phase: str) -> list[tuple[str, str]]:
         if model == "n1.5":
             return _train_n15(variant)
     if phase == "eval":
+        if variant.vars.get("EVAL_HARNESS") == "dexjoco":
+            return _eval_dexjoco(variant)
         if model == "n1.6":
             return _eval_n16(variant)
         if model == "n1.5":
@@ -110,3 +112,16 @@ def _eval_n15(v: Variant) -> list[tuple[str, str]]:
 
 def _eval_n16(v: Variant) -> list[tuple[str, str]]:
     return _eval_n15(v)
+
+
+def _eval_dexjoco(v: Variant) -> list[tuple[str, str]]:
+    """Mirror lib/eval_body_dexjoco.sh — dexjoco-openpi-eval client run."""
+    return [
+        ("--task", v.vars.get("DEXJOCO_TASK", "")),
+        ("--server", v.vars.get("DEXJOCO_SERVER_TYPE", "groot")),
+        ("(families)", " ".join(v.arrays.get("EVAL_SETS") or [])),
+        ("--episodes", v.vars.get("N_EPISODES", "")),
+        ("--n-runs", v.vars.get("N_RUNS", "")),
+        ("--seed", v.vars.get("EVAL_BASE_SEED", "")),
+        ("--checkpoint", "<eval-checkpoint>"),
+    ]

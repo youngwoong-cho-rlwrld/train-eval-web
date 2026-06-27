@@ -123,6 +123,8 @@ def ts_of(name: str) -> str:
 def normalize(variant: str, job_name: str) -> tuple[str | None, str | None]:
     v, n = variant or "", job_name or ""
     pt_ps = re.search(r"pt(\d+)_ps(\d+)", n)
+    if re.match(r"^physixel_poc4", v):
+        return "PoC4", v
     if re.match(r"^physixel_poc3", v):
         return "PoC3", v
     if re.match(r"^physixel_poc1", v):
@@ -320,12 +322,13 @@ def main() -> None:
     emit_simple("discrete_MI (PoC1-style)", "discrete_MI", trains, evals, pair, order=poc1_order)
     emit_simple("PoC2 (heuristic)", "PoC2", trains, evals, pair, order=poc1_order)
     emit_simple("PoC3", "PoC3", trains, evals, pair)
+    emit_simple("PoC4 (part-specific state encoder)", "PoC4", trains, evals, pair)
     emit_runs("Action-horizon ablation", "AH", trains, evals, pair)
     emit_runs("Batch-size ablation", "BS", trains, evals, pair)
 
     # Open items
     print("\n## Open items\n")
-    for exp in ("PoC1", "PoC1old", "discrete_MI", "PoC2", "PoC3", "AH", "BS"):
+    for exp in ("PoC1", "PoC1old", "discrete_MI", "PoC2", "PoC3", "PoC4", "AH", "BS"):
         for (e, cv), tl in sorted(trains.items()):
             if e != exp:
                 continue
