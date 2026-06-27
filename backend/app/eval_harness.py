@@ -52,7 +52,7 @@ class EvalHarness(ABC):
         uses; the caller clamps it to ``max_steps``. No cross-harness signals.
         """
 
-    def validate_submit(self, req) -> None:
+    def validate_submit(self, req, variant: "Variant") -> None:
         """Raise ``ValueError`` if a harness-required submit field is missing.
 
         Default: the harness has no extra required field.
@@ -117,9 +117,13 @@ class DexjocoHarness(EvalHarness):
             ("--checkpoint", "<eval-checkpoint>"),
         ]
 
-    def validate_submit(self, req) -> None:
-        task = getattr(req, "dexjoco_task", None)
-        if not (task and task.strip()):
+    def validate_submit(self, req, variant: "Variant") -> None:
+        # The task can come from the submit request (UI picker) or fall back to
+        # the variant's own DEXJOCO_TASK (set in config.sh). The fallback is what
+        # lets retries / programmatic resubmits work without re-specifying it —
+        # the submission keeps the variant's DEXJOCO_TASK when req omits it.
+        task = (getattr(req, "dexjoco_task", None) or variant.vars.get("DEXJOCO_TASK") or "")
+        if not task.strip():
             raise ValueError("dexjoco_task is required for DexJoCo evals")
 
     def progress_probe(self, *, eval_dir_expr: str, log_dir_q: str, job_id_q: str) -> str:

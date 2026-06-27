@@ -355,7 +355,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     train_note = resolve_train_note(req.train_note, variant)
 
     if req.phase == "eval":
-        harness_for(variant).validate_submit(req)
+        harness_for(variant).validate_submit(req, variant)
 
     # ── Resolve partition + model + body script + walltime ──
     model = resolve_training_model(variant)
