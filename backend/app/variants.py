@@ -11,6 +11,8 @@ in the local repo.
 import asyncio
 import re
 import shutil
+from collections.abc import Callable, Set
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -233,23 +235,20 @@ def _active_second_file(exp_dir: Path, variant: Variant, model_family: str) -> V
 
 
 def _active_second_title(exp_dir: Path, variant: Variant, model_family: str) -> str:
+    spec = _spec_for(model_family)
+    rel = (variant.vars.get(spec.config_var) or "").strip()
+    if rel and _is_safe_relative_file(rel, spec.suffixes):
+        return rel
     if model_family == "n1.5":
-        rel = (variant.vars.get("TRAIN_DATA_CONFIG") or "").strip()
-        if rel and _is_safe_relative_file(rel, {".yaml", ".yml"}):
-            return rel
         for candidate in ("data_config.yaml", "data_config.yml"):
             if (exp_dir / candidate).is_file():
                 return candidate
-        return "data_config.yaml"
-
-    rel = (variant.vars.get("TRAIN_MODALITY_CONFIG") or "").strip()
-    if rel and _is_safe_relative_file(rel, {".py"}):
-        return rel
+        return spec.default_name
     py_files = sorted(p.name for p in exp_dir.glob("*.py") if p.is_file())
-    return py_files[0] if len(py_files) == 1 else "modality.py"
+    return py_files[0] if len(py_files) == 1 else spec.default_name
 
 
-def _is_safe_relative_file(rel: str, suffixes: set[str]) -> bool:
+def _is_safe_relative_file(rel: str, suffixes: Set[str]) -> bool:
     path = Path(rel)
     return (
         bool(rel)
@@ -262,17 +261,15 @@ def _is_safe_relative_file(rel: str, suffixes: set[str]) -> bool:
 
 
 def _second_kind(model_family: str) -> str:
-    return "data_config_yaml" if model_family == "n1.5" else "modality_py"
+    return _spec_for(model_family).kind
 
 
 def _second_label(model_family: str) -> str:
-    return "data_config.yaml" if model_family == "n1.5" else "modality.py"
+    return _spec_for(model_family).label
 
 
 def _second_purpose(model_family: str) -> str:
-    if model_family == "n1.5":
-        return "YAML passed to gr00t_finetune.py as --data-config. It lists datasets and DATA_CONFIG_MAP keys such as allex_thetwo_ck40_egostereo."
-    return "Python modality config passed to GR00T N1.6/Physixel as --modality-config-path for train and --modality-config for eval."
+    return _spec_for(model_family).purpose
 
 
 def _default_second_content(variant: Variant, model_family: str) -> str:
@@ -309,8 +306,8 @@ def _generated_data_config_yaml(variant: Variant) -> str:
 
 def _validate_second_title(title: str, model_family: str) -> str:
     clean = title.strip()
-    suffixes = {".yaml", ".yml"} if model_family == "n1.5" else {".py"}
-    if not _is_safe_relative_file(clean, suffixes):
+    spec = _spec_for(model_family)
+    if not _is_safe_relative_file(clean, spec.suffixes):
         suffix = ".yaml/.yml" if model_family == "n1.5" else ".py"
         raise ValueError(f"second file title must be a single {suffix} filename")
     if clean == "config.sh":
@@ -319,10 +316,7 @@ def _validate_second_title(title: str, model_family: str) -> str:
 
 
 def _validate_second_content(text: str, title: str, model_family: str) -> None:
-    if model_family == "n1.5":
-        _validate_n15_data_config_yaml(text, title)
-        return
-    _validate_python(text, title)
+    _spec_for(model_family).validator(text, title)
 
 
 def _validate_n15_data_config_yaml(text: str, title: str) -> None:
@@ -348,6 +342,45 @@ def _validate_python(text: str, title: str) -> None:
         compile(text, title, "exec")
     except SyntaxError as e:
         raise ValueError(f"{title}: Python syntax error at line {e.lineno}: {e.msg}")
+
+
+@dataclass(frozen=True)
+class SecondFileSpec:
+    config_var: str
+    suffixes: frozenset[str]
+    default_name: str
+    kind: str
+    label: str
+    purpose: str
+    validator: Callable[[str, str], None]
+
+
+# Keyed by model family. The n1.6 spec is the default for any non-n1.5 family,
+# preserving the original `else` semantics (physixel/dexjoco-* resolve here).
+_SECOND_FILE_SPECS: dict[str, SecondFileSpec] = {
+    "n1.5": SecondFileSpec(
+        config_var="TRAIN_DATA_CONFIG",
+        suffixes=frozenset({".yaml", ".yml"}),
+        default_name="data_config.yaml",
+        kind="data_config_yaml",
+        label="data_config.yaml",
+        purpose="YAML passed to gr00t_finetune.py as --data-config. It lists datasets and DATA_CONFIG_MAP keys such as allex_thetwo_ck40_egostereo.",
+        validator=_validate_n15_data_config_yaml,
+    ),
+    "n1.6": SecondFileSpec(
+        config_var="TRAIN_MODALITY_CONFIG",
+        suffixes=frozenset({".py"}),
+        default_name="modality.py",
+        kind="modality_py",
+        label="modality.py",
+        purpose="Python modality config passed to GR00T N1.6/Physixel as --modality-config-path for train and --modality-config for eval.",
+        validator=_validate_python,
+    ),
+}
+
+
+def _spec_for(model_family: str) -> SecondFileSpec:
+    return _SECOND_FILE_SPECS["n1.5"] if model_family == "n1.5" else _SECOND_FILE_SPECS["n1.6"]
 
 
 def _set_second_file_ref(config_text: str, second_title: str, model_family: str) -> str:

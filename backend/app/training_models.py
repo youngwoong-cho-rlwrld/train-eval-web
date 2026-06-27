@@ -16,6 +16,7 @@ from typing import Any
 from .paths import MODELS_DIR
 
 ACTION_HORIZON_MODES = {"none", "modality", "cli", "modality_and_cli"}
+SUPPORTED_FAMILIES = frozenset({"n1.5", "n1.6"})  # training families flags.py + variants.py know how to render; pi0.5 is eval-only (dexjoco harness)
 
 
 @dataclass(frozen=True)
@@ -83,10 +84,9 @@ def load_training_model(model_id: str) -> TrainingModel:
     data = _parse_model_env(path.read_text())
     family = (data.get("MODEL_FAMILY") or data.get("MODEL_VERSION") or model_id).strip()
     flags_profile = (data.get("FLAGS_PROFILE") or family).strip()
-    supported_profiles = {"n1.5", "n1.6"}
-    if family not in supported_profiles:
+    if family not in SUPPORTED_FAMILIES:
         raise ValueError(f"model {model_id}: unsupported MODEL_FAMILY {family!r}")
-    if flags_profile not in supported_profiles:
+    if flags_profile not in SUPPORTED_FAMILIES:
         raise ValueError(f"model {model_id}: unsupported FLAGS_PROFILE {flags_profile!r}")
     action_horizon_mode = (
         data.get("ACTION_HORIZON_MODE")
@@ -99,7 +99,7 @@ def load_training_model(model_id: str) -> TrainingModel:
         raise ValueError(f"model {model_id}: TRAIN_BODY_SCRIPT and EVAL_BODY_SCRIPT are required")
     return TrainingModel(
         id=model_id,
-        label=(data.get("MODEL_LABEL") or f"GR00T {model_id}").strip(),
+        label=(data.get("MODEL_LABEL") or model_id).strip(),
         family=family,
         flags_profile=flags_profile,
         slurm_repo_var=(data.get("SLURM_REPO_VAR") or "").strip() or None,
