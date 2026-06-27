@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
-# Run by sbatch via the top-level submit wrapper.
-# Reads $VARIANT and $CLUSTER from the environment.
+# Run by sbatch via the top-level submit wrapper (Isaac harness eval).
+# Reads $REPO_ROOT, $CLUSTER, $VARIANT from the environment (set by submit --export).
+#
+# Unified across model families: the family is taken from the sourced config.sh
+# as MODEL_FAMILY (preferred), then MODEL_VERSION, defaulting to n1.5. The
+# family-specific parts are the eval client invocation, the server-ready
+# timeout base, and the results aggregation output keys; everything else
+# (checkpoint/count validation, the PID-pool helpers, the task/run loop, the
+# DONE marker) is shared via lib/_common.sh.
 set -euo pipefail
 export OMNI_KIT_ACCEPT_EULA=Y
 export TOKENIZERS_PARALLELISM=false
@@ -21,11 +28,19 @@ EXP_DIR="${SUBMIT_EXP_DIR:-$REPO_ROOT/experiments/$VARIANT}"
 CONFIG_FILE="${SUBMIT_CONFIG_FILE:-$EXP_DIR/config.sh}"
 [ -f "$CONFIG_FILE" ] || { echo "ERROR: config not found: $CONFIG_FILE"; exit 1; }
 source "$CONFIG_FILE"
+
+# Resolve the model family: MODEL_FAMILY > MODEL_VERSION > n1.5 default.
+MODEL_FAMILY="${MODEL_FAMILY:-${MODEL_VERSION:-n1.5}}"
+
 if [ -n "${SUBMIT_DATA_DIR:-}" ]; then
     DATA_DIR="$SUBMIT_DATA_DIR"
 fi
 TRAIN_NUM_GPUS="${SUBMIT_TRAIN_NUM_GPUS:-${TRAIN_NUM_GPUS:-1}}"
-TRAIN_REPO_DIR="${SUBMIT_TRAIN_REPO_DIR:-${TRAIN_REPO_DIR:-$GROOT_DIR}}"
+if [ "$MODEL_FAMILY" = "n1.5" ]; then
+    TRAIN_REPO_DIR="${SUBMIT_TRAIN_REPO_DIR:-${TRAIN_REPO_DIR:-$GROOT_DIR}}"
+else
+    TRAIN_REPO_DIR="${SUBMIT_TRAIN_REPO_DIR:-${TRAIN_REPO_DIR:-$GROOT_N16_DIR}}"
+fi
 
 GPU_INSTANCE="$(detect_gpu_instance)"
 EXP_NAME="${SLURM_JOB_NAME:-${VARIANT}_eval_${GPU_INSTANCE}_$(date +%Y%m%d%H%M%S)}"
@@ -48,21 +63,25 @@ pin_training_repo_dir "$TRAIN_REPO_DIR" "$SUBMIT_GIT_COMMIT" "${SLURM_JOB_ID:-$O
 
 log "========================================================"
 log "$EXP_NAME"
-log "  cluster=$CLUSTER  partition=${SUBMIT_PARTITION:-$PARTITION}  gpu=$GPU_INSTANCE"
+if [ "$MODEL_FAMILY" = "n1.5" ]; then
+    log "  cluster=$CLUSTER  partition=${SUBMIT_PARTITION:-$PARTITION}  gpu=$GPU_INSTANCE"
+else
+    log "  cluster=$CLUSTER  partition=${SUBMIT_PARTITION:-$PARTITION}  gpu=$GPU_INSTANCE  model=${MODEL_ID:-n1.6}"
+    log "  train repo=$TRAIN_REPO_DIR"
+fi
 log "  run namespace=${OUTPUT_NAMESPACE:-legacy}"
 log "  eval results=$EVAL_DIR"
 log "========================================================"
 
-if [ -z "${EVAL_CHECKPOINT:-}" ]; then
-    log "ERROR: EVAL_CHECKPOINT is required"
-    exit 1
+validate_eval_checkpoint
+
+if [ "$MODEL_FAMILY" != "n1.5" ]; then
+    # Per-variant Python modality config (relative to experiment dir, copied at variant-creation time)
+    : "${TRAIN_MODALITY_CONFIG:?TRAIN_MODALITY_CONFIG not set in config.sh}"
+    MODALITY_CONFIG_FILE="$EXP_DIR/$TRAIN_MODALITY_CONFIG"
+    [ -f "$MODALITY_CONFIG_FILE" ] || { echo "ERROR: modality config not found: $MODALITY_CONFIG_FILE"; exit 1; }
+    log "Modality config: $MODALITY_CONFIG_FILE"
 fi
-LAST_CKPT="$EVAL_CHECKPOINT"
-if [ -z "$LAST_CKPT" ] || [ ! -d "$LAST_CKPT" ]; then
-    log "ERROR: no checkpoint at '$LAST_CKPT'"
-    exit 1
-fi
-log "Checkpoint: $LAST_CKPT"
 
 # Task mode:
 #   (a) TASKS=("short|task_name|instruction" ...) — multi-task eval matrix.
@@ -81,63 +100,44 @@ else
     log "Mode: single-task ($TASK_NAME)"
 fi
 
-# DATASET_NAME may be absent in multi-task variants (they use DATASETS at train time).
-if [[ "${DATASET_NAME+set}" == set ]]; then
-    DATA_PATH="$DATA_DIR/$DATASET_NAME"
-else
-    DATA_PATH="(multi-dataset; see $EXP_DIR/data_config.yaml)"
-fi
+if [ "$MODEL_FAMILY" = "n1.5" ]; then
+    # DATASET_NAME may be absent in multi-task variants (they use DATASETS at train time).
+    if [[ "${DATASET_NAME+set}" == set ]]; then
+        DATA_PATH="$DATA_DIR/$DATASET_NAME"
+    else
+        DATA_PATH="(multi-dataset; see $EXP_DIR/data_config.yaml)"
+    fi
 
-# Auto-detect input resolution from training dataset's meta/info.json.
-# gr00t bakes this into the checkpoint's modality config and asserts equality
-# at eval time (VideoToTensor.check_input). Mismatched sim -> ckpt = hard fail.
-if [[ "${DATASET_NAME+set}" == set ]]; then
-    FIRST_DS_PATH="$DATA_DIR/$DATASET_NAME"
-elif [[ "${DATASETS+set}" == set && ${#DATASETS[@]} -gt 0 ]]; then
-    FIRST_DS_PATH="$DATA_DIR/${DATASETS[0]%%|*}"
-else
-    FIRST_DS_PATH=""
-fi
-if [[ -n "$FIRST_DS_PATH" && -f "$FIRST_DS_PATH/meta/info.json" ]]; then
-    read EVAL_IMG_H EVAL_IMG_W < <(python3 -c "
+    # Auto-detect input resolution from training dataset's meta/info.json.
+    # gr00t bakes this into the checkpoint's modality config and asserts equality
+    # at eval time (VideoToTensor.check_input). Mismatched sim -> ckpt = hard fail.
+    if [[ "${DATASET_NAME+set}" == set ]]; then
+        FIRST_DS_PATH="$DATA_DIR/$DATASET_NAME"
+    elif [[ "${DATASETS+set}" == set && ${#DATASETS[@]} -gt 0 ]]; then
+        FIRST_DS_PATH="$DATA_DIR/${DATASETS[0]%%|*}"
+    else
+        FIRST_DS_PATH=""
+    fi
+    if [[ -n "$FIRST_DS_PATH" && -f "$FIRST_DS_PATH/meta/info.json" ]]; then
+        read EVAL_IMG_H EVAL_IMG_W < <(python3 -c "
 import json, sys
 d = json.load(open(sys.argv[1]))
 shape = next(v['shape'] for v in d['features'].values() if v.get('dtype') == 'video')
 print(shape[1], shape[2])
 " "$FIRST_DS_PATH/meta/info.json")
-    log "Auto-detected input resolution: ${EVAL_IMG_H}x${EVAL_IMG_W} (from $FIRST_DS_PATH/meta/info.json)"
-else
-    EVAL_IMG_H=224
-    EVAL_IMG_W=224
-    log "Could not locate info.json; defaulting input resolution to ${EVAL_IMG_H}x${EVAL_IMG_W}"
+        log "Auto-detected input resolution: ${EVAL_IMG_H}x${EVAL_IMG_W} (from $FIRST_DS_PATH/meta/info.json)"
+    else
+        EVAL_IMG_H=224
+        EVAL_IMG_W=224
+        log "Could not locate info.json; defaulting input resolution to ${EVAL_IMG_H}x${EVAL_IMG_W}"
+    fi
 fi
 
 ###############################################################################
 # Phase 2: Evaluation
 ###############################################################################
 
-if [ -n "${SUBMIT_EVAL_N_EPISODES:-}" ]; then
-    N_EPISODES="$SUBMIT_EVAL_N_EPISODES"
-fi
-if [ -n "${SUBMIT_EVAL_N_RUNS:-}" ]; then
-    N_RUNS="$SUBMIT_EVAL_N_RUNS"
-fi
-if [ -n "${SUBMIT_EVAL_SETS:-}" ]; then
-    read -r -a EVAL_SETS <<< "$SUBMIT_EVAL_SETS"
-fi
-if ! [[ "${N_EPISODES:-}" =~ ^[0-9]+$ ]] || [ "$N_EPISODES" -lt 1 ]; then
-    log "ERROR: N_EPISODES must be a positive integer, got '${N_EPISODES:-}'"
-    exit 1
-fi
-if ! [[ "${N_RUNS:-}" =~ ^[0-9]+$ ]] || [ "$N_RUNS" -lt 1 ]; then
-    log "ERROR: N_RUNS must be a positive integer, got '${N_RUNS:-}'"
-    exit 1
-fi
-if [[ "${EVAL_SETS+set}" != set ]] || [ "${#EVAL_SETS[@]}" -eq 0 ]; then
-    log "ERROR: EVAL_SETS must contain at least one eval set"
-    exit 1
-fi
-log "Eval shape: ${N_RUNS} runs x ${N_EPISODES} episodes; eval_sets=${EVAL_SETS[*]}"
+validate_eval_counts
 
 EVAL_OVERWRITE_RESULTS="${SUBMIT_EVAL_OVERWRITE_RESULTS:-${EVAL_OVERWRITE_RESULTS:-0}}"
 if [ "$EVAL_OVERWRITE_RESULTS" != "0" ] && [ "$EVAL_OVERWRITE_RESULTS" != "1" ]; then
@@ -216,7 +216,15 @@ if ! [[ "$EVAL_SIM_START_STAGGER_SECONDS" =~ ^[0-9]+$ ]]; then
     exit 1
 fi
 if [ -z "${EVAL_SERVER_READY_TIMEOUT_SECONDS:-}" ]; then
-    EVAL_SERVER_READY_TIMEOUT_SECONDS=$((240 + EVAL_PARALLEL_WORKERS * EVAL_SIM_START_STAGGER_SECONDS))
+    if [ "$MODEL_FAMILY" = "n1.5" ]; then
+        EVAL_SERVER_READY_TIMEOUT_SECONDS=$((240 + EVAL_PARALLEL_WORKERS * EVAL_SIM_START_STAGGER_SECONDS))
+    else
+        # Cold Isaac kit/shader caches on freshly provisioned nodes (skt dy-*)
+        # routinely push server startup past 280s, especially when several jobs
+        # cold-start against the shared filesystem at once. Crashed servers are
+        # detected separately, so a generous deadline only delays true hangs.
+        EVAL_SERVER_READY_TIMEOUT_SECONDS=$((900 + EVAL_PARALLEL_WORKERS * EVAL_SIM_START_STAGGER_SECONDS))
+    fi
 fi
 if ! [[ "$EVAL_SERVER_READY_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || [ "$EVAL_SERVER_READY_TIMEOUT_SECONDS" -lt 1 ]; then
     log "ERROR: EVAL_SERVER_READY_TIMEOUT_SECONDS must be a positive integer, got '$EVAL_SERVER_READY_TIMEOUT_SECONDS'"
@@ -229,112 +237,8 @@ FAILED=0
 LAUNCH_IDX=0
 EVAL_LAUNCHED=0
 
-cleanup_all() {
-    for pid in "${PIDS[@]}"; do
-        kill "$pid" 2>/dev/null || true
-    done
-}
 trap cleanup_all EXIT
 trap 'cleanup_all; exit 130' INT TERM
-
-refresh_running_pids() {
-    local status=0
-    local pid
-    local running_pid
-    local is_running
-    local running_pids=()
-    local active_pids=()
-
-    mapfile -t running_pids < <(jobs -pr)
-    for pid in "${PIDS[@]}"; do
-        is_running=0
-        for running_pid in "${running_pids[@]}"; do
-            if [ "$pid" = "$running_pid" ]; then
-                is_running=1
-                break
-            fi
-        done
-        if [ "$is_running" -eq 1 ]; then
-            active_pids+=("$pid")
-        elif wait "$pid"; then
-            :
-        else
-            local worker_status=$?
-            log "ERROR: eval worker pid $pid exited with status $worker_status"
-            FAILED=1
-            status=1
-        fi
-    done
-    PIDS=("${active_pids[@]}")
-    return "$status"
-}
-
-wait_for_slot() {
-    while true; do
-        if ! refresh_running_pids; then
-            return 1
-        fi
-        if [ "${#PIDS[@]}" -lt "$EVAL_PARALLEL_WORKERS" ]; then
-            return 0
-        fi
-        sleep 2
-    done
-}
-
-wait_for_all() {
-    local status=0
-    while true; do
-        if ! refresh_running_pids; then
-            status=1
-        fi
-        if [ "${#PIDS[@]}" -eq 0 ]; then
-            break
-        fi
-        sleep 2
-    done
-    PIDS=()
-    return "$status"
-}
-
-find_eval_port() {
-    local port
-    local existing
-    local used
-    while true; do
-        port="$(find_available_port)"
-        used=0
-        for existing in "${PORTS[@]}"; do
-            if [ "$existing" = "$port" ]; then
-                used=1
-                break
-            fi
-        done
-        if [ "$used" -eq 0 ]; then
-            PORTS+=("$port")
-            echo "$port"
-            return 0
-        fi
-    done
-}
-
-select_cuda_device() {
-    local slot="$1"
-    local visible="${CUDA_VISIBLE_DEVICES:-}"
-    if [ -n "$visible" ]; then
-        IFS=',' read -r -a devices <<< "$visible"
-        local count="${#devices[@]}"
-        if [ "$count" -gt 0 ]; then
-            echo "${devices[$((slot % count))]}"
-            return 0
-        fi
-    fi
-    local gpu_count="${TRAIN_NUM_GPUS:-}"
-    if [[ "$gpu_count" =~ ^[0-9]+$ ]] && [ "$gpu_count" -gt 0 ]; then
-        echo "$((slot % gpu_count))"
-    else
-        echo "$slot"
-    fi
-}
 
 run_eval_one() (
     set -euo pipefail
@@ -448,46 +352,90 @@ run_eval_one() (
     fi
     log "  Isaac Sim server starting on port $PORT with CUDA_VISIBLE_DEVICES=${server_cuda_devices}, num_envs=${EVAL_NUM_ENVS_PER_GPU}"
 
-    setsid bash -c "
-        if [ '${EVAL_UNSET_CUDA_VISIBLE_DEVICES_FOR_SERVER}' = '1' ]; then
-            unset CUDA_VISIBLE_DEVICES
-        fi
-        source '${ISAAC_DIR}/.venv/bin/activate'
-        cd '${ISAAC_DIR}'
-        exec python '${REPO_ROOT}/lib/isaac_server_runner.py' scripts/environments/server_v2.py \
-            --task 'Isaac-UniPickPlace-ALLEX-JointAction-VisualStereo-Abs-v0' \
-            --task_name '${TASK_NAME_LOOP}' \
-            --max-episode-steps ${MAX_EPISODE_STEPS} \
-            --image_crop_ratio 1.0 \
-            --image_resize_height $EVAL_IMG_H \
-            --image_resize_width $EVAL_IMG_W \
-            --port $PORT \
-            --num_envs ${EVAL_NUM_ENVS_PER_GPU} \
-            --device cpu \
-            --eval_set "$EVAL_SET" \
-            --app_launcher.headless
-    " > "$SERVER_LOG" 2>&1 &
-    SERVER_PID=$!
+    if [ "$MODEL_FAMILY" = "n1.5" ]; then
+        setsid bash -c "
+            if [ '${EVAL_UNSET_CUDA_VISIBLE_DEVICES_FOR_SERVER}' = '1' ]; then
+                unset CUDA_VISIBLE_DEVICES
+            fi
+            source '${ISAAC_DIR}/.venv/bin/activate'
+            cd '${ISAAC_DIR}'
+            exec python '${REPO_ROOT}/lib/isaac_server_runner.py' scripts/environments/server_v2.py \
+                --task 'Isaac-UniPickPlace-ALLEX-JointAction-VisualStereo-Abs-v0' \
+                --task_name '${TASK_NAME_LOOP}' \
+                --max-episode-steps ${MAX_EPISODE_STEPS} \
+                --image_crop_ratio 1.0 \
+                --image_resize_height $EVAL_IMG_H \
+                --image_resize_width $EVAL_IMG_W \
+                --port $PORT \
+                --num_envs ${EVAL_NUM_ENVS_PER_GPU} \
+                --device cpu \
+                --eval_set "$EVAL_SET" \
+                --app_launcher.headless
+        " > "$SERVER_LOG" 2>&1 &
+        SERVER_PID=$!
+    else
+        # Server: run from rlwrld_isaac venv (Python 3.11 + isaac-sim).
+        setsid bash -c "
+            if [ '${EVAL_UNSET_CUDA_VISIBLE_DEVICES_FOR_SERVER}' = '1' ]; then
+                unset CUDA_VISIBLE_DEVICES
+            fi
+            source '${ISAAC_DIR}/.venv/bin/activate'
+            cd '${ISAAC_DIR}'
+            exec python '${REPO_ROOT}/lib/isaac_server_runner.py' scripts/environments/server_v2.py \
+                --task 'Isaac-UniPickPlace-ALLEX-JointAction-VisualStereo-Abs-v0' \
+                --task_name '${TASK_NAME_LOOP}' \
+                --max-episode-steps ${MAX_EPISODE_STEPS} \
+                --image_crop_ratio 1.0 \
+                --image_resize_height 480 \
+                --image_resize_width 640 \
+                --port $PORT \
+                --num_envs ${EVAL_NUM_ENVS_PER_GPU} \
+                --device cpu \
+                --eval_set "$EVAL_SET" \
+                --app_launcher.headless
+        " > "$SERVER_LOG" 2>&1 &
+        SERVER_PID=$!
+    fi
 
     log "  Waiting for server readiness..."
     wait_for_server_ready
 
-    source "${TRAIN_REPO_DIR}/.venv/bin/activate"
-    cd "${TRAIN_REPO_DIR}"
+    if [ "$MODEL_FAMILY" = "n1.5" ]; then
+        source "${TRAIN_REPO_DIR}/.venv/bin/activate"
+        cd "${TRAIN_REPO_DIR}"
 
-    log "  Running eval on CUDA_VISIBLE_DEVICES=${cuda_devices} -> ${RUN_DIR}"
+        log "  Running eval on CUDA_VISIBLE_DEVICES=${cuda_devices} -> ${RUN_DIR}"
 
-    python scripts/eval_allex.py \
-        --model-path "$LAST_CKPT" \
-        --server-port $PORT \
-        --output-dir "$RUN_DIR" \
-        --instruction "${INSTRUCTION_LOOP}" \
-        --n-episodes ${N_EPISODES} \
-        --execution_horizon ${EXECUTION_HORIZON} \
-        --data_config "${DATA_CONFIG}" \
-        --action_type joint_action \
-        --seed ${RUN_SEED} &
-    local CLIENT_PID=$!
+        python scripts/eval_allex.py \
+            --model-path "$LAST_CKPT" \
+            --server-port $PORT \
+            --output-dir "$RUN_DIR" \
+            --instruction "${INSTRUCTION_LOOP}" \
+            --n-episodes ${N_EPISODES} \
+            --execution_horizon ${EXECUTION_HORIZON} \
+            --data_config "${DATA_CONFIG}" \
+            --action_type joint_action \
+            --seed ${RUN_SEED} &
+        local CLIENT_PID=$!
+    else
+        # Client: gr00t-n16 venv (uv run handles env activation; PATH carries uv).
+        export PATH="$HOME/.local/bin:$PATH"
+        cd "$TRAIN_REPO_DIR"
+
+        log "  Running eval on CUDA_VISIBLE_DEVICES=${cuda_devices} -> ${RUN_DIR}"
+        uv run --extra allex python scripts/eval_allex.py \
+            --model-path "$LAST_CKPT" \
+            --modality-config "$MODALITY_CONFIG_FILE" \
+            --embodiment-tag NEW_EMBODIMENT \
+            --server-host localhost \
+            --server-port $PORT \
+            --output-dir "$RUN_DIR" \
+            --instruction "${INSTRUCTION_LOOP}" \
+            --n-episodes ${N_EPISODES} \
+            --execution-horizon ${EXECUTION_HORIZON} \
+            --seed ${RUN_SEED} &
+        local CLIENT_PID=$!
+    fi
     while kill -0 "$CLIENT_PID" 2>/dev/null; do
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
             log "ERROR: Isaac Sim server exited during eval (port=$PORT)"
@@ -522,8 +470,10 @@ run_eval_one() (
     return 0
 )
 
-source "${TRAIN_REPO_DIR}/.venv/bin/activate"
-cd "${TRAIN_REPO_DIR}"
+if [ "$MODEL_FAMILY" = "n1.5" ]; then
+    source "${TRAIN_REPO_DIR}/.venv/bin/activate"
+    cd "${TRAIN_REPO_DIR}"
+fi
 
 TASK_IDX=0
 for task_entry in "${TASKS[@]}"; do
@@ -584,101 +534,6 @@ finish_eval_launch_phase "$EVAL_LAUNCHED" "$FAILED" "$RESULTS_PATH"
 # Phase 3: Aggregate
 ###############################################################################
 
-log "Aggregating results..."
-
-# Dump the TASKS list as JSON so the python block can iterate it cleanly
-# (avoids quoting/escaping instructions through a bash-built python literal).
-TASKS_JSON="$EVAL_DIR/.eval_tasks.json"
-python - "$TASKS_JSON" "${TASKS[@]}" <<'PYDUMP'
-import json, sys
-out_path = sys.argv[1]
-tasks = []
-for entry in sys.argv[2:]:
-    parts = entry.split('|', 2)
-    tasks.append({'short': parts[0], 'task_name': parts[1], 'instruction': parts[2]})
-with open(out_path, 'w') as f:
-    json.dump(tasks, f)
-PYDUMP
-
-EVAL_SETS_STR=$(printf "'%s', " "${EVAL_SETS[@]}")
-EVAL_SETS_STR="[${EVAL_SETS_STR%, }]"
-
-python - <<PYEOF
-import json, numpy as np
-from pathlib import Path
-
-base = Path('${EVAL_DIR}')
-eval_sets = ${EVAL_SETS_STR}
-n_runs = ${N_RUNS}
-multi_task = bool(${MULTI_TASK})
-
-with open('${TASKS_JSON}') as f:
-    tasks = json.load(f)
-
-def aggregate_task(task_eval_dir):
-    all_results = {}
-    for es in eval_sets:
-        rates = []
-        for i in range(1, n_runs + 1):
-            p = task_eval_dir / es / f'run_{i}' / 'results.json'
-            if p.exists():
-                with open(p) as fh:
-                    rates.append(json.load(fh)['summary']['success_rate'])
-            else:
-                print(f'WARNING: {p} not found')
-        if rates:
-            rates = np.array(rates)
-            all_results[es] = {
-                'per_run_success_rate': rates.tolist(),
-                'mean_success_rate': float(np.mean(rates)),
-                'std_success_rate': float(np.std(rates)),
-            }
-            print(f'  {es}: {np.mean(rates):.4f} +/- {np.std(rates):.4f}  {rates}')
-    return all_results
-
-agg = {
-    'experiment': '${EXP_NAME}',
-    'output_namespace': '${OUTPUT_NAMESPACE}',
-    'cluster': '${CLUSTER}',
-    'gpu': '${GPU_INSTANCE}',
-    'note': '${TRAIN_NOTE}',
-    'checkpoint': '${LAST_CKPT}',
-    'data_config': '${DATA_CONFIG}',
-    'dataset': '${DATA_PATH}',
-    'n_episodes': ${N_EPISODES},
-    'execution_horizon': ${EXECUTION_HORIZON},
-    'max_steps': ${MAX_STEPS},
-    'n_runs': n_runs,
-    'server_workers': ${EVAL_PARALLEL_WORKERS},
-    'requested_num_envs_per_gpu': ${EVAL_REQUESTED_NUM_ENVS_PER_GPU},
-    'num_envs_per_gpu': ${EVAL_NUM_ENVS_PER_GPU},
-    'total_num_envs': ${EVAL_TOTAL_NUM_ENVS},
-    'eval_base_seed': ${EVAL_BASE_SEED},
-    'eval_seed_run_stride': ${EVAL_SEED_RUN_STRIDE},
-    'eval_seed_set_stride': ${EVAL_SEED_SET_STRIDE},
-    'eval_seed_task_stride': ${EVAL_SEED_TASK_STRIDE},
-}
-
-if multi_task:
-    tasks_out = {}
-    for t in tasks:
-        ts = t['short']
-        print(f'=== {ts} ({t["task_name"]}) ===')
-        tasks_out[ts] = {
-            'task_name': t['task_name'],
-            'instruction': t['instruction'],
-            'eval_sets': aggregate_task(base / ts),
-        }
-    agg['tasks'] = tasks_out
-else:
-    agg['task_name'] = tasks[0]['task_name']
-    agg['eval_sets'] = aggregate_task(base)
-
-out = Path('${RESULTS_PATH}')
-out.parent.mkdir(parents=True, exist_ok=True)
-with open(out, 'w') as f:
-    json.dump(agg, f, indent=2)
-print(f'Saved to {out}')
-PYEOF
+aggregate_eval_results "$MODEL_FAMILY"
 
 log "DONE  $RESULTS_PATH"

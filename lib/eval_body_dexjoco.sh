@@ -79,19 +79,10 @@ export MAMBA_ROOT_PREFIX
 [ -n "$DEXJOCO_TASK" ] || { echo "ERROR: DEXJOCO_TASK not set (config.sh or submit picker)"; exit 1; }
 [ -d "$DEXJOCO_DIR" ] || { echo "ERROR: DEXJOCO_DIR not found: $DEXJOCO_DIR"; exit 1; }
 [ -x "$MICROMAMBA_BIN" ] || { echo "ERROR: micromamba not executable: $MICROMAMBA_BIN"; exit 1; }
-if ! [[ "$N_EPISODES" =~ ^[0-9]+$ ]] || [ "$N_EPISODES" -lt 1 ]; then
-    echo "ERROR: N_EPISODES must be a positive integer, got '$N_EPISODES'"; exit 1
-fi
-if ! [[ "$N_RUNS" =~ ^[0-9]+$ ]] || [ "$N_RUNS" -lt 1 ]; then
-    echo "ERROR: N_RUNS must be a positive integer, got '$N_RUNS'"; exit 1
-fi
-if [ -z "${EVAL_CHECKPOINT:-}" ]; then
-    echo "ERROR: EVAL_CHECKPOINT is required"; exit 1
-fi
-LAST_CKPT="$EVAL_CHECKPOINT"
-if [ ! -e "$LAST_CKPT" ]; then
-    echo "ERROR: checkpoint path not found: $LAST_CKPT"; exit 1
-fi
+# Shared validators (lib/_common.sh): positive-int counts + checkpoint path.
+require_positive_int "N_EPISODES" "$N_EPISODES"
+require_positive_int "N_RUNS" "$N_RUNS"
+require_eval_checkpoint_path
 
 ADAPTER="$REPO_ROOT/lib/dexjoco/gr00t_dexjoco_server.py"
 if [ "$DEXJOCO_SERVER_TYPE" = "groot" ]; then
