@@ -1928,9 +1928,13 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
 
         # One remote probe is materially faster than several serial SSH calls on
         # SKT. It returns: completed result files, stdout episode-completion
-        # count for this job, stdout completed-run count for this job, and
-        # saved per-episode video artifacts across the eval dir. The video
-        # count covers active runs whose Python stdout is still buffered.
+        # count for this job, stdout completed-run count for this job, saved
+        # per-episode video artifacts across the eval dir, and finished DexJoCo
+        # episode dirs. The video count covers active Isaac runs whose Python
+        # stdout is still buffered; the DexJoCo count is the only live signal
+        # for openpi/dexjoco evals, which write one episode_NN_<success|failure>
+        # dir per finished episode (episode_NN_temp is the in-flight one) and
+        # only emit results.json / "Results saved to:" once the whole run ends.
         eval_dir_expr = remote_path_expr(eval_dir)
         log_dir_q = shlex.quote(env.vars["LOG_DIR"])
         job_id_q = shlex.quote(job_id)
@@ -1940,22 +1944,24 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
             f"job_id={job_id_q}; "
             'completed=$(find "$eval_dir" -type f -name results.json 2>/dev/null | wc -l); '
             "video_eps=$(find \"$eval_dir\" -type f -path '*/videos/ep*.mp4' 2>/dev/null | wc -l); "
+            "dexjoco_eps=$(find \"$eval_dir\" -type d 2>/dev/null | grep -cE '/episode_[0-9]+_(success|failure)$'); "
             'pattern="$log_dir"/*_"$job_id".out; '
             "stdout_eps=$(grep -h '^Episode .* completed' $pattern 2>/dev/null | wc -l); "
             "stdout_runs=$(grep -h '^Results saved to:' $pattern 2>/dev/null | wc -l); "
-            "printf '%s %s %s %s\\n' \"$completed\" \"$stdout_eps\" \"$stdout_runs\" \"$video_eps\""
+            "printf '%s %s %s %s %s\\n' \"$completed\" \"$stdout_eps\" \"$stdout_runs\" \"$video_eps\" \"$dexjoco_eps\""
         )
         r = await ssh_run(host, probe_cmd, timeout=12.0)
         if r.returncode != 0:
             raise RuntimeError((r.stderr or r.stdout or "eval progress probe failed").strip())
         try:
             parts = r.stdout.strip().split()
-            if len(parts) != 4:
-                raise ValueError(f"expected 4 counters, got {len(parts)}")
+            if len(parts) != 5:
+                raise ValueError(f"expected 5 counters, got {len(parts)}")
             completed = int(parts[0])
             stdout_eps = int(parts[1])
             job_completed_runs = int(parts[2])
             video_eps = int(parts[3])
+            dexjoco_eps = int(parts[4])
         except ValueError as exc:
             raise RuntimeError(f"invalid eval progress probe output: {r.stdout.strip()!r}") from exc
         progress.completed_runs = completed
@@ -1973,7 +1979,7 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
             completed_steps = completed * n_eps
             stdout_incomplete_eps = min(n_eps, max(0, stdout_eps - job_completed_runs * n_eps))
             stdout_current = completed_steps + stdout_incomplete_eps
-            current = max(completed_steps, stdout_current, video_eps)
+            current = max(completed_steps, stdout_current, video_eps, dexjoco_eps)
             progress.current_step = min(current, progress.max_steps)
             progress.percent = round(100.0 * progress.current_step / progress.max_steps, 1)
             episode_label = f"{progress.current_step}/{progress.max_steps} episodes"
