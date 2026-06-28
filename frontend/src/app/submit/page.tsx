@@ -80,6 +80,7 @@ type TrainConfigEdit = {
   batchSize: string;
   maxSteps: string;
   saveSteps: string;
+  numWorkers: string;
   actionHorizon: string;
   gitCommit: string;
 };
@@ -94,6 +95,7 @@ const TRAIN_CONFIG_FIELDS: readonly (keyof TrainConfigValues)[] = [
   "batchSize",
   "maxSteps",
   "saveSteps",
+  "numWorkers",
   "actionHorizon",
   "gitCommit",
 ] as const;
@@ -406,6 +408,7 @@ export default function SubmitPage() {
       batchSize,
       maxSteps: vars?.MAX_STEPS ?? "",
       saveSteps: vars?.SAVE_STEPS ?? "",
+      numWorkers: vars?.TRAIN_NUM_WORKERS ?? "16",
       actionHorizon:
         vars?.TRAIN_ACTION_HORIZON ??
         (dataInterface.data?.action_horizon != null
@@ -428,6 +431,9 @@ export default function SubmitPage() {
   const trainSaveSteps = activeTrainConfigEdit
     ? activeTrainConfigEdit.saveSteps
     : trainConfigDefaults.saveSteps;
+  const trainNumWorkers = activeTrainConfigEdit
+    ? activeTrainConfigEdit.numWorkers
+    : trainConfigDefaults.numWorkers;
   const trainActionHorizon = activeTrainConfigEdit
     ? activeTrainConfigEdit.actionHorizon
     : trainConfigDefaults.actionHorizon;
@@ -442,6 +448,7 @@ export default function SubmitPage() {
   );
   const trainMaxStepsParsed = Number.parseInt(trainMaxSteps.trim(), 10);
   const trainSaveStepsParsed = Number.parseInt(trainSaveSteps.trim(), 10);
+  const trainNumWorkersParsed = Number.parseInt(trainNumWorkers.trim(), 10);
   const trainActionHorizonParsed = Number.parseInt(
     trainActionHorizon.trim(),
     10,
@@ -463,6 +470,8 @@ export default function SubmitPage() {
     !wantsTrainConfig || isPositiveInteger(trainMaxSteps);
   const trainSaveStepsValid =
     !wantsTrainConfig || isPositiveInteger(trainSaveSteps);
+  const trainNumWorkersValid =
+    !wantsTrainConfig || isPositiveInteger(trainNumWorkers);
   const trainActionHorizonValid =
     !trainActionHorizonEnabled ||
     isPositiveInteger(trainActionHorizon);
@@ -475,6 +484,7 @@ export default function SubmitPage() {
     trainBatchSizeValid &&
     trainMaxStepsValid &&
     trainSaveStepsValid &&
+    trainNumWorkersValid &&
     trainActionHorizonValid &&
     trainGitCommitValid;
   const updateTrainConfig = (
@@ -563,6 +573,7 @@ export default function SubmitPage() {
       train_global_batch_size: submittedTrainGlobalBatchSize,
       train_max_steps: phase === "train" ? trainMaxStepsParsed : null,
       train_save_steps: phase === "train" ? trainSaveStepsParsed : null,
+      train_num_workers: phase === "train" ? trainNumWorkersParsed : null,
       train_action_horizon: submittedTrainActionHorizon,
       train_git_commit: submittedGitCommit,
       eval_num_envs_per_gpu: null,
@@ -608,6 +619,7 @@ export default function SubmitPage() {
       trainBatchSize,
       trainMaxSteps,
       trainSaveSteps,
+      trainNumWorkers,
       trainActionHorizon,
       submittedGitCommit,
       evalNEpisodes,
@@ -980,6 +992,16 @@ export default function SubmitPage() {
         invalidMessage="Positive integer."
       />
     );
+    const workersEditor = (
+      <NumberCellEditor
+        value={trainNumWorkers}
+        onChange={(value) => updateTrainConfig({ numWorkers: value })}
+        valid={trainNumWorkersValid}
+        invalidMessage="Positive integer."
+      />
+    );
+    flagEditors["--dataloader_num_workers"] = workersEditor;
+    flagEditors["--dataloader-num-workers"] = workersEditor;
   }
   if (wantsCheckpoint) {
     flagEditors["--n-episodes"] = (

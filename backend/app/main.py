@@ -392,6 +392,7 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
                 global_batch_override=req.train_global_batch_size,
                 max_steps_override=req.train_max_steps,
                 save_steps_override=req.train_save_steps,
+                num_workers_override=req.train_num_workers,
             )
             train_action_horizon = submit.resolve_train_action_horizon(
                 req,
@@ -429,6 +430,7 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
                 train_global_batch_size=train_settings.global_batch_size,
                 train_max_steps=train_settings.max_steps,
                 train_save_steps=train_settings.save_steps,
+                train_num_workers=train_settings.num_workers,
                 train_action_horizon=train_action_horizon,
                 train_modality_config=train_modality_config,
                 train_git_commit=train_git_commit,
@@ -444,6 +446,7 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
                 global_batch_override=req.train_global_batch_size,
                 max_steps_override=req.train_max_steps,
                 save_steps_override=req.train_save_steps,
+                num_workers_override=req.train_num_workers,
             )
             checkpoint_path = submit.require_eval_checkpoint_path(req)
             eval_sets = submit.normalize_eval_sets(req.eval_sets)
@@ -518,6 +521,7 @@ async def post_submit(req: submit.SubmitRequest):
                 global_batch_size=req.train_global_batch_size if req.phase == "train" else None,
                 max_steps=req.train_max_steps if req.phase == "train" else None,
                 save_steps=req.train_save_steps if req.phase == "train" else None,
+                num_workers=req.train_num_workers if req.phase == "train" else None,
                 action_horizon=req.train_action_horizon if req.phase == "train" else None,
                 train_git_commit=req.train_git_commit,
                 node=req.node,

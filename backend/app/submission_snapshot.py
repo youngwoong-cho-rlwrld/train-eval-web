@@ -856,6 +856,7 @@ def render_training_config_snapshot(
     train_global_batch_size: int | None,
     train_max_steps: int,
     train_save_steps: int,
+    train_num_workers: int,
     train_action_horizon: int | None = None,
     train_modality_config: str | None = None,
     train_git_commit: str | None = None,
@@ -872,6 +873,7 @@ def render_training_config_snapshot(
     text = _set_scalar(text, "TRAIN_NUM_GPUS", train_num_gpus)
     text = _set_scalar(text, "MAX_STEPS", train_max_steps)
     text = _set_scalar(text, "SAVE_STEPS", train_save_steps)
+    text = _set_scalar(text, "TRAIN_NUM_WORKERS", train_num_workers)
     if train_action_horizon is not None:
         text = _set_scalar(text, "TRAIN_ACTION_HORIZON", train_action_horizon)
     if train_modality_config is not None:
@@ -1020,6 +1022,7 @@ def snapshot_metadata(
     train_global_batch_size: int | None = None,
     train_max_steps: int | None = None,
     train_save_steps: int | None = None,
+    train_num_workers: int | None = None,
     train_action_horizon: int | None = None,
     train_modality_config: str | None = None,
     train_git_commit: str | None = None,
@@ -1044,6 +1047,7 @@ def snapshot_metadata(
             "global_batch_size": train_global_batch_size,
             "max_steps": train_max_steps,
             "save_steps": train_save_steps,
+            "num_workers": train_num_workers,
             "action_horizon": train_action_horizon,
             "modality_config": train_modality_config,
             "requested_git_commit": train_git_commit,

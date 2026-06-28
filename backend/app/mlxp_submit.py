@@ -148,6 +148,7 @@ class MlxpSubmitRequest(BaseModel):
     global_batch_size: int | None = None
     max_steps: int | None = None
     save_steps: int | None = None
+    num_workers: int | None = None
     action_horizon: int | None = Field(default=None, ge=1)
     train_git_commit: str | None = None
     # The k8s node to pin via nodeAffinity. Leave None to fall back to the
@@ -333,10 +334,12 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
         global_batch_override=req.global_batch_size,
         max_steps_override=req.max_steps,
         save_steps_override=req.save_steps,
+        num_workers_override=req.num_workers,
     )
     train_num_gpus = train_settings.num_gpus
     train_max_steps = train_settings.max_steps
     train_save_steps = train_settings.save_steps
+    train_num_workers = train_settings.num_workers
     train_global_batch_size = train_settings.global_batch_size
     suffix = req.output_namespace or f"{snapshot_suffix(job_name)}_{job_id}"
     exp_dir = f"{settings.experiments_dir}/{variant.name}"
@@ -355,6 +358,7 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
         train_global_batch_size=train_global_batch_size,
         train_max_steps=train_max_steps,
         train_save_steps=train_save_steps,
+        train_num_workers=train_num_workers,
         train_action_horizon=req.action_horizon,
         train_modality_config=(
             f"modality_{suffix}.py"
@@ -380,6 +384,7 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
         train_global_batch_size=train_global_batch_size,
         train_max_steps=train_max_steps,
         train_save_steps=train_save_steps,
+        train_num_workers=train_num_workers,
         train_action_horizon=req.action_horizon,
         train_modality_config=(
             f"{exp_dir}/modality_{suffix}.py"
@@ -716,6 +721,7 @@ def _render_body_script(
 
     max_steps = str(req.max_steps or variant_int(variant, "MAX_STEPS", 30000))
     save_steps = str(req.save_steps or variant_int(variant, "SAVE_STEPS", 1000))
+    num_workers = str(req.num_workers or variant_int(variant, "TRAIN_NUM_WORKERS", 16))
     batch_size = variant.vars.get("TRAIN_BATCH_SIZE", "64")
     if family == "n1.5" and req.global_batch_size is not None:
         batch_size = str(req.global_batch_size // req.num_gpus)
@@ -730,7 +736,8 @@ def _render_body_script(
     if family == "n1.6":
         return _render_body_n16(
             variant=variant, req=req, job_name=job_name, names=names,
-            max_steps=max_steps, save_steps=save_steps, batch_size=batch_size,
+            max_steps=max_steps, save_steps=save_steps, num_workers=num_workers,
+            batch_size=batch_size,
             train_extra=train_extra, user_extra=user_extra, ckpt_dir=ckpt_dir,
             snapshot=snapshot, model=model, repo_path=repo_path, settings=settings,
         )
@@ -799,7 +806,7 @@ torchrun --nproc_per_node={req.num_gpus} scripts/gr00t_finetune.py \\
     --data-config /tmp/data_config.yaml \\
     --max-steps {max_steps} \\
     --save-steps {save_steps} \\
-    --dataloader_num_workers 16 \\
+    --dataloader_num_workers {num_workers} \\
     --dataloader-prefetch-factor 10 \\
     --video-backend torchcodec \\
     --report-to wandb \\
@@ -867,6 +874,7 @@ def _safe_yaml_relpath(rel: str) -> bool:
 
 def _render_body_n16(*, variant, req: MlxpSubmitRequest, job_name: str,
                      names: list[str], max_steps: str, save_steps: str,
+                     num_workers: str,
                      batch_size: str, train_extra: str, user_extra: str,
                      ckpt_dir: str, snapshot: dict, model: TrainingModel, repo_path: str,
                      settings: MlxpSettings) -> str:
@@ -954,7 +962,7 @@ uv run $UV_RUN_ARGS torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/la
     --max-steps {max_steps} \\
     --save-steps {save_steps} \\
     --save-total-limit 5 \\
-    --dataloader-num-workers 16 \\
+    --dataloader-num-workers {num_workers} \\
     --experiment-name "{output_namespace}" \\
     --use-wandb \\
     --wandb-project {wandb_project} \\
@@ -1108,9 +1116,11 @@ def _job_comment(req: MlxpSubmitRequest, variant, snapshot: dict) -> str:
     if req.phase == "train":
         max_steps = req.max_steps or variant_int(variant, "MAX_STEPS", 30000)
         save_steps = req.save_steps or variant_int(variant, "SAVE_STEPS", 1000)
+        num_workers = req.num_workers or variant_int(variant, "TRAIN_NUM_WORKERS", 16)
         comment += (
             f";train_num_gpus={req.num_gpus};"
-            f"train_max_steps={max_steps};train_save_steps={save_steps}"
+            f"train_max_steps={max_steps};train_save_steps={save_steps};"
+            f"train_num_workers={num_workers}"
         )
         if req.global_batch_size is not None:
             comment += f";train_global_batch_size={req.global_batch_size}"

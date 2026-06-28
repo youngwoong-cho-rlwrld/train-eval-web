@@ -88,6 +88,7 @@ class SubmitRequest(BaseModel):
     train_global_batch_size: int | None = Field(default=None, ge=1)
     train_max_steps: int | None = Field(default=None, ge=1)
     train_save_steps: int | None = Field(default=None, ge=1)
+    train_num_workers: int | None = Field(default=None, ge=1)
     train_action_horizon: int | None = Field(default=None, ge=1)
     # Optional model-code git commit. If set, the backend verifies the commit
     # exists in the selected model repo and runs from a detached worktree at
@@ -208,15 +209,18 @@ class TrainSettings:
     global_batch_size: int | None
     max_steps: int
     save_steps: int
+    num_workers: int
 
 
 def resolve_train_settings(variant, model_family: str, *, num_gpus_override: int | None,
                            global_batch_override: int | None, max_steps_override: int | None,
-                           save_steps_override: int | None) -> TrainSettings:
+                           save_steps_override: int | None,
+                           num_workers_override: int | None) -> TrainSettings:
     """Resolve train-time override values exactly once for submit and preview."""
     train_num_gpus = num_gpus_override or variant_int(variant, "TRAIN_NUM_GPUS", 2)
     train_max_steps = max_steps_override or variant_int(variant, "MAX_STEPS", 30000)
     train_save_steps = save_steps_override or variant_int(variant, "SAVE_STEPS", 1000)
+    train_num_workers = num_workers_override or variant_int(variant, "TRAIN_NUM_WORKERS", 16)
     train_global_batch_size = global_batch_override
 
     if train_global_batch_size is None:
@@ -238,6 +242,7 @@ def resolve_train_settings(variant, model_family: str, *, num_gpus_override: int
         global_batch_size=train_global_batch_size,
         max_steps=train_max_steps,
         save_steps=train_save_steps,
+        num_workers=train_num_workers,
     )
 
 
@@ -378,6 +383,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         global_batch_override=req.train_global_batch_size,
         max_steps_override=req.train_max_steps,
         save_steps_override=req.train_save_steps,
+        num_workers_override=req.train_num_workers,
     )
     train_action_horizon = resolve_train_action_horizon(
         req,
@@ -483,6 +489,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             train_global_batch_size=train_settings.global_batch_size,
             train_max_steps=train_settings.max_steps,
             train_save_steps=train_settings.save_steps,
+            train_num_workers=train_settings.num_workers,
             train_action_horizon=train_action_horizon,
             train_modality_config=Path(snapshot_modality_rel).name if snapshot_modality_rel else None,
             train_git_commit=train_git_commit,
@@ -503,6 +510,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             train_global_batch_size=train_settings.global_batch_size,
             train_max_steps=train_settings.max_steps,
             train_save_steps=train_settings.save_steps,
+            train_num_workers=train_settings.num_workers,
             train_action_horizon=train_action_horizon,
             train_modality_config=snapshot_modality_path,
             train_git_commit=train_git_commit,
@@ -696,7 +704,8 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         + f",SUBMIT_TRAIN_NUM_GPUS={train_settings.num_gpus}"
         + (
             f",SUBMIT_TRAIN_MAX_STEPS={train_settings.max_steps},"
-            f"SUBMIT_TRAIN_SAVE_STEPS={train_settings.save_steps}"
+            f"SUBMIT_TRAIN_SAVE_STEPS={train_settings.save_steps},"
+            f"SUBMIT_TRAIN_NUM_WORKERS={train_settings.num_workers}"
             if req.phase == "train" else ""
         )
         + (
@@ -813,6 +822,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             f"train_num_gpus={train_settings.num_gpus}\n"
             f"train_max_steps={train_settings.max_steps}\n"
             f"train_save_steps={train_settings.save_steps}\n"
+            f"train_num_workers={train_settings.num_workers}\n"
             if req.phase == "train"
             else ""
         )

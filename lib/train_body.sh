@@ -37,6 +37,7 @@ if [ "$MODEL_FAMILY" = "n1.5" ]; then
     TRAIN_NUM_GPUS="${SUBMIT_TRAIN_NUM_GPUS:-$TRAIN_NUM_GPUS}"
     MAX_STEPS="${SUBMIT_TRAIN_MAX_STEPS:-$MAX_STEPS}"
     SAVE_STEPS="${SUBMIT_TRAIN_SAVE_STEPS:-$SAVE_STEPS}"
+    TRAIN_NUM_WORKERS="${SUBMIT_TRAIN_NUM_WORKERS:-${TRAIN_NUM_WORKERS:-16}}"
     if [ -n "${SUBMIT_TRAIN_GLOBAL_BATCH_SIZE:-}" ]; then
         if (( SUBMIT_TRAIN_GLOBAL_BATCH_SIZE % TRAIN_NUM_GPUS != 0 )); then
             echo "ERROR: SUBMIT_TRAIN_GLOBAL_BATCH_SIZE must be divisible by TRAIN_NUM_GPUS for n1.5 training"
@@ -49,6 +50,7 @@ else
     TRAIN_NUM_GPUS="${SUBMIT_TRAIN_NUM_GPUS:-$TRAIN_NUM_GPUS}"
     MAX_STEPS="${SUBMIT_TRAIN_MAX_STEPS:-$MAX_STEPS}"
     SAVE_STEPS="${SUBMIT_TRAIN_SAVE_STEPS:-$SAVE_STEPS}"
+    TRAIN_NUM_WORKERS="${SUBMIT_TRAIN_NUM_WORKERS:-${TRAIN_NUM_WORKERS:-16}}"
     append_submit_extra_train_args
 fi
 
@@ -161,7 +163,7 @@ if [ "$MODEL_FAMILY" = "n1.5" ]; then
         --data-config "$DATA_CONFIG_YAML" \
         --max-steps "$MAX_STEPS" \
         --save-steps "$SAVE_STEPS" \
-        --dataloader_num_workers 16 \
+        --dataloader_num_workers "$TRAIN_NUM_WORKERS" \
         --dataloader-prefetch-factor 10 \
         --video-backend torchcodec \
     $([[ "$RESUME_FLAG" == "True" ]] && echo "--resume ") \
@@ -263,7 +265,7 @@ else
         --max-steps "$MAX_STEPS" \
         --save-steps "$SAVE_STEPS" \
         --save-total-limit 5 \
-        --dataloader-num-workers 16 \
+        --dataloader-num-workers "$TRAIN_NUM_WORKERS" \
         --experiment-name "$OUTPUT_NAMESPACE" \
         --use-wandb \
         --wandb-project "$WANDB_PROJECT" \

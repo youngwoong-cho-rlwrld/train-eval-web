@@ -118,6 +118,7 @@ async def _resubmit_slurm_job(
                 train_global_batch_size=int_meta("train_global_batch_size"),
                 train_max_steps=int_meta("train_max_steps"),
                 train_save_steps=int_meta("train_save_steps"),
+                train_num_workers=int_meta("train_num_workers"),
                 train_action_horizon=int_meta("train_action_horizon"),
                 job_name=_retry_job_name(job_name) if retrying else job_name,
                 output_namespace=(meta.get("output_namespace") or "").strip() or None,
