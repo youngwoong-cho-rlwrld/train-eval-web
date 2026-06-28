@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import time
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -71,25 +72,69 @@ class ResultsResponse(BaseModel):
     errors: list[ClusterResultError] = Field(default_factory=list)
 
 
+# Scanning a cluster's experiment tree is slow on metadata-heavy network
+# filesystems — notably skt's FSx, where even a shallow walk can take a
+# minute-plus under multi-tenant load. To keep the Results page responsive we
+# cache the last successful per-cluster scan and refresh it in the background:
+# a fresh-enough cache returns instantly, a stale one is served immediately
+# while a single background scan refreshes it, and only a cold cache blocks on
+# the walk. Single-flight refresh stops scans from piling up across tabs.
+_RESULTS_CACHE: dict[str, tuple[float, list["ResultVariant"]]] = {}
+_RESULTS_REFRESH: dict[str, asyncio.Task] = {}
+_RESULTS_CACHE_TTL = 60.0
+
+
+async def _scan_cluster_results(
+    c: str, payload, checkpoint_links
+) -> tuple[list[ResultVariant], ClusterResultError | None]:
+    try:
+        if c == "mlxp":
+            raw = await _read_mlxp_results(payload, checkpoint_links)
+        else:
+            env = await load_cluster(c)
+            raw = await _read_cluster_results(env.ssh_alias, c, payload, checkpoint_links)
+        return [ResultVariant.model_validate(x) for x in raw], None
+    except Exception as e:
+        # asyncio.TimeoutError (and some others) stringify to "" — fall back to
+        # the type name so the UI never shows a blank error.
+        return [], ClusterResultError(cluster=c, error=str(e) or type(e).__name__)
+
+
+async def _refresh_cluster_results(c: str, payload, checkpoint_links) -> None:
+    rows, err = await _scan_cluster_results(c, payload, checkpoint_links)
+    if err is None:
+        _RESULTS_CACHE[c] = (time.monotonic(), rows)
+
+
+async def _cluster_results_cached(
+    c: str, payload, checkpoint_links
+) -> tuple[list[ResultVariant], ClusterResultError | None]:
+    cached = _RESULTS_CACHE.get(c)
+    if cached is not None:
+        ts, rows = cached
+        if time.monotonic() - ts > _RESULTS_CACHE_TTL:
+            task = _RESULTS_REFRESH.get(c)
+            if task is None or task.done():
+                _RESULTS_REFRESH[c] = asyncio.create_task(
+                    _refresh_cluster_results(c, payload, checkpoint_links)
+                )
+        return rows, None
+    # Cold cache: scan synchronously and cache on success (errors aren't cached,
+    # so a transient failure retries on the next request).
+    rows, err = await _scan_cluster_results(c, payload, checkpoint_links)
+    if err is None:
+        _RESULTS_CACHE[c] = (time.monotonic(), rows)
+    return rows, err
+
+
 async def list_results(cluster: str | None = None) -> ResultsResponse:
     target_clusters = [cluster] if cluster else list_clusters()
     payload = await _variant_payload()
     checkpoint_links = await _checkpoint_link_payload()
 
-    async def _one(c: str) -> tuple[list[ResultVariant], ClusterResultError | None]:
-        try:
-            if c == "mlxp":
-                raw = await _read_mlxp_results(payload, checkpoint_links)
-                return [ResultVariant.model_validate(x) for x in raw], None
-            env = await load_cluster(c)
-            raw = await _read_cluster_results(env.ssh_alias, c, payload, checkpoint_links)
-            return [ResultVariant.model_validate(x) for x in raw], None
-        except Exception as e:
-            # asyncio.TimeoutError (and some others) stringify to "" — fall back
-            # to the type name so the UI never shows a blank error.
-            return [], ClusterResultError(cluster=c, error=str(e) or type(e).__name__)
-
-    groups = await asyncio.gather(*(_one(c) for c in target_clusters))
+    groups = await asyncio.gather(
+        *(_cluster_results_cached(c, payload, checkpoint_links) for c in target_clusters)
+    )
     out: list[ResultVariant] = []
     errors: list[ClusterResultError] = []
     for rows, err in groups:
