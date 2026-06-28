@@ -7,6 +7,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { api, type Job, type SubmitResponse } from "@/lib/api";
 import { jobDetailHref } from "@/lib/job-links";
+import type { JobPhase } from "@/lib/job-status";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -17,7 +18,6 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 
-type ResumePhase = "train" | "resume" | "eval" | "unknown" | "other";
 type ResumeAction = "resume" | "retry";
 
 export function ResumeJobButton({
@@ -31,7 +31,7 @@ export function ResumeJobButton({
 }: {
   cluster: string;
   jobId: string;
-  phase?: ResumePhase | null;
+  phase?: JobPhase | null;
   variant?: string | null;
   jobName?: string | null;
   action?: ResumeAction;
@@ -60,7 +60,8 @@ export function ResumeJobButton({
       qc.invalidateQueries({ queryKey: ["resumed-jobs", cluster, jobId] });
       router.push(`/jobs/${cluster}/${data.job_id}`);
     },
-    onError: (err: Error) => toast.error(`${actionLabel(action)} failed: ${err.message}`),
+    onError: (err: Error) =>
+      toast.error(`${action === "retry" ? "Retry" : "Resume"} failed: ${err.message}`),
   });
 
   const normalizedPhase = phase === "resume" ? "train" : phase;
@@ -193,8 +194,4 @@ export function ResumeJobButton({
       </Dialog>
     </>
   );
-}
-
-function actionLabel(action: ResumeAction) {
-  return action === "retry" ? "Retry" : "Resume";
 }

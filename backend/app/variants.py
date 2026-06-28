@@ -7,11 +7,13 @@ return a typed Pydantic object.
 Parsing is done in a local bash subprocess — no SSH needed since configs live
 in the local repo.
 """
+from __future__ import annotations
+
 
 import asyncio
 import re
 import shutil
-from collections.abc import Callable, Set
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -19,9 +21,13 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel
 
-from .clusters import _BASH
-from .paths import EXPERIMENTS_DIR
+from .clusters import _BASH, _bash_unescape
+from .paths import EXPERIMENTS_DIR, REPO_ROOT
+from .submission_snapshot import set_scalar
 from .training_models import resolve_training_model
+
+# Default DATA_CONFIG_MAP key used when a variant does not set DATA_CONFIG.
+DEFAULT_DATA_CONFIG = "allex_thetwo_ck40_egostereo"
 
 
 class Variant(BaseModel):
@@ -196,8 +202,8 @@ async def restore_variant_file_version(
 
 
 async def parse_variant_text(name: str, raw: str) -> Variant:
-    vars, arrays = await _parse_bash(raw)
-    return Variant(name=name, raw=raw, vars=vars, arrays=arrays)
+    scalars, arrays = await _parse_bash(raw)
+    return Variant(name=name, raw=raw, vars=scalars, arrays=arrays)
 
 
 def _experiment_dir(name: str) -> Path:
@@ -215,7 +221,7 @@ def _display_path(variant: str, rel: str) -> str:
 
 def _relative_display_path(path: Path) -> str:
     try:
-        return str(path.relative_to(EXPERIMENTS_DIR.parent.parent))
+        return str(path.relative_to(REPO_ROOT))
     except ValueError:
         return str(path)
 
@@ -248,7 +254,7 @@ def _active_second_title(exp_dir: Path, variant: Variant, model_family: str) -> 
     return py_files[0] if len(py_files) == 1 else spec.default_name
 
 
-def _is_safe_relative_file(rel: str, suffixes: Set[str]) -> bool:
+def _is_safe_relative_file(rel: str, suffixes: frozenset[str]) -> bool:
     path = Path(rel)
     return (
         bool(rel)
@@ -283,7 +289,7 @@ def _generated_data_config_yaml(variant: Variant) -> str:
     if variant.arrays.get("DATASETS"):
         entries = variant.arrays["DATASETS"]
     elif variant.vars.get("DATASET_NAME"):
-        cfg = variant.vars.get("DATA_CONFIG", "allex_thetwo_ck40_egostereo")
+        cfg = variant.vars.get("DATA_CONFIG", DEFAULT_DATA_CONFIG)
         entries = [f"{variant.vars['DATASET_NAME']}|{cfg}|1.0"]
     else:
         entries = []
@@ -293,7 +299,7 @@ def _generated_data_config_yaml(variant: Variant) -> str:
             name, cfg, weight = parts
         else:
             name = entry
-            cfg = variant.vars.get("DATA_CONFIG", "allex_thetwo_ck40_egostereo")
+            cfg = variant.vars.get("DATA_CONFIG", DEFAULT_DATA_CONFIG)
             weight = "1.0"
         rows.extend([
             f"    - path: $DATA_DIR/{name}",
@@ -384,18 +390,10 @@ def _spec_for(model_family: str) -> SecondFileSpec:
 
 
 def _set_second_file_ref(config_text: str, second_title: str, model_family: str) -> str:
-    if model_family == "n1.5":
-        return _set_scalar(config_text, "TRAIN_DATA_CONFIG", second_title)
-    return _set_scalar(config_text, "TRAIN_MODALITY_CONFIG", second_title)
-
-
-def _set_scalar(config_text: str, key: str, value: str) -> str:
-    line = f"{key}={value}"
-    pattern = re.compile(rf"(?m)^(?:export\s+)?{re.escape(key)}=.*$")
-    if pattern.search(config_text):
-        return pattern.sub(line, config_text)
-    suffix = "" if config_text.endswith("\n") else "\n"
-    return f"{config_text}{suffix}\n{line}\n"
+    spec = _spec_for(model_family)
+    # second_title is a validated relative filename (see _is_safe_relative_file),
+    # so it is stored unquoted to match the on-disk config.sh convention.
+    return set_scalar(config_text, spec.config_var, second_title, quote=False)
 
 
 def _snapshot_variant_files(exp_dir: Path, paths: list[Path]) -> Path | None:
@@ -415,7 +413,7 @@ def _snapshot_variant_files(exp_dir: Path, paths: list[Path]) -> Path | None:
     return dest
 
 
-def _list_file_versions(exp_dir, variant: str) -> list[VariantFileVersion]:
+def _list_file_versions(exp_dir: Path, variant: str) -> list[VariantFileVersion]:
     root = exp_dir / ".versions"
     if not root.is_dir():
         return []
@@ -465,7 +463,3 @@ async def _parse_bash(script_text: str) -> tuple[dict[str, str], dict[str, list[
         elif m := _SCALAR_RE.match(line):
             scalars[m.group(1)] = _bash_unescape(m.group(2))
     return scalars, arrays
-
-
-def _bash_unescape(s: str) -> str:
-    return s.replace(r"\"", '"').replace(r"\\", "\\").replace(r"\$", "$")

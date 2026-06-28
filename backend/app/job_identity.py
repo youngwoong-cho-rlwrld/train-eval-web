@@ -1,5 +1,7 @@
 """Shared helpers for recovering a job's phase and experiment variant."""
 
+from __future__ import annotations
+
 import re
 
 from .variants import list_variants
@@ -18,7 +20,7 @@ def parse_comment_fields(comment: str | None) -> dict[str, str]:
     return fields
 
 
-def comment_field_fragment(fields: dict[str, object | None]) -> str:
+def comment_field_fragment(fields: dict[str, str | None]) -> str:
     """Render scheduler Comment metadata without a leading semicolon."""
     parts: list[str] = []
     for key, value in fields.items():
@@ -112,3 +114,20 @@ def phase_variant_from_meta(fields: dict[str, str]) -> tuple[str | None, str | N
     if phase not in ("train", "resume", "eval"):
         phase = None
     return phase, fields.get("variant")
+
+
+def resolve_identity(
+    meta: dict[str, str] | None,
+    job_name: str,
+    record: dict | None = None,
+) -> tuple[str, str | None]:
+    """Recover (phase, variant) using the canonical precedence:
+    sidecar metadata -> scheduler Comment -> job name.
+
+    Returns ("unknown", None) when nothing resolves the phase.
+    """
+    if meta:
+        phase, variant = phase_variant_from_meta(meta)
+        if phase and variant:
+            return phase, variant
+    return resolve_phase_and_variant(job_name, record)

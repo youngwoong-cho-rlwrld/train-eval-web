@@ -11,13 +11,20 @@ Conventions:
   - State synthesized from job.status counts (Pending/Running/Succeeded/Failed).
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import shlex
 from datetime import datetime, timezone
 from typing import Any
 
-from .job_identity import parse_comment_fields
+from .job_identity import (
+    parse_comment_fields,
+    parse_comment_metadata,
+    parse_phase_and_variant,
+    resolve_identity,
+)
 from .jobs import ACTIVE_STATES, Job
 from .k8s_resources import (
     affinity_node,
@@ -26,9 +33,11 @@ from .k8s_resources import (
     parse_k8s_time,
     requested_gpus,
 )
-from .kubectl_errors import is_kubectl_transport_error
+from .kubectl_errors import is_kubectl_not_found, is_kubectl_transport_error
 from .mlxp_config import get_settings, owner_selector
+from .mlxp_data_pod import ensure_listing_pod
 from .paths import CHECKPOINT_COPY_HISTORY_REL
+from .ssh import iter_logical_lines
 from .time_utils import to_kst_iso
 
 
@@ -38,7 +47,7 @@ def _path_leaf(path: str | None) -> str | None:
     return path.rstrip("/").rsplit("/", 1)[-1] or None
 
 
-def _state_from_pod_and_job(job_status: dict, pod: dict | None, *, suspended: bool = False) -> str:
+def _state_from_pod_and_job(job_status: dict[str, Any], pod: dict[str, Any] | None, *, suspended: bool = False) -> str:
     """Derive a slurm-like state. Pod phase is authoritative when a pod
     exists: k8s Job's `status.active` counts both Pending and Running pods,
     so it shows 1 even when the pod is unscheduled — bad for the UI.
@@ -95,7 +104,7 @@ def _latest_k8s_time(values: list[str | None]) -> str | None:
     return latest[1] if latest else None
 
 
-def _terminated_container_times(pod: dict | None) -> list[str | None]:
+def _terminated_container_times(pod: dict[str, Any] | None) -> list[str | None]:
     if not pod:
         return []
     status = pod.get("status") or {}
@@ -108,7 +117,7 @@ def _terminated_container_times(pod: dict | None) -> list[str | None]:
     return out
 
 
-def _end_time(job_status: dict, pod: dict | None = None) -> str | None:
+def _end_time(job_status: dict[str, Any], pod: dict[str, Any] | None = None) -> str | None:
     """Kubernetes does not consistently set Job.status.completionTime for
     failed Jobs. Use condition transition and container termination times as
     fallbacks so failed jobs sort by actual termination time in the UI."""
@@ -125,7 +134,7 @@ def _end_time(job_status: dict, pod: dict | None = None) -> str | None:
     return _latest_k8s_time(candidates)
 
 
-def _actual_pod_start(state: str, pod: dict | None, job_status: dict) -> str | None:
+def _actual_pod_start(state: str, pod: dict[str, Any] | None, job_status: dict[str, Any]) -> str | None:
     if state.upper() == "PENDING":
         return None
     pod_status = (pod or {}).get("status") or {}
@@ -145,7 +154,7 @@ async def list_jobs(
     """
     live, seen = await _list_live_jobs()
     if active_only:
-        return [j for j in live if _is_active_state(j.state)]
+        return [j for j in live if j.state.upper() in ACTIVE_STATES]
     # Date-bound the (expensive) DDN archived scan: only walk runs whose
     # artifact mtime is at/after the window start, minus a 1-day margin. That
     # mtime is exactly what _job_in_range filters on, so this can't drop an
@@ -159,11 +168,7 @@ async def list_jobs(
     rows = live + archived
     if not start and not end:
         return rows
-    return [j for j in rows if _is_active_state(j.state) or _job_in_range(j, start, end)]
-
-
-def _is_active_state(state: str) -> bool:
-    return state.upper() in ACTIVE_STATES
+    return [j for j in rows if j.state.upper() in ACTIVE_STATES or _job_in_range(j, start, end)]
 
 
 def _time_bound(value: str | None) -> float | None:
@@ -185,8 +190,6 @@ def _job_in_range(job: Job, start: str | None, end: str | None) -> bool:
 
 
 async def _list_live_jobs() -> tuple[list[Job], set[str]]:
-    from .job_identity import parse_comment_metadata, parse_phase_and_variant
-
     settings = get_settings()
     data = await kubectl_json(
         "get", "jobs", "-n", settings.namespace, "-l", owner_selector(settings)
@@ -218,9 +221,7 @@ async def _list_live_jobs() -> tuple[list[Job], set[str]]:
             comment_fields.get("output_namespace"),
             _path_leaf(comment_fields.get("checkpoint_dir")),
         ) if x)
-        phase, variant = parse_comment_metadata(comment)
-        if not phase or not variant:
-            phase, variant = parse_phase_and_variant(job_name)
+        phase, variant = resolve_identity(None, job_name, {"JobComment": comment})
         status = j.get("status", {}) or {}
         pod = pods_by_job.get(job_id)
         state = _state_from_pod_and_job(
@@ -295,8 +296,6 @@ async def _list_archived_jobs(seen: set[str], since_epoch: int | None = None) ->
 
 
 async def _list_archived_runs(since_epoch: int | None = None) -> list[dict[str, str]]:
-    from .mlxp_data_pod import ensure_listing_pod
-
     try:
         pod = await ensure_listing_pod()
     except Exception:
@@ -659,7 +658,7 @@ async def cancel_job(name: str) -> None:
         if proc.returncode == 0:
             return
         last_error = err or out or "kubectl delete failed"
-        if _kubectl_not_found(last_error) or await _job_deleted(name):
+        if is_kubectl_not_found(last_error) or await _job_deleted(name):
             return
         if not is_kubectl_transport_error(last_error) or attempt == 4:
             break
@@ -673,18 +672,13 @@ async def cancel_job(name: str) -> None:
     raise RuntimeError(f"kubectl delete failed: {last_error}")
 
 
-def _kubectl_not_found(message: str) -> bool:
-    lower = message.lower()
-    return "notfound" in lower or "not found" in lower
-
-
 async def _job_deleted(name: str) -> bool:
     settings = get_settings()
     try:
         await kubectl_json("get", "job", name, "-n", settings.namespace, timeout=10.0)
     except RuntimeError as e:
         message = str(e)
-        if _kubectl_not_found(message):
+        if is_kubectl_not_found(message):
             return True
         # A transport failure during verification is not proof that delete
         # succeeded, so keep retrying the original delete path.
@@ -692,7 +686,7 @@ async def _job_deleted(name: str) -> bool:
     return False
 
 
-async def tail_logs(job_name: str, follow: bool = True, start_line: int = 1):
+async def tail_logs(job_name: str, start_line: int = 1):
     """Stream log lines for an MLXP job.
 
     Primary source is `kubectl logs` on the job's pod. Once a job's k8s
@@ -711,9 +705,7 @@ async def tail_logs(job_name: str, follow: bool = True, start_line: int = 1):
 
     # No --tail: stream the full log from the start. Frontend handles the
     # scrollback; backend just delivers everything kubectl will emit.
-    args = ["kubectl", "logs", "-n", settings.namespace, pod_name]
-    if follow:
-        args.append("-f")
+    args = ["kubectl", "logs", "-n", settings.namespace, pod_name, "-f"]
     # 1MB stream limit: tqdm progress lines use \r instead of \n, and at
     # 64KB (asyncio's default) a long-running tqdm bar overflows readline.
     proc = await asyncio.create_subprocess_exec(
@@ -725,7 +717,7 @@ async def tail_logs(job_name: str, follow: bool = True, start_line: int = 1):
     assert proc.stdout is not None
     try:
         line_no = 1
-        async for line in _iter_logical_lines(proc.stdout):
+        async for line in iter_logical_lines(proc.stdout):
             if line_no >= start_line:
                 yield line
             line_no += 1
@@ -738,9 +730,6 @@ async def tail_logs(job_name: str, follow: bool = True, start_line: int = 1):
 async def _tail_archived_log(job_name: str, start_line: int = 1):
     """Serve <variant>/checkpoints/logs/training_rank0.log via the data pod,
     holding the connection open with tail -F so EventSource doesn't loop."""
-    from .job_identity import parse_comment_metadata, parse_phase_and_variant
-    from .mlxp_data_pod import ensure_listing_pod
-
     record = await _archived_record(job_name)
     variant = None
     output_namespace = None
@@ -786,40 +775,12 @@ async def _tail_archived_log(job_name: str, start_line: int = 1):
     )
     assert proc.stdout is not None
     try:
-        async for line in _iter_logical_lines(proc.stdout):
+        async for line in iter_logical_lines(proc.stdout):
             yield line
     finally:
         if proc.returncode is None:
             proc.kill()
             await proc.wait()
-
-
-async def _iter_logical_lines(reader):
-    """Yield logical lines, splitting on either \\n or \\r so tqdm progress
-    bars (which use \\r) don't accumulate into one giant buffer."""
-    buf = b""
-    while True:
-        try:
-            chunk = await reader.read(8192)
-        except Exception:
-            return
-        if not chunk:
-            if buf:
-                yield buf.decode(errors="replace")
-            return
-        buf += chunk
-        while True:
-            i_n = buf.find(b"\n")
-            i_r = buf.find(b"\r")
-            idx = min(i for i in (i_n, i_r) if i != -1) if (i_n != -1 or i_r != -1) else -1
-            if idx == -1:
-                if len(buf) > (1 << 19):  # 512KB safety flush
-                    yield buf.decode(errors="replace")
-                    buf = b""
-                break
-            line = buf[:idx]
-            buf = buf[idx + 1:]
-            yield line.decode(errors="replace")
 
 
 async def _archived_record(name: str) -> dict[str, Any] | None:

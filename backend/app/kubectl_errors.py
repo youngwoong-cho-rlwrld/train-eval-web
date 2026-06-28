@@ -1,5 +1,7 @@
 """Shared Kubernetes transport error classifiers."""
 
+from __future__ import annotations
+
 _KUBECTL_TRANSPORT_TOKENS = (
     "failed calling webhook",
     "failed to call webhook",
@@ -45,3 +47,8 @@ def is_kubectl_exec_transport_error(message: str) -> bool:
 def is_completed_pod_exec_error(message: str) -> bool:
     lower = message.lower()
     return any(token in lower for token in _KUBECTL_COMPLETED_POD_EXEC_TOKENS)
+
+
+def is_kubectl_not_found(message: str) -> bool:
+    lower = message.lower()
+    return "notfound" in lower or "not found" in lower

@@ -26,11 +26,11 @@ def resolve_train_action_horizon(
     the value to model code through --action-horizon.
     """
     mode = action_horizon_mode or model.action_horizon_mode
-    if model.family != "n1.6" or mode == "none":
+    if mode == "none":
         return None
 
     modality_horizon = load_data_interface_for_variant(variant).action_horizon
-    config_horizon = _variant_action_horizon(variant)
+    config_horizon = variant_int_opt(variant, "TRAIN_ACTION_HORIZON")
     action_horizon = requested if requested is not None else config_horizon or modality_horizon
 
     if action_horizon is None:
@@ -49,10 +49,6 @@ def resolve_train_action_horizon(
             "TRAIN_MODALITY_CONFIG for clean ablations"
         )
     return action_horizon
-
-
-def _variant_action_horizon(variant: Any) -> int | None:
-    return variant_int_opt(variant, "TRAIN_ACTION_HORIZON")
 
 
 def validate_global_batch_divisible(model_family: str, global_batch_size: int | None, num_gpus: int) -> None:

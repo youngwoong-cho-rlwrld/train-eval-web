@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # DexJoCo (MuJoCo benchmark) eval harness for train-eval-web.
 #
-# Unlike eval_body{,_n16}.sh (Isaac Sim server + gr00t client), DexJoCo eval is a
+# Unlike eval_body.sh (Isaac Sim server + gr00t client), DexJoCo eval is a
 # policy server (holds the model) + a MuJoCo client (dexjoco-openpi-eval) talking
 # the openpi-client websocket protocol. Two server backends are supported:
 #   - groot : a GR00T N1.6 / PhysiXel finetune served via lib/dexjoco/gr00t_dexjoco_server.py

@@ -1,8 +1,11 @@
 """Completion checks for eval jobs whose Slurm state is misleading."""
+from __future__ import annotations
+
 
 import shlex
 
 from .paths import CLUSTER_STAGING_REL
+from .remote_paths import remote_path_expr
 from .ssh import ssh_run
 from .variants import Variant, load_variant
 
@@ -29,11 +32,44 @@ def eval_shape(
     return eval_sets, n_runs, n_eps, tasks
 
 
+def eval_shape_from_meta(
+    meta: dict[str, str] | None,
+) -> tuple[list[str], int, int, list[str]]:
+    """Best-effort eval shape from job metadata when the variant config is gone.
+
+    Mirrors the variant-missing fallback: eval_sets/n_runs/n_episodes come from
+    the sidecar, tasks are unknown (empty).
+    """
+    meta = meta or {}
+    eval_sets = _override_list(meta.get("eval_sets"))
+    n_runs = _override_int(meta.get("eval_n_runs"), "0")
+    n_eps = _override_int(meta.get("eval_n_episodes"), "0")
+    return eval_sets, n_runs, n_eps, []
+
+
 def exp_dir_rel_candidates(variant: str) -> list[str]:
     return [
         f"{CLUSTER_STAGING_REL}/experiments/{variant}",
         f"train-eval-scripts/experiments/{variant}",
     ]
+
+
+# The completion probe counts, from the job's stdout, lines that mark a
+# finished/skipped run, plus the on-disk results.json files. Shared verbatim
+# by both entry points; only the stdout-path resolution and the results.json
+# counting differ (single dir vs max-over-candidates).
+_COMPLETION_PROBE_GREP = (
+    "saved=$(grep -h '^Results saved to:' \"$stdout_path\" 2>/dev/null | wc -l); "
+    "skipped=$(grep -h 'SKIP (results.json already exists):' \"$stdout_path\" 2>/dev/null | wc -l); "
+    "done_count=$(grep -h '^DONE[[:space:]]' \"$stdout_path\" 2>/dev/null | wc -l); "
+)
+_COMPLETION_PROBE_ECHO = "echo \"$saved $skipped $done_count $files\""
+
+
+async def _probe_completion(host: str, prefix: str, files_block: str, expected: int) -> bool:
+    cmd = prefix + _COMPLETION_PROBE_GREP + files_block + _COMPLETION_PROBE_ECHO
+    r = await ssh_run(host, cmd, timeout=10.0)
+    return _parse_completion_probe(r.stdout, expected)
 
 
 async def eval_job_completed(
@@ -49,16 +85,9 @@ async def eval_job_completed(
 
     stdout_q = shlex.quote(stdout_path)
     eval_dir_q = remote_path_expr(eval_dir)
-    cmd = (
-        f"stdout_path={stdout_q}; eval_dir={eval_dir_q}; expected={expected}; "
-        "saved=$(grep -h '^Results saved to:' \"$stdout_path\" 2>/dev/null | wc -l); "
-        "skipped=$(grep -h 'SKIP (results.json already exists):' \"$stdout_path\" 2>/dev/null | wc -l); "
-        "done_count=$(grep -h '^DONE[[:space:]]' \"$stdout_path\" 2>/dev/null | wc -l); "
-        "files=$(find \"$eval_dir\" -type f -name results.json 2>/dev/null | wc -l); "
-        "echo \"$saved $skipped $done_count $files\""
-    )
-    r = await ssh_run(host, cmd, timeout=10.0)
-    return _parse_completion_probe(r.stdout, expected)
+    prefix = f"stdout_path={stdout_q}; eval_dir={eval_dir_q}; expected={expected}; "
+    files_block = "files=$(find \"$eval_dir\" -type f -name results.json 2>/dev/null | wc -l); "
+    return await _probe_completion(host, prefix, files_block, expected)
 
 
 async def eval_job_completed_from_log_dir(
@@ -81,22 +110,19 @@ async def eval_job_completed_from_log_dir(
             remote_path_expr(f"$HOME/{rel}/eval_results")
             for rel in exp_dir_rel_candidates(variant)
         )
-    cmd = (
+    prefix = (
         f"stdout_path=$(ls -1 {log_dir_q}/*_{job_id_q}.out 2>/dev/null | head -1); "
         "if [ -z \"$stdout_path\" ]; then echo '0 0 0 0'; exit 0; fi; "
-        "saved=$(grep -h '^Results saved to:' \"$stdout_path\" 2>/dev/null | wc -l); "
-        "skipped=$(grep -h 'SKIP (results.json already exists):' \"$stdout_path\" 2>/dev/null | wc -l); "
-        "done_count=$(grep -h '^DONE[[:space:]]' \"$stdout_path\" 2>/dev/null | wc -l); "
+    )
+    files_block = (
         "files=0; "
         f"for d in {eval_dirs}; do "
         'c=$(find "$d" -type f -name results.json 2>/dev/null | wc -l); '
         'case "$c" in ""|*[!0-9]*) c=0;; esac; '
         'if [ "$c" -gt "$files" ]; then files="$c"; fi; '
         "done; "
-        "echo \"$saved $skipped $done_count $files\""
     )
-    r = await ssh_run(host, cmd, timeout=10.0)
-    return _parse_completion_probe(r.stdout, expected)
+    return await _probe_completion(host, prefix, files_block, expected)
 
 
 def _parse_completion_probe(stdout: str, expected: int) -> bool:
@@ -112,10 +138,6 @@ def _parse_completion_probe(stdout: str, expected: int) -> bool:
     stdout_complete = done_count > 0 or (saved + skipped) >= expected
     files_complete = files >= expected
     return stdout_complete and files_complete
-
-
-def remote_path_expr(path: str) -> str:
-    return path if path.startswith("$HOME/") else shlex.quote(path)
 
 
 def _override_int(value: str | None, fallback: str) -> int:

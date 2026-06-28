@@ -13,6 +13,7 @@ from .clusters import list_clusters, load_cluster
 from .mlxp_config import get_settings as get_mlxp_settings
 from .mlxp_data_pod import ensure_listing_pod
 from .paths import CHECKPOINT_COPY_HISTORY_REL, CLUSTER_STAGING_REL
+from .remote_paths import _kubectl_bash_lc
 from .ssh import ssh_run
 
 
@@ -35,6 +36,11 @@ def checkpoint_parent_if_step(path: Any) -> str | None:
     return path.rsplit("/", 1)[0]
 
 
+def _dedupe(keys: list[str]) -> list[str]:
+    """Order-preserving dedupe, dropping empty keys."""
+    return list(dict.fromkeys(k for k in keys if k))
+
+
 def checkpoint_lookup_keys(path: Any) -> list[str]:
     path = str(path or "").strip().rstrip("/")
     if not path:
@@ -46,7 +52,7 @@ def checkpoint_lookup_keys(path: Any) -> list[str]:
         keys.extend([parent, checkpoint_leaf(parent) or ""])
     elif leaf:
         keys.append(leaf)
-    return [k for k in dict.fromkeys(k for k in keys if k)]
+    return _dedupe(keys)
 
 
 async def checkpoint_copy_links() -> list[dict[str, Any]]:
@@ -147,7 +153,7 @@ def checkpoint_strong_lookup_keys(path: Any) -> list[str]:
     parent = checkpoint_parent_if_step(path)
     if parent:
         keys.append(parent)
-    return [k for k in dict.fromkeys(k for k in keys if k)]
+    return _dedupe(keys)
 
 
 async def _slurm_copy_history_records(host: str) -> list[dict[str, Any]]:
@@ -216,57 +222,53 @@ def _copy_record_checkpoint_keys(record: dict[str, Any]) -> list[str]:
         path = str(record.get(field) or "").strip()
         if path:
             keys.extend(checkpoint_lookup_keys(path))
-    return [k for k in dict.fromkeys(k for k in keys if k)]
+    return _dedupe(keys)
 
 
 async def _local_checkpoint_job(cluster: str, checkpoint: str) -> dict[str, Any] | None:
     checkpoint_b64 = base64.b64encode(checkpoint.encode()).decode()
     if cluster == "mlxp":
-        return await _mlxp_local_checkpoint_job(checkpoint_b64)
+        settings = get_mlxp_settings()
+        env_assignments = [
+            f"CHECKPOINT_LOOKUP_B64={shlex.quote(checkpoint_b64)}",
+            "CHECKPOINT_LOOKUP_CLUSTER=mlxp",
+            f"CHECKPOINT_LOOKUP_EXPERIMENTS_ROOT={shlex.quote(settings.experiments_dir)}",
+        ]
+    else:
+        env_assignments = [
+            f"CHECKPOINT_LOOKUP_B64={shlex.quote(checkpoint_b64)}",
+            f"CHECKPOINT_LOOKUP_CLUSTER={shlex.quote(cluster)}",
+            f"CHECKPOINT_LOOKUP_STAGING_REL={shlex.quote(CLUSTER_STAGING_REL)}",
+        ]
+    return await _run_remote_lookup(cluster, env_assignments)
 
-    env = await load_cluster(cluster)
+
+async def _run_remote_lookup(
+    cluster: str,
+    env_assignments: list[str],
+) -> dict[str, Any] | None:
+    """Run the checkpoint-lookup script over ssh (slurm) or kubectl (mlxp).
+
+    Both transports assemble the same `<env> python3 - <<PY ... PY` heredoc and
+    decode the JSON payload; only the env vars and the transport differ.
+    """
     cmd = (
-        f"CHECKPOINT_LOOKUP_B64={shlex.quote(checkpoint_b64)} "
-        f"CHECKPOINT_LOOKUP_CLUSTER={shlex.quote(cluster)} "
-        f"CHECKPOINT_LOOKUP_STAGING_REL={shlex.quote(CLUSTER_STAGING_REL)} "
-        "python3 - <<'PY'\n"
+        " ".join(env_assignments)
+        + " python3 - <<'PY'\n"
         + _REMOTE_CHECKPOINT_LOOKUP_SCRIPT
         + "\nPY"
     )
+    if cluster == "mlxp":
+        rc, out, _err = await _kubectl_bash_lc(cmd, 20.0)
+        if rc != 0:
+            return None
+        return _decode_lookup_payload(out)
+
+    env = await load_cluster(cluster)
     r = await ssh_run(env.ssh_alias, cmd, timeout=20.0)
     if r.returncode != 0:
         return None
     return _decode_lookup_payload(r.stdout)
-
-
-async def _mlxp_local_checkpoint_job(checkpoint_b64: str) -> dict[str, Any] | None:
-    settings = get_mlxp_settings()
-    pod = await ensure_listing_pod()
-    cmd = (
-        f"CHECKPOINT_LOOKUP_B64={shlex.quote(checkpoint_b64)} "
-        "CHECKPOINT_LOOKUP_CLUSTER=mlxp "
-        f"CHECKPOINT_LOOKUP_EXPERIMENTS_ROOT={shlex.quote(settings.experiments_dir)} "
-        "python3 - <<'PY'\n"
-        + _REMOTE_CHECKPOINT_LOOKUP_SCRIPT
-        + "\nPY"
-    )
-    proc = await asyncio.create_subprocess_exec(
-        "kubectl",
-        "exec",
-        "-n",
-        settings.namespace,
-        pod,
-        "--",
-        "bash",
-        "-lc",
-        cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20.0)
-    if proc.returncode != 0:
-        return None
-    return _decode_lookup_payload(stdout.decode(errors="replace"))
 
 
 def _decode_lookup_payload(text: str) -> dict[str, Any] | None:

@@ -42,14 +42,21 @@ detect_gpu_instance() {
 }
 
 find_available_port() {
+    if ! command -v ss >/dev/null 2>&1; then
+        echo "ERROR: ss not found; cannot probe for an available port" >&2
+        exit 1
+    fi
     local port
-    while true; do
+    local attempt
+    for attempt in $(seq 1 100); do
         port=$((RANDOM % 64511 + 1024))
         if ! ss -tuln | grep -q ":$port "; then
             echo $port
             return 0
         fi
     done
+    echo "ERROR: could not find an available port after 100 attempts" >&2
+    exit 1
 }
 
 append_submit_extra_train_args() {
@@ -183,9 +190,9 @@ require_eval_checkpoint_path() {
 }
 
 # ── Shared eval helpers (Isaac harness: eval_body.sh, both n1.5 and n1.6) ──────
-# These were duplicated verbatim between eval_body.sh and eval_body_n16.sh.
-# They read/modify caller-scope variables (PIDS, PORTS, FAILED, EVAL_*, etc.)
-# because eval_body.sh sources this file into the same shell.
+# These are shared by the unified eval_body.sh (n1.5/n1.6 branches selected via
+# MODEL_FAMILY). They read/modify caller-scope variables (PIDS, PORTS, FAILED,
+# EVAL_*, etc.) because eval_body.sh sources this file into the same shell.
 
 # Validate EVAL_CHECKPOINT is set and points at a checkpoint dir; export LAST_CKPT.
 validate_eval_checkpoint() {
@@ -194,7 +201,7 @@ validate_eval_checkpoint() {
         exit 1
     fi
     LAST_CKPT="$EVAL_CHECKPOINT"
-    if [ -z "$LAST_CKPT" ] || [ ! -d "$LAST_CKPT" ]; then
+    if [ ! -d "$LAST_CKPT" ]; then
         log "ERROR: no checkpoint at '$LAST_CKPT'"
         exit 1
     fi
@@ -230,6 +237,7 @@ validate_eval_counts() {
 # Background-worker PID pool shared by the eval launch loop. cleanup_all and the
 # trap are installed by the caller after PIDS=() is declared.
 cleanup_all() {
+    [ "${#PIDS[@]}" -eq 0 ] && return 0
     for pid in "${PIDS[@]}"; do
         kill "$pid" 2>/dev/null || true
     done
@@ -341,6 +349,7 @@ select_cuda_device() {
 # interpolated values are read from caller scope (this file is sourced).
 aggregate_eval_results() {
     local family="$1"
+    local TASKS_JSON EVAL_SETS_STR
     # n1.5 historically invoked `python`; n1.6 invoked `python3`. Preserve each
     # family's interpreter so the emitted commands stay byte-equivalent.
     local PY="python3"

@@ -85,7 +85,9 @@ type TrainConfigEdit = {
   gitCommit: string;
 };
 type TrainConfigValues = Omit<TrainConfigEdit, "scope">;
-type TrainNoteEdit = {
+/** A scoped single-value edit (train note, checkpoint path): the `scope` keys
+ *  the edit to the current cluster/variant/phase so it resets when they change. */
+type ScopedEdit = {
   scope: string;
   value: string;
 };
@@ -100,6 +102,8 @@ const TRAIN_CONFIG_FIELDS: readonly (keyof TrainConfigValues)[] = [
   "gitCommit",
 ] as const;
 
+const isPositiveInteger = (value: string) => /^[1-9]\d*$/.test(value.trim());
+
 function buildDefaultJobName(phase: Phase, variant: string): string {
   if (!variant) return "";
   const d = new Date();
@@ -113,14 +117,6 @@ function buildDefaultJobName(phase: Phase, variant: string): string {
 function ellipsize(value: string, maxLength: number): string {
   if (value.length <= maxLength) return value;
   return `${value.slice(0, Math.max(0, maxLength - 3))}...`;
-}
-
-function makeTrainConfigEdit(
-  scope: string,
-  defaults: TrainConfigValues,
-  patch: Partial<TrainConfigValues> = {},
-): TrainConfigEdit {
-  return { scope, ...defaults, ...patch };
 }
 
 function trainConfigHasChanges(
@@ -181,11 +177,8 @@ export default function SubmitPage() {
   const [evalOverwriteResults, setEvalOverwriteResults] = useState<boolean>(false);
   const [evalConfigEdit, setEvalConfigEdit] = useState<EvalConfigEdit | null>(null);
   const [trainConfigEdit, setTrainConfigEdit] = useState<TrainConfigEdit | null>(null);
-  const [checkpointEdit, setCheckpointEdit] = useState<{
-    scope: string;
-    value: string;
-  } | null>(null);
-  const [trainNoteEdit, setTrainNoteEdit] = useState<TrainNoteEdit | null>(null);
+  const [checkpointEdit, setCheckpointEdit] = useState<ScopedEdit | null>(null);
+  const [trainNoteEdit, setTrainNoteEdit] = useState<ScopedEdit | null>(null);
   const [jobName, setJobName] = useState<string>("");
   const [jobNameTouched, setJobNameTouched] = useState<boolean>(false);
   const [gitDialogOpen, setGitDialogOpen] = useState<boolean>(false);
@@ -350,9 +343,9 @@ export default function SubmitPage() {
   const evalNEpisodesParsed = Number.parseInt(evalNEpisodesTrimmed, 10);
   const evalNRunsParsed = Number.parseInt(evalNRunsTrimmed, 10);
   const evalNEpisodesValid =
-    !wantsCheckpoint || /^[1-9]\d*$/.test(evalNEpisodesTrimmed);
+    !wantsCheckpoint || isPositiveInteger(evalNEpisodesTrimmed);
   const evalNRunsValid =
-    !wantsCheckpoint || /^[1-9]\d*$/.test(evalNRunsTrimmed);
+    !wantsCheckpoint || isPositiveInteger(evalNRunsTrimmed);
   const evalSetsCharactersValid = evalSetValues.every((v) =>
     /^[A-Za-z0-9_.-]+$/.test(v),
   );
@@ -453,15 +446,13 @@ export default function SubmitPage() {
     trainActionHorizon.trim(),
     10,
   );
-  const isPositiveInteger = (value: string) => /^[1-9]\d*$/.test(value.trim());
   const { model: trainModel } = resolveModel(variant.data?.vars);
   const wantsTrainConfig = phase === "train" && !!variantName;
-  const wantsGpuConfig = !!variantName;
-  const wantsGitCommitConfig = !!variantName;
+  const hasVariant = !!variantName;
   const trainActionHorizonEnabled = wantsTrainConfig && trainModel === "n1.6";
   const modalityActionHorizon = dataInterface.data?.action_horizon ?? null;
   const trainNumGpusValid =
-    !wantsGpuConfig ||
+    !hasVariant ||
     (isPositiveInteger(trainNumGpus) &&
       (isSlurm || [1, 2, 4, 8].includes(trainNumGpusParsed)));
   const trainBatchSizeValid =
@@ -476,7 +467,7 @@ export default function SubmitPage() {
     !trainActionHorizonEnabled ||
     isPositiveInteger(trainActionHorizon);
   const trainGitCommitValid =
-    !wantsGitCommitConfig ||
+    !hasVariant ||
     !trainGitCommitTrimmed ||
     /^[0-9a-fA-F]{7,40}$/.test(trainGitCommitTrimmed);
   const trainConfigValid =
@@ -491,8 +482,7 @@ export default function SubmitPage() {
     patch: Partial<Omit<TrainConfigEdit, "scope">>,
   ) => {
     const base =
-      activeTrainConfigEdit ??
-      makeTrainConfigEdit(trainConfigScope, trainConfigDefaults);
+      activeTrainConfigEdit ?? { scope: trainConfigScope, ...trainConfigDefaults };
     setTrainConfigEdit({ ...base, ...patch, scope: trainConfigScope });
   };
 
@@ -569,14 +559,13 @@ export default function SubmitPage() {
         multiDatasets,
       }),
       extra_args: phase === "eval" && !isSlurm ? [] : splitArgs(extraArgs),
-      train_num_gpus: wantsGpuConfig ? trainNumGpusParsed : null,
+      train_num_gpus: hasVariant ? trainNumGpusParsed : null,
       train_global_batch_size: submittedTrainGlobalBatchSize,
       train_max_steps: phase === "train" ? trainMaxStepsParsed : null,
       train_save_steps: phase === "train" ? trainSaveStepsParsed : null,
       train_num_workers: phase === "train" ? trainNumWorkersParsed : null,
       train_action_horizon: submittedTrainActionHorizon,
       train_git_commit: submittedGitCommit,
-      eval_num_envs_per_gpu: null,
       eval_n_episodes: wantsCheckpoint ? evalNEpisodesParsed : null,
       eval_n_runs: wantsCheckpoint ? evalNRunsParsed : null,
       eval_sets: wantsCheckpoint ? evalSetValues : null,
@@ -650,7 +639,13 @@ export default function SubmitPage() {
     ? (configPreview.data ?? null)
     : null;
   const jobGitStatus = useQuery({
-    queryKey: ["submit-git-status", cluster, variantName, submittedGitCommit],
+    queryKey: [
+      "submit-git-status",
+      cluster,
+      variantName,
+      includeGitCommitParam,
+      includeGitCommitParam ? trainGitCommitTrimmed : "",
+    ],
     queryFn: () => {
       const qs = submitGitQueryParams(
         cluster,
@@ -730,13 +725,27 @@ export default function SubmitPage() {
     }
     setPreflightPending(true);
     try {
-      const qs = submitGitQueryParams(
-        cluster,
-        variantName,
-        trainGitCommit,
-        includeGitCommitParam,
-      );
-      const status = await api<GitStatus>(`/api/submit/git-status?${qs}`);
+      // Reuse the cached jobGitStatus entry (same key + queryFn) so the
+      // preflight check and the displayed status can never diverge.
+      const status = await qc.fetchQuery({
+        queryKey: [
+          "submit-git-status",
+          cluster,
+          variantName,
+          includeGitCommitParam,
+          includeGitCommitParam ? trainGitCommitTrimmed : "",
+        ],
+        queryFn: () => {
+          const qs = submitGitQueryParams(
+            cluster,
+            variantName,
+            trainGitCommit,
+            includeGitCommitParam,
+          );
+          return api<GitStatus>(`/api/submit/git-status?${qs}`);
+        },
+        staleTime: 30_000,
+      });
       if (status.error) {
         toast.error(`Git status failed: ${status.error}`);
         return;
@@ -954,7 +963,7 @@ export default function SubmitPage() {
     flagEditors["--data-config"] = datasetEditor;
   }
   const gpuCountEditor =
-    wantsGpuConfig && variant.data ? (
+    hasVariant && variant.data ? (
       <NumberCellEditor
         value={trainNumGpus}
         onChange={(value) => updateTrainConfig({ numGpus: value })}
@@ -1045,7 +1054,7 @@ export default function SubmitPage() {
       });
     }
   }
-  if (phase === "eval" && wantsGpuConfig) {
+  if (phase === "eval" && hasVariant) {
     extraFlagRows.push({
       key: "eval-num-gpus",
       flag: "TRAIN_NUM_GPUS",
@@ -1053,7 +1062,7 @@ export default function SubmitPage() {
       editor: gpuCountEditor,
     });
   }
-  if (wantsGitCommitConfig) {
+  if (hasVariant) {
     extraFlagRows.push({
       key: "train-git-commit",
       flag: "TRAIN_GIT_COMMIT",
@@ -1259,7 +1268,7 @@ export default function SubmitPage() {
                               </Badge>
                             )}
                             <span className="ml-2 text-xs text-slate-500">
-                              {p.gpu_idle}/{p.gpu_total} {p.gpu_type ?? "GPU"} available
+                              {p.gpu_free}/{p.gpu_total} {p.gpu_type ?? "GPU"} available
                             </span>
                           </span>
                         </SelectItem>

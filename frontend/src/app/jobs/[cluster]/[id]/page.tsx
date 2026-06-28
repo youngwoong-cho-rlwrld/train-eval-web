@@ -23,17 +23,19 @@ import {
   type JobMetadata,
   type JobProgress,
   type PathExistence,
+  type WandbStatus,
 } from "@/lib/api";
-import { formatJobTimestamp } from "@/lib/job-time";
-import { jobDetailHref } from "@/lib/job-links";
-import { stepEta } from "@/lib/job-progress";
+import { hasRenderableProgress, stepEta } from "@/lib/job-progress";
 import { formatPct } from "@/lib/format";
 import {
+  canCopyCheckpoint,
+  canResumeJob,
+  canRetryJob,
   isCompletedJobState,
-  isFailedJobState,
+  isRunningOrCompletingJobState,
   isTerminalJobState,
-  isTimeoutJobState,
   isTrainJobPhase,
+  resubmitSourceLabel,
 } from "@/lib/job-status";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -56,9 +58,25 @@ import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state
 import { JobStateBadge } from "@/components/job-state-badge";
 import { ImmediateTooltip } from "@/components/immediate-tooltip";
 import { Th } from "@/components/table";
+import { JobTimestamp } from "@/components/job-timestamp";
+import { ProgressBar } from "@/components/progress-bar";
+import { JobLink } from "@/components/job-link";
 
 const REFRESH_MS = 60_000;
 const LOG_PAGE_SIZE = 100;
+
+// Per-job query-key families scoped by [family, cluster, id]. The in-flight
+// indicator watches exactly these; refreshAll invalidates them plus the
+// checkpoint-copies list (which is deliberately excluded from the indicator).
+const JOB_DETAIL_QUERY_FAMILIES = [
+  "job",
+  "job-details",
+  "job-progress",
+  "job-flags",
+  "job-metadata",
+  "job-gpu",
+  "job-eval-runs",
+] as const;
 
 export default function JobDetail({ params }: { params: Promise<{ cluster: string; id: string }> }) {
   const { cluster, id } = use(params);
@@ -99,7 +117,7 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
   const gpu = useQuery({
     queryKey: ["job-gpu", cluster, id],
     queryFn: () => api<JobGpu>(`/api/jobs/${cluster}/${id}/gpu`),
-    enabled: /^(RUNNING|COMPLETING)/i.test(details.data?.state ?? ""),
+    enabled: isRunningOrCompletingJobState(details.data?.state),
     refetchInterval: REFRESH_MS,
   });
 
@@ -120,13 +138,9 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
   const stopped = isTerminalJobState(sacct.data?.State) || isTerminalJobState(details.data?.state);
 
   const refreshAll = () => {
-    qc.invalidateQueries({ queryKey: ["job", cluster, id] });
-    qc.invalidateQueries({ queryKey: ["job-details", cluster, id] });
-    qc.invalidateQueries({ queryKey: ["job-progress", cluster, id] });
-    qc.invalidateQueries({ queryKey: ["job-metadata", cluster, id] });
-    qc.invalidateQueries({ queryKey: ["job-gpu", cluster, id] });
-    qc.invalidateQueries({ queryKey: ["job-eval-runs", cluster, id] });
-    qc.invalidateQueries({ queryKey: ["job-flags", cluster, id] });
+    for (const family of JOB_DETAIL_QUERY_FAMILIES) {
+      qc.invalidateQueries({ queryKey: [family, cluster, id] });
+    }
     qc.invalidateQueries({ queryKey: ["checkpoint-copies", cluster, id] });
   };
 
@@ -135,14 +149,8 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
       predicate: (q) => {
         const [k0, k1, k2] = q.queryKey as unknown[];
         return (
-          (
-            k0 === "job" ||
-            k0 === "job-details" ||
-            k0 === "job-progress" ||
-            k0 === "job-flags" ||
-            k0 === "job-metadata" ||
-            k0 === "job-gpu" ||
-            k0 === "job-eval-runs"
+          JOB_DETAIL_QUERY_FAMILIES.includes(
+            k0 as (typeof JOB_DETAIL_QUERY_FAMILIES)[number],
           ) &&
           k1 === cluster &&
           k2 === id
@@ -162,8 +170,6 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
 
   const phase = details.data?.phase;
   const isEval = phase === "eval";
-  const isTrainPhase = isTrainJobPhase(phase);
-  const isComplete = isCompletedJobState(sacct.data?.State);
   const stateForActions = sacct.data?.State ?? details.data?.state ?? "";
   const checkpointPath = details.data?.paths.ckpt_dir ?? null;
   const checkpointPathExists = useQuery({
@@ -175,9 +181,9 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
     enabled: Boolean(checkpointPath),
   });
   const checkpointMissing = checkpointPathExists.data?.exists === false;
-  const canResume = cluster !== "mlxp" && isTimeoutJobState(stateForActions);
-  const canRetry = cluster !== "mlxp" && isFailedJobState(stateForActions);
-  const canCopy = isTrainPhase && isComplete;
+  const canResume = canResumeJob({ cluster, state: stateForActions });
+  const canRetry = canRetryJob({ cluster, state: stateForActions });
+  const canCopy = canCopyCheckpoint({ state: sacct.data?.State, phase });
   const detailsError = details.error as Error | null;
   const progressError = progress.error as Error | null;
   const metadataError = metadata.error as Error | null;
@@ -205,14 +211,13 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
             {resumeOf && (
               <span className="text-base font-normal text-slate-500">
                 {" "}({resubmitSourceLabel(details.data?.resubmit_action, sourceJob.data?.State)}{" "}
-                <Link
-                  href={jobDetailHref(cluster, resumeOf)!}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="font-mono text-blue-600 hover:underline dark:text-blue-400"
+                <JobLink
+                  cluster={cluster}
+                  jobId={resumeOf}
+                  className="font-mono dark:text-blue-400"
                 >
                   {resumeOf}
-                </Link>
+                </JobLink>
                 )
               </span>
             )}{" "}
@@ -246,16 +251,15 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
               {isEval && details.data.training_job && (
                 <div className="flex items-center gap-1.5 text-sm text-slate-600 dark:text-slate-400">
                   <span>Training job:</span>
-                  <Link
-                    href={jobDetailHref(details.data.training_job.cluster, details.data.training_job.job_id)!}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="inline-flex items-center gap-1 font-mono text-blue-600 hover:underline dark:text-blue-400"
+                  <JobLink
+                    cluster={details.data.training_job.cluster}
+                    jobId={details.data.training_job.job_id}
+                    className="inline-flex items-center gap-1 font-mono dark:text-blue-400"
                     title={details.data.training_job.job_name ?? undefined}
                   >
                     {details.data.training_job.cluster}/{details.data.training_job.job_id}
                     <ExternalLink className="h-3 w-3" />
-                  </Link>
+                  </JobLink>
                   {details.data.training_job.job_name && (
                     <span className="truncate font-mono text-xs text-slate-500">
                       {details.data.training_job.job_name}
@@ -385,7 +389,7 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
                     <div key={k} className="flex flex-col">
                       <dt className="text-xs uppercase tracking-wide text-slate-500">{k}</dt>
                       <dd className="font-mono text-xs">
-                        {k === "State" ? <JobStateBadge state={sacct.data[k]} /> : formatSacctValue(k, sacct.data[k], cluster)}
+                        {k === "State" ? <JobStateBadge state={sacct.data[k]} /> : formatSacctValue(k, sacct.data[k])}
                       </dd>
                     </div>
                   ) : null,
@@ -595,25 +599,9 @@ function SnapshotRow({ label, value }: { label: string; value: string }) {
   );
 }
 
-function formatSacctValue(key: string, value: string, cluster: string) {
+function formatSacctValue(key: string, value: string) {
   if (key !== "Start" && key !== "End") return value;
-  const formatted = formatJobTimestamp(value, cluster);
-  if (!formatted) return <span className="text-slate-400">—</span>;
-  return (
-    <ImmediateTooltip content={formatted.full}>
-      <span>{formatted.short}</span>
-    </ImmediateTooltip>
-  );
-}
-
-function resubmitSourceLabel(action?: string | null, sourceState?: string | null) {
-  if (action === "retry" || isFailedJobState(sourceState)) {
-    return "restarted from a failed job:";
-  }
-  if (action === "resume" || isTimeoutJobState(sourceState)) {
-    return "resumed from a timeout job:";
-  }
-  return "resubmitted from job:";
+  return <JobTimestamp iso={value} />;
 }
 
 function GpuUsageSection({
@@ -659,12 +647,7 @@ function GpuUsageSection({
                     {util != null && ` · compute ${util}%`}
                   </span>
                 </div>
-                <div className="h-2 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
-                  <div
-                    className="h-full rounded-full bg-slate-900 transition-all dark:bg-slate-50"
-                    style={{ width: `${memoryPercent}%` }}
-                  />
-                </div>
+                <ProgressBar percent={memoryPercent} height="h-2" />
               </div>
             );
           })}
@@ -704,23 +687,19 @@ function ProgressCard({
   // Treat a completed job as 100% even when the backend signal didn't make
   // it (e.g. wandb run already archived, checkpoint path moved off DDN).
   const effectivePercent = isComplete ? 100 : (p?.percent ?? 0);
-  const showBar = Boolean(
-    isComplete ||
-    (p?.current_step !== null && p?.max_steps) ||
-    (p?.completed_runs !== null && p?.total_runs),
-  );
+  const showBar = hasRenderableProgress(p, { isComplete });
   // Surface wandb-not-configured as the actionable cause of empty progress,
   // rather than the generic "No progress yet" which looks like a backend bug.
   const wandbStatus = useQuery({
     queryKey: ["wandb-status"],
-    queryFn: () => api<{ logged_in: boolean; entity: string | null; project: string; error: string | null }>("/api/wandb/status"),
+    queryFn: () => api<WandbStatus>("/api/wandb/status"),
     enabled: !!d && isTrainJobPhase(phase) && !isComplete,
     staleTime: 60_000,
   });
   const isTrain = isTrainJobPhase(phase);
   const wandbMissing =
     !isComplete && isTrain && wandbStatus.data && !wandbStatus.data.logged_in;
-  const showGpu = /^(RUNNING|COMPLETING)/i.test(state ?? "");
+  const showGpu = isRunningOrCompletingJobState(state);
 
   // ETA from elapsed × steps-remaining / current-step. Same linear model the
   // /jobs table uses.
@@ -782,12 +761,7 @@ function ProgressCard({
                   <span className="font-mono">{label}</span>
                   <span className="text-slate-500">{effectivePercent.toFixed(1)}%</span>
                 </div>
-                <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
-                  <div
-                    className="h-full rounded-full bg-slate-900 transition-all dark:bg-slate-50"
-                    style={{ width: `${Math.max(0, Math.min(100, effectivePercent))}%` }}
-                  />
-                </div>
+                <ProgressBar percent={effectivePercent} height="h-2" className="mt-2" />
                 {eta && (
                   <ImmediateTooltip content={eta.etaTitle}>
                     <div className="mt-2 text-xs text-slate-500">
@@ -995,7 +969,7 @@ function EvalRunRow({ row, showTask }: { row: EvalRun; showTask: boolean }) {
         {row.seed ?? <span className="text-slate-400">—</span>}
       </td>
       <td className="whitespace-nowrap py-2 pr-4 font-mono text-xs">
-        {formatEvalRunSuccess(row)}
+        {formatEvalRunSuccess(row) ?? <span className="text-slate-400">—</span>}
       </td>
       <td className="w-full py-2">
         <div className="flex min-w-0 items-center justify-between gap-4">
@@ -1011,12 +985,12 @@ function EvalRunRow({ row, showTask }: { row: EvalRun; showTask: boolean }) {
   );
 }
 
-function formatEvalRunSuccess(row: EvalRun) {
+function formatEvalRunSuccess(row: EvalRun): string | null {
   const rate = row.success_rate == null ? null : formatPct(row.success_rate);
   if (row.success_count != null && row.total_episodes != null) {
     return `${row.success_count}/${row.total_episodes}${rate ? ` (${rate})` : ""}`;
   }
-  return rate ?? <span className="text-slate-400">—</span>;
+  return rate;
 }
 
 function LogStream({

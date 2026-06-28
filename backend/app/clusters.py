@@ -4,10 +4,13 @@ A cluster.env is a bash file with `export FOO=bar` lines. We `source` it in a
 subprocess and capture the exported variables via `declare -p`. This handles
 quoting / variable expansion correctly without us re-implementing bash.
 """
+from __future__ import annotations
+
 
 import asyncio
 import re
 import shutil
+import subprocess
 
 from pydantic import BaseModel
 
@@ -25,7 +28,6 @@ def _find_bash() -> str:
 
 
 def _bash_version(path: str) -> int:
-    import subprocess
     try:
         out = subprocess.check_output([path, "-c", "echo $BASH_VERSINFO"], text=True)
         return int(out.split()[0])
@@ -49,8 +51,6 @@ class ClusterEnv(BaseModel):
         match self.name:
             case "kakao":
                 return "kakao-login-1"
-            case "skt":
-                return "skt"
             case other:
                 return other
 
@@ -100,5 +100,22 @@ async def _source_and_dump(script_text: str) -> dict[str, str]:
 
 
 def _bash_unescape(s: str) -> str:
-    """Reverse bash's `declare -p` quoting: \" → ", \\ → \\, \\$ → $."""
-    return s.replace(r"\"", '"').replace(r"\\", "\\").replace(r"\$", "$")
+    """Reverse bash's `declare -p` quoting: \" → ", \\ → \\, \\$ → $.
+
+    Decode in a single left-to-right scan so overlapping escapes (e.g. an
+    escaped backslash immediately followed by an escaped dollar) decode
+    unambiguously: a backslash introduces an escape and the next char is
+    emitted literally.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch == "\\" and i + 1 < n:
+            out.append(s[i + 1])
+            i += 2
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)

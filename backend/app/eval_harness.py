@@ -23,6 +23,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from .submit import SubmitRequest
     from .variants import Variant
 
 
@@ -52,7 +53,7 @@ class EvalHarness(ABC):
         uses; the caller clamps it to ``max_steps``. No cross-harness signals.
         """
 
-    def validate_submit(self, req, variant: "Variant") -> None:
+    def validate_submit(self, req: "SubmitRequest", variant: "Variant") -> None:
         """Raise ``ValueError`` if a harness-required submit field is missing.
 
         Default: the harness has no extra required field.
@@ -117,7 +118,7 @@ class DexjocoHarness(EvalHarness):
             ("--checkpoint", "<eval-checkpoint>"),
         ]
 
-    def validate_submit(self, req, variant: "Variant") -> None:
+    def validate_submit(self, req: "SubmitRequest", variant: "Variant") -> None:
         # The task can come from the submit request (UI picker) or fall back to
         # the variant's own DEXJOCO_TASK (set in config.sh). The fallback is what
         # lets retries / programmatic resubmits work without re-specifying it —

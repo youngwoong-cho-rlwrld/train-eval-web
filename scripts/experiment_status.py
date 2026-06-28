@@ -42,7 +42,6 @@ import json
 import os
 import re
 import subprocess
-import sys
 import urllib.request
 
 MLXP_RES = {
@@ -134,15 +133,18 @@ def normalize(variant: str, job_name: str) -> tuple[str | None, str | None]:
     if re.match(r"^heuristic_", v):
         return "PoC2", v
     if re.match(r"^batch_size_ablation", v):
-        return "BS", re.search(r"bs\d+", v).group(0)
+        m = re.search(r"bs\d+", v)
+        return ("BS", m.group(0)) if m else (None, None)
     if re.match(r"^action_horizon_ablation", v):
-        return "AH", "ah" + re.search(r"_ah(\d+)", v).group(1)
+        m = re.search(r"_ah(\d+)", v)
+        return ("AH", "ah" + m.group(1)) if m else (None, None)
     if v.startswith("physixel_multitask") and pt_ps:
         return "PoC1old", f"physixel_poc1_pt{pt_ps.group(1)}_ps{pt_ps.group(2)} (old)"
     if v.startswith("physixel_multitask") and re.search(r"_ah(\d+)", v):
         if "skt_eval" in v or "ckpt" in v:
             return None, None
-        return "AH", "ah" + re.search(r"_ah(\d+)", v).group(1) + " (old)"
+        m = re.search(r"_ah(\d+)", v)
+        return ("AH", "ah" + m.group(1) + " (old)") if m else (None, None)
     return None, None
 
 
@@ -198,7 +200,7 @@ def attempt_no(chosen: dict, recs: list) -> int:
 def fmt_state(state: str, n_attempts: int) -> str:
     s = f"**{state}**" if state in BAD_EVAL_STATES else state
     if n_attempts > 1:
-        s += f" ({n_attempts}{'st' if n_attempts == 1 else 'nd' if n_attempts == 2 else 'rd' if n_attempts == 3 else 'th'} try)"
+        s += f" ({n_attempts}{'nd' if n_attempts == 2 else 'rd' if n_attempts == 3 else 'th'} try)"
     return s
 
 

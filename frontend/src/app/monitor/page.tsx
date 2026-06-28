@@ -9,6 +9,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { RefreshButton } from "@/components/refresh-button";
 import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state";
 import { GpuQueueTooltipContent } from "@/components/gpu-queue-visualization";
+import { sumGpu } from "@/lib/gpu";
 import { cn } from "@/lib/utils";
 
 const REFRESH_MS = 60_000;
@@ -52,33 +53,19 @@ export default function MonitorPage() {
       </div>
 
       <div className="mt-8 space-y-6">
-        {clusters.isLoading && (
+        {(clusters.isLoading || clusters.error || slurm.length === 0) && (
           <Card>
             <CardHeader>
               <CardTitle className="text-base">Slurm clusters</CardTitle>
             </CardHeader>
             <CardContent>
-              <LoadingState label="Loading clusters..." rows={3} />
-            </CardContent>
-          </Card>
-        )}
-        {clusters.error && (
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base">Slurm clusters</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <ErrorState message={(clusters.error as Error).message} />
-            </CardContent>
-          </Card>
-        )}
-        {!clusters.isLoading && !clusters.error && slurm.length === 0 && (
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base">Slurm clusters</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <EmptyState message="No Slurm clusters configured." />
+              {clusters.isLoading ? (
+                <LoadingState label="Loading clusters..." rows={3} />
+              ) : clusters.error ? (
+                <ErrorState message={(clusters.error as Error).message} />
+              ) : (
+                <EmptyState message="No Slurm clusters configured." />
+              )}
             </CardContent>
           </Card>
         )}
@@ -98,9 +85,9 @@ function SlurmClusterPanel({ cluster }: { cluster: string }) {
     refetchInterval: REFRESH_MS,
   });
   const ps = q.data ?? [];
-  const available = ps.reduce((s, p) => s + p.gpu_idle, 0);
-  const total = ps.reduce((s, p) => s + p.gpu_total, 0);
-  const queued = ps.reduce((s, p) => s + p.queued_gpus, 0);
+  const available = sumGpu(ps, "gpu_free");
+  const total = sumGpu(ps, "gpu_total");
+  const queued = sumGpu(ps, "queued_gpus");
 
   return (
     <Card>
@@ -147,8 +134,8 @@ function SlurmClusterPanel({ cluster }: { cluster: string }) {
                       {p.is_default && <Badge variant="secondary" className="ml-1 text-[10px]">default</Badge>}
                     </td>
                     <td className="py-2 pr-4 font-mono text-xs">
-                      <span className={p.gpu_idle > 0 ? "text-green-600 dark:text-green-400" : "text-slate-500"}>
-                        {p.gpu_idle}
+                      <span className={p.gpu_free > 0 ? "text-green-600 dark:text-green-400" : "text-slate-500"}>
+                        {p.gpu_free}
                       </span>
                       <span className="text-slate-400"> / {p.gpu_total}</span>
                     </td>
@@ -184,9 +171,9 @@ function MlxpPanel() {
     retry: false,
   });
   const nodes = q.data ?? [];
-  const available = nodes.reduce((s, n) => s + n.gpu_free, 0);
-  const total = nodes.reduce((s, n) => s + n.gpu_total, 0);
-  const queued = nodes.reduce((s, n) => s + n.queued_gpus, 0);
+  const available = sumGpu(nodes, "gpu_free");
+  const total = sumGpu(nodes, "gpu_total");
+  const queued = sumGpu(nodes, "queued_gpus");
 
   return (
     <Card>

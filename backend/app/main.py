@@ -1,5 +1,7 @@
 """FastAPI entrypoint."""
 
+from __future__ import annotations
+
 import asyncio
 import os
 
@@ -159,8 +161,6 @@ async def get_path_exists(name: str, path: str):
 
 @app.get("/api/clusters/{name}/datasets", response_model=list[datasets.DatasetInfo])
 async def get_cluster_datasets(name: str, path: str | None = None):
-    if name not in clusters.list_clusters():
-        raise HTTPException(404, f"cluster {name} not found")
     try:
         return await datasets.list_datasets(name, path)
     except FileNotFoundError:
@@ -171,8 +171,6 @@ async def get_cluster_datasets(name: str, path: str | None = None):
 
 @app.get("/api/dexjoco/tasks", response_model=dexjoco.DexjocoTasks)
 async def get_dexjoco_tasks(cluster: str):
-    if cluster not in clusters.list_clusters():
-        raise HTTPException(404, f"cluster {cluster} not found")
     try:
         return await dexjoco.list_dexjoco_tasks(cluster)
     except FileNotFoundError:
@@ -240,7 +238,7 @@ async def get_variant_flags(name: str, cluster: str, phase: str = "train"):
     except FileNotFoundError:
         raise HTTPException(404, f"variant {name} not found")
     out = flags.flags_for(v, phase)
-    return {"flags": [{"flag": f, "value": val} for f, val in out]}
+    return {"flags": flags.serialize_flags(out)}
 
 
 @app.get("/api/variants/{name}/data-interface", response_model=data_interface.DataInterfaceSummary)
@@ -275,23 +273,32 @@ class SubmitGitCommitsResponse(BaseModel):
     commits: list[submission_snapshot.GitCommitSummary]
 
 
-async def _submit_git_repo(cluster: str, model) -> tuple[str | None, str]:
+async def _submit_git_repo(cluster: str, model: training_models.TrainingModel) -> tuple[str | None, str]:
     if cluster == "mlxp":
         return None, mlxp_submit.mlxp_training_repo_path(model)
     env = await clusters.load_cluster(cluster)
     return env.ssh_alias, submission_snapshot.slurm_training_repo_path(env.vars, model)
 
 
+async def _resolve_submit_git_repo(cluster: str, variant: str, commit: str | None):
+    """Resolve the shared preamble for the submit git-status/commits endpoints.
+
+    Returns (model, repo_label, host, repo_path, requested_commit). host is None
+    for MLXP (no ssh); the caller dispatches on it.
+    """
+    v = await variants.load_variant(variant)
+    model = training_models.resolve_training_model(v)
+    repo_label = submission_snapshot.training_repo_label(model)
+    host, repo_path = await _submit_git_repo(cluster, model)
+    requested_commit = submission_snapshot.resolve_train_git_commit_override(commit, v.vars)
+    return model, repo_label, host, repo_path, requested_commit
+
+
 @app.get("/api/submit/git-status", response_model=submission_snapshot.GitStatus)
 async def get_submit_git_status(cluster: str, variant: str, commit: str | None = None):
     try:
-        v = await variants.load_variant(variant)
-        model = training_models.resolve_training_model(v)
-        repo_label = submission_snapshot.training_repo_label(model)
-        host, repo_path = await _submit_git_repo(cluster, model)
-        requested_commit = submission_snapshot.resolve_train_git_commit_override(
-            commit,
-            v.vars,
+        _, repo_label, host, repo_path, requested_commit = await _resolve_submit_git_repo(
+            cluster, variant, commit
         )
         if host is None:
             status = await submission_snapshot.mlxp_git_status(
@@ -325,12 +332,8 @@ async def get_submit_git_commits(
     selected: str | None = None,
 ):
     try:
-        v = await variants.load_variant(variant)
-        model = training_models.resolve_training_model(v)
-        host, repo_path = await _submit_git_repo(cluster, model)
-        selected_commit = submission_snapshot.resolve_train_git_commit_override(
-            selected,
-            v.vars,
+        _, _, host, repo_path, selected_commit = await _resolve_submit_git_repo(
+            cluster, variant, selected
         )
         if host is None:
             commits = await submission_snapshot.mlxp_git_commits(
@@ -485,7 +488,7 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
             "model_repo_path": model_repo_path,
             "model_repo_error": model_repo_error,
             "text": text,
-            "flags": [{"flag": f, "value": val} for f, val in out],
+            "flags": flags.serialize_flags(out),
         }
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
@@ -695,6 +698,36 @@ def _sse_next_line(request: Request) -> int:
         return 1
 
 
+async def _sse_log_stream(request: Request, start_line: int, line_source, error_formatter=None):
+    """Yield SSE line events from a line-source until the client disconnects.
+
+    ``line_source`` is a callable taking the next start line and returning an
+    async iterator of log lines. ``error_formatter`` (optional) turns a caught
+    RuntimeError into a single line to emit instead of aborting the stream.
+    """
+    line_no = start_line
+    while not await request.is_disconnected():
+        saw_line = False
+        try:
+            async for line in line_source(line_no):
+                if await request.is_disconnected():
+                    return
+                saw_line = True
+                yield {"event": "line", "id": str(line_no), "retry": 10000, "data": line}
+                line_no += 1
+        except RuntimeError as e:
+            if error_formatter is None:
+                raise
+            yield {
+                "event": "line",
+                "id": str(line_no),
+                "retry": 10000,
+                "data": error_formatter(e),
+            }
+            line_no += 1
+        await asyncio.sleep(1 if saw_line else 2)
+
+
 @app.get("/api/jobs/{cluster}/{job_id}/logs")
 async def stream_logs(request: Request, cluster: str, job_id: str, stream: str = "out"):
     """Server-Sent Events stream of log lines.
@@ -708,22 +741,12 @@ async def stream_logs(request: Request, cluster: str, job_id: str, stream: str =
     start_line = _sse_next_line(request)
     if cluster == "mlxp":
         from . import mlxp_jobs
-        async def gen_mlxp():
-            line_no = start_line
-            while not await request.is_disconnected():
-                saw_line = False
-                try:
-                    async for line in mlxp_jobs.tail_logs(job_id, start_line=line_no):
-                        if await request.is_disconnected():
-                            return
-                        saw_line = True
-                        yield {"event": "line", "id": str(line_no), "retry": 10000, "data": line}
-                        line_no += 1
-                except RuntimeError as e:
-                    yield {"event": "line", "id": str(line_no), "retry": 10000, "data": f"(kubectl error: {e})"}
-                    line_no += 1
-                await asyncio.sleep(1 if saw_line else 2)
-        return EventSourceResponse(gen_mlxp())
+        return EventSourceResponse(_sse_log_stream(
+            request,
+            start_line,
+            lambda line_no: mlxp_jobs.tail_logs(job_id, start_line=line_no),
+            error_formatter=lambda e: f"(kubectl error: {e})",
+        ))
 
     if stream not in ("out", "err", "isaac"):
         raise HTTPException(400, "stream must be 'out', 'err', or 'isaac'")
@@ -741,19 +764,11 @@ async def stream_logs(request: Request, cluster: str, job_id: str, stream: str =
         log_dir = env.vars["LOG_DIR"]
         pattern = f"{log_dir}/*_{job_id}.{stream}"
 
-    async def gen():
-        line_no = start_line
-        while not await request.is_disconnected():
-            saw_line = False
-            async for line in ssh_tail_lines(env.ssh_alias, pattern, start_line=line_no):
-                if await request.is_disconnected():
-                    return
-                saw_line = True
-                yield {"event": "line", "id": str(line_no), "retry": 10000, "data": line}
-                line_no += 1
-            await asyncio.sleep(1 if saw_line else 2)
-
-    return EventSourceResponse(gen())
+    return EventSourceResponse(_sse_log_stream(
+        request,
+        start_line,
+        lambda line_no: ssh_tail_lines(env.ssh_alias, pattern, start_line=line_no),
+    ))
 
 
 # ── wandb ──
@@ -817,8 +832,7 @@ async def get_job_flags(cluster: str, job_id: str):
             or ""
         ).strip()
         try:
-            if int(envs_override) > submit.MAX_EVAL_NUM_ENVS_PER_GPU:
-                envs_override = str(submit.MAX_EVAL_NUM_ENVS_PER_GPU)
+            envs_override = str(submit.clamp_eval_num_envs(int(envs_override)))
         except ValueError:
             pass
         overrides = {
@@ -841,7 +855,7 @@ async def get_job_flags(cluster: str, job_id: str):
                 if flag not in replaced:
                     rewritten.append((flag, value))
             out = rewritten
-    return {"flags": [{"flag": f, "value": val} for f, val in out]}
+    return {"flags": flags.serialize_flags(out)}
 
 
 # ── copy checkpoint ──

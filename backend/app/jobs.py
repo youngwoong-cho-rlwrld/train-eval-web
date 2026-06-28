@@ -1,7 +1,8 @@
 """Slurm job listing + status + cancel."""
 
+from __future__ import annotations
+
 import asyncio
-import re
 import shlex
 from datetime import timezone
 
@@ -9,7 +10,8 @@ from pydantic import BaseModel
 
 from .clusters import load_cluster, list_clusters
 from .eval_completion import eval_job_completed_from_log_dir
-from .job_identity import phase_variant_from_meta, resolve_phase_and_variant
+from .job_identity import resolve_identity
+from .partitions import gpu_count_from_tres
 from .slurm_meta import read_slurm_meta, read_slurm_meta_many
 from .ssh import ssh_run
 from .time_utils import scheduler_timezone, to_kst_iso
@@ -37,6 +39,41 @@ class Job(BaseModel):
 _SQUEUE_FMT = "%i|%j|%P|%T|%M|%R|%L|%S"
 _SACCT_LIST_FMT = "JobID,JobName,Partition,State,Elapsed,Start,End,NodeList"
 ACTIVE_STATES = {"RUNNING", "PENDING", "COMPLETING", "CONFIGURING", "SUSPENDED"}
+
+# Slurm terminal-state prefix groups (sacct may suffix states, e.g.
+# "CANCELLED by <uid>"), so classify by uppercase prefix.
+TIMEOUT_PREFIXES = ("TIMEOUT",)
+# Failures a `retry` should re-submit; TIMEOUT is handled by `resume` and
+# CANCELLED is not retryable, so both are intentionally excluded here.
+RETRYABLE_FAILURE_PREFIXES = ("FAIL", "OUT_OF_MEMORY", "NODE_FAIL", "PREEMPT")
+TERMINAL_NON_COMPLETED_PREFIXES = (
+    "FAIL",
+    "TIMEOUT",
+    "OUT_OF_MEMORY",
+    "NODE_FAIL",
+    "PREEMPT",
+    "CANCEL",
+)
+
+
+def short_state(raw: str) -> str:
+    """Truncate sacct's "CANCELLED by <uid>" suffix to the bare state token."""
+    return raw.split(" ")[0]
+
+
+def is_timeout(state: str) -> bool:
+    return state.upper().startswith(TIMEOUT_PREFIXES)
+
+
+def is_retryable_failure(state: str) -> bool:
+    return state.upper().startswith(RETRYABLE_FAILURE_PREFIXES)
+
+
+def is_terminal_non_completed(state: str) -> bool:
+    upper = state.upper()
+    if upper in ACTIVE_STATES or upper.startswith("COMPLET"):
+        return False
+    return upper.startswith(TERMINAL_NON_COMPLETED_PREFIXES)
 
 
 def _actual_start_for_state(state: str, value: str | None, source_tz: timezone | None = None) -> str | None:
@@ -168,7 +205,7 @@ async def list_jobs(
                 continue
             jid = parts[0]
             # Truncate sacct's CANCELLED+by labels for cleaner display.
-            state = parts[3].split(" ")[0]
+            state = short_state(parts[3])
             job_start = _actual_start_for_state(state, parts[5], source_tz)
             job_end = to_kst_iso(parts[6], source_tz)
             if jid in seen:
@@ -180,7 +217,7 @@ async def list_jobs(
                 if (
                     existing is not None
                     and existing.state.upper() == "COMPLETING"
-                    and (state.upper() == "COMPLETED" or _terminal_non_completed(state))
+                    and (state.upper() == "COMPLETED" or is_terminal_non_completed(state))
                 ):
                     existing.state = state
                     existing.end = job_end
@@ -206,9 +243,7 @@ async def list_jobs(
 def _attach_phase_metadata(rows: list[Job], meta_by_job_id: dict[str, dict[str, str]]) -> None:
     for job in rows:
         meta = meta_by_job_id.get(job.job_id, {})
-        phase, variant = phase_variant_from_meta(meta)
-        if not phase or not variant:
-            phase, variant = resolve_phase_and_variant(job.job_name)
+        phase, variant = resolve_identity(meta, job.job_name)
         job.phase = None if phase == "unknown" else phase
         job.variant = variant
         job.resume_of = meta.get("resume_of") or None
@@ -221,25 +256,8 @@ _SQUEUE_DETAIL_FMT = "%i|%j|%P|%T|%V|%S|%M|%N|%R|%b"
 
 
 def _gpu_count_from_tres(value: str | None) -> str | None:
-    if not value or value in {"N/A", "(null)", "None"}:
-        return None
-    for part in re.split(r"[, ]+", value):
-        if "gpu" not in part:
-            continue
-        if "=" in part:
-            name, raw = part.rsplit("=", 1)
-            if "gpu" in name:
-                try:
-                    return str(int(raw))
-                except ValueError:
-                    continue
-        pieces = part.split(":")
-        if pieces and "gpu" in pieces[0]:
-            try:
-                return str(int(pieces[-1]))
-            except ValueError:
-                continue
-    return None
+    count = gpu_count_from_tres(value)
+    return str(count) if count is not None else None
 
 
 def _gpu_count_from_meta(meta: dict[str, str]) -> str | None:
@@ -335,18 +353,29 @@ async def cancel_job(cluster: str, job_id: str) -> None:
         raise RuntimeError(f"scancel failed: {r.stderr}")
 
 
-def _terminal_non_completed(state: str) -> bool:
-    upper = state.upper()
-    if upper in ACTIVE_STATES or upper.startswith("COMPLET"):
+EVAL_OVERRIDE_REASON = "Slurm exited nonzero after eval artifacts completed"
+
+
+async def _eval_artifacts_completed(
+    host: str,
+    log_dir: str,
+    job_id: str,
+    job_name: str,
+    state: str,
+    meta: dict[str, str],
+    record: dict | None = None,
+) -> bool:
+    """True when a terminal-but-nonzero eval job actually finished writing its
+    artifacts, so callers can rewrite its state to COMPLETED."""
+    if not is_terminal_non_completed(state):
         return False
-    return upper.startswith((
-        "FAIL",
-        "TIMEOUT",
-        "OUT_OF_MEMORY",
-        "NODE_FAIL",
-        "PREEMPT",
-        "CANCEL",
-    ))
+    phase, variant = resolve_identity(meta, job_name, record)
+    if phase != "eval" or not variant:
+        return False
+    try:
+        return await eval_job_completed_from_log_dir(host, log_dir, job_id, variant, meta)
+    except Exception:
+        return False
 
 
 async def _normalize_completed_eval_jobs(
@@ -356,24 +385,12 @@ async def _normalize_completed_eval_jobs(
     meta_by_job_id: dict[str, dict[str, str]],
 ) -> None:
     async def _one(job: Job) -> None:
-        if not _terminal_non_completed(job.state):
-            return
         meta = meta_by_job_id.get(job.job_id, {})
-        phase, variant = job.phase, job.variant
-        if phase != "eval" or not variant:
-            p, v = phase_variant_from_meta(meta)
-            if p and v:
-                phase, variant = p, v
-        if phase != "eval" or not variant:
-            phase, variant = resolve_phase_and_variant(job.job_name)
-        if phase != "eval" or not variant:
-            return
-        try:
-            if await eval_job_completed_from_log_dir(host, log_dir, job.job_id, variant, meta):
-                job.state = "COMPLETED"
-                job.reason = job.reason or "Slurm exited nonzero after eval artifacts completed"
-        except Exception:
-            return
+        if await _eval_artifacts_completed(
+            host, log_dir, job.job_id, job.job_name, job.state, meta
+        ):
+            job.state = "COMPLETED"
+            job.reason = job.reason or EVAL_OVERRIDE_REASON
 
     await asyncio.gather(*(_one(j) for j in rows), return_exceptions=True)
 
@@ -385,29 +402,18 @@ async def _normalize_completed_eval_record(
     meta: dict[str, str] | None = None,
 ) -> None:
     state = str(record.get("State") or "")
-    if not _terminal_non_completed(state):
-        return
     meta = meta or {}
-    phase, variant = resolve_phase_and_variant(str(record.get("JobName") or ""), record)
-    if phase != "eval" or not variant:
-        p, v = phase_variant_from_meta(meta)
-        if p and v:
-            phase, variant = p, v
-    if phase != "eval" or not variant:
-        return
-    try:
-        completed = await eval_job_completed_from_log_dir(
-            host,
-            log_dir,
-            str(record.get("JobID") or ""),
-            variant,
-            meta,
-        )
-    except Exception:
-        return
-    if not completed:
+    if not await _eval_artifacts_completed(
+        host,
+        log_dir,
+        str(record.get("JobID") or ""),
+        str(record.get("JobName") or ""),
+        state,
+        meta,
+        record,
+    ):
         return
     record.setdefault("SlurmState", state)
     record["State"] = "COMPLETED"
     if not record.get("Reason") or record.get("Reason") == "None":
-        record["Reason"] = "Slurm exited nonzero after eval artifacts completed"
+        record["Reason"] = EVAL_OVERRIDE_REASON

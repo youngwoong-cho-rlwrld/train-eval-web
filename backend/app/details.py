@@ -6,11 +6,13 @@ the cluster a few small questions over SSH (slurm) or kubectl (mlxp) to
 compute progress.
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
-import os
 import re
 import shlex
+import shutil
 from typing import Any
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
@@ -22,9 +24,9 @@ from .data_interface import DataInterfaceSummary, summarize_data_interface_text
 from .eval_completion import (
     eval_job_completed,
     eval_shape,
+    eval_shape_from_meta,
     eval_total,
     exp_dir_rel_candidates,
-    remote_path_expr,
 )
 from .eval_harness import harness_for, harness_for_name
 from .job_identity import (
@@ -36,17 +38,22 @@ from .job_identity import (
 )
 from .jobs import get_job
 from .mlxp_config import get_settings
+from .mlxp_data_pod import ensure_listing_pod
 from .paths import CLUSTER_STAGING_REL
-from .remote_paths import expand_cluster_home, expand_home_path, remote_home
+from .remote_paths import expand_cluster_home, expand_home_path, remote_home, remote_path_expr
 from .submission_snapshot import SubmitGitInfo, render_training_config_snapshot
 from .ssh import ssh_run
 from .slurm_meta import read_slurm_meta
 from .training_models import resolve_training_model
-from .variant_values import variant_int
+from .variant_values import variant_int, variant_int_opt
 from .variants import load_variant
 
 
-from .wandb_config import get_project
+from .wandb_config import (
+    WANDB_ENTITY_OVERRIDE,
+    WANDB_WORKSPACE_OVERRIDE,
+    get_project,
+)
 
 # Wandb config:
 #   - run id: WANDB_RUN_ID pinned by submit.py (slurm) / body script
@@ -55,8 +62,6 @@ from .wandb_config import get_project
 #     laptop. Resolved lazily in _wandb_entity.
 #   - project: captured at submit time in job metadata/config snapshot; if an
 #     older job lacks that field, the current Settings value is the fallback.
-WANDB_ENTITY_OVERRIDE = os.environ.get("TRAIN_EVAL_WEB_WANDB_ENTITY")
-WANDB_WORKSPACE_OVERRIDE = os.environ.get("TRAIN_EVAL_WEB_WANDB_WORKSPACE")
 
 
 class Paths(BaseModel):
@@ -153,24 +158,6 @@ class JobDetails(BaseModel):
     config_snapshot: ConfigSnapshot | None = None
     data_interface: DataInterfaceSummary | None = None
     eval_runs: list[EvalRun] = Field(default_factory=list)
-
-
-def _snapshot_wandb_project(text: str | None) -> str | None:
-    if not text:
-        return None
-    match = re.search(r"^SUBMIT_WANDB_PROJECT=(.*)$", text, flags=re.MULTILINE)
-    if not match:
-        return None
-    raw = match.group(1).strip()
-    if not raw:
-        return None
-    try:
-        parts = shlex.split(raw, comments=False, posix=True)
-        if parts:
-            return parts[0]
-    except ValueError:
-        pass
-    return raw.strip("'\"") or None
 
 
 async def _read_slurm_scontrol_comment(host: str, job_id: str) -> str | None:
@@ -630,6 +617,33 @@ def _reconcile_eval_progress_from_runs(progress: Progress, eval_runs: list[EvalR
         )
 
 
+def _apply_eval_step_shape(
+    progress: Progress,
+    completed: int,
+    total: int,
+    n_eps: int,
+    current_eps: int,
+) -> None:
+    """Set the unified eval step shape (max_steps/current_step/percent/label).
+
+    When N_EPISODES is known the bar is measured in episodes
+    (max_steps = total_runs · N_EPISODES) so the frontend ETA matches training;
+    otherwise it falls back to completed/total result files. Shared by the slurm
+    and mlxp eval-progress paths so their labels stay identical.
+    """
+    if n_eps > 0:
+        progress.max_steps = total * n_eps
+        progress.current_step = min(current_eps, progress.max_steps)
+        progress.percent = round(100.0 * progress.current_step / progress.max_steps, 1)
+        progress.current_label = (
+            f"{completed}/{total} result files · "
+            f"{progress.current_step}/{progress.max_steps} episodes"
+        )
+    else:
+        progress.percent = round(100.0 * completed / total, 1)
+        progress.current_label = f"{completed}/{total} result files"
+
+
 async def _mlxp_details(
     job_id: str,
     job_name: str,
@@ -807,7 +821,7 @@ async def _slurm_config_snapshot(
         extra_args=extra_args,
         wandb_project=meta.get("wandb_project")
         or meta.get("submit_wandb_project")
-        or _snapshot_wandb_project(text),
+        or _snapshot_shell_value(text, "SUBMIT_WANDB_PROJECT"),
         git_repo_path=display_git_repo_path or None,
         git_repo_label=meta.get("submit_git_repo_label") or None,
         git_branch=meta.get("submit_git_branch") or None,
@@ -838,13 +852,13 @@ async def _recover_slurm_training_snapshot(
         train_global_batch_size = _meta_int(meta, "train_global_batch_size")
         if train_global_batch_size is None:
             for key in ("TRAIN_GLOBAL_BATCH_SIZE", "GLOBAL_BATCH_SIZE"):
-                raw = (variant.vars.get(key) or "").strip()
-                if raw:
-                    try:
-                        train_global_batch_size = int(raw)
-                        break
-                    except ValueError:
-                        pass
+                try:
+                    parsed = variant_int_opt(variant, key)
+                except ValueError:
+                    continue
+                if parsed is not None:
+                    train_global_batch_size = parsed
+                    break
         git = _snapshot_git_from_meta(meta)
         text = render_training_config_snapshot(
             base_config=variant.raw,
@@ -939,7 +953,7 @@ def _resolve_remote_modality_path(
     if not source:
         return None, None
     if source.startswith("$HOME/") or source.startswith("/") or source.startswith("~/"):
-        return source, source
+        return source.rsplit("/", 1)[-1], source
 
     config_path = config_snapshot.path if config_snapshot else None
     if not config_path or "/" not in config_path:
@@ -1028,7 +1042,7 @@ async def _mlxp_config_snapshot(meta: dict[str, str]) -> ConfigSnapshot | None:
         text=text,
         wandb_project=meta.get("wandb_project")
         or meta.get("submit_wandb_project")
-        or _snapshot_wandb_project(text),
+        or _snapshot_shell_value(text, "SUBMIT_WANDB_PROJECT"),
         git_repo_path=display_git_repo_path or None,
         git_repo_label=meta.get("submit_git_repo_label") or None,
         git_branch=meta.get("submit_git_branch") or None,
@@ -1090,32 +1104,50 @@ async def _mlxp_data_interface_snapshot(
     )
 
 
-async def _mlxp_read_file(path: str) -> tuple[str | None, str | None]:
-    import asyncio
-    import shutil
-    from .mlxp_data_pod import ensure_listing_pod
+async def _mlxp_exec(
+    *command: str,
+    timeout: float,
+    pod: str | None = None,
+) -> tuple[int, str, str]:
+    """Run `kubectl exec` in an MLXP pod and return (rc, stdout, stderr).
 
+    Centralizes the subprocess create + timeout-guarded communicate + kill-on-
+    timeout/cancel boilerplate that the MLXP detail helpers all share, so none of
+    them can leak an orphaned kubectl child. When `pod` is None the shared
+    listing pod is used; pass an explicit pod (e.g. a job's own pod for GPU
+    sampling) to target it directly. Callers keep their own try/except for the
+    "kubectl unavailable / probe failed" fallbacks.
+    """
+    settings = get_settings()
+    if pod is None:
+        pod = await ensure_listing_pod()
+    proc = await asyncio.create_subprocess_exec(
+        "kubectl", "exec", "-n", settings.namespace, pod, "--", *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except BaseException:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        raise
+    return (
+        proc.returncode or 0,
+        stdout.decode(errors="replace"),
+        stderr.decode(errors="replace"),
+    )
+
+
+async def _mlxp_read_file(path: str) -> tuple[str | None, str | None]:
     if shutil.which("kubectl") is None:
         return None, "kubectl not found on PATH"
-    settings = get_settings()
     try:
-        pod = await ensure_listing_pod()
-        proc = await asyncio.create_subprocess_exec(
-            "kubectl",
-            "exec",
-            "-n",
-            settings.namespace,
-            pod,
-            "--",
-            "cat",
-            path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=12.0)
-        if proc.returncode == 0:
-            return stdout.decode(errors="replace"), None
-        return None, stderr.decode(errors="replace").strip() or "file not found"
+        rc, stdout, stderr = await _mlxp_exec("cat", path, timeout=12.0)
+        if rc == 0:
+            return stdout, None
+        return None, stderr.strip() or "file not found"
     except Exception as exc:
         return None, str(exc)
 
@@ -1206,16 +1238,7 @@ async def _slurm_eval_runs(host: str, eval_dir: str) -> list[EvalRun]:
 
 
 async def _mlxp_eval_runs(eval_dir: str) -> list[EvalRun]:
-    import asyncio
-    import shutil
-    from .mlxp_data_pod import ensure_listing_pod
-
     if shutil.which("kubectl") is None:
-        return []
-    settings = get_settings()
-    try:
-        pod = await ensure_listing_pod()
-    except Exception:
         return []
     cmd = (
         f"EVAL_DIR={shlex.quote(eval_dir)} "
@@ -1223,26 +1246,32 @@ async def _mlxp_eval_runs(eval_dir: str) -> list[EvalRun]:
         + _EVAL_RUNS_SCRIPT
         + "\nPY"
     )
-    proc = None
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "kubectl", "exec", "-n", settings.namespace, pod, "--", "bash", "-lc", cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20.0)
+        rc, stdout, _ = await _mlxp_exec("bash", "-lc", cmd, timeout=20.0)
     except Exception:
-        if proc is not None and proc.returncode is None:
-            proc.kill()
-            await proc.wait()
         return []
-    if proc.returncode != 0:
+    if rc != 0:
         return []
     try:
-        raw = json.loads(stdout.decode(errors="replace") or "[]")
+        raw = json.loads(stdout or "[]")
     except json.JSONDecodeError:
         return []
     return [EvalRun.model_validate(item) for item in raw]
+
+
+# Slurm reports "no node assigned" as one of these sentinel strings; treat them
+# all as "no node" when resolving the GPU host.
+_NO_NODE_SENTINELS = {"", "None assigned", "N/A", "(None)"}
+
+# Sample nvidia-smi three times (1s apart) so utilization isn't a single-instant
+# reading. Shared verbatim by the slurm and mlxp GPU helpers.
+GPU_SAMPLE_CMD = (
+    "for i in 1 2 3; do "
+    "nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total "
+    "--format=csv,noheader,nounits; "
+    '[ "$i" = 3 ] || sleep 1; '
+    "done"
+)
 
 
 def _parse_gpu_usage(stdout: str, node: str | None) -> GpuUsage | None:
@@ -1326,7 +1355,7 @@ def _parse_gpu_usage(stdout: str, node: str | None) -> GpuUsage | None:
 
 async def _first_slurm_node(host: str, nodelist: str) -> str | None:
     node_expr = nodelist.strip()
-    if not node_expr or node_expr in {"None assigned", "N/A", "(None)"}:
+    if node_expr in _NO_NODE_SENTINELS:
         return None
     r = await ssh_run(
         host,
@@ -1344,17 +1373,13 @@ async def _slurm_gpu_usage(
     state: str,
 ) -> GpuUsage:
     node_expr = nodelist.strip()
-    fallback_node = None if node_expr in {"", "None assigned", "N/A", "(None)"} else node_expr
+    fallback_node = None if node_expr in _NO_NODE_SENTINELS else node_expr
     if not state.upper().startswith(("RUNNING", "COMPLETING")):
         return GpuUsage(node=fallback_node, error="GPU memory is only available while the job is running")
 
     node = await _first_slurm_node(host, nodelist)
 
-    smi_query = (
-        "nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total "
-        "--format=csv,noheader,nounits"
-    )
-    query = f"for i in 1 2 3; do {smi_query}; [ \"$i\" = 3 ] || sleep 1; done"
+    query = GPU_SAMPLE_CMD
 
     # Preferred: execute inside the job allocation. This works even when
     # compute-node SSH is not available directly from the login node.
@@ -1390,9 +1415,6 @@ async def _mlxp_gpu_usage(
     node: str | None,
     state: str,
 ) -> GpuUsage:
-    import asyncio
-    import shutil
-
     fallback_node = node or pod_name or None
     if not state.upper().startswith(("RUNNING", "COMPLETING")):
         return GpuUsage(node=fallback_node, error="GPU memory is only available while the job is running")
@@ -1400,45 +1422,23 @@ async def _mlxp_gpu_usage(
         return GpuUsage(node=fallback_node, error="MLXP pod is not available yet")
     if shutil.which("kubectl") is None:
         return GpuUsage(node=fallback_node, error="kubectl not found on PATH")
-    settings = get_settings()
 
-    proc = None
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "kubectl",
-            "exec",
-            "-n",
-            settings.namespace,
-            pod_name,
-            "--",
-            "bash",
-            "-lc",
-            (
-                "for i in 1 2 3; do "
-                "nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total "
-                "--format=csv,noheader,nounits; "
-                '[ "$i" = 3 ] || sleep 1; '
-                "done"
-            ),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        rc, stdout, stderr = await _mlxp_exec(
+            "bash", "-lc", GPU_SAMPLE_CMD, timeout=12.0, pod=pod_name,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=12.0)
     except Exception as exc:
-        if proc is not None and proc.returncode is None:
-            proc.kill()
-            await proc.wait()
         return GpuUsage(node=fallback_node, error=f"MLXP GPU sample failed: {exc}")
 
-    if proc.returncode != 0:
-        msg = stderr.decode(errors="replace").strip() or stdout.decode(errors="replace").strip()
+    if rc != 0:
+        msg = stderr.strip() or stdout.strip()
         lines = msg.splitlines()
         return GpuUsage(
             node=fallback_node,
             error=(lines[-1] if lines else "MLXP GPU sample failed")[:240],
         )
 
-    usage = _parse_gpu_usage(stdout.decode(errors="replace"), fallback_node)
+    usage = _parse_gpu_usage(stdout, fallback_node)
     return usage or GpuUsage(node=fallback_node, error="MLXP GPU sample returned no devices")
 
 
@@ -1458,8 +1458,6 @@ async def _mlxp_progress(
     `run_id` is the wandb run id — the job_name (display name) for MLXP,
     not the k8s job_id which has no wandb run behind it.
     """
-    import asyncio
-
     progress = Progress(phase=phase)
     if not variant:
         return progress
@@ -1493,7 +1491,6 @@ async def _mlxp_progress(
         return progress
 
     # 2. checkpoint dir count — coarse (SAVE_STEPS granularity).
-    import shutil
     if shutil.which("kubectl") is None:
         return progress
     settings = get_settings()
@@ -1510,33 +1507,18 @@ async def _mlxp_progress(
         ]
         if d
     ]
-    from .mlxp_data_pod import ensure_listing_pod
-    try:
-        pod = await ensure_listing_pod()
-    except Exception:
-        return progress
-
     dirs = " ".join(shlex.quote(d) for d in ckpt_dirs)
     cmd = (
         f"for d in {dirs}; do "
         'ls -d "$d"/checkpoint-* 2>/dev/null; '
         "done | sed 's:.*checkpoint-::' | sort -n | tail -1"
     )
-    proc = None
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "kubectl", "exec", "-n", settings.namespace, pod, "--", "bash", "-c", cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+        _, stdout, _ = await _mlxp_exec("bash", "-c", cmd, timeout=15.0)
     except Exception:
-        if proc is not None and proc.returncode is None:
-            proc.kill()
-            await proc.wait()
         return progress
 
-    latest = stdout.decode(errors="replace").strip()
+    latest = stdout.strip()
     if not latest.isdigit():
         return progress
     cur = int(latest)
@@ -1554,9 +1536,6 @@ async def _mlxp_eval_progress(
     metadata: dict[str, str],
     progress: Progress,
 ) -> Progress:
-    import asyncio
-    import shutil
-
     try:
         v = await load_variant(variant)
         eval_sets, n_runs, n_eps, tasks = eval_shape(v, metadata)
@@ -1573,41 +1552,18 @@ async def _mlxp_eval_progress(
         return progress
     settings = get_settings()
     eval_dir = metadata.get("eval_dir") or f"{settings.experiments_dir}/{variant}/eval_results"
-    from .mlxp_data_pod import ensure_listing_pod
-    try:
-        pod = await ensure_listing_pod()
-    except Exception:
-        return progress
 
     cmd = f"find {shlex.quote(eval_dir)} -type f -name results.json 2>/dev/null | wc -l"
-    proc = None
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "kubectl", "exec", "-n", settings.namespace, pod, "--", "bash", "-c", cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+        _, stdout, _ = await _mlxp_exec("bash", "-c", cmd, timeout=15.0)
     except Exception:
-        if proc is not None and proc.returncode is None:
-            proc.kill()
-            await proc.wait()
         return progress
     try:
-        completed = int(stdout.decode(errors="replace").strip())
+        completed = int(stdout.strip())
     except ValueError:
         completed = 0
     progress.completed_runs = completed
-    if n_eps > 0 and progress.max_steps:
-        progress.current_step = min(completed * n_eps, progress.max_steps)
-        progress.percent = round(100.0 * progress.current_step / progress.max_steps, 1)
-        progress.current_label = (
-            f"{completed}/{total} result files · "
-            f"{progress.current_step}/{progress.max_steps} episodes"
-        )
-    else:
-        progress.percent = round(100.0 * completed / total, 1)
-        progress.current_label = f"{completed}/{total} result files"
+    _apply_eval_step_shape(progress, completed, total, n_eps, completed * n_eps)
     return progress
 
 
@@ -1626,8 +1582,6 @@ async def _wandb_workspace(entity: str) -> str | None:
         return WANDB_WORKSPACE_OVERRIDE
     if entity in _wandb_workspace_cache:
         return _wandb_workspace_cache[entity] or None
-
-    import asyncio
 
     def _query() -> str | None:
         try:
@@ -1660,8 +1614,6 @@ _wandb_workspace_cache: dict[str, str] = {}
 
 
 async def _wandb_url(run_id: str, project: str | None = None) -> str | None:
-    import asyncio
-
     entity = await _wandb_entity()
     if not entity:
         return None
@@ -1694,7 +1646,6 @@ async def _wandb_entity() -> str | None:
         return WANDB_ENTITY_OVERRIDE
     if _wandb_entity_cache is not None:
         return _wandb_entity_cache or None
-    import asyncio
 
     def _default() -> str:
         try:
@@ -1709,8 +1660,6 @@ async def _wandb_entity() -> str | None:
 
 async def _wandb_step(run_id: str, project: str | None = None) -> int | None:
     """Return the run's latest step (None if API unreachable / run not found)."""
-    import asyncio
-
     entity = await _wandb_entity()
     if not entity:
         return None
@@ -1894,7 +1843,7 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
             return progress
         r = await ssh_run(
             host,
-            f"ls -d {ckpt_dir}/checkpoint-* 2>/dev/null | sed 's:.*checkpoint-::' | sort -n | tail -1",
+            f"ls -d {remote_path_expr(ckpt_dir)}/checkpoint-* 2>/dev/null | sed 's:.*checkpoint-::' | sort -n | tail -1",
             timeout=10.0,
         )
         latest = r.stdout.strip()
@@ -1913,10 +1862,7 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
             eval_sets, n_runs, n_eps, tasks = eval_shape(v, slurm_meta)
             harness = harness_for(v)
         except FileNotFoundError:
-            eval_sets = [s for s in ((slurm_meta or {}).get("eval_sets") or "").split() if s]
-            n_runs = _meta_int(slurm_meta or {}, "eval_n_runs") or 0
-            n_eps = _meta_int(slurm_meta or {}, "eval_n_episodes") or 0
-            tasks = []
+            eval_sets, n_runs, n_eps, tasks = eval_shape_from_meta(slurm_meta)
             harness = harness_for_name((slurm_meta or {}).get("eval_harness"))
         total = eval_total(eval_sets, n_runs, tasks)
         progress.total_runs = total or None
@@ -1946,17 +1892,7 @@ async def _compute_progress(cluster: str, job_id: str, phase: str, variant: str 
             raise RuntimeError(str(exc)) from exc
         progress.completed_runs = completed
 
-        if n_eps > 0:
-            # Unified step shape so the frontend ETA + bar match training:
-            #   max_steps = total_runs · N_EPISODES; current_step = live episodes.
-            progress.max_steps = total * n_eps
-            progress.current_step = min(current_eps, progress.max_steps)
-            progress.percent = round(100.0 * progress.current_step / progress.max_steps, 1)
-            progress.current_label = (
-                f"{completed}/{total} result files · "
-                f"{progress.current_step}/{progress.max_steps} episodes"
-            )
-        else:
-            progress.percent = round(100.0 * completed / total, 1)
-            progress.current_label = f"{completed}/{total} result files"
+        # Unified step shape so the frontend ETA + bar match training:
+        #   max_steps = total_runs · N_EPISODES; current_step = live episodes.
+        _apply_eval_step_shape(progress, completed, total, n_eps, current_eps)
     return progress

@@ -17,6 +17,7 @@ from .mlxp_config import get_settings as get_mlxp_settings
 from .mlxp_data_pod import ensure_listing_pod
 from .paths import CLUSTER_STAGING_REL
 from .ssh import ssh_run
+from .variant_values import variant_int_opt
 
 
 class ResultCell(BaseModel):
@@ -175,8 +176,8 @@ async def _variant_payload() -> list[dict[str, Any]]:
                 "model_version": v.vars.get("MODEL_ID") or v.vars.get("MODEL_VERSION"),
                 "note": v.vars.get("TRAIN_NOTE"),
                 "eval_sets": v.arrays.get("EVAL_SETS", []),
-                "n_runs": _int_or_none(v.vars.get("N_RUNS")),
-                "n_episodes": _int_or_none(v.vars.get("N_EPISODES")),
+                "n_runs": variant_int_opt(v, "N_RUNS"),
+                "n_episodes": variant_int_opt(v, "N_EPISODES"),
                 "tasks": tasks,
             }
         )
@@ -212,18 +213,7 @@ def _split_task_entry(entry: str) -> tuple[str | None, str | None, str | None]:
         return parts[0], parts[1], parts[2]
     if len(parts) == 2:
         return parts[0], parts[1], None
-    if len(parts) == 1:
-        return parts[0], parts[0], None
-    return None, None, None
-
-
-def _int_or_none(value: Any) -> int | None:
-    try:
-        if value is None or value == "":
-            return None
-        return int(value)
-    except (TypeError, ValueError):
-        return None
+    return parts[0], parts[0], None
 
 
 def _remote_program(env_vars: dict[str, str]) -> str:

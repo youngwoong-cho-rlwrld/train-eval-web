@@ -9,10 +9,10 @@ MODEL_VERSION=n1.5/n1.6 still resolve to the matching model id.
 from __future__ import annotations
 
 import re
-import shlex
 from dataclasses import dataclass
 from typing import Any
 
+from .cluster_settings import parse_env_text
 from .paths import MODELS_DIR
 
 ACTION_HORIZON_MODES = {"none", "modality", "cli", "modality_and_cli"}
@@ -43,11 +43,11 @@ class TrainingModel:
 
 
 def model_id_for_variant(variant: Any) -> str:
-    vars = getattr(variant, "vars", {}) or {}
+    variant_vars = getattr(variant, "vars", {}) or {}
     return (
-        vars.get("MODEL_ID")
-        or vars.get("TRAIN_MODEL")
-        or vars.get("MODEL_VERSION")
+        variant_vars.get("MODEL_ID")
+        or variant_vars.get("TRAIN_MODEL")
+        or variant_vars.get("MODEL_VERSION")
         or "n1.5"
     ).strip()
 
@@ -57,13 +57,24 @@ def resolve_training_model(variant: Any) -> TrainingModel:
 
 
 def action_horizon_mode_for_variant(model: TrainingModel, variant: Any) -> str:
-    vars = getattr(variant, "vars", {}) or {}
+    variant_vars = getattr(variant, "vars", {}) or {}
     mode = (
-        vars.get("TRAIN_ACTION_HORIZON_MODE")
-        or vars.get("ACTION_HORIZON_MODE")
+        variant_vars.get("TRAIN_ACTION_HORIZON_MODE")
+        or variant_vars.get("ACTION_HORIZON_MODE")
         or model.action_horizon_mode
     ).strip()
     return _validate_action_horizon_mode(model.id, mode)
+
+
+def family_derives_per_gpu_batch_size(family: str) -> bool:
+    """Whether a model family derives TRAIN_BATCH_SIZE = global_batch / num_gpus.
+
+    n1.5 (gr00t_finetune.py) takes a per-GPU batch size, so the renderer splits
+    the requested global batch across GPUs; n1.6/PhysiXel consume the global
+    batch directly. Centralized here so adding/renaming families doesn't require
+    editing config renderers.
+    """
+    return family == "n1.5"
 
 
 def rewrites_modality_action_horizon(mode: str) -> bool:
@@ -81,7 +92,7 @@ def load_training_model(model_id: str) -> TrainingModel:
         raise ValueError(
             f"training model {model_id!r} not found; add configs/models/{model_id}.env"
         )
-    data = _parse_model_env(path.read_text())
+    data = parse_env_text(path.read_text(), validate_keys=True)
     family = (data.get("MODEL_FAMILY") or data.get("MODEL_VERSION") or model_id).strip()
     flags_profile = (data.get("FLAGS_PROFILE") or family).strip()
     if family not in SUPPORTED_FAMILIES:
@@ -139,38 +150,6 @@ def expand_value(value: str, env: dict[str, str]) -> str:
         return env.get(key, match.group(0))
 
     return _VAR_RE.sub(repl, value)
-
-
-def _parse_model_env(text: str) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if stripped.startswith("export "):
-            stripped = stripped[len("export "):].strip()
-        if "=" not in stripped:
-            continue
-        key, raw_value = stripped.split("=", 1)
-        key = key.strip()
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
-            continue
-        out[key] = _parse_value(raw_value.strip())
-    return out
-
-
-def _parse_value(raw: str) -> str:
-    if not raw:
-        return ""
-    try:
-        parts = shlex.split(raw, comments=False, posix=True)
-        if len(parts) == 1:
-            return parts[0]
-    except ValueError:
-        pass
-    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"'):
-        return raw[1:-1]
-    return raw
 
 
 def _validate_action_horizon_mode(model_id: str, mode: str) -> str:

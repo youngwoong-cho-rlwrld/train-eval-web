@@ -1,5 +1,7 @@
 """Auto-provision a data pod on MLXP for DDN listing operations."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 import shutil
@@ -8,7 +10,6 @@ from .kubectl_errors import is_kubectl_transport_error
 from .mlxp_config import (
     MlxpSettings,
     get_settings,
-    owner_selector,
 )
 
 def _data_pod_yaml(settings: MlxpSettings) -> str:
@@ -123,22 +124,6 @@ async def _kubectl_get_pods_json(
         return data
     items = [it for it in data.get("items", []) if _label_matches(it, label)]
     return {**data, "items": items}
-
-
-async def _find_running_with_ddn(*, refresh: bool = False, strict: bool = False) -> str | None:
-    """First Running owned pod that has the configured DDN PVC mounted."""
-    settings = get_settings()
-    data = await _kubectl_get_pods_json(owner_selector(settings), refresh=refresh, strict=strict)
-    for item in data.get("items", []):
-        if (item.get("status") or {}).get("phase") != "Running":
-            continue
-        vols = ((item.get("spec") or {}).get("volumes") or [])
-        if any(
-            ((v.get("persistentVolumeClaim") or {}).get("claimName") == settings.ddn_pvc)
-            for v in vols
-        ):
-            return item["metadata"]["name"]
-    return None
 
 
 async def _apply_yaml(yaml_text: str) -> None:

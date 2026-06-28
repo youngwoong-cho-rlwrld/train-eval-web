@@ -3,7 +3,7 @@
 import type { ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { CircleHelp } from "lucide-react";
-import { api, type DataInterfaceSummary } from "@/lib/api";
+import { api, type ConfigPreviewFlag, type DataInterfaceSummary } from "@/lib/api";
 import {
   Card,
   CardContent,
@@ -14,8 +14,7 @@ import { CopyButton } from "@/components/copy-button";
 import { ImmediateTooltip } from "@/components/immediate-tooltip";
 import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state";
 
-type FlagEntry = { flag: string; value: string };
-type FlagRow = { key: string; entry: FlagEntry };
+type FlagRow = { key: string; entry: ConfigPreviewFlag };
 export type FlagEditor =
   | ReactNode
   | {
@@ -76,7 +75,7 @@ export function ConfigCard({
   modelRepoChecking?: boolean;
   effectiveConfigLoading?: boolean;
   effectiveConfigError?: Error | null;
-  flagsOverride?: FlagEntry[] | null;
+  flagsOverride?: ConfigPreviewFlag[] | null;
   flagEditors?: Record<string, FlagEditor>;
   extraFlagRows?: ExtraFlagRow[];
   showCheckpointPathRow?: boolean;
@@ -87,7 +86,7 @@ export function ConfigCard({
 }) {
   const flags = useQuery({
     queryKey,
-    queryFn: () => api<{ flags: FlagEntry[] }>(flagsUrl),
+    queryFn: () => api<{ flags: ConfigPreviewFlag[] }>(flagsUrl),
     enabled: !!variantName && !loading && !error,
   });
   const wantsCheckpoint =
@@ -264,10 +263,10 @@ function resolveShownFlags({
   loaded,
   editors,
 }: {
-  override?: FlagEntry[] | null;
-  loaded?: FlagEntry[];
+  override?: ConfigPreviewFlag[] | null;
+  loaded?: ConfigPreviewFlag[];
   editors?: Record<string, FlagEditor>;
-}): FlagEntry[] | undefined {
+}): ConfigPreviewFlag[] | undefined {
   const base = override ?? loaded;
   if (base) {
     const editableFlags = editors ? Object.keys(editors) : [];
@@ -286,7 +285,7 @@ function resolveShownFlags({
     : undefined;
 }
 
-function toFlagRows(flags: FlagEntry[]): FlagRow[] {
+function toFlagRows(flags: ConfigPreviewFlag[]): FlagRow[] {
   const seen = new Map<string, number>();
   return flags.map((entry) => {
     const occurrence = seen.get(entry.flag) ?? 0;

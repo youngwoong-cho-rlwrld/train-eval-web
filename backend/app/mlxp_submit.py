@@ -13,6 +13,8 @@ Different from slurm:
   - logs/status come from `kubectl logs` / `kubectl get pod`, not slurm tools
 """
 
+from __future__ import annotations
+
 import asyncio
 import hashlib
 import io
@@ -21,7 +23,6 @@ import shlex
 import shutil
 import tarfile
 import time
-from pathlib import Path
 from typing import Literal
 
 import yaml
@@ -34,13 +35,17 @@ from .mlxp_config import (
     get_settings,
     labels,
 )
+from . import paths
 from .output_namespace import make_output_namespace, validate_output_namespace
 from .paths import EXPERIMENTS_DIR, LIB_DIR
 from .submission_snapshot import (
+    ensure_trailing_newline,
+    is_safe_relpath,
     metadata_json,
     prepare_mlxp_training_git,
     render_eval_config_preview,
     render_training_config_snapshot,
+    resolve_modality_config,
     resolve_train_git_commit_override,
     snapshot_metadata,
     snapshot_suffix,
@@ -58,7 +63,7 @@ from .training_models import (
 from .train_overrides import resolve_train_action_horizon, validate_global_batch_divisible
 from .variant_values import variant_int
 from .wandb_config import get_project as _wandb_project
-from .variants import load_variant
+from .variants import DEFAULT_DATA_CONFIG, load_variant
 
 
 # Per-GPU resource map (from the Notion MLXP guide section 3.1).
@@ -99,6 +104,35 @@ export HF_HOME={hf_home}
 export HF_HUB_CACHE="$HF_HOME/hub"
 mkdir -p "$HF_HOME" "$HF_HUB_CACHE"
 """
+
+
+def _uv_bootstrap_block(settings: MlxpSettings) -> str:
+    """Install uv into the DDN user base when it isn't already on PATH."""
+    uv_userbase = shlex.quote(f"{settings.ddn_user_home}/.local")
+    return f"""\
+if ! command -v uv >/dev/null 2>&1; then
+    PYTHONUSERBASE={uv_userbase} python3 -m pip install --user uv
+fi"""
+
+
+def _strip_resume_state_block(ckpt_dir: str, max_steps: str) -> str:
+    """Shell snippet that strips resume-only trainer state from each step dir.
+
+    Byte-identical between the n1.5 and n1.6 body scripts; keeps the same
+    deployable core files the checkpoint-copy feature keeps.
+    """
+    return f"""\
+# Training complete — strip resume-only trainer state from each step dir,
+# keeping the same deployable core files the checkpoint-copy feature keeps.
+if [ -d "{ckpt_dir}/checkpoint-{max_steps}" ]; then
+    echo "[mlxp] removing resume-only trainer state under {ckpt_dir}"
+    for step_dir in "{ckpt_dir}"/checkpoint-*/; do
+        [ -d "$step_dir" ] || continue
+        rm -rf "$step_dir"global_step* "$step_dir"optimizer* "$step_dir"scheduler.pt \\
+               "$step_dir"rng_state_*.pth "$step_dir"trainer_state.json \\
+               "$step_dir"latest "$step_dir"zero_to_fp32.py || true
+    done
+fi"""
 
 
 def _mlxp_isaac_assets_block(settings: MlxpSettings) -> str:
@@ -343,8 +377,8 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
     train_global_batch_size = train_settings.global_batch_size
     suffix = req.output_namespace or f"{snapshot_suffix(job_name)}_{job_id}"
     exp_dir = f"{settings.experiments_dir}/{variant.name}"
-    path = f"{exp_dir}/config_{suffix}.sh"
-    meta_path = f"{exp_dir}/config_{suffix}.meta.json"
+    path = paths.config_path(exp_dir, suffix)
+    meta_path = paths.meta_path(exp_dir, suffix)
     config_text = render_training_config_snapshot(
         base_config=variant.raw,
         variant=variant.name,
@@ -397,7 +431,7 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
         git=submit_git,
     )
     meta["output_namespace"] = req.output_namespace
-    meta["checkpoint_dir"] = f"{exp_dir}/checkpoints/{req.output_namespace}"
+    meta["checkpoint_dir"] = paths.checkpoint_dir(exp_dir, req.output_namespace)
     payload = {
         "job_id": job_id,
         "job_name": job_name,
@@ -417,14 +451,7 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
         "action_horizon_mode": action_horizon_mode,
     }
     if rewrites_modality_action_horizon(action_horizon_mode) and req.action_horizon is not None:
-        modality_rel = (variant.vars.get("TRAIN_MODALITY_CONFIG") or "").strip()
-        if not modality_rel:
-            raise ValueError(f"variant {variant.name}: TRAIN_MODALITY_CONFIG missing")
-        if Path(modality_rel).is_absolute() or ".." in Path(modality_rel).parts:
-            raise ValueError("TRAIN_MODALITY_CONFIG must be relative to the experiment directory")
-        modality_path = EXPERIMENTS_DIR / variant.name / modality_rel
-        if not modality_path.is_file():
-            raise FileNotFoundError(f"modality config not found: {modality_path}")
+        _, modality_path = resolve_modality_config(variant)
         payload["modality_path"] = f"{exp_dir}/modality_{suffix}.py"
         payload["modality_text"] = rewrite_action_horizon(
             modality_path.read_text(),
@@ -441,8 +468,8 @@ def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str
     eval_sets = normalize_eval_sets(req.eval_sets)
     suffix = req.output_namespace or f"{snapshot_suffix(job_name)}_{job_id}"
     exp_dir = f"{settings.experiments_dir}/{variant.name}"
-    path = f"{exp_dir}/config_{suffix}.sh"
-    meta_path = f"{exp_dir}/config_{suffix}.meta.json"
+    path = paths.config_path(exp_dir, suffix)
+    meta_path = paths.meta_path(exp_dir, suffix)
     checkpoint_path = (req.checkpoint_path or "").strip()
     config_text = render_eval_config_preview(
         base_config=variant.raw,
@@ -479,9 +506,9 @@ def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str
         git=submit_git,
     )
     meta["output_namespace"] = req.output_namespace
-    meta["eval_dir"] = f"{exp_dir}/eval_results/{req.output_namespace}"
-    meta["results_path"] = f"{exp_dir}/eval_results/{req.output_namespace}/results.json"
-    meta["job_log_dir"] = f"{exp_dir}/logs/{req.output_namespace}"
+    meta["eval_dir"] = paths.eval_dir(exp_dir, req.output_namespace)
+    meta["results_path"] = paths.results_path(meta["eval_dir"])
+    meta["job_log_dir"] = paths.job_log_dir(exp_dir, req.output_namespace)
     meta["eval"] = {
         "checkpoint_path": checkpoint_path,
         "num_envs_per_gpu": req.eval_num_envs_per_gpu,
@@ -515,10 +542,6 @@ def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str
 def _path_slug(value: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-")
     return slug or "job"
-
-
-def _ensure_trailing_newline(text: str) -> str:
-    return text if text.endswith("\n") else text + "\n"
 
 
 def _shell_words(args: list[str]) -> str:
@@ -602,7 +625,7 @@ def _snapshot_preamble(snapshot: dict) -> str:
     modality_text = snapshot.get("modality_text")
     modality_block = ""
     if isinstance(modality_path, str) and isinstance(modality_text, str):
-        modality_text = _ensure_trailing_newline(modality_text)
+        modality_text = ensure_trailing_newline(modality_text)
         modality_block = f"""
 mkdir -p {shlex.quote(modality_path.rsplit('/', 1)[0])}
 cat > {shlex.quote(modality_path)} <<'TRAIN_EVAL_MODALITY_SNAPSHOT'
@@ -729,7 +752,7 @@ def _render_body_script(
     user_extra = _shell_words(req.extra_args)
 
     output_namespace = req.output_namespace or _path_slug(job_name)
-    ckpt_dir = f"{settings.experiments_dir}/{variant.name}/checkpoints/{output_namespace}"
+    ckpt_dir = paths.checkpoint_dir(f"{settings.experiments_dir}/{variant.name}", output_namespace)
     run_log_dir = f"{ckpt_dir}/logs"
     wandb_project = shlex.quote(_wandb_project())
 
@@ -748,12 +771,12 @@ def _render_body_script(
     if override_full is not None and isinstance(override, list) and any("|" in e for e in override):
         datasets_decl = override_full
     elif override_full is not None and isinstance(override, str):
-        cfg = variant.vars.get("DATA_CONFIG", "allex_thetwo_ck40_egostereo")
+        cfg = variant.vars.get("DATA_CONFIG", DEFAULT_DATA_CONFIG)
         datasets_decl = [f"{override}|{cfg}|1.0"]
     elif variant.arrays.get("DATASETS"):
         datasets_decl = variant.arrays["DATASETS"]
     else:
-        cfg = variant.vars.get("DATA_CONFIG", "allex_thetwo_ck40_egostereo")
+        cfg = variant.vars.get("DATA_CONFIG", DEFAULT_DATA_CONFIG)
         datasets_decl = [f"{names[0]}|{cfg}|1.0"]
 
     data_config_yaml = _n15_data_config_yaml(
@@ -815,17 +838,7 @@ torchrun --nproc_per_node={req.num_gpus} scripts/gr00t_finetune.py \\
     --seed 42 \\
     $RESUME_FLAG {train_extra} {user_extra}
 
-# Training complete — strip resume-only trainer state from each step dir,
-# keeping the same deployable core files the checkpoint-copy feature keeps.
-if [ -d "{ckpt_dir}/checkpoint-{max_steps}" ]; then
-    echo "[mlxp] removing resume-only trainer state under {ckpt_dir}"
-    for step_dir in "{ckpt_dir}"/checkpoint-*/; do
-        [ -d "$step_dir" ] || continue
-        rm -rf "$step_dir"global_step* "$step_dir"optimizer* "$step_dir"scheduler.pt \\
-               "$step_dir"rng_state_*.pth "$step_dir"trainer_state.json \\
-               "$step_dir"latest "$step_dir"zero_to_fp32.py || true
-    done
-fi
+{_strip_resume_state_block(ckpt_dir, max_steps)}
 """
 
 
@@ -838,7 +851,7 @@ def _n15_data_config_yaml(
 ) -> str:
     rel = (variant.vars.get("TRAIN_DATA_CONFIG") or "data_config.yaml").strip()
     path = EXPERIMENTS_DIR / variant.name / rel
-    if use_file and _safe_yaml_relpath(rel) and path.is_file():
+    if use_file and is_safe_relpath(rel, {".yaml", ".yml"}) and path.is_file():
         return (
             path.read_text()
             .replace("${DATA_DIR}", settings.datasets_dir)
@@ -860,18 +873,6 @@ def _n15_data_config_yaml(
     return "train:\n  datasets:\n" + "\n".join(yaml_rows)
 
 
-def _safe_yaml_relpath(rel: str) -> bool:
-    path = Path(rel)
-    return (
-        bool(rel)
-        and not path.is_absolute()
-        and path.name == rel
-        and not rel.startswith(".")
-        and ".." not in path.parts
-        and path.suffix in {".yaml", ".yml"}
-    )
-
-
 def _render_body_n16(*, variant, req: MlxpSubmitRequest, job_name: str,
                      names: list[str], max_steps: str, save_steps: str,
                      num_workers: str,
@@ -884,16 +885,11 @@ def _render_body_n16(*, variant, req: MlxpSubmitRequest, job_name: str,
     (a Python file). We inline the modality config from the local variant
     directory so MLXP doesn't need a rsync step.
     """
-    modality_rel = variant.vars.get("TRAIN_MODALITY_CONFIG")
-    if not modality_rel:
-        raise ValueError(f"variant {variant.name}: TRAIN_MODALITY_CONFIG missing")
-    modality_path = EXPERIMENTS_DIR / variant.name / modality_rel
-    if not modality_path.is_file():
-        raise FileNotFoundError(f"modality config not found: {modality_path}")
+    _, modality_path = resolve_modality_config(variant)
     modality_text = snapshot.get("modality_text")
     if not isinstance(modality_text, str):
         modality_text = modality_path.read_text()
-    modality_text = _ensure_trailing_newline(modality_text)
+    modality_text = ensure_trailing_newline(modality_text)
 
     dataset_paths_arg = " \\\n        ".join(
         f"{settings.datasets_dir}/{n}" for n in names
@@ -901,7 +897,6 @@ def _render_body_n16(*, variant, req: MlxpSubmitRequest, job_name: str,
     global_batch = req.global_batch_size or int(batch_size) * req.num_gpus
     run_log_dir = f"{ckpt_dir}/logs"
     wandb_project = shlex.quote(_wandb_project())
-    uv_userbase = shlex.quote(f"{settings.ddn_user_home}/.local")
     uv_bin_dir = shlex.quote(f"{settings.ddn_user_home}/.local/bin")
     output_namespace = ckpt_dir.rstrip("/").rsplit("/", 1)[-1]
     output_parent = ckpt_dir.rsplit("/", 1)[0]
@@ -923,9 +918,7 @@ export TOKENIZERS_PARALLELISM=false
 export OMNI_KIT_ACCEPT_EULA=Y
 {_hf_cache_exports(settings)}
 
-if ! command -v uv >/dev/null 2>&1; then
-    PYTHONUSERBASE={uv_userbase} python3 -m pip install --user uv
-fi
+{_uv_bootstrap_block(settings)}
 
 {_repo_runtime_preamble(repo_path, snapshot)}
 UV_RUN_ARGS=""
@@ -968,17 +961,7 @@ uv run $UV_RUN_ARGS torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/la
     --wandb-project {wandb_project} \\
     $RESUME_FLAG{action_horizon_arg} {train_extra} {user_extra}
 
-# Training complete — strip resume-only trainer state from each step dir,
-# keeping the same deployable core files the checkpoint-copy feature keeps.
-if [ -d "{ckpt_dir}/checkpoint-{max_steps}" ]; then
-    echo "[mlxp] removing resume-only trainer state under {ckpt_dir}"
-    for step_dir in "{ckpt_dir}"/checkpoint-*/; do
-        [ -d "$step_dir" ] || continue
-        rm -rf "$step_dir"global_step* "$step_dir"optimizer* "$step_dir"scheduler.pt \\
-               "$step_dir"rng_state_*.pth "$step_dir"trainer_state.json \\
-               "$step_dir"latest "$step_dir"zero_to_fp32.py || true
-    done
-fi
+{_strip_resume_state_block(ckpt_dir, max_steps)}
 """
 
 
@@ -992,6 +975,14 @@ def _render_eval_body_script(
     settings: MlxpSettings,
 ) -> str:
     """Render MLXP eval by staging the same eval body script used on Slurm."""
+    # DexJoCo eval drives an Isaac-side server from lib/dexjoco/, which MLXP does
+    # not stage into the pod. DexJoCo eval is Slurm-only for now; fail fast rather
+    # than launch a job that cannot find the server.
+    if model.eval_body_script == "eval_body_dexjoco.sh":
+        raise ValueError(
+            "DexJoCo eval is not supported on MLXP yet "
+            "(lib/dexjoco/ is not staged into the MLXP pod); run DexJoCo eval on a Slurm cluster"
+        )
     eval_body_path = LIB_DIR / model.eval_body_script
     common_path = LIB_DIR / "_common.sh"
     isaac_runner_path = LIB_DIR / "isaac_server_runner.py"
@@ -999,24 +990,21 @@ def _render_eval_body_script(
         raise FileNotFoundError(f"eval body script not found: {eval_body_path}")
     if not isaac_runner_path.is_file():
         raise FileNotFoundError(f"Isaac server runner not found: {isaac_runner_path}")
-    common_text = _ensure_trailing_newline(common_path.read_text())
-    eval_body_text = _ensure_trailing_newline(eval_body_path.read_text())
-    isaac_runner_text = _ensure_trailing_newline(isaac_runner_path.read_text())
+    common_text = ensure_trailing_newline(common_path.read_text())
+    eval_body_text = ensure_trailing_newline(eval_body_path.read_text())
+    isaac_runner_text = ensure_trailing_newline(isaac_runner_path.read_text())
 
     exp_dir = f"{settings.experiments_dir}/{variant.name}"
     output_namespace = str(snapshot.get("output_namespace") or _path_slug(job_name))
-    eval_dir = f"{exp_dir}/eval_results/{output_namespace}"
-    results_path = f"{eval_dir}/results.json"
+    eval_dir = paths.eval_dir(exp_dir, output_namespace)
+    results_path = paths.results_path(eval_dir)
     runtime_root = f"{settings.experiments_dir}/.runtime/{snapshot['job_id']}"
     config_path = snapshot["path"]
     modality_block = ""
-    modality_rel = variant.vars.get("TRAIN_MODALITY_CONFIG")
-    if modality_rel:
-        modality_path = EXPERIMENTS_DIR / variant.name / modality_rel
-        if not modality_path.is_file():
-            raise FileNotFoundError(f"modality config not found: {modality_path}")
+    if variant.vars.get("TRAIN_MODALITY_CONFIG"):
+        modality_rel, modality_path = resolve_modality_config(variant)
         modality_target = f"{exp_dir}/{modality_rel}"
-        modality_text = _ensure_trailing_newline(modality_path.read_text())
+        modality_text = ensure_trailing_newline(modality_path.read_text())
         modality_block = f"""
 mkdir -p {shlex.quote(modality_target.rsplit('/', 1)[0])}
 cat > {shlex.quote(modality_target)} <<'TEW_MODALITY_EOF'
@@ -1065,7 +1053,6 @@ cat > {shlex.quote(modality_target)} <<'TEW_MODALITY_EOF'
     if req.eval_overwrite_results:
         eval_exports.append("export SUBMIT_EVAL_OVERWRITE_RESULTS=1")
 
-    uv_userbase = shlex.quote(f"{settings.ddn_user_home}/.local")
     uv_bin_dir = shlex.quote(f"{settings.ddn_user_home}/.local/bin")
 
     return f"""\
@@ -1076,9 +1063,7 @@ export TOKENIZERS_PARALLELISM=false
 export NO_ALBUMENTATIONS_UPDATE=1
 {_hf_cache_exports(settings)}
 
-if ! command -v uv >/dev/null 2>&1; then
-    PYTHONUSERBASE={uv_userbase} python3 -m pip install --user uv
-fi
+{_uv_bootstrap_block(settings)}
 
 {_repo_runtime_preamble(repo_path, snapshot)}
 TRAIN_REPO_WORKTREE="$PWD"
@@ -1109,58 +1094,53 @@ def _job_comment(req: MlxpSubmitRequest, variant, snapshot: dict) -> str:
     settings = get_settings()
     output_namespace = str(snapshot.get("output_namespace") or req.output_namespace or _path_slug(snapshot.get("job_name") or "job"))
     exp_dir = f"{settings.experiments_dir}/{variant.name}"
-    comment = (
-        f"phase={req.phase};variant={req.variant};model_id={variant.vars.get('MODEL_ID') or variant.vars.get('MODEL_VERSION') or ''};"
-        f"wandb_project={_wandb_project()};output_namespace={output_namespace}"
-    )
+    fields: dict[str, str | None] = {
+        "phase": req.phase,
+        "variant": req.variant,
+        "model_id": variant.vars.get("MODEL_ID") or variant.vars.get("MODEL_VERSION") or "",
+        "wandb_project": _wandb_project(),
+        "output_namespace": output_namespace,
+    }
     if req.phase == "train":
         max_steps = req.max_steps or variant_int(variant, "MAX_STEPS", 30000)
         save_steps = req.save_steps or variant_int(variant, "SAVE_STEPS", 1000)
         num_workers = req.num_workers or variant_int(variant, "TRAIN_NUM_WORKERS", 16)
-        comment += (
-            f";train_num_gpus={req.num_gpus};"
-            f"train_max_steps={max_steps};train_save_steps={save_steps};"
-            f"train_num_workers={num_workers}"
-        )
+        fields["train_num_gpus"] = str(req.num_gpus)
+        fields["train_max_steps"] = str(max_steps)
+        fields["train_save_steps"] = str(save_steps)
+        fields["train_num_workers"] = str(num_workers)
         if req.global_batch_size is not None:
-            comment += f";train_global_batch_size={req.global_batch_size}"
+            fields["train_global_batch_size"] = str(req.global_batch_size)
         if req.action_horizon is not None:
-            comment += f";train_action_horizon={req.action_horizon}"
-        comment += f";checkpoint_dir={exp_dir}/checkpoints/{output_namespace}"
+            fields["train_action_horizon"] = str(req.action_horizon)
+        fields["checkpoint_dir"] = paths.checkpoint_dir(exp_dir, output_namespace)
     else:
         if req.eval_num_envs_per_gpu is not None:
-            comment += f";eval_num_envs_per_gpu={req.eval_num_envs_per_gpu}"
+            fields["eval_num_envs_per_gpu"] = str(req.eval_num_envs_per_gpu)
         if req.eval_n_episodes is not None:
-            comment += f";eval_n_episodes={req.eval_n_episodes}"
+            fields["eval_n_episodes"] = str(req.eval_n_episodes)
         if req.eval_n_runs is not None:
-            comment += f";eval_n_runs={req.eval_n_runs}"
+            fields["eval_n_runs"] = str(req.eval_n_runs)
         if snapshot.get("eval_sets"):
-            comment += f";eval_sets={' '.join(snapshot['eval_sets'])}"
+            fields["eval_sets"] = " ".join(snapshot["eval_sets"])
         if req.eval_overwrite_results:
-            comment += ";eval_overwrite_results=true"
+            fields["eval_overwrite_results"] = "true"
         if req.checkpoint_path:
-            comment += f";checkpoint_path={req.checkpoint_path.strip()}"
-        comment += (
-            f";eval_dir={exp_dir}/eval_results/{output_namespace}"
-            f";results_path={exp_dir}/eval_results/{output_namespace}/results.json"
-            f";job_log_dir={exp_dir}/logs/{output_namespace}"
-        )
-    comment += (
-        f";config_snapshot_path={snapshot['path']}"
-        f";config_snapshot_meta_path={snapshot['meta_path']}"
-    )
-    comment += ";" + comment_field_fragment(
-        {
-            "submit_git_repo_path": snapshot.get("git_repo_path"),
-            "submit_git_repo_label": snapshot.get("git_repo_label"),
-            "submit_git_branch": snapshot.get("git_branch"),
-            "submit_git_commit": snapshot.get("git_commit"),
-            "submit_git_commit_subject": snapshot.get("git_commit_subject"),
-            "submit_git_dirty_at_submit": "true" if snapshot.get("git_dirty_at_submit") else "false",
-            "submit_git_committed_dirty": "true" if snapshot.get("git_committed_dirty") else "false",
-        }
-    )
-    return comment
+            fields["checkpoint_path"] = req.checkpoint_path.strip()
+        eval_dir = paths.eval_dir(exp_dir, output_namespace)
+        fields["eval_dir"] = eval_dir
+        fields["results_path"] = paths.results_path(eval_dir)
+        fields["job_log_dir"] = paths.job_log_dir(exp_dir, output_namespace)
+    fields["config_snapshot_path"] = snapshot["path"]
+    fields["config_snapshot_meta_path"] = snapshot["meta_path"]
+    fields["submit_git_repo_path"] = snapshot.get("git_repo_path")
+    fields["submit_git_repo_label"] = snapshot.get("git_repo_label")
+    fields["submit_git_branch"] = snapshot.get("git_branch")
+    fields["submit_git_commit"] = snapshot.get("git_commit")
+    fields["submit_git_commit_subject"] = snapshot.get("git_commit_subject")
+    fields["submit_git_dirty_at_submit"] = "true" if snapshot.get("git_dirty_at_submit") else "false"
+    fields["submit_git_committed_dirty"] = "true" if snapshot.get("git_committed_dirty") else "false"
+    return comment_field_fragment(fields)
 
 
 def _render_job_yaml(job_id: str, job_name: str, body: str, num_gpus: int, cpu: str, mem: str,

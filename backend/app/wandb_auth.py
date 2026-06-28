@@ -5,11 +5,13 @@ project name is persisted to `~/.train-eval-web/wandb.json` (see
 wandb_config) and is used both for the backend's run lookup and as the
 default project passed to training jobs.
 """
+from __future__ import annotations
+
 
 import asyncio
 from pydantic import BaseModel
 
-from .wandb_config import get_project, set_project
+from .wandb_config import WANDB_ENTITY_OVERRIDE, get_project, set_project
 
 
 class WandbStatus(BaseModel):
@@ -29,7 +31,6 @@ class ProjectRequest(BaseModel):
 
 async def get_status() -> WandbStatus:
     """Probe wandb to see whether the local netrc/key works."""
-    from .details import WANDB_ENTITY_OVERRIDE
 
     def _probe() -> tuple[str | None, str | None]:
         try:

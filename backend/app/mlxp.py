@@ -12,6 +12,8 @@ the configured default node is always emitted explicitly even if it has
 no owned pods.
 """
 
+from __future__ import annotations
+
 import asyncio
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -131,7 +133,7 @@ async def gpu_queue_snapshot(
         node_names = {scoped_node}
     else:
         node_names = set(used)
-        node_names.update(node for _, node, *_ in pending if node)
+        node_names.update(pod_node for _, pod_node, *_ in pending if pod_node)
         if settings.default_node:
             node_names.add(settings.default_node)
 

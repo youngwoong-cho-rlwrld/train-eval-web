@@ -11,6 +11,8 @@ it each call is its own handshake, which on slow links (skt) was costing
 5-12s per command — the dominant factor in /api/jobs latency.
 """
 
+from __future__ import annotations
+
 import asyncio
 import os
 from dataclasses import dataclass
@@ -142,6 +144,39 @@ async def rsync_to(
     )
 
 
+async def iter_logical_lines(reader: asyncio.StreamReader):
+    """Yield logical lines from a byte reader, splitting on either \\n or \\r
+    so tqdm progress bars (which use \\r) don't accumulate into one giant
+    buffer. A 512KB safety flush guards against an unbounded line."""
+    buf = b""
+    while True:
+        try:
+            chunk = await reader.read(8192)
+        except Exception:
+            return
+        if not chunk:
+            if buf:
+                yield buf.decode(errors="replace")
+            return
+        buf += chunk
+        while True:
+            i_n = buf.find(b"\n")
+            i_r = buf.find(b"\r")
+            idx = (
+                min(i for i in (i_n, i_r) if i != -1)
+                if (i_n != -1 or i_r != -1)
+                else -1
+            )
+            if idx == -1:
+                if len(buf) > (1 << 19):  # 512KB safety flush
+                    yield buf.decode(errors="replace")
+                    buf = b""
+                break
+            line = buf[:idx]
+            buf = buf[idx + 1:]
+            yield line.decode(errors="replace")
+
+
 async def ssh_tail_lines(host: str, remote_pattern: str, start_line: int = 1):
     """Async generator yielding `tail -F` lines from a remote file glob.
 
@@ -170,33 +205,8 @@ async def ssh_tail_lines(host: str, remote_pattern: str, start_line: int = 1):
     )
     assert proc.stdout is not None
     try:
-        buf = b""
-        while True:
-            try:
-                chunk = await proc.stdout.read(8192)
-            except Exception:
-                break
-            if not chunk:
-                if buf:
-                    yield buf.decode(errors="replace")
-                break
-            buf += chunk
-            while True:
-                i_n = buf.find(b"\n")
-                i_r = buf.find(b"\r")
-                idx = (
-                    min(i for i in (i_n, i_r) if i != -1)
-                    if (i_n != -1 or i_r != -1)
-                    else -1
-                )
-                if idx == -1:
-                    if len(buf) > (1 << 19):
-                        yield buf.decode(errors="replace")
-                        buf = b""
-                    break
-                line = buf[:idx]
-                buf = buf[idx + 1:]
-                yield line.decode(errors="replace")
+        async for line in iter_logical_lines(proc.stdout):
+            yield line
     finally:
         if proc.returncode is None:
             proc.kill()

@@ -1,5 +1,7 @@
 """Helpers for Slurm submit sidecar metadata."""
 
+from __future__ import annotations
+
 import asyncio
 import shlex
 

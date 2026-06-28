@@ -3,7 +3,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import { keepPreviousData, useIsFetching, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertCircle, Check, ChevronDown, ChevronRight, CircleHelp, Copy, Database, ExternalLink, Table2 } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, CircleHelp, Copy, Database, ExternalLink, Table2 } from "lucide-react";
 import { toast } from "sonner";
 import { api, type ResultCell, type ResultsResponse, type ResultTask, type ResultVariant } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
@@ -13,13 +13,13 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { RefreshButton } from "@/components/refresh-button";
-import { LoadingState } from "@/components/loading-state";
+import { ErrorState, LoadingState } from "@/components/loading-state";
 import { ImmediateTooltip } from "@/components/immediate-tooltip";
 import { JobStateBadge } from "@/components/job-state-badge";
-import { isActiveJobState } from "@/lib/job-status";
+import { isActiveJobState, primaryJobState } from "@/lib/job-status";
 import { Th } from "@/components/table";
 import { jobDetailHref } from "@/lib/job-links";
-import { formatPct } from "@/lib/format";
+import { basename, formatPct } from "@/lib/format";
 import { copyRich } from "@/lib/clipboard";
 
 const REFRESH_MS = 120_000;
@@ -161,10 +161,10 @@ export default function ResultsPage() {
       </div>
 
       {queryErrors.map((err) => (
-        <ErrorBanner key={`query-${err.cluster}`} message={`${err.cluster}: ${err.error}`} />
+        <ErrorState key={`query-${err.cluster}`} message={`${err.cluster}: ${err.error}`} className="mt-6" />
       ))}
       {backendErrors.map((err) => (
-        <ErrorBanner key={err.cluster} message={`${err.cluster}: ${err.error}`} />
+        <ErrorState key={err.cluster} message={`${err.cluster}: ${err.error}`} className="mt-6" />
       ))}
 
       {initialLoading && (
@@ -210,15 +210,6 @@ export default function ResultsPage() {
           ))}
         </div>
       )}
-    </div>
-  );
-}
-
-function ErrorBanner({ message }: { message: string }) {
-  return (
-    <div className="mt-6 flex items-start gap-2 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-300">
-      <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-      <span>{message}</span>
     </div>
   );
 }
@@ -305,7 +296,7 @@ function ExperimentGroup({
   const modelVersions = [
     ...new Set(group.members.map((m) => m.model_version).filter((v): v is string => !!v)),
   ];
-  const kinds = [...new Set(group.members.map((m) => (m.tasks.length > 1 ? "multitask" : "single")))];
+  const kinds = [...new Set(group.members.map((m) => taskKind(m.tasks)))];
   const latest = formatGroupRecency(group.latest);
 
   // Per-state counts across this group's results ("CANCELLED by N" → "CANCELLED"
@@ -313,7 +304,7 @@ function ExperimentGroup({
   // they remain covered by the total result count.
   const stateCounts = new Map<string, number>();
   for (const m of group.members) {
-    const state = (m.job_state ?? "").split(" ")[0].toUpperCase();
+    const state = primaryJobState(m.job_state);
     if (!state) continue;
     stateCounts.set(state, (stateCounts.get(state) ?? 0) + 1);
   }
@@ -408,8 +399,8 @@ function ResultCard({ variant, className }: { variant: ResultVariant; className?
           <CopyResultTableButton variant={variant} evalSets={evalSets} />
           <Badge variant="outline">{variant.cluster}</Badge>
           {variant.model_version && <Badge variant="secondary">{variant.model_version}</Badge>}
-          <Badge variant={variant.tasks.length > 1 ? "default" : "outline"}>
-            {variant.tasks.length > 1 ? "multitask" : "single"}
+          <Badge variant={taskKind(variant.tasks) === "multitask" ? "default" : "outline"}>
+            {taskKind(variant.tasks)}
           </Badge>
           {nRuns != null && <Badge variant="secondary">{nRuns} runs</Badge>}
           {nEpisodes != null && <Badge variant="secondary">{nEpisodes} episodes</Badge>}
@@ -445,11 +436,7 @@ function ResultCard({ variant, className }: { variant: ResultVariant; className?
           {variant.checkpoint && (
             <Meta
               label="checkpoint"
-              value={
-                variant.checkpoint_job_id
-                  ? `${checkpointLabel} (${variant.checkpoint_job_id})`
-                  : checkpointLabel
-              }
+              value={withId(checkpointLabel, variant.checkpoint_job_id)}
               title={variant.checkpoint_job_name ? `Open ${variant.checkpoint_job_name}` : variant.checkpoint}
               href={checkpointJobHref}
             />
@@ -485,7 +472,7 @@ function ResultTitle({ variant }: { variant: ResultVariant }) {
         <ExternalLink className="h-3.5 w-3.5 shrink-0" />
       </Link>
       {variant.job_state && (
-        <JobStateBadge state={variant.job_state.split(" ")[0].toUpperCase()} />
+        <JobStateBadge state={primaryJobState(variant.job_state)} />
       )}
     </span>
   );
@@ -645,20 +632,25 @@ function displayTaskName(task: ResultTask) {
   return (task.task_name || task.task).replace(/^task-/, "");
 }
 
-function basename(path: string) {
-  const parts = path.split("/").filter(Boolean);
-  return parts[parts.length - 1] ?? path;
-}
-
 function checkpointDisplayName(path: string) {
   const parts = path.split("/").filter(Boolean);
-  const leaf = parts[parts.length - 1] ?? path;
+  const leaf = basename(path);
   if (!leaf.startsWith("checkpoint-")) return leaf;
   return parts[parts.length - 2] ?? leaf;
 }
 
+/** "name (id)" when an id is present, else just the name. */
+function withId(name: string, id?: string | null): string {
+  return id ? `${name} (${id})` : name;
+}
+
+/** Single- vs multi-task classification from a result's task list. */
+function taskKind(tasks: ResultTask[]): "multitask" | "single" {
+  return tasks.length > 1 ? "multitask" : "single";
+}
+
 function resultTableTitle(variant: ResultVariant) {
-  return variant.job_id ? `${variant.variant} (${variant.job_id})` : variant.variant;
+  return withId(variant.variant, variant.job_id);
 }
 
 function resultTableTsv(variant: ResultVariant, evalSets: string[]) {

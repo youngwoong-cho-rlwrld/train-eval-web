@@ -5,14 +5,14 @@ import { useEffect, useState } from "react";
 const PREFIX = "datasetDir";
 const EVENT = "dataset-dir-change";
 
-const SLURM_DEFAULT = "~/datasets";
+const DATASET_DIR_FALLBACK = "~/datasets";
 
 function keyFor(cluster: string) {
   return `${PREFIX}:${cluster}`;
 }
 
 function defaultFor(defaultDir?: string) {
-  return defaultDir || SLURM_DEFAULT;
+  return defaultDir || DATASET_DIR_FALLBACK;
 }
 
 function storedFor(cluster: string, defaultDir?: string) {

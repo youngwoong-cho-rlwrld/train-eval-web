@@ -148,6 +148,16 @@ def remote_shell_path(path: str) -> str:
     return shlex.quote(path)
 
 
+def remote_path_expr(path: str) -> str:
+    """Render a path for a remote shell, passing a `$HOME/` prefix through.
+
+    Distinct from ``remote_shell_path``: this only special-cases a literal
+    ``$HOME/`` prefix (left unquoted so the shell expands it) and otherwise
+    ``shlex.quote``s the whole path.
+    """
+    return path if path.startswith("$HOME/") else shlex.quote(path)
+
+
 def _has_home_token(path: str | None) -> bool:
     if not path:
         return False

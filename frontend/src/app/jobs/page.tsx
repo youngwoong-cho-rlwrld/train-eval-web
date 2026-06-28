@@ -1,6 +1,5 @@
 "use client";
 
-import Link from "next/link";
 import { Loader2 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { keepPreviousData, useIsFetching, useQueries, useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
@@ -19,22 +18,31 @@ import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state
 import { JobStateBadge } from "@/components/job-state-badge";
 import { ImmediateTooltip } from "@/components/immediate-tooltip";
 import { PendingQueueLabel, pendingQueuePositionLabel } from "@/components/pending-queue-label";
-import { formatJobTimestamp, parseJobTimestampMs } from "@/lib/job-time";
-import { jobDetailHref } from "@/lib/job-links";
-import { activeProgressLabel, stepEta } from "@/lib/job-progress";
+import { parseJobTimestampMs } from "@/lib/job-time";
+import { activeProgressLabel, hasRenderableProgress, stepEta } from "@/lib/job-progress";
 import { Th } from "@/components/table";
+import { JobTimestamp } from "@/components/job-timestamp";
+import { ProgressBar } from "@/components/progress-bar";
+import { JobLink } from "@/components/job-link";
 import {
+  canCopyCheckpoint,
+  canResumeJob,
+  canRetryJob,
   isActiveJobState,
-  isCompletedJobState,
-  isFailedJobState,
-  isTimeoutJobState,
+  isRunningOrCompletingJobState,
   isTrainJobPhase,
   jobPhase,
   normalizeJobPhase,
+  resubmitSourceLabel,
   type JobPhase,
 } from "@/lib/job-status";
 
 const REFRESH_MS = 60_000;
+
+// Query-key families that make up the /jobs view. The refresh button
+// invalidates them and the in-flight indicator watches them, so keep the two
+// derived from one list (N163).
+const JOB_QUERY_FAMILIES = ["jobs", "job-progress", "gpu-queue"] as const;
 
 type ClusterJobError = { cluster: string; error: string };
 
@@ -102,17 +110,15 @@ export default function JobsPage() {
   const recentMerged = mergeJobQueries(recentQueries, clusterNames, clustersQuery.isLoading);
 
   const refreshAll = () => {
-    qc.invalidateQueries({ queryKey: ["jobs"] });
-    qc.invalidateQueries({ queryKey: ["job-progress"] });
-    qc.invalidateQueries({ queryKey: ["gpu-queue"] });
+    for (const family of JOB_QUERY_FAMILIES) {
+      qc.invalidateQueries({ queryKey: [family] });
+    }
   };
 
   const isFetching =
     useIsFetching({
-      predicate: (q) => {
-        const k = q.queryKey[0];
-        return k === "jobs" || k === "job-progress" || k === "gpu-queue";
-      },
+      predicate: (q) =>
+        JOB_QUERY_FAMILIES.includes(q.queryKey[0] as (typeof JOB_QUERY_FAMILIES)[number]),
     }) > 0;
 
   const active = useMemo(() => {
@@ -300,7 +306,8 @@ type RecentJobFilters = {
 };
 
 function normalizeStateFilterValue(state: string) {
-  return state.trim().split(/\s+/, 1)[0].toUpperCase() || "UNKNOWN";
+  const head = state.trim().split(/\s+/)[0] ?? "";
+  return head.toUpperCase() || "UNKNOWN";
 }
 
 function recentJobMatchesFilters(job: Job, filters: RecentJobFilters) {
@@ -464,33 +471,40 @@ function JobTable({
                 </td>
                 {showActions && (
                   <Td>
-                    <div className="flex items-center gap-2">
-                      {canResumeJob(j) && (
-                        <ResumeJobButton
-                          cluster={j.cluster}
-                          jobId={j.job_id}
-                          phase={phase}
-                          jobName={j.job_name}
-                          className="h-7 px-2 text-xs"
-                        />
-                      )}
-                      {canRetryJob(j) && (
-                        <ResumeJobButton
-                          cluster={j.cluster}
-                          jobId={j.job_id}
-                          phase={phase}
-                          jobName={j.job_name}
-                          action="retry"
-                          className="h-7 px-2 text-xs"
-                        />
-                      )}
-                      {canCopyCheckpoint(j, phase) && (
-                        <CopyCheckpointShortcut job={j} />
-                      )}
-                      {!canResumeJob(j) && !canRetryJob(j) && !canCopyCheckpoint(j, phase) && (
-                        <span className="text-slate-400">—</span>
-                      )}
-                    </div>
+                    {(() => {
+                      const resumable = canResumeJob(j);
+                      const retryable = canRetryJob(j);
+                      const copyable = canCopyCheckpoint({ state: j.state, phase });
+                      return (
+                        <div className="flex items-center gap-2">
+                          {resumable && (
+                            <ResumeJobButton
+                              cluster={j.cluster}
+                              jobId={j.job_id}
+                              phase={phase}
+                              variant={j.variant}
+                              jobName={j.job_name}
+                              className="h-7 px-2 text-xs"
+                            />
+                          )}
+                          {retryable && (
+                            <ResumeJobButton
+                              cluster={j.cluster}
+                              jobId={j.job_id}
+                              phase={phase}
+                              variant={j.variant}
+                              jobName={j.job_name}
+                              action="retry"
+                              className="h-7 px-2 text-xs"
+                            />
+                          )}
+                          {copyable && <CopyCheckpointShortcut job={j} />}
+                          {!resumable && !retryable && !copyable && (
+                            <span className="text-slate-400">—</span>
+                          )}
+                        </div>
+                      );
+                    })()}
                   </Td>
                 )}
                 <Td>{j.cluster}</Td>
@@ -501,9 +515,9 @@ function JobTable({
                     {j.time_left || <span className="text-slate-400">—</span>}
                   </Td>
                 )}
-                <Td className="font-mono text-xs"><Timestamp iso={j.start} cluster={j.cluster} /></Td>
+                <Td className="font-mono text-xs"><JobTimestamp iso={j.start} /></Td>
                 {!showProgress && (
-                  <Td className="font-mono text-xs"><Timestamp iso={j.end} cluster={j.cluster} /></Td>
+                  <Td className="font-mono text-xs"><JobTimestamp iso={j.end} /></Td>
                 )}
                 <Td className="font-mono text-xs">{j.elapsed}</Td>
               </tr>
@@ -516,7 +530,7 @@ function JobTable({
 }
 
 function ActiveProgressCell({ job }: { job: Job }) {
-  const shouldFetch = /^(RUNNING|COMPLETING)$/i.test(job.state);
+  const shouldFetch = isRunningOrCompletingJobState(job.state);
   const progressQuery = useQuery({
     queryKey: ["job-progress", job.cluster, job.job_id],
     queryFn: () =>
@@ -558,17 +572,7 @@ function ActiveProgressCell({ job }: { job: Job }) {
   const d = progressQuery.data;
   const p = d?.progress;
   const percent = p?.percent ?? null;
-  const hasStepProgress =
-    p?.current_step !== null &&
-    p?.current_step !== undefined &&
-    p.max_steps !== null &&
-    p.max_steps !== undefined;
-  const hasRunProgress =
-    p?.completed_runs !== null &&
-    p?.completed_runs !== undefined &&
-    p.total_runs !== null &&
-    p.total_runs !== undefined;
-  const showBar = percent !== null || hasStepProgress || hasRunProgress;
+  const showBar = hasRenderableProgress(p);
   if (!showBar) {
     return (
       <span className="text-xs text-slate-500">
@@ -596,12 +600,7 @@ function ActiveProgressCell({ job }: { job: Job }) {
           )}
         </span>
       </div>
-      <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
-        <div
-          className="h-full rounded-full bg-slate-900 transition-all dark:bg-slate-50"
-          style={{ width: `${effectivePercent}%` }}
-        />
-      </div>
+      <ProgressBar percent={effectivePercent} />
     </div>
   );
 }
@@ -629,16 +628,6 @@ function CopyCheckpointShortcut({ job }: { job: Job }) {
   );
 }
 
-function Timestamp({ iso, cluster }: { iso?: string | null; cluster: string }) {
-  const formatted = formatJobTimestamp(iso, cluster);
-  if (!formatted) return <span className="text-slate-400">—</span>;
-  return (
-    <ImmediateTooltip content={formatted.full}>
-      <span>{formatted.short}</span>
-    </ImmediateTooltip>
-  );
-}
-
 function JobIdLink({
   cluster,
   jobId,
@@ -653,14 +642,13 @@ function JobIdLink({
   const widthClass = fixedWidth ? "inline-block min-w-[23ch]" : "inline";
   return (
     <ImmediateTooltip content={jobId} className="min-w-0">
-      <Link
-        href={jobDetailHref(cluster, jobId)!}
-        target="_blank"
-        rel="noreferrer"
-        className={`${widthClass} whitespace-nowrap text-blue-600 hover:underline ${className}`}
+      <JobLink
+        cluster={cluster}
+        jobId={jobId}
+        className={`${widthClass} whitespace-nowrap ${className}`}
       >
         {shortJobId(jobId)}
-      </Link>
+      </JobLink>
     </ImmediateTooltip>
   );
 }
@@ -685,42 +673,24 @@ function PhaseBadge({ phase }: { phase: JobPhase }) {
   return <Badge variant="secondary">other</Badge>;
 }
 
-function canResumeJob(job: Job): boolean {
-  return job.cluster !== "mlxp" && isTimeoutJobState(job.state);
-}
-
-function canRetryJob(job: Job): boolean {
-  return job.cluster !== "mlxp" && isFailedJobState(job.state);
-}
-
-function resubmitSourceLabel(action?: string | null) {
-  if (action === "retry") return "restarted from a failed job:";
-  if (action === "resume") return "resumed from:";
-  return "resubmitted from job:";
-}
-
-function canCopyCheckpoint(job: Job, phase: JobPhase): boolean {
-  return isTrainJobPhase(phase) && isCompletedJobState(job.state);
-}
-
 function compareEndedDesc(a: Job, b: Job): number {
-  const aEnd = parseJobTimestampMs(a.end, a.cluster);
-  const bEnd = parseJobTimestampMs(b.end, b.cluster);
+  const aEnd = parseJobTimestampMs(a.end);
+  const bEnd = parseJobTimestampMs(b.end);
   if (aEnd !== bEnd) return bEnd - aEnd;
 
-  const aStart = parseJobTimestampMs(a.start, a.cluster);
-  const bStart = parseJobTimestampMs(b.start, b.cluster);
+  const aStart = parseJobTimestampMs(a.start);
+  const bStart = parseJobTimestampMs(b.start);
   if (aStart !== bStart) return bStart - aStart;
   return compareJobIdDesc(a.job_id, b.job_id);
 }
 
 function compareActiveDesc(a: Job, b: Job): number {
-  const aStart = parseJobTimestampMs(a.start, a.cluster);
-  const bStart = parseJobTimestampMs(b.start, b.cluster);
+  const aStart = parseJobTimestampMs(a.start);
+  const bStart = parseJobTimestampMs(b.start);
   if (aStart !== bStart) return bStart - aStart;
 
-  const aEnd = parseJobTimestampMs(a.end, a.cluster);
-  const bEnd = parseJobTimestampMs(b.end, b.cluster);
+  const aEnd = parseJobTimestampMs(a.end);
+  const bEnd = parseJobTimestampMs(b.end);
   if (aEnd !== bEnd) return bEnd - aEnd;
   return compareJobIdDesc(a.job_id, b.job_id);
 }

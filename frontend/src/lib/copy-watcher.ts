@@ -2,6 +2,7 @@
 
 import { toast } from "sonner";
 import { api, type CopyJobStatus } from "@/lib/api";
+import { basename } from "@/lib/format";
 
 const STORAGE_KEY = "copy-checkpoint.active";
 const POLL_MS = 2000;
@@ -149,9 +150,7 @@ async function watch({ copyId, destCluster }: ActiveCopy) {
           ? Math.min(100, Math.round((shownDst / src) * 100))
           : null;
       const summary = `${s.copies_done + 1}/${s.copies_total}`;
-      const name = s.current_source
-        ? s.current_source.split("/").filter(Boolean).pop()
-        : null;
+      const name = s.current_source ? basename(s.current_source) : null;
       const prefix = name
         ? `Copying ${name} (${summary})`
         : `Copying ${summary}`;

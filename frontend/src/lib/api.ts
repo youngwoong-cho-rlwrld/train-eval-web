@@ -275,10 +275,14 @@ export type MlxpSettings = {
 export type ClusterEnvSettings = {
   name: string;
   env_text: string;
-  template_text: string;
-  configured: boolean;
-  source: string;
   path: string | null;
+};
+
+export type WandbStatus = {
+  logged_in: boolean;
+  entity: string | null;
+  project: string;
+  error: string | null;
 };
 
 export type Partition = {
@@ -288,7 +292,7 @@ export type Partition = {
   total_nodes: number;
   idle_nodes: number;
   gpu_total: number;
-  gpu_idle: number;
+  gpu_free: number;
   queued_jobs: number;
   queued_gpus: number;
   gpu_type: string | null;

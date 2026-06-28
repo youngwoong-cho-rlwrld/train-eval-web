@@ -5,6 +5,8 @@ backend, the body script renderer, and the URL builder all agree on
 where the runs live. The TRAIN_EVAL_WEB_WANDB_PROJECT env var still
 wins over the saved value when present.
 """
+from __future__ import annotations
+
 
 import json
 import os
@@ -13,6 +15,13 @@ from pathlib import Path
 DEFAULT_PROJECT = "my project"
 _SETTINGS_DIR = Path.home() / ".train-eval-web"
 _SETTINGS_FILE = _SETTINGS_DIR / "wandb.json"
+
+# Wandb identity overrides:
+#   - entity: wandb.Api().default_entity after `wandb login` on this laptop is
+#     used by default; this env var forces a specific entity.
+#   - workspace: the browser workspace selector for the entity.
+WANDB_ENTITY_OVERRIDE = os.environ.get("TRAIN_EVAL_WEB_WANDB_ENTITY")
+WANDB_WORKSPACE_OVERRIDE = os.environ.get("TRAIN_EVAL_WEB_WANDB_WORKSPACE")
 
 
 def _load() -> dict:
@@ -37,8 +46,7 @@ def get_project() -> str:
     return _load().get("project") or DEFAULT_PROJECT
 
 
-def set_project(name: str) -> str:
+def set_project(name: str) -> None:
     data = _load()
     data["project"] = name.strip()
     _save(data)
-    return data["project"]

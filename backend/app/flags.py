@@ -5,12 +5,19 @@ their flag set so the UI can show the same list of flags the body would
 actually emit for a given variant. If you change lib/train_body*.sh,
 update the corresponding builder here.
 """
+from __future__ import annotations
+
 
 
 from .eval_harness import harness_for
 from .training_models import resolve_training_model
 from .variants import Variant
 from .wandb_config import get_project
+
+
+def serialize_flags(out: list[tuple[str, str]]) -> list[dict[str, str]]:
+    """Serialize a [(flag, value), ...] list to the API's flag-dict shape."""
+    return [{"flag": f, "value": val} for f, val in out]
 
 
 def flags_for(variant: Variant, phase: str) -> list[tuple[str, str]]:

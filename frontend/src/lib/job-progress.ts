@@ -23,6 +23,26 @@ export function activeProgressLabel(
 }
 
 /**
+ * Whether there is enough signal to render a progress bar. Shared by the /jobs
+ * table (ActiveProgressCell) and the job detail page (ProgressCard) so the two
+ * can't disagree about when a bar appears: a completed job, a known percent, a
+ * step pair, or a run pair each qualifies. Step/run pairs are checked for
+ * non-null (not truthiness) so a legitimately-zero bound still counts.
+ */
+export function hasRenderableProgress(
+  progress: Progress | null | undefined,
+  { isComplete = false }: { isComplete?: boolean } = {},
+): boolean {
+  if (isComplete) return true;
+  if (progress?.percent != null) return true;
+  const hasStepProgress =
+    progress?.current_step != null && progress?.max_steps != null;
+  const hasRunProgress =
+    progress?.completed_runs != null && progress?.total_runs != null;
+  return hasStepProgress || hasRunProgress;
+}
+
+/**
  * Linear ETA from elapsed × steps-remaining / current-step. Shared by the
  * /jobs table (ActiveProgressCell) and the job detail page (ProgressCard).
  * Returns null when the inputs can't support an estimate.

@@ -4,7 +4,7 @@
  * helpers centralize the precedence rules so the UI reads them consistently.
  */
 
-export type EvalHarness = "isaac" | "dexjoco";
+type EvalHarness = "isaac" | "dexjoco";
 
 /**
  * Resolve the variant's model identity from its env vars.

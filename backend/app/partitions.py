@@ -4,6 +4,8 @@ The monitor counts available GPUs from Slurm's per-node TRES allocation
 (`CfgTRES - AllocTRES`) on usable nodes. Fully idle nodes are still tracked
 separately as node availability.
 """
+from __future__ import annotations
+
 
 import asyncio
 import re
@@ -34,7 +36,7 @@ class PartitionInfo(BaseModel):
     total_nodes: int
     idle_nodes: int              # schedulable plain-idle nodes
     gpu_total: int
-    gpu_idle: int                # schedulable plain-idle GPUs
+    gpu_free: int                # schedulable plain-idle GPUs
     queued_jobs: int = 0         # pending jobs requesting GPUs
     queued_gpus: int = 0         # pending GPU requests
     gpu_type: str | None = None
@@ -95,6 +97,30 @@ def _gpu_type(gres: str) -> str | None:
 def _gpu_tres_value(tres: str) -> int:
     m = _GPU_TRES_RE.search(tres)
     return int(m.group(1)) if m else 0
+
+
+def gpu_count_from_tres(value: str | None) -> int | None:
+    """Parse a GPU count from a TRES string, accepting both the
+    `gres/gpu=N` (name=value) and `gpu:N` (colon) forms."""
+    if not value or value in {"N/A", "(null)", "None"}:
+        return None
+    for part in re.split(r"[, ]+", value):
+        if "gpu" not in part:
+            continue
+        if "=" in part:
+            name, raw = part.rsplit("=", 1)
+            if "gpu" in name:
+                try:
+                    return int(raw)
+                except ValueError:
+                    continue
+        pieces = part.split(":")
+        if pieces and "gpu" in pieces[0]:
+            try:
+                return int(pieces[-1])
+            except ValueError:
+                continue
+    return None
 
 
 def _clean_partition_name(name: str, defaults: set[str]) -> str:
@@ -165,7 +191,7 @@ async def list_partitions(cluster: str) -> list[PartitionInfo]:
     per_part: dict[str, dict] = defaultdict(lambda: {
         "states": defaultdict(int),
         "total_nodes": 0, "idle_nodes": 0,
-        "gpu_total": 0, "gpu_idle": 0,
+        "gpu_total": 0, "gpu_free": 0,
         "queued_jobs": 0, "queued_gpus": 0,
         "gpu_type": None,
     })
@@ -201,7 +227,7 @@ async def list_partitions(cluster: str) -> list[PartitionInfo]:
             continue
         for name in node_partitions:
             if name:
-                per_part[name]["gpu_idle"] += free
+                per_part[name]["gpu_free"] += free
 
     job_fields_by_id: dict[str, dict[str, str]] = {}
     for line in job_r.stdout.splitlines():
@@ -252,7 +278,7 @@ async def list_partitions(cluster: str) -> list[PartitionInfo]:
             total_nodes=d["total_nodes"],
             idle_nodes=d["idle_nodes"],
             gpu_total=d["gpu_total"],
-            gpu_idle=d["gpu_idle"],
+            gpu_free=d["gpu_free"],
             queued_jobs=d["queued_jobs"],
             queued_gpus=d["queued_gpus"],
             gpu_type=d["gpu_type"],

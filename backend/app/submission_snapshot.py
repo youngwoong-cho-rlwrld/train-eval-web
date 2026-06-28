@@ -15,17 +15,23 @@ import shlex
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from pydantic import BaseModel, Field
 
 from .kubectl_errors import is_kubectl_exec_transport_error
+from .paths import EXPERIMENTS_DIR
 from .ssh import ssh_run
 from .training_models import (
     TrainingModel,
+    family_derives_per_gpu_batch_size,
     load_training_model,
     slurm_repo_path,
 )
+
+if TYPE_CHECKING:
+    from .variants import Variant
 
 
 class GitStatus(BaseModel):
@@ -495,7 +501,6 @@ async def _mlxp_git_run_with_pod(cmd: str, timeout: float) -> tuple[int, str, st
 
     settings = get_settings()
     pod_name = f"tew-git-{uuid.uuid4().hex[:10]}"
-    marker = f"__TRAIN_EVAL_WEB_RC_{uuid.uuid4().hex}__"
     wrapped_cmd = (
         "set +e\n"
         f"{cmd} >/tmp/tew-git.out 2>/tmp/tew-git.err\n"
@@ -665,14 +670,7 @@ async def _mlxp_git_run_with_pod(cmd: str, timeout: float) -> tuple[int, str, st
         if logs_rc != 0:
             return logs_rc, "", logs_err.strip() or "kubectl logs git pod failed"
         parsed_rc = exit_code if exit_code is not None else (0 if phase == "Succeeded" else 1)
-        output = logs
-        marker_match = re.search(rf"\n?{re.escape(marker)}(\d+)\s*$", output)
-        if marker_match:
-            parsed_rc = int(marker_match.group(1))
-            output = output[: marker_match.start()].rstrip("\n")
-            if output:
-                output += "\n"
-        return parsed_rc, output, ""
+        return parsed_rc, logs, ""
     finally:
         await kubectl(
             "delete", "pod", pod_name, "-n", settings.namespace, "--wait=false", deadline=15.0
@@ -757,6 +755,46 @@ def snapshot_suffix(job_name: str) -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
+def ensure_trailing_newline(text: str) -> str:
+    """Return `text` guaranteed to end with exactly one trailing newline added."""
+    return text if text.endswith("\n") else text + "\n"
+
+
+def is_safe_relpath(rel: str, allowed_suffixes: set[str] | None = None) -> bool:
+    """Return whether `rel` is a safe path relative to the experiment dir.
+
+    Safe means non-empty, not absolute, and free of `..` segments. When
+    `allowed_suffixes` is given, the path must be a bare filename (no
+    subdirectory), not dotfile-prefixed, and carry one of those suffixes.
+    """
+    if not rel:
+        return False
+    path = Path(rel)
+    if path.is_absolute() or ".." in path.parts:
+        return False
+    if allowed_suffixes is not None:
+        if path.name != rel or rel.startswith(".") or path.suffix not in allowed_suffixes:
+            return False
+    return True
+
+
+def resolve_modality_config(variant: "Variant") -> tuple[str, Path]:
+    """Validate TRAIN_MODALITY_CONFIG and return (rel, absolute path).
+
+    Raises ValueError when missing or not a safe relative path, and
+    FileNotFoundError when the resolved file does not exist.
+    """
+    modality_rel = (variant.vars.get("TRAIN_MODALITY_CONFIG") or "").strip()
+    if not modality_rel:
+        raise ValueError(f"variant {variant.name}: TRAIN_MODALITY_CONFIG missing")
+    if not is_safe_relpath(modality_rel):
+        raise ValueError("TRAIN_MODALITY_CONFIG must be relative to the experiment directory")
+    modality_path = EXPERIMENTS_DIR / variant.name / modality_rel
+    if not modality_path.is_file():
+        raise FileNotFoundError(f"modality config not found: {modality_path}")
+    return modality_rel, modality_path
+
+
 def apply_dataset_override(config_text: str, override: str | list[str]) -> str:
     """Rewrite a variant config.sh to use the requested dataset(s)."""
     if isinstance(override, str):
@@ -770,10 +808,7 @@ def apply_dataset_override(config_text: str, override: str | list[str]) -> str:
 
     is_names_only = all("|" not in e for e in override)
     block_name = "TRAIN_DATASET_NAMES" if is_names_only else "DATASETS"
-    new_block_lines = [f"{block_name}=("]
-    new_block_lines.extend(f"    {shlex.quote(entry)}" for entry in override)
-    new_block_lines.append(")")
-    new_block = "\n".join(new_block_lines)
+    new_block = shell_array_assignment(block_name, list(override))
     pattern = rf"^{block_name}=\(.*?^\)\s*$"
     updated = re.sub(
         pattern,
@@ -787,8 +822,8 @@ def apply_dataset_override(config_text: str, override: str | list[str]) -> str:
     return updated
 
 
-def _set_scalar(config_text: str, name: str, value: int | str) -> str:
-    rendered = f"{name}={shlex.quote(str(value))}"
+def set_scalar(config_text: str, name: str, value: int | str, *, quote: bool = True) -> str:
+    rendered = f"{name}={shlex.quote(str(value))}" if quote else f"{name}={value}"
     pattern = rf"^(\s*(?:export\s+)?)({re.escape(name)})=.*$"
     if re.search(pattern, config_text, flags=re.MULTILINE):
         return re.sub(
@@ -835,9 +870,9 @@ def _apply_submission_config_overrides(
     if dataset_override is not None:
         text = apply_dataset_override(text, dataset_override)
     if train_note is not None:
-        text = _set_scalar(text, "TRAIN_NOTE", train_note)
+        text = set_scalar(text, "TRAIN_NOTE", train_note)
     if data_dir:
-        text = _set_scalar(text, "DATA_DIR", data_dir)
+        text = set_scalar(text, "DATA_DIR", data_dir)
     return text
 
 
@@ -870,20 +905,20 @@ def render_training_config_snapshot(
         train_note=train_note,
     )
 
-    text = _set_scalar(text, "TRAIN_NUM_GPUS", train_num_gpus)
-    text = _set_scalar(text, "MAX_STEPS", train_max_steps)
-    text = _set_scalar(text, "SAVE_STEPS", train_save_steps)
-    text = _set_scalar(text, "TRAIN_NUM_WORKERS", train_num_workers)
+    text = set_scalar(text, "TRAIN_NUM_GPUS", train_num_gpus)
+    text = set_scalar(text, "MAX_STEPS", train_max_steps)
+    text = set_scalar(text, "SAVE_STEPS", train_save_steps)
+    text = set_scalar(text, "TRAIN_NUM_WORKERS", train_num_workers)
     if train_action_horizon is not None:
-        text = _set_scalar(text, "TRAIN_ACTION_HORIZON", train_action_horizon)
+        text = set_scalar(text, "TRAIN_ACTION_HORIZON", train_action_horizon)
     if train_modality_config is not None:
-        text = _set_scalar(text, "TRAIN_MODALITY_CONFIG", train_modality_config)
+        text = set_scalar(text, "TRAIN_MODALITY_CONFIG", train_modality_config)
     if train_git_commit is not None:
-        text = _set_scalar(text, "TRAIN_GIT_COMMIT", train_git_commit)
+        text = set_scalar(text, "TRAIN_GIT_COMMIT", train_git_commit)
     if train_global_batch_size is not None:
-        text = _set_scalar(text, "TRAIN_GLOBAL_BATCH_SIZE", train_global_batch_size)
-        if model == "n1.5" and train_num_gpus > 0:
-            text = _set_scalar(text, "TRAIN_BATCH_SIZE", train_global_batch_size // train_num_gpus)
+        text = set_scalar(text, "TRAIN_GLOBAL_BATCH_SIZE", train_global_batch_size)
+        if family_derives_per_gpu_batch_size(model) and train_num_gpus > 0:
+            text = set_scalar(text, "TRAIN_BATCH_SIZE", train_global_batch_size // train_num_gpus)
 
     footer = [
         "",
@@ -955,19 +990,19 @@ def render_eval_config_preview(
         data_dir=data_dir,
     )
     if dexjoco_task is not None and dexjoco_task.strip():
-        text = _set_scalar(text, "DEXJOCO_TASK", dexjoco_task.strip())
+        text = set_scalar(text, "DEXJOCO_TASK", dexjoco_task.strip())
     if train_git_commit is not None:
-        text = _set_scalar(text, "TRAIN_GIT_COMMIT", train_git_commit)
+        text = set_scalar(text, "TRAIN_GIT_COMMIT", train_git_commit)
     if train_num_gpus is not None:
-        text = _set_scalar(text, "TRAIN_NUM_GPUS", train_num_gpus)
+        text = set_scalar(text, "TRAIN_NUM_GPUS", train_num_gpus)
     if eval_n_episodes is not None:
-        text = _set_scalar(text, "N_EPISODES", eval_n_episodes)
+        text = set_scalar(text, "N_EPISODES", eval_n_episodes)
     if eval_n_runs is not None:
-        text = _set_scalar(text, "N_RUNS", eval_n_runs)
+        text = set_scalar(text, "N_RUNS", eval_n_runs)
     if eval_sets is not None:
         text = _set_array(text, "EVAL_SETS", eval_sets)
     if eval_unset_cuda_visible_devices_for_server is not None:
-        text = _set_scalar(
+        text = set_scalar(
             text,
             "EVAL_UNSET_CUDA_VISIBLE_DEVICES_FOR_SERVER",
             eval_unset_cuda_visible_devices_for_server,

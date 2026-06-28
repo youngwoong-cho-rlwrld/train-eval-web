@@ -6,6 +6,8 @@ Flow:
   3. Build an `sbatch` command targeting the cluster-side body script.
   4. Run it over ssh, parse "Submitted batch job <id>" out of stdout.
 """
+from __future__ import annotations
+
 
 import re
 import shlex
@@ -18,6 +20,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from . import cluster_settings
+from . import paths
 from .clusters import load_cluster
 from .data_interface import rewrite_action_horizon
 from .eval_harness import harness_for
@@ -33,6 +36,7 @@ from .submission_snapshot import (
     prepare_slurm_training_git,
     render_eval_config_preview,
     render_training_config_snapshot,
+    resolve_modality_config,
     resolve_train_git_commit_override,
     snapshot_metadata,
     snapshot_suffix,
@@ -279,6 +283,17 @@ class SubmitResponse(BaseModel):
 MAX_EVAL_NUM_ENVS_PER_GPU = 1
 
 
+def clamp_eval_num_envs(value: int | None) -> int | None:
+    """Cap eval_num_envs_per_gpu at the supported maximum.
+
+    Resubmit/edit paths clamp defensively so submit()'s hard ValueError for
+    out-of-range values never fires on values recovered from old metadata.
+    """
+    if value is not None and value > MAX_EVAL_NUM_ENVS_PER_GPU:
+        return MAX_EVAL_NUM_ENVS_PER_GPU
+    return value
+
+
 @dataclass(frozen=True)
 class ConfigSnapshotPaths:
     suffix: str
@@ -412,17 +427,17 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     submitted_wandb_project = wandb_project()
     exp_dir_remote = f"$HOME/{CLUSTER_STAGING_REL}/experiments/{req.variant}"
     checkpoint_dir = (
-        f"{exp_dir_remote}/checkpoints/{output_namespace}"
+        paths.checkpoint_dir(exp_dir_remote, output_namespace)
         if req.phase == "train" and output_namespace
         else None
     )
     eval_dir = (
-        f"{exp_dir_remote}/eval_results/{output_namespace}"
+        paths.eval_dir(exp_dir_remote, output_namespace)
         if req.phase == "eval" and output_namespace
         else (f"{exp_dir_remote}/eval_results" if req.phase == "eval" else None)
     )
-    results_path = f"{eval_dir}/results.json" if eval_dir else None
-    job_log_dir = f"{exp_dir_remote}/logs/{output_namespace}" if output_namespace else ""
+    results_path = paths.results_path(eval_dir) if eval_dir else None
+    job_log_dir = paths.job_log_dir(exp_dir_remote, output_namespace) if output_namespace else ""
     snapshot_paths = config_snapshot_paths(req.variant, job_name)
 
     snapshot_rel = snapshot_paths.rel
@@ -462,14 +477,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
                 + "\n"
             )
         if rewrites_modality_action_horizon(action_horizon_mode) and train_action_horizon is not None:
-            modality_rel = (variant.vars.get("TRAIN_MODALITY_CONFIG") or "").strip()
-            if not modality_rel:
-                raise ValueError(f"variant {variant.name}: TRAIN_MODALITY_CONFIG missing")
-            if Path(modality_rel).is_absolute() or ".." in Path(modality_rel).parts:
-                raise ValueError("TRAIN_MODALITY_CONFIG must be relative to the experiment directory")
-            modality_path = CONFIGS_DIR / "experiments" / req.variant / modality_rel
-            if not modality_path.is_file():
-                raise FileNotFoundError(f"modality config not found: {modality_path}")
+            _, modality_path = resolve_modality_config(variant)
             snapshot_modality_rel = snapshot_paths.modality_rel
             snapshot_modality_path = snapshot_paths.modality_path
             snapshot_modality_text = rewrite_action_horizon(
@@ -582,7 +590,6 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
                 "config_*.sh",
                 "config_*.meta.json",
                 "modality_*.py",
-                "extra_args_*.sh",
             ]
             if remote_name == "experiments"
             else None

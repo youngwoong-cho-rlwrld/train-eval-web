@@ -11,6 +11,10 @@ task (env_name) selectable from the submit page's task picker.
 configs/clusters/<cluster>.env). When it's unset we return empty lists so
 the picker just shows nothing rather than erroring.
 """
+from __future__ import annotations
+
+
+import shlex
 
 from pydantic import BaseModel
 
@@ -50,11 +54,6 @@ for d in sorted(glob.glob(os.path.join(cfg, '*'))):
 """
 
 
-def _shell_quote(s: str) -> str:
-    """Wrap an arbitrary string in single quotes for inline shell use."""
-    return "'" + s.replace("'", "'\"'\"'") + "'"
-
-
 def _parse_lines(text: str) -> DexjocoTasks:
     families: list[DexjocoFamily] = []
     union: set[str] = set()
@@ -79,7 +78,7 @@ async def list_dexjoco_tasks(cluster: str) -> DexjocoTasks:
     if not dexjoco_dir:
         return DexjocoTasks(families=[], tasks=[])
     script = _list_py(dexjoco_dir)
-    r = await ssh_run(env.ssh_alias, f"python3 -c {_shell_quote(script)}", timeout=30.0)
+    r = await ssh_run(env.ssh_alias, f"python3 -c {shlex.quote(script)}", timeout=30.0)
     if r.returncode != 0:
         raise RuntimeError(f"list_dexjoco_tasks({cluster}, {dexjoco_dir}) failed: {r.stderr}")
     return _parse_lines(r.stdout)

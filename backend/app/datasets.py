@@ -14,8 +14,11 @@ The directory to scan is supplied per request by the caller (the
 frontend persists it in localStorage). When omitted we fall back to
 `~/datasets/` for slurm and the configured MLXP datasets dir for MLXP.
 """
+from __future__ import annotations
+
 
 import asyncio
+import shlex
 
 from pydantic import BaseModel
 
@@ -73,11 +76,6 @@ for p in sorted(glob.glob(os.path.join(base, '*/meta/info.json'))):
 """
 
 
-def _shell_quote(s: str) -> str:
-    """Wrap an arbitrary string in single quotes for inline shell use."""
-    return "'" + s.replace("'", "'\"'\"'") + "'"
-
-
 def _parse_lines(text: str) -> list[DatasetInfo]:
     out: list[DatasetInfo] = []
     for line in text.splitlines():
@@ -106,7 +104,7 @@ async def list_datasets(cluster: str, path: str | None = None) -> list[DatasetIn
 async def _list_datasets_slurm(cluster: str, dir_path: str) -> list[DatasetInfo]:
     env = await load_cluster(cluster)
     script = _list_py(dir_path)
-    r = await ssh_run(env.ssh_alias, f"python3 -c {_shell_quote(script)}", timeout=30.0)
+    r = await ssh_run(env.ssh_alias, f"python3 -c {shlex.quote(script)}", timeout=30.0)
     if r.returncode != 0:
         raise RuntimeError(f"list_datasets({cluster}, {dir_path}) failed: {r.stderr}")
     return _parse_lines(r.stdout)

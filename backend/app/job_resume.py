@@ -1,27 +1,17 @@
 """Resume timed-out jobs from their original train/eval intent."""
 
+from __future__ import annotations
+
 import re
 import shlex
 from datetime import datetime
 
 from . import details, jobs, submit
 from .clusters import load_cluster
+from .job_identity import phase_variant_from_meta
 from .slurm_meta import read_slurm_meta, read_slurm_meta_many
 from .ssh import ssh_run
 from .variants import load_variant
-
-
-def _is_timeout(state: str) -> bool:
-    return state.upper().startswith("TIMEOUT")
-
-
-def _is_failure(state: str) -> bool:
-    return state.upper().startswith((
-        "FAIL",
-        "OUT_OF_MEMORY",
-        "NODE_FAIL",
-        "PREEMPT",
-    ))
 
 
 def _original_phase(phase: str) -> str:
@@ -70,9 +60,9 @@ async def _resubmit_slurm_job(
 
     record = await jobs.get_job(cluster, job_id)
     state = str(record.get("State") or "")
-    if action == "resume" and not _is_timeout(state):
+    if action == "resume" and not jobs.is_timeout(state):
         raise ValueError(f"job {job_id} on {cluster} is {state or 'unknown'}, not TIMEOUT")
-    if action == "retry" and not _is_failure(state):
+    if action == "retry" and not jobs.is_retryable_failure(state):
         raise ValueError(f"job {job_id} on {cluster} is {state or 'unknown'}, not FAILED")
 
     det = await details.get_details(cluster, job_id, include_progress=False)
@@ -133,13 +123,7 @@ async def _resubmit_slurm_job(
         raise ValueError(f"cannot resume eval job {job_id}: checkpoint is unknown")
 
     seed_eval_dirs = [det.paths.eval_dir] if det.paths.eval_dir else []
-    eval_num_envs = (meta.get("eval_num_envs_per_gpu") or "").strip()
-    try:
-        eval_num_envs_per_gpu = int(eval_num_envs) if eval_num_envs else None
-    except ValueError:
-        eval_num_envs_per_gpu = None
-    if eval_num_envs_per_gpu and eval_num_envs_per_gpu > submit.MAX_EVAL_NUM_ENVS_PER_GPU:
-        eval_num_envs_per_gpu = submit.MAX_EVAL_NUM_ENVS_PER_GPU
+    eval_num_envs_per_gpu = submit.clamp_eval_num_envs(int_meta("eval_num_envs_per_gpu"))
     eval_n_episodes = int_meta("eval_n_episodes")
     eval_n_runs = int_meta("eval_n_runs")
     eval_sets = [s for s in (meta.get("eval_sets") or "").split() if s] or None
@@ -204,40 +188,39 @@ async def list_resumed_jobs(cluster: str, job_id: str) -> list[jobs.Job]:
     linked: list[jobs.Job] = []
     for child_id in child_ids:
         meta = meta_by_job_id.get(child_id, {})
+        phase, variant = phase_variant_from_meta(meta)
+        meta_kwargs = {
+            "cluster": cluster,
+            "job_id": child_id,
+            "phase": phase,
+            "variant": variant or None,
+            "resume_of": meta.get("resume_of") or None,
+            "resubmit_action": meta.get("resubmit_action") or None,
+        }
         try:
             record = await jobs.get_job(cluster, child_id)
             state = str(record.get("State") or "")
             linked.append(
                 jobs.Job(
-                    cluster=cluster,
-                    job_id=child_id,
+                    **meta_kwargs,
                     job_name=str(record.get("JobName") or meta.get("job_name") or child_id),
                     partition=str(record.get("Partition") or ""),
-                    state=state.split(" ")[0],
+                    state=jobs.short_state(state),
                     elapsed=str(record.get("Elapsed") or ""),
                     nodelist=str(record.get("NodeList") or record.get("Reason") or ""),
                     start=str(record.get("Start") or "") or None,
                     end=str(record.get("End") or "") or None,
-                    phase=meta.get("phase") or None,
-                    variant=meta.get("variant") or None,
-                    resume_of=meta.get("resume_of") or None,
-                    resubmit_action=meta.get("resubmit_action") or None,
                 )
             )
         except Exception:
             linked.append(
                 jobs.Job(
-                    cluster=cluster,
-                    job_id=child_id,
+                    **meta_kwargs,
                     job_name=meta.get("job_name") or child_id,
                     partition="",
                     state="UNKNOWN",
                     elapsed="",
                     nodelist="",
-                    phase=meta.get("phase") or None,
-                    variant=meta.get("variant") or None,
-                    resume_of=meta.get("resume_of") or None,
-                    resubmit_action=meta.get("resubmit_action") or None,
                 )
             )
     return linked

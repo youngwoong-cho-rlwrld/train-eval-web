@@ -7,7 +7,7 @@ export async function generateMetadata({
 }): Promise<Metadata> {
   const { name } = await params;
   return {
-    title: `Experiment - ${decodeURIComponent(name)}`,
+    title: `Experiment - ${name}`,
   };
 }
 

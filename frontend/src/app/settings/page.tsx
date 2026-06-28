@@ -4,7 +4,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ExternalLink } from "lucide-react";
-import { api, type ClusterEnvSettings } from "@/lib/api";
+import { api, type ClusterEnvSettings, type WandbStatus } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -18,13 +18,6 @@ import {
   renderEnvText,
   sameEnvValues,
 } from "@/lib/cluster-env";
-
-type WandbStatus = {
-  logged_in: boolean;
-  entity: string | null;
-  project: string;
-  error: string | null;
-};
 
 export default function SettingsPage() {
   return (

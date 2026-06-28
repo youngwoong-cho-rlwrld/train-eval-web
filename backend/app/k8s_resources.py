@@ -39,7 +39,7 @@ async def kubectl_json(*args: str, timeout: float = 20.0) -> dict[str, Any]:
         raise RuntimeError(f"kubectl {' '.join(args)} returned invalid JSON: {exc}") from exc
 
 
-def requested_gpus(spec: dict) -> int:
+def requested_gpus(spec: dict[str, Any]) -> int:
     total = 0
     for container in spec.get("containers", []):
         req = (container.get("resources") or {}).get("requests") or {}
@@ -60,7 +60,7 @@ def pod_job_id(pod: dict[str, Any]) -> str | None:
     )
 
 
-def affinity_node(spec: dict) -> str | None:
+def affinity_node(spec: dict[str, Any]) -> str | None:
     affinity = spec.get("affinity") or {}
     node_affinity = affinity.get("nodeAffinity") or {}
     required = node_affinity.get("requiredDuringSchedulingIgnoredDuringExecution") or {}
@@ -79,7 +79,7 @@ def parse_k8s_time(value: str | None) -> datetime | None:
         return None
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+    except (ValueError, TypeError, AttributeError):
         return None
 
 

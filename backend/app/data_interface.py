@@ -8,7 +8,7 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from .paths import EXPERIMENTS_DIR
-from .variants import Variant, load_variant
+from .variants import Variant, _display_path, load_variant
 
 
 class DataInterfaceSummary(BaseModel):
@@ -42,13 +42,13 @@ def load_data_interface_for_variant(variant: Variant) -> DataInterfaceSummary:
         )
 
     path = EXPERIMENTS_DIR / variant.name / rel
-    shown_path = f"configs/experiments/{variant.name}/{rel}"
+    shown_path = _display_path(variant.name, rel)
     if not path.is_file():
         return DataInterfaceSummary(
             variant=variant.name,
             source=rel,
             path=shown_path,
-            error=f"modality.py not found: {shown_path}",
+            error=f"{rel} not found: {shown_path}",
         )
 
     text = path.read_text()
@@ -67,20 +67,23 @@ def summarize_data_interface_text(
     path: str | None,
     text: str,
 ) -> DataInterfaceSummary:
-    base = {
-        "variant": variant_name,
-        "source": source,
-        "path": path,
-        "text": text,
-    }
     try:
         tree = ast.parse(text)
         config_name, embodiment_tag = _registered_metadata(tree)
         action_horizon = _action_horizon(tree, config_name)
     except SyntaxError as e:
-        return DataInterfaceSummary(**base, error=f"could not parse Python file: {e.msg}")
+        return DataInterfaceSummary(
+            variant=variant_name,
+            source=source,
+            path=path,
+            text=text,
+            error=f"could not parse Python file: {e.msg}",
+        )
     return DataInterfaceSummary(
-        **base,
+        variant=variant_name,
+        source=source,
+        path=path,
+        text=text,
         config_name=config_name,
         embodiment_tag=embodiment_tag,
         action_horizon=action_horizon,

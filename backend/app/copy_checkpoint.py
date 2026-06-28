@@ -18,6 +18,8 @@ Transfer mechanism:
 - mlxp  → mlxp:  cp inside one pod (same DDN PVC).
 """
 
+from __future__ import annotations
+
 import asyncio
 import contextlib
 import json
@@ -31,14 +33,16 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from .checkpoint_links import checkpoint_leaf
 from .clusters import load_cluster
-from .details import get_details, resolve_phase_and_variant
+from .details import get_details
+from .job_identity import resolve_phase_and_variant
 from .jobs import get_job
 from .kubectl_errors import is_completed_pod_exec_error
 from .mlxp_config import get_settings
 from .mlxp_data_pod import ensure_listing_pod, invalidate_pods_cache
 from .paths import CHECKPOINT_COPY_HISTORY_REL
-from .remote_paths import expand_cluster_home, remote_path_exists, remote_shell_path
+from .remote_paths import expand_cluster_home, remote_path_exists, remote_path_expr, remote_shell_path
 from .ssh import ssh_run, _CM_OPTS, rsync_ssh_transport
 from .submission_snapshot import is_mlxp_transport_error
 
@@ -236,8 +240,8 @@ done
             if len(parts) != 2 or not parts[1].isdigit():
                 continue
             path, step = parts
-            job_name = det.paths.ckpt_dir.rstrip("/").rsplit("/", 1)[-1]
-            if job_name == "checkpoints":
+            job_name = checkpoint_leaf(det.paths.ckpt_dir)
+            if not job_name or job_name == "checkpoints":
                 job_name = det.job_name or job_id
             result.append(CheckpointEntry(
                 path=path, job_name=job_name, step=int(step),
@@ -252,20 +256,17 @@ done
     if not det.paths.ckpt_dir:
         return []
 
-    def path_expr(path: str) -> str:
-        return path if path.startswith("$HOME/") else shlex.quote(path)
-
     root = det.paths.ckpt_dir.rstrip("/")
-    root_expr = path_expr(root)
+    root_expr = remote_path_expr(root)
     cmds = f"ls -d {root_expr}/checkpoint-* 2>/dev/null"
     if root.endswith("/checkpoints"):
         job_glob = shlex.quote(det.job_name) + "*"
         cmds += f" ; ls -d {root_expr}/{job_glob}/checkpoint-* 2>/dev/null"
     r = await ssh_run(env.ssh_alias, cmds, timeout=15.0)
-    return _parse_paths(r.stdout, nested=False, fallback_job=job_id)
+    return _parse_paths(r.stdout, fallback_job=job_id)
 
 
-def _parse_paths(stdout: str, *, nested: bool, fallback_job: str = "") -> list[CheckpointEntry]:
+def _parse_paths(stdout: str, *, fallback_job: str = "") -> list[CheckpointEntry]:
     out: list[CheckpointEntry] = []
     for line in stdout.strip().splitlines():
         line = line.strip()
@@ -280,7 +281,7 @@ def _parse_paths(stdout: str, *, nested: bool, fallback_job: str = "") -> list[C
         except ValueError:
             continue
         parent = line.rsplit("/", 2)[1] if "/" in line else ""
-        job_name = parent if (nested or parent != "checkpoints") else fallback_job
+        job_name = parent if parent != "checkpoints" else fallback_job
         out.append(CheckpointEntry(path=line, job_name=job_name, step=step))
     return _dedupe_checkpoints(out)
 
@@ -921,7 +922,16 @@ async def _mlxp_to_mlxp(copy_id: str, src: str, dest: str,
         stderr=asyncio.subprocess.PIPE,
     )
     _track_proc(copy_id, proc)
-    out, err = await asyncio.wait_for(proc.communicate(), timeout=3600.0)
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=3600.0)
+    except asyncio.CancelledError:
+        proc.kill()
+        await proc.wait()
+        raise
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise RuntimeError("cp timed out after 3600s")
     if proc.returncode != 0:
         raise RuntimeError(f"cp failed: {err.decode(errors='replace').strip()}")
     return out.decode(errors="replace")
@@ -1258,7 +1268,20 @@ async def _delete_source(src_cluster: str, src_path: str) -> None:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        await asyncio.wait_for(proc.communicate(), timeout=300.0)
+        try:
+            _, err = await asyncio.wait_for(proc.communicate(), timeout=300.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            proc.kill()
+            await proc.wait()
+            raise
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"source delete failed: {err.decode(errors='replace').strip() or 'rm -rf'}"
+            )
         return
     env = await load_cluster(src_cluster)
-    await ssh_run(env.ssh_alias, f"rm -rf {shlex.quote(src_path)}", timeout=300.0)
+    r = await ssh_run(env.ssh_alias, f"rm -rf {shlex.quote(src_path)}", timeout=300.0)
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"source delete failed: {r.stderr.strip() or r.stdout.strip() or 'rm -rf'}"
+        )
