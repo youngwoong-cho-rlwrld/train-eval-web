@@ -196,20 +196,28 @@ eps = sorted(
     [p for p in out.glob("episode_*") if p.is_dir()],
     key=lambda p: int(re.match(r"episode_(\d+)", p.name).group(1)) if re.match(r"episode_(\d+)", p.name) else 0,
 )
-success = [p.name.endswith("_success") for p in eps]
+# DexJoCo names each episode dir episode_<NN>_<status>_<details>, e.g.
+# episode_03_success_1_2_3 or episode_01_failure_no_password_input. The status
+# is the token right after the index, NOT a suffix — multi-criterion (bimanual)
+# tasks append per-goal details — so match it positionally.
+def _is_success(name):
+    m = re.match(r"episode_\d+_(success|failure)(?:_|$)", name)
+    return m is not None and m.group(1) == "success"
+
+success = [_is_success(p.name) for p in eps]
 success_count = sum(success)
 total = len(eps)
 
-# Cross-check against the zero-byte success_rate_<pass>_<total>.txt marker.
+# The eval harness also drops a zero-byte success_rate_<pass>_<total>.txt marker;
+# treat it as authoritative for the summary when present.
 marker = next(iter(out.glob("success_rate_*_*.txt")), None)
 if marker is not None:
     m = re.match(r"success_rate_(\d+)_(\d+)\.txt$", marker.name)
     if m:
         mp, mt = int(m.group(1)), int(m.group(2))
-        if total == 0:
-            success_count, total = mp, mt
-        elif (mp, mt) != (success_count, total):
-            print(f"WARNING: marker {marker.name} disagrees with dir count {success_count}/{total}", file=sys.stderr)
+        if (mp, mt) != (success_count, total):
+            print(f"WARNING: marker {marker.name} disagrees with dir count {success_count}/{total}; using marker", file=sys.stderr)
+        success_count, total = mp, mt
 
 if total == 0:
     raise SystemExit(f"ERROR: no episode_* dirs and no success marker in {out_dir}")
