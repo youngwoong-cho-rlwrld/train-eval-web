@@ -887,11 +887,60 @@ def instruction_for(short, configured_tasks, fallback=None):
     return fallback
 
 
+def _config_scalar_int(text, name):
+    prefix = name + "="
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("export "):
+            s = s[7:].lstrip()
+        if s.startswith(prefix):
+            value = s[len(prefix):].strip().strip('"').strip("'")
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None
+
+
+def _namespace_stamp(name):
+    parts = name.split("_")
+    for i in range(len(parts) - 1):
+        if (len(parts[i]) == 8 and parts[i].isdigit()
+                and len(parts[i + 1]) == 6 and parts[i + 1].isdigit()):
+            return parts[i] + "_" + parts[i + 1]
+    return None
+
+
+def snapshot_run_shape(eval_root):
+    """(n_runs, n_episodes) from the per-submission config snapshot the eval
+    actually ran with -- the same config the eval body sourced. The submitted
+    run/episode counts (and any --n-runs override) live there, so expected
+    counts stay correct even before the final aggregate is written and even if
+    the live variant config was edited after submission. (None, None) for the
+    legacy layout or when the snapshot is absent."""
+    root = Path(eval_root)
+    stamp = _namespace_stamp(root.name)
+    if not stamp:
+        return None, None
+    snapshot = root.parent.parent / ("config_" + stamp + ".sh")
+    try:
+        text = snapshot.read_text()
+    except Exception:
+        return None, None
+    return _config_scalar_int(text, "N_RUNS"), _config_scalar_int(text, "N_EPISODES")
+
+
 def build_variant_from_root(meta, eval_node, eval_root, top_path, top_exists, top_mtime):
     variant = meta["variant"]
     configured_tasks = meta.get("tasks") or []
     configured_eval_sets = meta.get("eval_sets") or []
     expected_runs = int_or_none(meta.get("n_runs"))
+    n_episodes = int_or_none(meta.get("n_episodes"))
+    snapshot_runs, snapshot_episodes = snapshot_run_shape(eval_root)
+    if snapshot_runs:
+        expected_runs = snapshot_runs
+    if snapshot_episodes:
+        n_episodes = snapshot_episodes
     top = None
     aggregate_tasks = []
     if top_exists:
@@ -913,7 +962,7 @@ def build_variant_from_root(meta, eval_node, eval_root, top_path, top_exists, to
         "model_version": meta.get("model_version"),
         "note": meta.get("note"),
         "checkpoint": None,
-        "n_episodes": int_or_none(meta.get("n_episodes")),
+        "n_episodes": n_episodes,
         "n_runs": expected_runs,
         "num_envs_per_gpu": None,
         "total_num_envs": None,
