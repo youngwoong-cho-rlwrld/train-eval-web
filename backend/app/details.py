@@ -1553,7 +1553,7 @@ async def _mlxp_eval_progress(
     settings = get_settings()
     eval_dir = metadata.get("eval_dir") or f"{settings.experiments_dir}/{variant}/eval_results"
 
-    cmd = f"find {shlex.quote(eval_dir)} -type f -name results.json 2>/dev/null | wc -l"
+    cmd = f"find {shlex.quote(eval_dir)} -type f -path '*/run_*/results.json' 2>/dev/null | wc -l"
     try:
         _, stdout, _ = await _mlxp_exec("bash", "-c", cmd, timeout=15.0)
     except Exception:

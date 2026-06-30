@@ -86,7 +86,7 @@ async def eval_job_completed(
     stdout_q = shlex.quote(stdout_path)
     eval_dir_q = remote_path_expr(eval_dir)
     prefix = f"stdout_path={stdout_q}; eval_dir={eval_dir_q}; expected={expected}; "
-    files_block = "files=$(find \"$eval_dir\" -type f -name results.json 2>/dev/null | wc -l); "
+    files_block = "files=$(find \"$eval_dir\" -type f -path '*/run_*/results.json' 2>/dev/null | wc -l); "
     return await _probe_completion(host, prefix, files_block, expected)
 
 
@@ -117,7 +117,7 @@ async def eval_job_completed_from_log_dir(
     files_block = (
         "files=0; "
         f"for d in {eval_dirs}; do "
-        'c=$(find "$d" -type f -name results.json 2>/dev/null | wc -l); '
+        'c=$(find "$d" -type f -path "*/run_*/results.json" 2>/dev/null | wc -l); '
         'case "$c" in ""|*[!0-9]*) c=0;; esac; '
         'if [ "$c" -gt "$files" ]; then files="$c"; fi; '
         "done; "

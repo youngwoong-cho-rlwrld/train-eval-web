@@ -82,7 +82,7 @@ class IsaacHarness(EvalHarness):
         # in-flight run's client-stdout episode/run markers.
         return (
             f"eval_dir={eval_dir_expr}; log_dir={log_dir_q}; job_id={job_id_q}; "
-            'completed=$(find "$eval_dir" -type f -name results.json 2>/dev/null | wc -l); '
+            'completed=$(find "$eval_dir" -type f -path "*/run_*/results.json" 2>/dev/null | wc -l); '
             "video_eps=$(find \"$eval_dir\" -type f -path '*/videos/ep*.mp4' 2>/dev/null | wc -l); "
             'pattern="$log_dir"/*_"$job_id".out; '
             "stdout_eps=$(grep -h '^Episode .* completed' $pattern 2>/dev/null | wc -l); "
@@ -133,8 +133,8 @@ class DexjocoHarness(EvalHarness):
         # finished run. The episode dirs are the only live mid-run signal.
         return (
             f"eval_dir={eval_dir_expr}; "
-            'completed=$(find "$eval_dir" -type f -name results.json 2>/dev/null | wc -l); '
-            "episode_dirs=$(find \"$eval_dir\" -type d 2>/dev/null | grep -cE '/episode_[0-9]+_(success|failure)$'); "
+            'completed=$(find "$eval_dir" -type f -path "*/run_*/results.json" 2>/dev/null | wc -l); '
+            "episode_dirs=$(find \"$eval_dir\" -type d 2>/dev/null | grep -cE '/episode_[0-9]+_(success|failure)(_|$)'); "
             "printf '%s %s\\n' \"$completed\" \"$episode_dirs\""
         )
 
