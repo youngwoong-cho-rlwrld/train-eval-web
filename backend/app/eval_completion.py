@@ -128,16 +128,17 @@ async def eval_job_completed_from_log_dir(
 def _parse_completion_probe(stdout: str, expected: int) -> bool:
     try:
         parts = stdout.strip().split()
-        saved = int(parts[0]) if len(parts) > 0 else 0
-        skipped = int(parts[1]) if len(parts) > 1 else 0
         done_count = int(parts[2]) if len(parts) > 2 else 0
         files = int(parts[3]) if len(parts) > 3 else 0
     except (ValueError, IndexError):
         return False
 
-    stdout_complete = done_count > 0 or (saved + skipped) >= expected
-    files_complete = files >= expected
-    return stdout_complete and files_complete
+    # Only treat a nonzero-exit eval as complete once the body emitted its final
+    # DONE marker, which is printed *after* the aggregate results.json is written.
+    # All per-run results being saved is NOT sufficient: the job can still die in
+    # the aggregate step (no top-level results.json) — a real failure, not a
+    # misleading Slurm state, and one the user must be able to resume.
+    return done_count > 0 and files >= expected
 
 
 def _override_int(value: str | None, fallback: str) -> int:
