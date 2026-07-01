@@ -4,13 +4,20 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ExternalLink } from "lucide-react";
-import { api, type ClusterEnvSettings, type WandbStatus } from "@/lib/api";
+import {
+  api,
+  type ClusterEnvSettings,
+  type NotificationSettings,
+  type WandbStatus,
+} from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import { CopyButton } from "@/components/copy-button";
+import { LoadingState } from "@/components/loading-state";
 import {
   fieldsForClusterEnv,
   normalizeEnvDraft,
@@ -25,6 +32,7 @@ export default function SettingsPage() {
       <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
       <ClusterSettingsCard />
       <WandbCard />
+      <NotificationsCard />
     </div>
   );
 }
@@ -73,7 +81,7 @@ function ClusterSettingsCard() {
         </p>
       </CardHeader>
       <CardContent className="space-y-6">
-        {settings.isLoading && <p className="text-sm text-slate-500">Loading cluster settings...</p>}
+        {settings.isLoading && <LoadingState label="Loading cluster settings..." rows={4} />}
         {settings.error && (
           <p className="text-sm text-red-600 dark:text-red-400">
             {(settings.error as Error).message}
@@ -253,7 +261,7 @@ function WandbCard() {
                 onClick={() => login.mutate()}
                 disabled={!key.trim() || login.isPending}
               >
-                {login.isPending ? "Saving…" : "Save"}
+                {login.isPending ? "Saving..." : "Save"}
               </Button>
             </div>
           )}
@@ -273,7 +281,7 @@ function WandbCard() {
               onClick={() => saveProject.mutate()}
               disabled={!projectDirty || saveProject.isPending}
             >
-              {saveProject.isPending ? "Saving…" : "Save"}
+              {saveProject.isPending ? "Saving..." : "Save"}
             </Button>
           </div>
           <p className="text-xs text-slate-500">
@@ -281,6 +289,168 @@ function WandbCard() {
             jobs.
           </p>
         </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function NotificationsCard() {
+  const qc = useQueryClient();
+  const [webhook, setWebhook] = useState("");
+  const [edits, setEdits] = useState<Partial<NotificationSettings>>({});
+
+  const q = useQuery({
+    queryKey: ["notifications"],
+    queryFn: () => api<NotificationSettings>("/api/notifications"),
+  });
+  const data = q.data;
+
+  const val = (k: keyof NotificationSettings): boolean =>
+    Boolean(edits[k] ?? data?.[k] ?? false);
+
+  const save = useMutation({
+    mutationFn: () =>
+      api<NotificationSettings>("/api/notifications", {
+        method: "POST",
+        body: JSON.stringify({
+          enabled: val("enabled"),
+          notify_submitted: val("notify_submitted"),
+          notify_running: val("notify_running"),
+          notify_completed: val("notify_completed"),
+          notify_failed: val("notify_failed"),
+          notify_cancelled: val("notify_cancelled"),
+          ...(webhook.trim() ? { slack_webhook_url: webhook.trim() } : {}),
+        }),
+      }),
+    onSuccess: (res) => {
+      toast.success("Notification settings saved");
+      setEdits({});
+      setWebhook("");
+      qc.setQueryData(["notifications"], res);
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+
+  const test = useMutation({
+    mutationFn: () =>
+      api<{ status: string }>("/api/notifications/test", { method: "POST" }),
+    onSuccess: () => toast.success("Test notification sent"),
+    onError: (e: Error) => toast.error(e.message),
+  });
+
+  const toggle = (k: keyof NotificationSettings) => (checked: boolean) =>
+    setEdits((prev) => ({ ...prev, [k]: checked }));
+
+  const dirty = Object.keys(edits).length > 0 || webhook.trim() !== "";
+
+  const events: { key: keyof NotificationSettings; label: string }[] = [
+    { key: "notify_submitted", label: "Submitted" },
+    { key: "notify_running", label: "Running" },
+    { key: "notify_completed", label: "Completed" },
+    { key: "notify_failed", label: "Failed / timeout" },
+    { key: "notify_cancelled", label: "Cancelled" },
+  ];
+
+  return (
+    <Card className="mt-8">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          Slack notifications
+          {data?.configured ? (
+            <Badge variant={data.enabled ? "success" : "warning"} className="text-[10px]">
+              {data.enabled ? "on" : "off"}
+            </Badge>
+          ) : (
+            <Badge variant="warning" className="text-[10px]">
+              not configured
+            </Badge>
+          )}
+        </CardTitle>
+        <p className="text-sm text-slate-500">
+          Post to a Slack incoming webhook when a job changes status. Saved
+          outside git under{" "}
+          <code className="font-mono">~/.train-eval-web/notifications.json</code>.
+        </p>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {q.isLoading && (
+          <LoadingState label="Loading notification settings..." rows={3} />
+        )}
+        {q.error && (
+          <p className="text-sm text-red-600 dark:text-red-400">
+            {(q.error as Error).message}
+          </p>
+        )}
+        {data && (
+          <>
+            <div className="space-y-2">
+              <Label className="flex items-center justify-between">
+                <span>Slack incoming webhook URL</span>
+                <a
+                  href="https://api.slack.com/messaging/webhooks"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1 text-xs text-blue-600 hover:underline"
+                >
+                  create one <ExternalLink className="h-3 w-3" />
+                </a>
+              </Label>
+              <Input
+                type="password"
+                value={webhook}
+                onChange={(e) => setWebhook(e.target.value)}
+                placeholder={
+                  data.configured
+                    ? "•••••• saved — leave blank to keep"
+                    : "https://hooks.slack.com/services/..."
+                }
+                className="font-mono text-xs"
+                autoComplete="off"
+              />
+            </div>
+
+            <div className="flex items-center justify-between">
+              <div>
+                <Label>Enabled</Label>
+                <p className="text-xs text-slate-500">
+                  Master switch for all job notifications.
+                </p>
+              </div>
+              <Switch
+                checked={val("enabled")}
+                onCheckedChange={toggle("enabled")}
+              />
+            </div>
+
+            <div className="divide-y divide-slate-100 rounded-md border border-slate-200 dark:divide-slate-900 dark:border-slate-800">
+              {events.map((ev) => (
+                <div
+                  key={ev.key}
+                  className="flex items-center justify-between px-3 py-2.5"
+                >
+                  <span className="text-sm">{ev.label}</span>
+                  <Switch
+                    checked={val(ev.key)}
+                    onCheckedChange={toggle(ev.key)}
+                  />
+                </div>
+              ))}
+            </div>
+
+            <div className="flex items-center gap-2">
+              <Button onClick={() => save.mutate()} disabled={!dirty || save.isPending}>
+                {save.isPending ? "Saving..." : "Save"}
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => test.mutate()}
+                disabled={!data.configured || test.isPending}
+              >
+                {test.isPending ? "Sending..." : "Send test"}
+              </Button>
+            </div>
+          </>
+        )}
       </CardContent>
     </Card>
   );

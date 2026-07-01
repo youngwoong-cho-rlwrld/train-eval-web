@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,6 +25,8 @@ from . import (
     mlxp,
     mlxp_config,
     mlxp_submit,
+    notifications,
+    notifications_config,
     partitions,
     results,
     remote_paths,
@@ -39,7 +42,23 @@ from .ssh import ssh_tail_lines
 from .wandb_config import get_project as wandb_project
 
 
-app = FastAPI(title="train-eval-web")
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    # The one persistent background task: poll job states and post Slack
+    # notifications on status transitions (no-op unless notifications are
+    # enabled + a webhook is configured).
+    monitor_task = asyncio.create_task(notifications.run_monitor())
+    try:
+        yield
+    finally:
+        monitor_task.cancel()
+        try:
+            await monitor_task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title="train-eval-web", lifespan=_lifespan)
 # Browser origins allowed to call the API. Defaults to the local dev frontend;
 # override with TRAIN_EVAL_CORS_ORIGINS (comma-separated) when the frontend is
 # served from another host, e.g. a remote deployment at http://<host>:3000.
@@ -541,6 +560,9 @@ async def post_submit(req: submit.SubmitRequest):
                 commit_dirty_changes=req.commit_dirty_changes,
             )
             r = await mlxp_submit.submit_mlxp(mlxp_req)
+            await notifications.note_submitted(
+                "mlxp", r.job_id, r.job_name, req.phase, req.variant
+            )
             return {
                 "job_id": r.job_id,
                 "job_name": r.job_name,
@@ -549,7 +571,11 @@ async def post_submit(req: submit.SubmitRequest):
                 "rsync_stdout": "",
                 "sbatch_stdout": r.apply_stdout,
             }
-        return await submit.submit(req)
+        resp = await submit.submit(req)
+        await notifications.note_submitted(
+            req.cluster, resp.job_id, resp.job_name, req.phase, req.variant
+        )
+        return resp
     except (FileNotFoundError, ValueError) as e:
         raise HTTPException(400, str(e))
     except RuntimeError as e:
@@ -790,6 +816,25 @@ async def post_wandb_project(req: wandb_auth.ProjectRequest):
     if not req.project.strip():
         raise HTTPException(400, "project must not be empty")
     return await wandb_auth.set_project_endpoint(req.project)
+
+
+# ── notifications ──
+
+@app.get("/api/notifications", response_model=notifications_config.NotificationSettings)
+async def get_notifications():
+    return notifications_config.get_settings()
+
+
+@app.post("/api/notifications", response_model=notifications_config.NotificationSettings)
+async def post_notifications(req: notifications_config.NotificationSettingsUpdate):
+    return notifications_config.save_settings(req)
+
+
+@app.post("/api/notifications/test")
+async def post_notifications_test():
+    if not await notifications.send_test():
+        raise HTTPException(400, "no webhook configured or Slack post failed")
+    return {"status": "sent"}
 
 
 # ── flags ──

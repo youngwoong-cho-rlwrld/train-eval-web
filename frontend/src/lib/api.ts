@@ -287,6 +287,16 @@ export type WandbStatus = {
   error: string | null;
 };
 
+export type NotificationSettings = {
+  enabled: boolean;
+  configured: boolean;
+  notify_submitted: boolean;
+  notify_running: boolean;
+  notify_completed: boolean;
+  notify_failed: boolean;
+  notify_cancelled: boolean;
+};
+
 export type Partition = {
   name: string;
   is_default: boolean;
