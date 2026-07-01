@@ -26,7 +26,7 @@ export default function ExperimentDetail({ params }: { params: Promise<{ name: s
   const { name } = use(params);
   const files = useQuery({
     queryKey: ["experiment-files", name],
-    queryFn: () => api<ExperimentFiles>(`/api/variants/${name}/files`),
+    queryFn: () => api<ExperimentFiles>(`/api/variants/${encodeURIComponent(name)}/files`),
   });
 
   return (
@@ -75,7 +75,7 @@ function ExperimentFilesEditor({
 
   const save = useMutation({
     mutationFn: () =>
-      api<SaveExperimentFilesResponse>(`/api/variants/${name}/files`, {
+      api<SaveExperimentFilesResponse>(`/api/variants/${encodeURIComponent(name)}/files`, {
         method: "PUT",
         body: JSON.stringify({
           config_title: configTitle,
