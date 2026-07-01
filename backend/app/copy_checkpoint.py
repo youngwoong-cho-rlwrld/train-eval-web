@@ -948,8 +948,8 @@ async def _slurm_to_slurm(copy_id: str, src_cluster: str, src_path: str,
     )
     if src_env.ssh_alias == dest_env.ssh_alias:
         cmd = (
-            f"mkdir -p {shlex.quote(dest_path)} >/dev/null 2>&1 && "
-            f"rsync -az {excludes} {shlex.quote(src_path)}/ {shlex.quote(dest_path)}/"
+            f"mkdir -p {remote_shell_path(dest_path)} >/dev/null 2>&1 && "
+            f"rsync -az {excludes} {remote_shell_path(src_path)}/ {remote_shell_path(dest_path)}/"
         )
         r = await ssh_run(src_env.ssh_alias, cmd, timeout=3600.0)
         if r.returncode != 0:
