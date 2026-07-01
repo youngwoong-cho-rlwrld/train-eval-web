@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import time
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -73,18 +72,6 @@ class ResultsResponse(BaseModel):
     errors: list[ClusterResultError] = Field(default_factory=list)
 
 
-# Scanning a cluster's experiment tree is slow on metadata-heavy network
-# filesystems — notably skt's FSx, where even a shallow walk can take a
-# minute-plus under multi-tenant load. To keep the Results page responsive we
-# cache the last successful per-cluster scan and refresh it in the background:
-# a fresh-enough cache returns instantly, a stale one is served immediately
-# while a single background scan refreshes it, and only a cold cache blocks on
-# the walk. Single-flight refresh stops scans from piling up across tabs.
-_RESULTS_CACHE: dict[str, tuple[float, list["ResultVariant"]]] = {}
-_RESULTS_REFRESH: dict[str, asyncio.Task] = {}
-_RESULTS_CACHE_TTL = 60.0
-
-
 async def _scan_cluster_results(
     c: str, payload, checkpoint_links
 ) -> tuple[list[ResultVariant], ClusterResultError | None]:
@@ -101,40 +88,14 @@ async def _scan_cluster_results(
         return [], ClusterResultError(cluster=c, error=str(e) or type(e).__name__)
 
 
-async def _refresh_cluster_results(c: str, payload, checkpoint_links) -> None:
-    rows, err = await _scan_cluster_results(c, payload, checkpoint_links)
-    if err is None:
-        _RESULTS_CACHE[c] = (time.monotonic(), rows)
-
-
-async def _cluster_results_cached(
-    c: str, payload, checkpoint_links
-) -> tuple[list[ResultVariant], ClusterResultError | None]:
-    cached = _RESULTS_CACHE.get(c)
-    if cached is not None:
-        ts, rows = cached
-        if time.monotonic() - ts > _RESULTS_CACHE_TTL:
-            task = _RESULTS_REFRESH.get(c)
-            if task is None or task.done():
-                _RESULTS_REFRESH[c] = asyncio.create_task(
-                    _refresh_cluster_results(c, payload, checkpoint_links)
-                )
-        return rows, None
-    # Cold cache: scan synchronously and cache on success (errors aren't cached,
-    # so a transient failure retries on the next request).
-    rows, err = await _scan_cluster_results(c, payload, checkpoint_links)
-    if err is None:
-        _RESULTS_CACHE[c] = (time.monotonic(), rows)
-    return rows, err
-
-
 async def list_results(cluster: str | None = None) -> ResultsResponse:
     target_clusters = [cluster] if cluster else list_clusters()
     payload = await _variant_payload()
     checkpoint_links = await _checkpoint_link_payload()
 
+    # Scan every cluster live and concurrently on each request.
     groups = await asyncio.gather(
-        *(_cluster_results_cached(c, payload, checkpoint_links) for c in target_clusters)
+        *(_scan_cluster_results(c, payload, checkpoint_links) for c in target_clusters)
     )
     out: list[ResultVariant] = []
     errors: list[ClusterResultError] = []
@@ -306,9 +267,14 @@ from pathlib import Path
 
 
 # Network filesystems (FSx Lustre on skt) charge a round trip per metadata
-# or read op; overlapping them in threads is what makes the scan fast. The
-# pool is only ever used from the main thread, never from its own workers.
-_IO_POOL = ThreadPoolExecutor(max_workers=16)
+# or read op; overlapping them in threads is what makes the scan fast. Tasks
+# submitted here are leaf FS ops that never re-enter the pool, so it is safe to
+# drive it from the main thread and from _VARIANT_POOL workers alike.
+_IO_POOL = ThreadPoolExecutor(max_workers=48)
+# Separate pool for the per-variant fan-out: build_variant uses _IO_POOL
+# internally (prefetch_json / build_tree), so running the variant loop on its
+# own pool overlaps every variant's FS waits without nested-pool starvation.
+_VARIANT_POOL = ThreadPoolExecutor(max_workers=16)
 
 payload = json.loads(base64.b64decode(os.environ["RESULTS_PAYLOAD_B64"]).decode())
 checkpoint_links = json.loads(
@@ -337,6 +303,10 @@ def float_or_none(value):
         return None
 
 
+# Touched from the main thread and from _VARIANT_POOL workers. dict writes are
+# GIL-atomic and loads are idempotent, so cross-thread dedup is best-effort (a
+# shared path may be read twice) but never corrupts — keep the writes simple
+# assignments, no compound read-modify-write.
 _json_cache = {}
 
 
@@ -403,7 +373,7 @@ def cell_from_rates(eval_set, rates, success_counts=None, episode_counts=None, e
     }
 
 
-def cells_from_aggregate(eval_sets_obj, expected_runs, configured_eval_sets, source):
+def cells_from_aggregate(eval_sets_obj, expected_runs, configured_eval_sets, source, n_episodes=None):
     cells = []
     for eval_set, data in sorted((eval_sets_obj or {}).items(), key=eval_set_key(configured_eval_sets)):
         runs = data.get("per_run_success_rate") or data.get("run_success_rates") or []
@@ -416,13 +386,22 @@ def cells_from_aggregate(eval_sets_obj, expected_runs, configured_eval_sets, sou
             std = statistics.pstdev(runs) if len(runs) > 1 else 0.0
         if mean is None:
             continue
+        # The aggregate stores only per-run rates; reconstruct the integer
+        # success/episode counts from rate x the fixed per-run episode count
+        # (rate = success / n_episodes, so success = round(rate * n_episodes)).
+        if n_episodes:
+            episode_counts = [n_episodes] * len(runs)
+            success_counts = [round(r * n_episodes) for r in runs]
+        else:
+            episode_counts = []
+            success_counts = []
         cells.append({
             "eval_set": eval_set,
             "mean_success_rate": mean,
             "std_success_rate": std or 0.0,
             "per_run_success_rate": runs,
-            "success_counts": [],
-            "episode_counts": [],
+            "success_counts": success_counts,
+            "episode_counts": episode_counts,
             "completed_runs": len(runs) if runs else expected_runs or 0,
             "expected_runs": expected_runs,
             "source": source,
@@ -449,7 +428,10 @@ def build_tree(root):
     the per-variant legacy pass); on metadata-slow filesystems (FSx
     Lustre) those repeated walks dominated the whole fetch. `videos/`
     run-artifact dirs are listed but not descended into, and symlinked
-    dirs are listed but not followed (matching pathlib `**` semantics).
+    dirs are listed but not followed (matching pathlib `**` semantics). A dir
+    that already holds its own results.json is treated as a self-sufficient
+    completed-eval aggregate and is not descended into; only aggregate-less
+    dirs are walked deeper.
     """
     root = Path(root)
     if not root.is_dir():
@@ -459,15 +441,22 @@ def build_tree(root):
     while level:
         next_level = []
         for node, entries in zip(level, _IO_POOL.map(_scan_dir, [n.path for n in level])):
+            dir_children = []
             for name, path, is_dir, descend, mtime in entries:
                 if is_dir:
                     child = DirNode(path, name)
                     node.children[name] = child
                     if descend and name != "videos":
-                        next_level.append(child)
+                        dir_children.append(child)
                 else:
                     node.has_results = True
                     node.results_mtime = mtime
+            # Aggregate-first: a dir that already holds its own results.json is a
+            # completed eval (a namespace or a run); its aggregate is
+            # self-sufficient, so don't descend into the per-run subtree. Evals
+            # still in progress (no aggregate yet) are walked so partial runs show.
+            if not node.has_results:
+                next_level.extend(dir_children)
         level = next_level
     return top
 
@@ -709,6 +698,19 @@ def job_meta_sort_key(path):
     return (0, int(stem)) if stem.isdigit() else (1, stem)
 
 
+_EVAL_NS_BY_VARIANT = {}
+
+
+def _config_meta_paths_in(variant_dir):
+    try:
+        return [
+            e.path for e in os.scandir(variant_dir)
+            if e.name.startswith("config_") and e.name.endswith(".meta.json")
+        ]
+    except OSError:
+        return []
+
+
 def load_result_job_index():
     path_index = {}
     name_index = {}
@@ -721,8 +723,18 @@ def load_result_job_index():
         meta = parse_sidecar_meta_text(text)
         info = job_info_from_meta(path.stem, meta)
         add_job_indexes(path_index, name_index, checkpoint_index, info, meta)
+        if meta.get("phase") == "eval" and meta.get("variant") and meta.get("output_namespace"):
+            _EVAL_NS_BY_VARIANT.setdefault(meta["variant"], []).append(meta["output_namespace"])
 
-    snapshot_meta_paths = sorted(experiments_root.glob("*/config_*.meta.json")) if experiments_root.exists() else []
+    # Parallel scandir (via the shared pool) instead of pathlib's serial
+    # `*/config_*.meta.json` glob, which scandirs every variant dir one-by-one.
+    if experiments_root.exists():
+        variant_dirs = [e.path for e in os.scandir(experiments_root) if e.is_dir()]
+        snapshot_meta_paths = sorted(
+            p for group in _IO_POOL.map(_config_meta_paths_in, variant_dirs) for p in group
+        )
+    else:
+        snapshot_meta_paths = []
     prefetch_json(snapshot_meta_paths)
     for path in snapshot_meta_paths:
         try:
@@ -1000,6 +1012,7 @@ def build_variant_from_root(meta, eval_node, eval_root, top_path, top_exists, to
                     expected_runs,
                     configured_eval_sets,
                     str(top_path),
+                    result["n_episodes"],
                 )
                 if cells:
                     aggregate_tasks.append({
@@ -1015,6 +1028,7 @@ def build_variant_from_root(meta, eval_node, eval_root, top_path, top_exists, to
                 expected_runs,
                 configured_eval_sets,
                 str(top_path),
+                result["n_episodes"],
             )
             if cells:
                 aggregate_tasks.append({
@@ -1064,7 +1078,22 @@ def build_variant_from_root(meta, eval_node, eval_root, top_path, top_exists, to
     return None
 
 
-def build_variant(meta):
+def _safe_mtime(path):
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _is_new_layout_source(source):
+    # A results.json under a namespaced eval_results dir (rather than the legacy
+    # top-level <variant>/results.json); used to drop a legacy row that just
+    # duplicates a namespaced one already emitted.
+    source = source or ""
+    return "/eval_results/" in source and source.endswith("/results.json")
+
+
+def _build_variant_by_walk(meta):
     variant = meta["variant"]
     exp_dir = experiments_root / variant
     if not exp_dir.exists():
@@ -1089,22 +1118,61 @@ def build_variant(meta):
             if item:
                 rows.append(item)
 
-    # Legacy layout: all eval runs directly under <variant>/eval_results and
-    # aggregate at <variant>/results.json.
+    # Legacy layout: eval runs directly under <variant>/eval_results, aggregate
+    # at <variant>/results.json.
     legacy_top = exp_dir / "results.json"
-    legacy_exists = legacy_top.exists()
-    legacy_mtime = None
+    legacy_exists = legacy_top.is_file()
+    legacy_item = build_variant_from_root(
+        meta, tree, eval_root, legacy_top, legacy_exists,
+        _safe_mtime(legacy_top) if legacy_exists else None,
+    )
+    if legacy_item and not _is_new_layout_source(legacy_item.get("source")):
+        rows.append(legacy_item)
+    return rows
+
+
+def build_variant(meta):
+    # Metadata-driven fast path: read each eval's aggregate results.json at its
+    # known path (constructed from the job-meta output_namespace) plus the legacy
+    # top-level aggregate DIRECTLY — no directory walk. Falls back to the
+    # recursive walk only where metadata can't resolve the results: meta-less
+    # variants, and live (in-progress) evals whose aggregate isn't written yet
+    # (so their partial per-run data still shows).
+    variant = meta["variant"]
+    exp_dir = experiments_root / variant
+    if not exp_dir.exists():
+        return []
+    eval_root = exp_dir / "eval_results"
+    legacy_top = exp_dir / "results.json"
+    namespaces = list(dict.fromkeys(_EVAL_NS_BY_VARIANT.get(variant, [])))
+    legacy_exists = legacy_top.is_file()
+
+    # Nothing to read directly -> discover on disk (covers meta-less variants).
+    if not namespaces and not legacy_exists:
+        return _build_variant_by_walk(meta)
+
+    ns_aggs = []
+    for ns in namespaces:
+        run_root = eval_root / ns
+        agg = run_root / "results.json"
+        if agg.is_file():
+            ns_aggs.append((run_root, agg))
+        elif run_root.exists():
+            # Namespace dir present but no aggregate yet = live eval; the walk
+            # reads its partial per-run data. (A missing dir is a dead-pointer
+            # meta whose real data lives under the legacy top-level aggregate.)
+            return _build_variant_by_walk(meta)
+
+    prefetch_json([str(agg) for _, agg in ns_aggs] + ([str(legacy_top)] if legacy_exists else []))
+    rows = []
+    for run_root, agg in ns_aggs:
+        item = build_variant_from_root(meta, None, run_root, agg, True, _safe_mtime(agg))
+        if item:
+            rows.append(item)
     if legacy_exists:
-        try:
-            legacy_mtime = legacy_top.stat().st_mtime
-        except OSError:
-            pass
-    legacy_item = build_variant_from_root(meta, tree, eval_root, legacy_top, legacy_exists, legacy_mtime)
-    if legacy_item:
-        legacy_source = legacy_item.get("source") or ""
-        duplicate_new_source = "/eval_results/" in legacy_source and legacy_source.endswith("/results.json")
-        if not duplicate_new_source:
-            rows.append(legacy_item)
+        item = build_variant_from_root(meta, None, eval_root, legacy_top, True, _safe_mtime(legacy_top))
+        if item and not _is_new_layout_source(item.get("source")):
+            rows.append(item)
     return rows
 
 
@@ -1112,7 +1180,7 @@ rows = []
 job_path_index, job_name_index, checkpoint_index = load_result_job_index()
 add_current_job_states(job_path_index, job_name_index)
 add_copied_checkpoint_indexes(checkpoint_index)
-for meta in payload:
-    rows.extend(build_variant(meta))
+for variant_rows in _VARIANT_POOL.map(build_variant, payload):
+    rows.extend(variant_rows)
 print(json.dumps(rows))
 '''
