@@ -42,22 +42,7 @@ else
     TRAIN_REPO_DIR="${SUBMIT_TRAIN_REPO_DIR:-${TRAIN_REPO_DIR:-$GROOT_N16_DIR}}"
 fi
 
-GPU_INSTANCE="$(detect_gpu_instance)"
-EXP_NAME="${SLURM_JOB_NAME:-${VARIANT}_eval_${GPU_INSTANCE}_$(date +%Y%m%d%H%M%S)}"
-OUTPUT_NAMESPACE="${SUBMIT_OUTPUT_NAMESPACE:-}"
-
-CKPT_DIR="$EXP_DIR/checkpoints"
-if [ -n "${SUBMIT_EVAL_DIR:-}" ]; then
-    EVAL_DIR="$SUBMIT_EVAL_DIR"
-elif [ -n "$OUTPUT_NAMESPACE" ]; then
-    EVAL_DIR="$EXP_DIR/eval_results/$OUTPUT_NAMESPACE"
-else
-    EVAL_DIR="$EXP_DIR/eval_results"
-fi
-RESULTS_PATH="${SUBMIT_RESULTS_PATH:-$EVAL_DIR/results.json}"
-JOB_LOG_DIR="$EXP_DIR/logs/${OUTPUT_NAMESPACE:-${SLURM_JOB_ID:-$EXP_NAME}}"
-mkdir -p "$JOB_LOG_DIR" "$LOG_DIR" "$EVAL_DIR"
-LOG_FILE="$JOB_LOG_DIR/eval.log"
+resolve_eval_output_paths
 SUBMIT_GIT_COMMIT="${SUBMIT_GIT_COMMIT:-${TRAIN_GIT_COMMIT:-}}"
 pin_training_repo_dir "$TRAIN_REPO_DIR" "$SUBMIT_GIT_COMMIT" "${SLURM_JOB_ID:-$OUTPUT_NAMESPACE}"
 
@@ -233,8 +218,8 @@ fi
 PIDS=()
 PORTS=()
 FAILED=0
-LAUNCH_IDX=0
 EVAL_LAUNCHED=0
+init_gpu_slot_pool
 
 trap cleanup_all EXIT
 trap 'cleanup_all; exit 130' INT TERM
@@ -500,10 +485,10 @@ for task_entry in "${TASKS[@]}"; do
                 continue
             fi
             wait_for_slot
-            GPU_SLOT="$LAUNCH_IDX"
-            START_SLOT="$((LAUNCH_IDX % EVAL_PARALLEL_WORKERS))"
+            acquire_gpu_slot
+            GPU_SLOT="$ACQUIRED_SLOT"
+            START_SLOT="$GPU_SLOT"
             PORT="$(find_eval_port)"
-            LAUNCH_IDX=$((LAUNCH_IDX + 1))
             run_eval_one \
                 "$TASK_SHORT_LOOP" \
                 "$TASK_NAME_LOOP" \
@@ -517,6 +502,7 @@ for task_entry in "${TASKS[@]}"; do
                 "$PORT" \
                 "$START_SLOT" &
             PIDS+=("$!")
+            PID_SLOTS+=("$GPU_SLOT")
             EVAL_LAUNCHED=$((EVAL_LAUNCHED + 1))
         done
         EVAL_SET_IDX=$((EVAL_SET_IDX + 1))
@@ -535,4 +521,4 @@ finish_eval_launch_phase "$EVAL_LAUNCHED" "$FAILED" "$RESULTS_PATH"
 
 aggregate_eval_results "$MODEL_FAMILY"
 
-log "DONE  $RESULTS_PATH"
+emit_done_marker "$RESULTS_PATH"
