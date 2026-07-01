@@ -85,6 +85,7 @@ async def _resubmit_slurm_job(
     partition = str(record.get("Partition") or "").strip() or None
     job_name = det.job_name or str(record.get("JobName") or "").strip() or None
     retrying = action == "retry"
+    resolved_job_name = _retry_job_name(job_name) if retrying else job_name
 
     env = await load_cluster(cluster)
     meta = await read_slurm_meta(env.ssh_alias, job_id)
@@ -110,7 +111,7 @@ async def _resubmit_slurm_job(
                 train_save_steps=int_meta("train_save_steps"),
                 train_num_workers=int_meta("train_num_workers"),
                 train_action_horizon=int_meta("train_action_horizon"),
-                job_name=_retry_job_name(job_name) if retrying else job_name,
+                job_name=resolved_job_name,
                 output_namespace=(meta.get("output_namespace") or "").strip() or None,
                 resume=not retrying,
                 resume_of=job_id,
@@ -150,7 +151,7 @@ async def _resubmit_slurm_job(
             eval_sets=eval_sets,
             checkpoint_path=checkpoint,
             seed_eval_results_from=seed_eval_dirs,
-            job_name=_retry_job_name(job_name) if retrying else job_name,
+            job_name=resolved_job_name,
             output_namespace=(meta.get("output_namespace") or "").strip() or None,
             resume_of=job_id,
             resubmit_action=action,
