@@ -1332,7 +1332,7 @@ export default function SubmitPage() {
                             <span
                               className={`text-xs ${n.gpu_free > 0 ? "text-green-600 dark:text-green-400" : "text-slate-500"}`}
                             >
-                              {n.gpu_free}/{n.gpu_total} available
+                              {n.gpu_free}/{n.gpu_total} {n.gpu_type ?? "GPU"} available
                             </span>
                           </span>
                         </SelectItem>
