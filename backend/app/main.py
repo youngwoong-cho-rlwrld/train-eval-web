@@ -166,7 +166,7 @@ async def get_cluster_datasets(name: str, path: str | None = None):
     except FileNotFoundError:
         raise HTTPException(404, f"cluster {name} not found")
     except RuntimeError as e:
-        raise HTTPException(503, str(e))
+        raise HTTPException(503 if name == "mlxp" else 500, str(e))
 
 
 @app.get("/api/dexjoco/tasks", response_model=dexjoco.DexjocoTasks)
@@ -176,7 +176,7 @@ async def get_dexjoco_tasks(cluster: str):
     except FileNotFoundError:
         raise HTTPException(404, f"cluster {cluster} not found")
     except RuntimeError as e:
-        raise HTTPException(503, str(e))
+        raise HTTPException(503 if cluster == "mlxp" else 500, str(e))
 
 
 # ── variants ──
@@ -797,65 +797,70 @@ async def post_wandb_project(req: wandb_auth.ProjectRequest):
 @app.get("/api/jobs/{cluster}/{job_id}/flags")
 async def get_job_flags(cluster: str, job_id: str):
     """All flags the training/eval entrypoint receives for this job."""
-    det = await details.get_details(
-        cluster,
-        job_id,
-        include_config=True,
-        include_progress=False,
-    )
-    if not det.variant:
-        return {"flags": []}
     try:
-        if det.config_snapshot and det.config_snapshot.text:
-            v = await variants.parse_variant_text(det.variant, det.config_snapshot.text)
-        else:
-            v = await variants.load_variant(det.variant)
-    except FileNotFoundError:
-        return {"flags": []}
-    out = flags.flags_for(v, det.phase)
-    submitted_extra_args = det.config_snapshot.extra_args if det.config_snapshot else []
-    if submitted_extra_args:
-        idx = 0
-        while idx < len(submitted_extra_args):
-            arg = submitted_extra_args[idx]
-            if arg.startswith("--") and idx + 1 < len(submitted_extra_args) and not submitted_extra_args[idx + 1].startswith("--"):
-                out.append((arg, submitted_extra_args[idx + 1]))
-                idx += 2
-            else:
-                out.append((arg, ""))
-                idx += 1
-    if cluster != "mlxp" and det.phase == "eval":
-        env = await clusters.load_cluster(cluster)
-        meta = await read_slurm_meta(env.ssh_alias, job_id)
-        envs_override = (
-            meta.get("eval_num_envs_per_gpu")
-            or ""
-        ).strip()
+        det = await details.get_details(
+            cluster,
+            job_id,
+            include_config=True,
+            include_progress=False,
+        )
+        if not det.variant:
+            return {"flags": []}
         try:
-            envs_override = str(submit.clamp_eval_num_envs(int(envs_override)))
-        except ValueError:
-            pass
-        overrides = {
-            "EVAL_NUM_ENVS_PER_GPU": envs_override,
-            "--n-episodes": (meta.get("eval_n_episodes") or "").strip(),
-            "--n-runs": (meta.get("eval_n_runs") or "").strip(),
-            "(eval_sets)": (meta.get("eval_sets") or "").strip(),
-        }
-        overrides = {k: v for k, v in overrides.items() if v}
-        if overrides:
-            rewritten: list[tuple[str, str]] = []
-            replaced: set[str] = set()
-            for flag, val in out:
-                if flag in overrides:
-                    rewritten.append((flag, overrides[flag]))
-                    replaced.add(flag)
+            if det.config_snapshot and det.config_snapshot.text:
+                v = await variants.parse_variant_text(det.variant, det.config_snapshot.text)
+            else:
+                v = await variants.load_variant(det.variant)
+        except FileNotFoundError:
+            return {"flags": []}
+        out = flags.flags_for(v, det.phase)
+        submitted_extra_args = det.config_snapshot.extra_args if det.config_snapshot else []
+        if submitted_extra_args:
+            idx = 0
+            while idx < len(submitted_extra_args):
+                arg = submitted_extra_args[idx]
+                if arg.startswith("--") and idx + 1 < len(submitted_extra_args) and not submitted_extra_args[idx + 1].startswith("--"):
+                    out.append((arg, submitted_extra_args[idx + 1]))
+                    idx += 2
                 else:
-                    rewritten.append((flag, val))
-            for flag, value in overrides.items():
-                if flag not in replaced:
-                    rewritten.append((flag, value))
-            out = rewritten
-    return {"flags": flags.serialize_flags(out)}
+                    out.append((arg, ""))
+                    idx += 1
+        if cluster != "mlxp" and det.phase == "eval":
+            env = await clusters.load_cluster(cluster)
+            meta = await read_slurm_meta(env.ssh_alias, job_id)
+            envs_override = (
+                meta.get("eval_num_envs_per_gpu")
+                or ""
+            ).strip()
+            try:
+                envs_override = str(submit.clamp_eval_num_envs(int(envs_override)))
+            except ValueError:
+                pass
+            overrides = {
+                "EVAL_NUM_ENVS_PER_GPU": envs_override,
+                "--n-episodes": (meta.get("eval_n_episodes") or "").strip(),
+                "--n-runs": (meta.get("eval_n_runs") or "").strip(),
+                "(eval_sets)": (meta.get("eval_sets") or "").strip(),
+            }
+            overrides = {k: v for k, v in overrides.items() if v}
+            if overrides:
+                rewritten: list[tuple[str, str]] = []
+                replaced: set[str] = set()
+                for flag, val in out:
+                    if flag in overrides:
+                        rewritten.append((flag, overrides[flag]))
+                        replaced.add(flag)
+                    else:
+                        rewritten.append((flag, val))
+                for flag, value in overrides.items():
+                    if flag not in replaced:
+                        rewritten.append((flag, value))
+                out = rewritten
+        return {"flags": flags.serialize_flags(out)}
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
 
 
 # ── copy checkpoint ──
