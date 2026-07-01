@@ -11,7 +11,6 @@ from typing import Any
 
 from .clusters import list_clusters, load_cluster
 from .mlxp_config import get_settings as get_mlxp_settings
-from .mlxp_data_pod import ensure_listing_pod
 from .paths import CHECKPOINT_COPY_HISTORY_REL, CLUSTER_STAGING_REL
 from .remote_paths import _kubectl_bash_lc
 from .ssh import ssh_run
@@ -166,25 +165,11 @@ async def _slurm_copy_history_records(host: str) -> list[dict[str, Any]]:
 
 async def _mlxp_copy_history_records() -> list[dict[str, Any]]:
     settings = get_mlxp_settings()
-    pod = await ensure_listing_pod()
     hist_dir = shlex.quote(f"{settings.experiments_dir}/{CHECKPOINT_COPY_HISTORY_REL}")
-    proc = await asyncio.create_subprocess_exec(
-        "kubectl",
-        "exec",
-        "-n",
-        settings.namespace,
-        pod,
-        "--",
-        "bash",
-        "-lc",
-        f"cat {hist_dir}/*.jsonl 2>/dev/null || true",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
-    if proc.returncode != 0:
+    rc, out, _err = await _kubectl_bash_lc(f"cat {hist_dir}/*.jsonl 2>/dev/null || true", 15.0)
+    if rc != 0:
         return []
-    return _parse_jsonl_records(stdout.decode(errors="replace"))
+    return _parse_jsonl_records(out)
 
 
 def _parse_jsonl_records(text: str) -> list[dict[str, Any]]:

@@ -23,7 +23,7 @@ from pydantic import BaseModel
 
 from .clusters import _BASH, _bash_unescape
 from .paths import EXPERIMENTS_DIR, REPO_ROOT
-from .submission_snapshot import set_scalar
+from .submission_snapshot import is_safe_relpath, set_scalar
 from .training_models import resolve_training_model
 
 # Default DATA_CONFIG_MAP key used when a variant does not set DATA_CONFIG.
@@ -243,7 +243,7 @@ def _active_second_file(exp_dir: Path, variant: Variant, model_family: str) -> V
 def _active_second_title(exp_dir: Path, variant: Variant, model_family: str) -> str:
     spec = _spec_for(model_family)
     rel = (variant.vars.get(spec.config_var) or "").strip()
-    if rel and _is_safe_relative_file(rel, spec.suffixes):
+    if rel and is_safe_relpath(rel, set(spec.suffixes)):
         return rel
     if model_family == "n1.5":
         for candidate in ("data_config.yaml", "data_config.yml"):
@@ -252,18 +252,6 @@ def _active_second_title(exp_dir: Path, variant: Variant, model_family: str) -> 
         return spec.default_name
     py_files = sorted(p.name for p in exp_dir.glob("*.py") if p.is_file())
     return py_files[0] if len(py_files) == 1 else spec.default_name
-
-
-def _is_safe_relative_file(rel: str, suffixes: frozenset[str]) -> bool:
-    path = Path(rel)
-    return (
-        bool(rel)
-        and not path.is_absolute()
-        and path.name == rel
-        and not rel.startswith(".")
-        and ".." not in path.parts
-        and path.suffix in suffixes
-    )
 
 
 def _second_kind(model_family: str) -> str:
@@ -313,7 +301,7 @@ def _generated_data_config_yaml(variant: Variant) -> str:
 def _validate_second_title(title: str, model_family: str) -> str:
     clean = title.strip()
     spec = _spec_for(model_family)
-    if not _is_safe_relative_file(clean, spec.suffixes):
+    if not is_safe_relpath(clean, set(spec.suffixes)):
         suffix = ".yaml/.yml" if model_family == "n1.5" else ".py"
         raise ValueError(f"second file title must be a single {suffix} filename")
     if clean == "config.sh":
@@ -391,7 +379,7 @@ def _spec_for(model_family: str) -> SecondFileSpec:
 
 def _set_second_file_ref(config_text: str, second_title: str, model_family: str) -> str:
     spec = _spec_for(model_family)
-    # second_title is a validated relative filename (see _is_safe_relative_file),
+    # second_title is a validated relative filename (see is_safe_relpath),
     # so it is stored unquoted to match the on-disk config.sh convention.
     return set_scalar(config_text, spec.config_var, second_title, quote=False)
 
