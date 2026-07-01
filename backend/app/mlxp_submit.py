@@ -959,6 +959,7 @@ uv run $UV_RUN_ARGS torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/la
     --experiment-name "{output_namespace}" \\
     --use-wandb \\
     --wandb-project {wandb_project} \\
+    --color-jitter-params brightness 0.2 contrast 0.2 saturation 0.2 hue 0.1 \\
     $RESUME_FLAG{action_horizon_arg} {train_extra} {user_extra}
 
 {_strip_resume_state_block(ckpt_dir, max_steps)}
