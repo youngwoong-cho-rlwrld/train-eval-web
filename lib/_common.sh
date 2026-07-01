@@ -1,4 +1,4 @@
-# Helpers shared by train_body.sh and eval_body.sh.
+# Helpers shared by train_body.sh, eval_body.sh and eval_body_dexjoco.sh.
 # Sourced — does not run on its own.
 
 log() {
@@ -160,6 +160,15 @@ finish_eval_launch_phase() {
     fi
 }
 
+# Emit the final eval completion marker. It MUST be an unprefixed, line-start
+# "DONE  <results_path>" so backend/app/eval_completion.py's `^DONE[[:space:]]`
+# grep matches — a log() timestamp prefix would defeat that anchored grep and
+# the backend would never recognise a nonzero-exit-but-complete eval. Shared by
+# eval_body.sh and eval_body_dexjoco.sh so the contract lives in one place.
+emit_done_marker() {
+    echo "DONE  $1" | tee -a "${LOG_FILE:-/dev/null}"
+}
+
 # ── Shared eval validation helpers (Isaac + DexJoCo harnesses) ────────────────
 # Used by eval_body.sh (both n1.5 and n1.6) and eval_body_dexjoco.sh. The Isaac
 # helpers read/modify caller-scope variables (N_EPISODES, EVAL_SETS, LAST_CKPT,
@@ -187,6 +196,28 @@ require_eval_checkpoint_path() {
     if [ ! -e "$LAST_CKPT" ]; then
         echo "ERROR: checkpoint path not found: $LAST_CKPT"; exit 1
     fi
+}
+
+# Resolve the standard eval output layout from EXP_DIR + submit overrides into
+# caller scope and create the dirs. Sets GPU_INSTANCE, EXP_NAME,
+# OUTPUT_NAMESPACE, EVAL_DIR, RESULTS_PATH, JOB_LOG_DIR, LOG_FILE. Shared by
+# eval_body.sh and eval_body_dexjoco.sh. Requires EXP_DIR, VARIANT and LOG_DIR
+# (from the sourced cluster env) to be set.
+resolve_eval_output_paths() {
+    GPU_INSTANCE="$(detect_gpu_instance)"
+    EXP_NAME="${SLURM_JOB_NAME:-${VARIANT}_eval_${GPU_INSTANCE}_$(date +%Y%m%d%H%M%S)}"
+    OUTPUT_NAMESPACE="${SUBMIT_OUTPUT_NAMESPACE:-}"
+    if [ -n "${SUBMIT_EVAL_DIR:-}" ]; then
+        EVAL_DIR="$SUBMIT_EVAL_DIR"
+    elif [ -n "$OUTPUT_NAMESPACE" ]; then
+        EVAL_DIR="$EXP_DIR/eval_results/$OUTPUT_NAMESPACE"
+    else
+        EVAL_DIR="$EXP_DIR/eval_results"
+    fi
+    RESULTS_PATH="${SUBMIT_RESULTS_PATH:-$EVAL_DIR/results.json}"
+    JOB_LOG_DIR="$EXP_DIR/logs/${OUTPUT_NAMESPACE:-${SLURM_JOB_ID:-$EXP_NAME}}"
+    mkdir -p "$JOB_LOG_DIR" "$LOG_DIR" "$EVAL_DIR"
+    LOG_FILE="$JOB_LOG_DIR/eval.log"
 }
 
 # ── Shared eval helpers (Isaac harness: eval_body.sh, both n1.5 and n1.6) ──────
@@ -234,8 +265,34 @@ validate_eval_counts() {
     log "Eval shape: ${N_RUNS} runs x ${N_EPISODES} episodes; eval_sets=${EVAL_SETS[*]}"
 }
 
-# Background-worker PID pool shared by the eval launch loop. cleanup_all and the
-# trap are installed by the caller after PIDS=() is declared.
+# Background-worker PID pool shared by the eval launch loop. The caller declares
+# PIDS=() and calls init_gpu_slot_pool, then installs cleanup_all + the trap.
+#
+# GPU-slot pool: each concurrent worker holds a distinct logical slot
+# (0..EVAL_PARALLEL_WORKERS-1) which select_cuda_device maps to a distinct GPU.
+# acquire_gpu_slot hands one out; refresh_running_pids returns it when the worker
+# exits. This is why slots are pooled rather than derived from a monotonic launch
+# counter: `launch_idx % gpu_count` co-locates two live workers on one GPU as soon
+# as completion is out of order (worker on slot 1 finishes while slot 0 still runs,
+# then the next launch reuses slot 0's GPU).
+init_gpu_slot_pool() {
+    FREE_SLOTS=()
+    local s
+    for ((s = 0; s < EVAL_PARALLEL_WORKERS; s++)); do
+        FREE_SLOTS+=("$s")
+    done
+    PID_SLOTS=()
+}
+
+# Pop the next free GPU slot into ACQUIRED_SLOT. wait_for_slot guarantees one is
+# available. Sets a global rather than echoing so the pop persists in the
+# caller's shell — a `$(acquire_gpu_slot)` command substitution would mutate
+# FREE_SLOTS only inside the subshell and always hand back the same slot.
+acquire_gpu_slot() {
+    ACQUIRED_SLOT="${FREE_SLOTS[0]}"
+    FREE_SLOTS=("${FREE_SLOTS[@]:1}")
+}
+
 cleanup_all() {
     [ "${#PIDS[@]}" -eq 0 ] && return 0
     for pid in "${PIDS[@]}"; do
@@ -245,14 +302,17 @@ cleanup_all() {
 
 refresh_running_pids() {
     local status=0
+    local i
     local pid
     local running_pid
     local is_running
     local running_pids=()
     local active_pids=()
+    local active_slots=()
 
     mapfile -t running_pids < <(jobs -pr)
-    for pid in "${PIDS[@]}"; do
+    for i in "${!PIDS[@]}"; do
+        pid="${PIDS[$i]}"
         is_running=0
         for running_pid in "${running_pids[@]}"; do
             if [ "$pid" = "$running_pid" ]; then
@@ -262,16 +322,22 @@ refresh_running_pids() {
         done
         if [ "$is_running" -eq 1 ]; then
             active_pids+=("$pid")
-        elif wait "$pid"; then
-            :
+            active_slots+=("${PID_SLOTS[$i]}")
         else
-            local worker_status=$?
-            log "ERROR: eval worker pid $pid exited with status $worker_status"
-            FAILED=1
-            status=1
+            # Worker finished — return its GPU slot to the pool, then reap it.
+            FREE_SLOTS+=("${PID_SLOTS[$i]}")
+            if wait "$pid"; then
+                :
+            else
+                local worker_status=$?
+                log "ERROR: eval worker pid $pid exited with status $worker_status"
+                FAILED=1
+                status=1
+            fi
         fi
     done
     PIDS=("${active_pids[@]}")
+    PID_SLOTS=("${active_slots[@]}")
     return "$status"
 }
 
@@ -299,6 +365,7 @@ wait_for_all() {
         sleep 2
     done
     PIDS=()
+    PID_SLOTS=()
     return "$status"
 }
 
@@ -326,6 +393,7 @@ find_eval_port() {
 select_cuda_device() {
     local slot="$1"
     local visible="${CUDA_VISIBLE_DEVICES:-}"
+    local devices
     if [ -n "$visible" ]; then
         IFS=',' read -r -a devices <<< "$visible"
         local count="${#devices[@]}"
