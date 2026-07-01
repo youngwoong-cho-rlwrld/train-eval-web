@@ -1,9 +1,10 @@
 """Per-job extended details: phase, paths, wandb url, progress.
 
-Parses metadata out of the job_name (shape `{train|resume|eval}_{variant}_{YYYYMMDD}_{HHMMSS}`,
-identical across slurm and mlxp), reads variant config locally, and asks
-the cluster a few small questions over SSH (slurm) or kubectl (mlxp) to
-compute progress.
+Parses metadata out of the job_name (canonical shape
+`{train|resume|eval}_{variant}_{YYYYMMDD}_{HHMMSS}`; prefixed and legacy slurm
+job-name shapes are also tolerated — see job_identity.parse_phase_and_variant
+for the authority), reads variant config locally, and asks the cluster a few
+small questions over SSH (slurm) or kubectl (mlxp) to compute progress.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ from .jobs import get_job
 from .mlxp_config import get_settings
 from .mlxp_data_pod import ensure_listing_pod
 from .paths import CLUSTER_STAGING_REL
-from .remote_paths import expand_cluster_home, expand_home_path, remote_home, remote_path_expr
+from .remote_paths import expand_cluster_home, expand_home_path, remote_home, remote_path_expr, remote_shell_path
 from .submission_snapshot import SubmitGitInfo, render_training_config_snapshot
 from .ssh import ssh_run
 from .slurm_meta import read_slurm_meta
@@ -610,11 +611,17 @@ def _reconcile_eval_progress_from_runs(progress: Progress, eval_runs: list[EvalR
         progress.current_step = min(current_step, progress.max_steps)
         progress.percent = round(100.0 * progress.current_step / progress.max_steps, 1)
         progress.current_label = (
-            f"{progress.completed_runs}/{progress.total_runs} result files · "
-            f"{progress.current_step}/{progress.max_steps} episodes"
+            _eval_episodes_label(
+                progress.completed_runs, progress.total_runs, progress.current_step, progress.max_steps
+            )
             if progress.total_runs
             else f"{progress.current_step}/{progress.max_steps} episodes"
         )
+
+
+def _eval_episodes_label(completed: int, total: int, current_step: int, max_steps: int) -> str:
+    """Shared label for eval progress measured in episodes (result files + steps)."""
+    return f"{completed}/{total} result files · {current_step}/{max_steps} episodes"
 
 
 def _apply_eval_step_shape(
@@ -635,9 +642,8 @@ def _apply_eval_step_shape(
         progress.max_steps = total * n_eps
         progress.current_step = min(current_eps, progress.max_steps)
         progress.percent = round(100.0 * progress.current_step / progress.max_steps, 1)
-        progress.current_label = (
-            f"{completed}/{total} result files · "
-            f"{progress.current_step}/{progress.max_steps} episodes"
+        progress.current_label = _eval_episodes_label(
+            completed, total, progress.current_step, progress.max_steps
         )
     else:
         progress.percent = round(100.0 * completed / total, 1)
@@ -785,11 +791,7 @@ async def _slurm_config_snapshot(
         if rel:
             cmd = f"cat $HOME/{shlex.quote(rel)} 2>/dev/null"
         else:
-            cat_path = path
-            if cat_path.startswith("$HOME/"):
-                cmd = f"cat $HOME/{shlex.quote(cat_path[len('$HOME/'):])} 2>/dev/null"
-            else:
-                cmd = f"cat {shlex.quote(cat_path)} 2>/dev/null"
+            cmd = f"cat {remote_shell_path(path)} 2>/dev/null"
         r = await ssh_run(host, cmd, timeout=10.0)
         if r.returncode == 0:
             text = r.stdout
@@ -994,12 +996,8 @@ async def _slurm_optional_text(host: str, path: str | None, rel: str | None = No
         return None
     if rel:
         cmd = f"cat $HOME/{shlex.quote(rel)} 2>/dev/null"
-    elif path and path.startswith("$HOME/"):
-        cmd = f"cat $HOME/{shlex.quote(path[len('$HOME/'):])} 2>/dev/null"
-    elif path and path.startswith("~/"):
-        cmd = f"cat $HOME/{shlex.quote(path[len('~/'):])} 2>/dev/null"
     elif path:
-        cmd = f"cat {shlex.quote(path)} 2>/dev/null"
+        cmd = f"cat {remote_shell_path(path)} 2>/dev/null"
     else:
         return None
     r = await ssh_run(host, cmd, timeout=10.0)
@@ -1241,7 +1239,7 @@ async def _mlxp_eval_runs(eval_dir: str) -> list[EvalRun]:
     if shutil.which("kubectl") is None:
         return []
     cmd = (
-        f"EVAL_DIR={shlex.quote(eval_dir)} "
+        f"EVAL_DIR={remote_path_expr(eval_dir)} "
         "python3 - <<'PY'\n"
         + _EVAL_RUNS_SCRIPT
         + "\nPY"
@@ -1451,8 +1449,10 @@ async def _mlxp_progress(
 ) -> Progress:
     """Progress for an MLXP training job.
 
-    Primary source: the run's wandb summary (its `_step` field is updated
-    every logging tick — i.e. every 10 training steps for gr00t-n16).
+    Primary source: the run's wandb summary `train/global_step` (the true
+    training-loop step), falling back to `global_step` then wandb's built-in
+    `_step` — which counts wandb.log() calls (~10x coarser for gr00t-n16) and
+    is only the last-resort fallback. See _wandb_step for the exact order.
     Fallback: highest `checkpoint-N` dir on DDN (SAVE_STEPS granularity).
 
     `run_id` is the wandb run id — the job_name (display name) for MLXP,
