@@ -1,5 +1,5 @@
-"""Websocket policy server exposing a fine-tuned GR00T N1.6 policy over the
-openpi-client protocol that the DexJoCo eval client speaks.
+"""Websocket policy server exposing a fine-tuned GR00T N1.6 / PhysiXel policy
+over the openpi-client protocol that the DexJoCo eval client speaks.
 
 obs in  (single-arm): {"base", "wrist": uint8[H,W,3], "state": float[23], "prompt": str}
 obs in  (dual-arm):   {"base", "wrist_left", "wrist_right": uint8[H,W,3], "state": float[46], "prompt": str}
