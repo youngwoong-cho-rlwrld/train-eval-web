@@ -686,7 +686,7 @@ function ProgressCard({
   const isComplete = isCompletedJobState(state);
   // Treat a completed job as 100% even when the backend signal didn't make
   // it (e.g. wandb run already archived, checkpoint path moved off DDN).
-  const effectivePercent = isComplete ? 100 : (p?.percent ?? 0);
+  const effectivePercent = isComplete ? 100 : Math.max(0, Math.min(100, p?.percent ?? 0));
   const showBar = hasRenderableProgress(p, { isComplete });
   // Surface wandb-not-configured as the actionable cause of empty progress,
   // rather than the generic "No progress yet" which looks like a backend bug.
