@@ -232,7 +232,7 @@ async def restore_variant_files(name: str, version: str):
 
 
 @app.get("/api/variants/{name}/flags")
-async def get_variant_flags(name: str, cluster: str, phase: str = "train"):
+async def get_variant_flags(name: str, cluster: str | None = None, phase: str = "train"):
     try:
         v = await variants.load_variant(name)
     except FileNotFoundError:
