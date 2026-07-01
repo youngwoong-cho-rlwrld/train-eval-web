@@ -1,4 +1,5 @@
 import type { GpuQueueSnapshot } from "@/lib/api";
+import { InlineLoading } from "@/components/loading-state";
 
 export function GpuQueueTooltipContent({
   snapshot,
@@ -14,7 +15,7 @@ export function GpuQueueTooltipContent({
   currentJobId?: string;
 }) {
   if (loading) {
-    return <span className="font-mono text-xs text-slate-500">loading queue...</span>;
+    return <InlineLoading label="Loading queue..." />;
   }
   if (error) {
     return <span className="text-xs text-red-600 dark:text-red-400">{error.message}</span>;
@@ -27,7 +28,7 @@ export function GpuQueueTooltipContent({
     <div className="space-y-1">
       {fetching && (
         <div className="font-mono text-[11px] text-amber-600 dark:text-amber-400">
-          fetching GPUs...
+          Fetching GPUs...
         </div>
       )}
       <GpuQueueVisualization snapshot={snapshot} currentJobId={currentJobId} />

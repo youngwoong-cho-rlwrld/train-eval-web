@@ -13,7 +13,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { RefreshButton } from "@/components/refresh-button";
-import { ErrorState, LoadingState } from "@/components/loading-state";
+import { ErrorState, InlineLoading, LoadingState } from "@/components/loading-state";
 import { ImmediateTooltip } from "@/components/immediate-tooltip";
 import { JobStateBadge } from "@/components/job-state-badge";
 import { isActiveJobState, primaryJobState } from "@/lib/job-status";
@@ -152,9 +152,7 @@ export default function ResultsPage() {
             Table View
           </Button>
           {probing.length > 0 && (
-            <span className="flex h-8 items-center text-xs text-slate-400">
-              loading {probing.join(", ")}…
-            </span>
+            <InlineLoading label={`Loading ${probing.join(", ")}...`} className="h-8" />
           )}
           <RefreshButton isFetching={isFetching} onRefresh={refresh} intervalMs={REFRESH_MS} />
         </div>

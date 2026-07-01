@@ -43,7 +43,7 @@ export function RefreshButton({
         className={cn("h-3.5 w-3.5", isFetching && "animate-spin")}
       />
       {isFetching
-        ? "Refreshing…"
+        ? "Refreshing..."
         : totalSec
           ? `Refresh now (${left}s)`
           : "Refresh now"}

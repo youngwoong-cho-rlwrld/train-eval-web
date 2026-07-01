@@ -9,6 +9,7 @@ import { api, type Job, type SubmitResponse } from "@/lib/api";
 import { jobDetailHref } from "@/lib/job-links";
 import type { JobPhase } from "@/lib/job-status";
 import { Button } from "@/components/ui/button";
+import { InlineLoading } from "@/components/loading-state";
 import {
   Dialog,
   DialogContent,
@@ -141,7 +142,7 @@ export function ResumeJobButton({
             <div className="grid gap-1">
               <span>{isRetry ? "Retry jobs:" : "Resumed jobs:"}</span>
               {resumedJobs.isLoading ? (
-                <span className="font-mono text-xs text-slate-500">loading...</span>
+                <InlineLoading />
               ) : resumedJobs.data?.length ? (
                 <ul className="space-y-1">
                   {resumedJobs.data.map((job) => (

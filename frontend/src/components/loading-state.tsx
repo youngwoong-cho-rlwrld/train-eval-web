@@ -1,3 +1,5 @@
+import { Loader2 } from "lucide-react";
+
 import { cn } from "@/lib/utils";
 
 export function LoadingState({
@@ -26,6 +28,27 @@ export function LoadingState({
         ))}
       </div>
     </div>
+  );
+}
+
+export function InlineLoading({
+  label = "Loading...",
+  className,
+}: {
+  label?: string;
+  className?: string;
+}) {
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400",
+        className,
+      )}
+      aria-busy="true"
+    >
+      <Loader2 aria-hidden="true" className="h-3.5 w-3.5 shrink-0 animate-spin" />
+      {label}
+    </span>
   );
 }
 

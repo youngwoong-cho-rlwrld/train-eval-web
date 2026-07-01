@@ -115,7 +115,7 @@ export function ConfigCard({
           config.sh{" "}
           <span className="text-xs font-normal text-slate-500">
             {loading
-              ? "(loading experiment...)"
+              ? "(Loading experiment...)"
               : variantName ?? "(experiment unknown - couldn't parse job_name)"}
           </span>
         </CardTitle>
@@ -344,7 +344,7 @@ export function DataInterfaceCard({
           </ImmediateTooltip>
           <span className="text-xs font-normal text-slate-500">
             {loading
-              ? "(loading experiment...)"
+              ? "(Loading experiment...)"
               : variantName ?? "(experiment unknown - couldn't parse job_name)"}
           </span>
         </CardTitle>

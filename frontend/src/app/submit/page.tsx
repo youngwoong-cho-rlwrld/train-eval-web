@@ -934,7 +934,7 @@ export default function SubmitPage() {
                 <SelectTrigger className="gap-2">
                   <SelectValue placeholder="select a task..." />
                   {dexjocoTasks.isFetching && (
-                    <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-slate-400" />
+                    <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-slate-500 dark:text-slate-400" />
                   )}
                 </SelectTrigger>
                 <SelectContent>
@@ -1244,7 +1244,7 @@ export default function SubmitPage() {
                 <Field label="Partition">
                   <Select value={selectedPartitionName} onValueChange={setPartition}>
                     <SelectTrigger>
-                      <SelectValue placeholder="loading partitions…" />
+                      <SelectValue placeholder="Loading partitions..." />
                     </SelectTrigger>
                     <SelectContent>
                       {partitions.data?.map((p) => (
@@ -1547,7 +1547,7 @@ export default function SubmitPage() {
               <SelectTrigger className="gap-2">
                 <SelectValue placeholder="select a commit..." />
                 {gitCommitOptions.isFetching && (
-                  <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-slate-400" />
+                  <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-slate-500 dark:text-slate-400" />
                 )}
               </SelectTrigger>
               <SelectContent className="w-[var(--radix-select-trigger-width)] max-w-[var(--radix-select-trigger-width)] min-w-0">

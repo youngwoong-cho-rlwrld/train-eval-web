@@ -54,7 +54,7 @@ import { CopyCheckpointDialog } from "@/components/copy-checkpoint-dialog";
 import { CheckpointCopyList } from "@/components/checkpoint-copy-history";
 import { ResumeJobButton } from "@/components/resume-job-button";
 import { RefreshButton } from "@/components/refresh-button";
-import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state";
+import { EmptyState, ErrorState, InlineLoading, LoadingState } from "@/components/loading-state";
 import { JobStateBadge } from "@/components/job-state-badge";
 import { ImmediateTooltip } from "@/components/immediate-tooltip";
 import { Th } from "@/components/table";
@@ -225,10 +225,7 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
             <span className="text-slate-500">{cluster}</span>
           </h1>
           {details.isLoading && (
-            <div className="mt-1 flex items-center gap-2 text-sm text-slate-600 dark:text-slate-400">
-              <Badge variant="secondary">loading</Badge>
-              <span className="font-mono text-xs">resolving job details...</span>
-            </div>
+            <InlineLoading label="Resolving job details..." className="mt-1" />
           )}
           {details.error && (
             <div className="mt-1 text-sm text-red-600 dark:text-red-400">
@@ -318,7 +315,7 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
             onClick={() => setConfirmCancel(true)}
             disabled={cancel.isPending}
           >
-            {cancel.isPending ? "Cancelling…" : cancelLabel}
+            {cancel.isPending ? "Cancelling..." : cancelLabel}
           </Button>
         </div>
       </div>
@@ -871,11 +868,7 @@ function CheckpointCopyHistoryRows({
   history: UseQueryResult<CheckpointCopyRecord[], Error>;
 }) {
   if (history.isLoading) {
-    return (
-      <div className="pb-2 pl-[110px] text-xs text-slate-500">
-        Loading copied checkpoints...
-      </div>
-    );
+    return <InlineLoading label="Loading copied checkpoints..." className="pb-2 pl-[110px]" />;
   }
   if (history.error) {
     return (

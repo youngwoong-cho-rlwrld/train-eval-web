@@ -1,6 +1,5 @@
 "use client";
 
-import { Loader2 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { keepPreviousData, useIsFetching, useQueries, useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
 import { api, type Job, type JobProgress } from "@/lib/api";
@@ -14,7 +13,7 @@ import { CopyButton } from "@/components/copy-button";
 import { CopyCheckpointDialog } from "@/components/copy-checkpoint-dialog";
 import { ResumeJobButton } from "@/components/resume-job-button";
 import { RefreshButton } from "@/components/refresh-button";
-import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state";
+import { EmptyState, ErrorState, InlineLoading, LoadingState } from "@/components/loading-state";
 import { JobStateBadge } from "@/components/job-state-badge";
 import { ImmediateTooltip } from "@/components/immediate-tooltip";
 import { PendingQueueLabel, pendingQueuePositionLabel } from "@/components/pending-queue-label";
@@ -173,7 +172,7 @@ export default function JobsPage() {
           )}
           {active.length > 0 && <JobTable rows={active} showProgress showActions={false} />}
           {!activeMerged.initialLoading && activeMerged.probing.length > 0 && (
-            <p className="mt-2 text-xs text-slate-400">loading {activeMerged.probing.join(", ")}…</p>
+            <InlineLoading label={`Loading ${activeMerged.probing.join(", ")}...`} className="mt-2" />
           )}
         </CardContent>
       </Card>
@@ -269,10 +268,7 @@ export default function JobsPage() {
               Apply
             </Button>
             {recentMerged.probing.length > 0 && (
-              <span className="flex h-8 items-center gap-1.5 text-xs text-slate-400">
-                <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-slate-400" />
-                loading {recentMerged.probing.join(", ")}…
-              </span>
+              <InlineLoading label={`Loading ${recentMerged.probing.join(", ")}...`} className="h-8" />
             )}
           </div>
           {recentMerged.initialLoading && <LoadingState label="Loading recent jobs..." rows={4} />}
