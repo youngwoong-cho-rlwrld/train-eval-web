@@ -276,7 +276,12 @@ async def _read_mlxp_results(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(program.encode()), timeout=_SCAN_TIMEOUT)
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(program.encode()), timeout=_SCAN_TIMEOUT)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise
     if proc.returncode != 0:
         raise RuntimeError(
             stderr.decode(errors="replace").strip()
