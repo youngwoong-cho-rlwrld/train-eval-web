@@ -1514,7 +1514,7 @@ async def _mlxp_progress(
         "done | sed 's:.*checkpoint-::' | sort -n | tail -1"
     )
     try:
-        _, stdout, _ = await _mlxp_exec("bash", "-c", cmd, timeout=15.0)
+        _, stdout, _ = await _mlxp_exec("bash", "-lc", cmd, timeout=15.0)
     except Exception:
         return progress
 
@@ -1551,11 +1551,13 @@ async def _mlxp_eval_progress(
     if shutil.which("kubectl") is None:
         return progress
     settings = get_settings()
-    eval_dir = metadata.get("eval_dir") or f"{settings.experiments_dir}/{variant}/eval_results"
+    _exp = f"{settings.experiments_dir}/{variant}"
+    _ns = metadata.get("output_namespace")
+    eval_dir = metadata.get("eval_dir") or (f"{_exp}/eval_results/{_ns}" if _ns else f"{_exp}/eval_results")
 
     cmd = f"find {shlex.quote(eval_dir)} -type f -path '*/run_*/results.json' 2>/dev/null | wc -l"
     try:
-        _, stdout, _ = await _mlxp_exec("bash", "-c", cmd, timeout=15.0)
+        _, stdout, _ = await _mlxp_exec("bash", "-lc", cmd, timeout=15.0)
     except Exception:
         return progress
     try:
