@@ -61,7 +61,7 @@ async def login(key: str) -> WandbStatus:
             if not ok:
                 return None, "wandb.login returned false"
             api = wandb.Api(timeout=5)
-            return api.default_entity, None
+            return WANDB_ENTITY_OVERRIDE or api.default_entity, None
         except Exception as e:
             return None, str(e)
 
