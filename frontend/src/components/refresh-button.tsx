@@ -9,12 +9,10 @@ export function RefreshButton({
   isFetching,
   onRefresh,
   intervalMs,
-  label = "Refresh now",
 }: {
   isFetching: boolean;
   onRefresh: () => void;
   intervalMs?: number;
-  label?: string;
 }) {
   const totalSec = intervalMs ? Math.round(intervalMs / 1000) : 0;
   const [left, setLeft] = useState(totalSec);
@@ -47,8 +45,8 @@ export function RefreshButton({
       {isFetching
         ? "Refreshing…"
         : totalSec
-          ? `${label} (${left}s)`
-          : label}
+          ? `Refresh now (${left}s)`
+          : "Refresh now"}
     </Button>
   );
 }

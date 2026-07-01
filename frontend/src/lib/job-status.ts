@@ -26,10 +26,6 @@ export function isActiveJobState(state?: string | null): boolean {
   return ACTIVE_STATES.has((state ?? "").toUpperCase());
 }
 
-export function isRunningJobState(state?: string | null): boolean {
-  return /^RUNNING$/i.test(state ?? "");
-}
-
 export function isRunningOrCompletingJobState(state?: string | null): boolean {
   return /^(RUNNING|COMPLETING)$/i.test(state ?? "");
 }

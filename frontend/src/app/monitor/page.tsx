@@ -94,13 +94,7 @@ function SlurmClusterPanel({ cluster }: { cluster: string }) {
       <CardHeader>
         <div className="flex items-baseline justify-between">
           <CardTitle className="text-base">{cluster} <span className="ml-1 text-xs font-normal text-slate-500">slurm</span></CardTitle>
-          <span className="font-mono text-sm">
-            <span className={available > 0 ? "text-green-600 dark:text-green-400" : "text-slate-500"}>{available}</span>
-            <span className="text-slate-400"> / {total} GPU available</span>
-            <span className="text-slate-400"> · </span>
-            <span className={queued > 0 ? "text-amber-600 dark:text-amber-400" : "text-slate-500"}>{queued}</span>
-            <span className="text-slate-400"> GPU queued</span>
-          </span>
+          <GpuAvailabilitySummary available={available} total={total} queued={queued} />
         </div>
         <CardDescription>{ps.length} partitions</CardDescription>
       </CardHeader>
@@ -180,13 +174,7 @@ function MlxpPanel() {
       <CardHeader>
         <div className="flex items-baseline justify-between">
           <CardTitle className="text-base">MLXP <span className="ml-1 text-xs font-normal text-slate-500">naver, k8s</span></CardTitle>
-          <span className="font-mono text-sm">
-            <span className={available > 0 ? "text-green-600 dark:text-green-400" : "text-slate-500"}>{available}</span>
-            <span className="text-slate-400"> / {total} GPU available</span>
-            <span className="text-slate-400"> · </span>
-            <span className={queued > 0 ? "text-amber-600 dark:text-amber-400" : "text-slate-500"}>{queued}</span>
-            <span className="text-slate-400"> GPU queued</span>
-          </span>
+          <GpuAvailabilitySummary available={available} total={total} queued={queued} />
         </div>
       </CardHeader>
       <CardContent>
@@ -233,6 +221,26 @@ function MlxpPanel() {
         )}
       </CardContent>
     </Card>
+  );
+}
+
+function GpuAvailabilitySummary({
+  available,
+  total,
+  queued,
+}: {
+  available: number;
+  total: number;
+  queued: number;
+}) {
+  return (
+    <span className="font-mono text-sm">
+      <span className={available > 0 ? "text-green-600 dark:text-green-400" : "text-slate-500"}>{available}</span>
+      <span className="text-slate-400"> / {total} GPU available</span>
+      <span className="text-slate-400"> · </span>
+      <span className={queued > 0 ? "text-amber-600 dark:text-amber-400" : "text-slate-500"}>{queued}</span>
+      <span className="text-slate-400"> GPU queued</span>
+    </span>
   );
 }
 

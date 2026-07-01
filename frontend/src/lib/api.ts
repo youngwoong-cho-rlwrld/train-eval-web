@@ -17,6 +17,8 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
 
 export type LogStream = "out" | "err" | "isaac";
 
+export type ApiJobPhase = "train" | "resume" | "eval" | "unknown";
+
 export function logStreamUrl(cluster: string, jobId: string, stream: LogStream) {
   return `${API_BASE}/api/jobs/${cluster}/${jobId}/logs?stream=${stream}`;
 }
@@ -326,7 +328,7 @@ export type JobDetails = {
   cluster: string;
   job_id: string;
   job_name: string;
-  phase: "train" | "resume" | "eval" | "unknown";
+  phase: ApiJobPhase;
   variant: string | null;
   resume_of: string | null;
   resubmit_action: string | null;
@@ -357,7 +359,7 @@ export type JobGpu = {
 export type JobProgress = {
   cluster: string;
   job_id: string;
-  phase: "train" | "resume" | "eval" | "unknown";
+  phase: ApiJobPhase;
   state: string;
   elapsed: string;
   wandb_url: string | null;
