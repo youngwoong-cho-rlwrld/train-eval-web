@@ -86,13 +86,17 @@ def _k8s_name_segment(value: str) -> str:
 
 def _mlxp_job_id(settings: MlxpSettings, job_name: str) -> str:
     """Kubernetes metadata.name following the MLXP guide:
-    `<user>-<job-name>`, with DNS-label sanitation and 63-char max length."""
+    `<user>-<job-name>`, with DNS-label sanitation and 63-char max length.
+
+    A short digest of the original job_name is always appended so two distinct
+    job_names that sanitize to the same DNS label do not collide (which would
+    make `kubectl apply` silently replace an existing Job). The digest is over
+    the full pre-sanitation name, which carries the `_HHMMSS` submit timestamp.
+    """
     prefix = _k8s_name_segment(settings.user)
     body = _k8s_name_segment(job_name)
+    digest = hashlib.sha1(job_name.encode()).hexdigest()[:8]
     name = f"{prefix}-{body}"
-    if len(name) <= 63:
-        return name
-    digest = hashlib.sha1(name.encode()).hexdigest()[:8]
     keep = 63 - len(digest) - 1
     return f"{name[:keep].rstrip('-')}-{digest}"
 
@@ -221,13 +225,19 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
         raise RuntimeError("kubectl not found on PATH")
     if req.num_gpus not in _GPU_RESOURCES:
         raise ValueError(f"num_gpus must be one of {list(_GPU_RESOURCES)}, got {req.num_gpus}")
+    # submit_mlxp resolves several fields (git commit, action horizon, output
+    # namespace, clamped eval envs) into the request as it runs. Work on a
+    # private copy so the caller's request is never mutated — slurm's submit()
+    # never mutates req, and a caller that reuses/retries the request must see
+    # its original values.
+    req = req.model_copy(deep=True)
     if req.phase == "eval" and not (req.checkpoint_path or "").strip():
         raise ValueError("checkpoint_path is required for MLXP eval")
-    if req.phase == "eval" and req.eval_num_envs_per_gpu is not None and req.eval_num_envs_per_gpu > 1:
-        raise ValueError(
-            "eval_num_envs_per_gpu > 1 is disabled: the ALLEX target reset "
-            "path is not vector-env safe"
-        )
+    # Clamp defensively, matching slurm: resubmit/edit paths recover
+    # eval_num_envs_per_gpu from old metadata and must not hard-fail on a stale
+    # out-of-range value. Fresh submits are already capped at 1 by the schema.
+    from .submit import clamp_eval_num_envs
+    req.eval_num_envs_per_gpu = clamp_eval_num_envs(req.eval_num_envs_per_gpu)
     if req.phase != "eval" and any((
         req.eval_num_envs_per_gpu is not None,
         req.eval_n_episodes is not None,
@@ -330,7 +340,7 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
         req.wandb_secret or settings.wandb_secret,
         node,
         req.job_class,
-        _job_comment(req, variant, snapshot),
+        _job_comment(req, variant, snapshot, model),
         train_note,
         settings,
     )
@@ -1091,14 +1101,18 @@ bash {shlex.quote(runtime_root)}/lib/{model.eval_body_script}
 """
 
 
-def _job_comment(req: MlxpSubmitRequest, variant, snapshot: dict) -> str:
+def _job_comment(req: MlxpSubmitRequest, variant, snapshot: dict, model: TrainingModel) -> str:
     settings = get_settings()
     output_namespace = str(snapshot.get("output_namespace") or req.output_namespace or _path_slug(snapshot.get("job_name") or "job"))
     exp_dir = f"{settings.experiments_dir}/{variant.name}"
+    # Use the resolved model identity (same as slurm's meta) rather than raw
+    # variant vars: a variant that sets only TRAIN_MODEL — or nothing — would
+    # otherwise record a divergent/empty model_id that the details page reads.
     fields: dict[str, str | None] = {
         "phase": req.phase,
         "variant": req.variant,
-        "model_id": variant.vars.get("MODEL_ID") or variant.vars.get("MODEL_VERSION") or "",
+        "model_id": model.id,
+        "model_label": model.label,
         "wandb_project": _wandb_project(),
         "output_namespace": output_namespace,
     }
