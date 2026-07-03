@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 
 from . import cluster_settings
 from . import paths
+from . import user_config
 from .clusters import load_cluster
 from .data_interface import rewrite_action_horizon
 from .eval_harness import harness_for
@@ -117,15 +118,17 @@ class SubmitRequest(BaseModel):
     # the submitter generates one immutable namespace for checkpoints/results.
     output_namespace: str | None = None
     # Optional override for the auto-generated job_name. Must match
-    # `{train|eval}_<anything>_<YYYYMMDD>_<HHMMSS>` so the parser
-    # keeps working. None → server builds the default.
+    # `[<prefix>_]{train|eval}_<anything>_<YYYYMMDD>_<HHMMSS>` so the
+    # parser keeps working. None → server builds the default.
     job_name: str | None = None
     # Train-only: set after explicit user approval when the repo is dirty.
     commit_dirty_changes: bool = False
 
 
 def make_default_job_name(phase: str, variant: str) -> str:
-    return f"{phase}_{variant}_{datetime.now():%Y%m%d_%H%M%S}"
+    username = user_config.get_username()
+    prefix = f"{username}_" if username else ""
+    return f"{prefix}{phase}_{variant}_{datetime.now():%Y%m%d_%H%M%S}"
 
 
 def resolve_job_name(req_job_name: str | None, phase: str, variant: str) -> str:
@@ -530,6 +533,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         snapshot_text = render_eval_config_preview(
             base_config=variant.raw,
             variant=req.variant,
+            model=model.family,
             job_name=job_name,
             cluster=req.cluster,
             partition=partition,

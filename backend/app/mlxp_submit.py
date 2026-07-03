@@ -484,6 +484,7 @@ def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str
     config_text = render_eval_config_preview(
         base_config=variant.raw,
         variant=variant.name,
+        model=model.family,
         job_name=job_name,
         cluster="mlxp",
         node=node,

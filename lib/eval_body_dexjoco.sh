@@ -99,7 +99,7 @@ log "========================================================"
 
 [ "$EVAL_OVERWRITE_RESULTS" = "1" ] && rm -f "$RESULTS_PATH"
 
-EVAL_GPU_COUNT="$TRAIN_NUM_GPUS"
+EVAL_GPU_COUNT="${EVAL_NUM_GPUS:-$TRAIN_NUM_GPUS}"
 if ! [[ "$EVAL_GPU_COUNT" =~ ^[0-9]+$ ]] || [ "$EVAL_GPU_COUNT" -lt 1 ]; then
     EVAL_GPU_COUNT=1
 fi

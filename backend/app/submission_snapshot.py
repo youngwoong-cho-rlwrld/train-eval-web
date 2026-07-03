@@ -837,6 +837,11 @@ def set_scalar(config_text: str, name: str, value: int | str, *, quote: bool = T
     return f"{config_text}{suffix}{rendered}\n"
 
 
+def remove_scalar(config_text: str, name: str) -> str:
+    pattern = rf"^\s*(?:export\s+)?{re.escape(name)}=.*(?:\n|$)"
+    return re.sub(pattern, "", config_text, flags=re.MULTILINE)
+
+
 def shell_array_assignment(name: str, values: list[str]) -> str:
     lines = [f"{name}=("]
     lines.extend(f"    {shlex.quote(v)}" for v in values)
@@ -919,6 +924,8 @@ def render_training_config_snapshot(
         text = set_scalar(text, "TRAIN_GLOBAL_BATCH_SIZE", train_global_batch_size)
         if family_derives_per_gpu_batch_size(model) and train_num_gpus > 0:
             text = set_scalar(text, "TRAIN_BATCH_SIZE", train_global_batch_size // train_num_gpus)
+        else:
+            text = remove_scalar(text, "TRAIN_BATCH_SIZE")
 
     footer = [
         "",
@@ -965,6 +972,7 @@ def render_eval_config_preview(
     *,
     base_config: str,
     variant: str,
+    model: str,
     job_name: str,
     cluster: str,
     partition: str | None = None,
@@ -991,6 +999,8 @@ def render_eval_config_preview(
     )
     if dexjoco_task is not None and dexjoco_task.strip():
         text = set_scalar(text, "DEXJOCO_TASK", dexjoco_task.strip())
+    if not family_derives_per_gpu_batch_size(model):
+        text = remove_scalar(text, "TRAIN_BATCH_SIZE")
     if train_git_commit is not None:
         text = set_scalar(text, "TRAIN_GIT_COMMIT", train_git_commit)
     if train_num_gpus is not None:

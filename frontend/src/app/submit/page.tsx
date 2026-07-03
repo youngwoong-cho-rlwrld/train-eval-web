@@ -23,6 +23,7 @@ import {
   type GitStatus,
   type GitCommitOption,
   type PathExistence,
+  type UserSettings,
 } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import {
@@ -104,14 +105,19 @@ const TRAIN_CONFIG_FIELDS: readonly (keyof TrainConfigValues)[] = [
 
 const isPositiveInteger = (value: string) => /^[1-9]\d*$/.test(value.trim());
 
-function buildDefaultJobName(phase: Phase, variant: string): string {
+function buildDefaultJobName(
+  phase: Phase,
+  variant: string,
+  username: string,
+): string {
   if (!variant) return "";
   const d = new Date();
   const pad = (n: number) => String(n).padStart(2, "0");
   const ts =
     `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}` +
     `_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
-  return `${phase}_${variant}_${ts}`;
+  const prefix = username ? `${username}_` : "";
+  return `${prefix}${phase}_${variant}_${ts}`;
 }
 
 function ellipsize(value: string, maxLength: number): string {
@@ -170,6 +176,11 @@ export default function SubmitPage() {
     queryKey: ["mlxp-settings"],
     queryFn: () => api<MlxpSettings>("/api/mlxp/settings"),
   });
+  const userSettings = useQuery({
+    queryKey: ["user-settings"],
+    queryFn: () => api<UserSettings>("/api/user-settings"),
+  });
+  const username = userSettings.data?.username ?? "";
   // Persisted across sessions + synced across pages via useMyMlxpNode.
   const [mlxpNode, setMlxpNode] = useMyMlxpNode(mlxpSettings.data?.default_node ?? "");
   const [mlxpJobClass, setMlxpJobClass] = useState<"dedicated" | "normal" | "background">("normal");
@@ -300,8 +311,8 @@ export default function SubmitPage() {
       : checkpointExists.data.exists && checkpointExists.data.kind === "dir";
 
   const defaultJobName = useMemo(
-    () => buildDefaultJobName(phase, variantName),
-    [phase, variantName],
+    () => buildDefaultJobName(phase, variantName, username),
+    [phase, variantName, username],
   );
   const shownJobName = jobNameTouched ? jobName : defaultJobName;
   const trainNoteDefault = variant.data?.vars.TRAIN_NOTE ?? "";
@@ -983,8 +994,8 @@ export default function SubmitPage() {
         invalidMessage="Positive integer."
       />
     );
-    flagEditors["--global-batch-size"] = batchEditor;
-    flagEditors["--batch-size"] = batchEditor;
+    flagEditors[trainModel === "n1.5" ? "--batch-size" : "--global-batch-size"] =
+      batchEditor;
     flagEditors["--max-steps"] = (
       <NumberCellEditor
         value={trainMaxSteps}

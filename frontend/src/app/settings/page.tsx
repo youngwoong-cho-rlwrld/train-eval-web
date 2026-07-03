@@ -8,6 +8,7 @@ import {
   api,
   type ClusterEnvSettings,
   type NotificationSettings,
+  type UserSettings,
   type WandbStatus,
 } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
@@ -30,10 +31,72 @@ export default function SettingsPage() {
   return (
     <div className="mx-auto max-w-7xl px-8 py-12">
       <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
+      <UserCard />
       <ClusterSettingsCard />
       <WandbCard />
       <NotificationsCard />
     </div>
+  );
+}
+
+function UserCard() {
+  const qc = useQueryClient();
+  const [draft, setDraft] = useState<string | null>(null);
+
+  const settings = useQuery({
+    queryKey: ["user-settings"],
+    queryFn: () => api<UserSettings>("/api/user-settings"),
+  });
+
+  const saved = settings.data?.username ?? "";
+  const username = draft ?? saved;
+  const dirty = draft !== null && draft.trim() !== saved;
+
+  const save = useMutation({
+    mutationFn: () =>
+      api<UserSettings>("/api/user-settings", {
+        method: "POST",
+        body: JSON.stringify({ username: username.trim() }),
+      }),
+    onSuccess: (res) => {
+      toast.success(
+        res.username ? `Username set to ${res.username}` : "Username cleared",
+      );
+      setDraft(null);
+      qc.setQueryData(["user-settings"], res);
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+
+  return (
+    <Card className="mt-8">
+      <CardHeader>
+        <CardTitle>User</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-2">
+        <Label>Username</Label>
+        <div className="flex gap-2">
+          <Input
+            value={username}
+            onChange={(e) => setDraft(e.target.value)}
+            placeholder="e.g. youngwoong"
+            className="flex-1 font-mono text-xs"
+            autoComplete="off"
+          />
+          <Button
+            onClick={() => save.mutate()}
+            disabled={!dirty || save.isPending}
+          >
+            {save.isPending ? "Saving..." : "Save"}
+          </Button>
+        </div>
+        <p className="text-xs text-slate-500">
+          Prefixed to default job names, e.g.{" "}
+          <code className="font-mono">youngwoong_train_...</code>. Leave empty
+          for no prefix.
+        </p>
+      </CardContent>
+    </Card>
   );
 }
 
@@ -304,9 +367,16 @@ function NotificationsCard() {
     queryFn: () => api<NotificationSettings>("/api/notifications"),
   });
   const data = q.data;
+  const webhookDraft = webhook.trim();
 
   const val = (k: keyof NotificationSettings): boolean =>
-    Boolean(edits[k] ?? data?.[k] ?? false);
+    Boolean(
+      edits[k] ??
+        (k === "enabled" && webhookDraft && !data?.configured
+          ? true
+          : data?.[k]) ??
+        false,
+    );
 
   const save = useMutation({
     mutationFn: () =>
@@ -319,7 +389,7 @@ function NotificationsCard() {
           notify_completed: val("notify_completed"),
           notify_failed: val("notify_failed"),
           notify_cancelled: val("notify_cancelled"),
-          ...(webhook.trim() ? { slack_webhook_url: webhook.trim() } : {}),
+          ...(webhookDraft ? { slack_webhook_url: webhookDraft } : {}),
         }),
       }),
     onSuccess: (res) => {
@@ -341,7 +411,7 @@ function NotificationsCard() {
   const toggle = (k: keyof NotificationSettings) => (checked: boolean) =>
     setEdits((prev) => ({ ...prev, [k]: checked }));
 
-  const dirty = Object.keys(edits).length > 0 || webhook.trim() !== "";
+  const dirty = Object.keys(edits).length > 0 || webhookDraft !== "";
 
   const events: { key: keyof NotificationSettings; label: string }[] = [
     { key: "notify_submitted", label: "Submitted" },

@@ -850,6 +850,7 @@ async def _recover_slurm_training_snapshot(
         train_num_gpus = _meta_int(meta, "train_num_gpus") or variant_int(variant, "TRAIN_NUM_GPUS", 2)
         train_max_steps = _meta_int(meta, "train_max_steps") or variant_int(variant, "MAX_STEPS", 30000)
         train_save_steps = _meta_int(meta, "train_save_steps") or variant_int(variant, "SAVE_STEPS", 1000)
+        train_num_workers = _meta_int(meta, "train_num_workers") or variant_int(variant, "TRAIN_NUM_WORKERS", 16)
         train_action_horizon = _meta_int(meta, "train_action_horizon")
         train_global_batch_size = _meta_int(meta, "train_global_batch_size")
         if train_global_batch_size is None:
@@ -875,6 +876,7 @@ async def _recover_slurm_training_snapshot(
             train_global_batch_size=train_global_batch_size,
             train_max_steps=train_max_steps,
             train_save_steps=train_save_steps,
+            train_num_workers=train_num_workers,
             train_action_horizon=train_action_horizon,
             wandb_project=meta.get("wandb_project") or meta.get("submit_wandb_project"),
             git=git,

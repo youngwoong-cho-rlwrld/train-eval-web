@@ -33,6 +33,7 @@ from . import (
     submission_snapshot,
     submit,
     training_models,
+    user_config,
     variants,
     wandb_auth,
 )
@@ -479,6 +480,7 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
             text = submission_snapshot.render_eval_config_preview(
                 base_config=variant.raw,
                 variant=req.variant,
+                model=model.family,
                 job_name=job_name,
                 cluster=req.cluster,
                 partition=partition,
@@ -816,6 +818,21 @@ async def post_wandb_project(req: wandb_auth.ProjectRequest):
     if not req.project.strip():
         raise HTTPException(400, "project must not be empty")
     return await wandb_auth.set_project_endpoint(req.project)
+
+
+# ── user ──
+
+@app.get("/api/user-settings", response_model=user_config.UserSettings)
+async def get_user_settings():
+    return user_config.get_settings()
+
+
+@app.post("/api/user-settings", response_model=user_config.UserSettings)
+async def post_user_settings(req: user_config.UserSettings):
+    try:
+        return user_config.save_settings(req)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 # ── notifications ──

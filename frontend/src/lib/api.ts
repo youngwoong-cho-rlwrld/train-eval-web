@@ -287,6 +287,10 @@ export type WandbStatus = {
   error: string | null;
 };
 
+export type UserSettings = {
+  username: string;
+};
+
 export type NotificationSettings = {
   enabled: boolean;
   configured: boolean;
