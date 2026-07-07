@@ -162,6 +162,9 @@ export type CopyJobStatus = {
   dest_size_bytes: number | null;
   started_at: number;
   finished_at: number | null;
+  source_cluster: string | null;
+  source_job: string | null;
+  dest_cluster: string | null;
 };
 
 export type Progress = {

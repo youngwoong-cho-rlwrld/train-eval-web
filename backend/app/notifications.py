@@ -9,8 +9,10 @@ submit route via note_submitted().
 
 Delivery uses stdlib urllib (no extra deps); the blocking POST runs in a
 worker thread so it never stalls the event loop. Last-seen state is persisted
-to ~/.train-eval-web/notify_state.json so a backend restart doesn't replay old
-transitions and can still surface changes that happened while it was down.
+to ~/.train-eval-web/notify_state.json, but each process start still seeds a
+fresh baseline before posting transitions. Jobs first seen in a terminal state
+are treated as baseline, not as fresh transitions, so enabling Slack does not
+replay old history.
 """
 from __future__ import annotations
 
@@ -143,9 +145,10 @@ class _Monitor:
             return
         if isinstance(data, dict):
             self.state = data
-            # Persisted state → diff immediately so changes that happened while
-            # the backend was down still surface (bounded by the 24h window).
-            self.primed = True
+            # Do not notify on the first tick after process start. The jobs
+            # list intentionally includes recent terminal jobs, so a persisted
+            # diff would replay historical completions when Slack is enabled.
+            self.primed = False
 
     def _persist(self) -> None:
         try:
@@ -194,8 +197,11 @@ class _Monitor:
             self._persist()
             return
         for jid, e in current.items():
+            previous = self.state.get(jid)
+            if previous is None:
+                continue
             new = e["event"]
-            old = (self.state.get(jid) or {}).get("event")
+            old = previous.get("event")
             if new and new != old and notifications_config.event_enabled(new):
                 j = e.get("_job")
                 await _post(_job_line(

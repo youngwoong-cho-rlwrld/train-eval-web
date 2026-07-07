@@ -726,14 +726,28 @@ def _sse_next_line(request: Request) -> int:
         return 1
 
 
-async def _sse_log_stream(request: Request, start_line: int, line_source, error_formatter=None):
+async def _job_finished(cluster: str, job_id: str) -> bool:
+    try:
+        j = await jobs.get_job(cluster, job_id)
+    except Exception:
+        return False
+    state = (j.get("State") or "").upper()
+    return state.startswith("COMPLET") or jobs.is_terminal_non_completed(state)
+
+
+async def _sse_log_stream(request: Request, start_line: int, line_source, error_formatter=None, is_finished=None):
     """Yield SSE line events from a line-source until the client disconnects.
 
     ``line_source`` is a callable taking the next start line and returning an
     async iterator of log lines. ``error_formatter`` (optional) turns a caught
     RuntimeError into a single line to emit instead of aborting the stream.
+    ``is_finished`` (optional) is polled on idle ticks; once the job is
+    terminal and the log has drained, a ``done`` event is emitted and the
+    stream ends. Browsers cap concurrent connections per origin (6), so a
+    stream for a finished job must not hold a connection forever.
     """
     line_no = start_line
+    idle_ticks = 0
     while not await request.is_disconnected():
         saw_line = False
         try:
@@ -753,6 +767,16 @@ async def _sse_log_stream(request: Request, start_line: int, line_source, error_
                 "data": error_formatter(e),
             }
             line_no += 1
+        if saw_line:
+            idle_ticks = 0
+        else:
+            idle_ticks += 1
+            # Check at ~4s idle, then every ~10s, so terminal-state queries
+            # do not fire on every 2s tick.
+            if is_finished is not None and idle_ticks >= 2 and (idle_ticks - 2) % 5 == 0:
+                if await is_finished():
+                    yield {"event": "done", "id": str(line_no), "retry": 10000, "data": ""}
+                    return
         await asyncio.sleep(1 if saw_line else 2)
 
 
@@ -774,6 +798,7 @@ async def stream_logs(request: Request, cluster: str, job_id: str, stream: str =
             start_line,
             lambda line_no: mlxp_jobs.tail_logs(job_id, start_line=line_no),
             error_formatter=lambda e: f"(kubectl error: {e})",
+            is_finished=lambda: _job_finished(cluster, job_id),
         ))
 
     if stream not in ("out", "err", "isaac"):
@@ -796,6 +821,7 @@ async def stream_logs(request: Request, cluster: str, job_id: str, stream: str =
         request,
         start_line,
         lambda line_no: ssh_tail_lines(env.ssh_alias, pattern, start_line=line_no),
+        is_finished=lambda: _job_finished(cluster, job_id),
     ))
 
 
@@ -938,6 +964,14 @@ async def get_checkpoints(cluster: str, job_id: str):
         raise HTTPException(404, str(e))
     except RuntimeError as e:
         raise HTTPException(500, str(e))
+
+
+@app.get(
+    "/api/jobs/{cluster}/{job_id}/copy-jobs",
+    response_model=list[copy_checkpoint.CopyJobStatus],
+)
+async def get_active_copy_jobs(cluster: str, job_id: str):
+    return copy_checkpoint.list_active_copies(cluster, job_id)
 
 
 @app.get(

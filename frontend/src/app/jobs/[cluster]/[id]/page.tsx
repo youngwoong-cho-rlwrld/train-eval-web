@@ -1063,6 +1063,9 @@ function LogStream({
       allLinesRef.current.push(e.data as string);
       scheduleFlush();
     });
+    // Backend signals terminal job + drained log. Close so finished-job tabs
+    // stop holding one of the browser's 6 per-origin connections.
+    es.addEventListener("done", () => es.close());
     return () => {
       es.close();
       if (frameRef.current !== null) {

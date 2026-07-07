@@ -118,6 +118,9 @@ class CopyJobStatus(BaseModel):
     dest_size_bytes: int | None = None
     started_at: float
     finished_at: float | None = None
+    source_cluster: str | None = None
+    source_job: str | None = None
+    dest_cluster: str | None = None
 
 
 class CheckpointCopyRecord(BaseModel):
@@ -429,6 +432,7 @@ async def start_copy(
         copy_id=copy_id, status="running",
         copies_total=len(sources), copies_done=0,
         started_at=time.time(),
+        source_cluster=src_cluster, source_job=src_job, dest_cluster=dest_cluster,
     )
     _COPY_HANDLES[copy_id] = {"task": None, "proc": None}
     task = asyncio.create_task(
@@ -443,6 +447,20 @@ async def start_copy(
 
 def get_copy_status(copy_id: str) -> CopyJobStatus | None:
     return _COPY_JOBS.get(copy_id)
+
+
+def list_active_copies(src_cluster: str, src_job: str) -> list[CopyJobStatus]:
+    """Running copies whose source is the given job, newest first."""
+    return sorted(
+        (
+            s for s in _COPY_JOBS.values()
+            if s.status == "running"
+            and s.source_cluster == src_cluster
+            and s.source_job == src_job
+        ),
+        key=lambda s: s.started_at,
+        reverse=True,
+    )
 
 
 async def _children_of(cluster: str, path: str) -> list[str]:
@@ -524,6 +542,20 @@ def _dest_leaf_for_source(src_path: str) -> str:
     return leaf
 
 
+def _delete_root_for_source(src_path: str) -> str:
+    """Directory removed by delete-after-copy: the owning run directory.
+
+    The UI selects step dirs (`.../<run>/checkpoint-N`); deleting only the
+    step dir leaves the run dir's top-level model export behind. Keep the
+    step dir itself for direct-root layouts (`.../checkpoints/checkpoint-N`)
+    where the parent is shared by other runs.
+    """
+    src = Path(src_path.rstrip("/"))
+    if src.name.startswith("checkpoint-") and src.parent.name not in ("", "checkpoints"):
+        return str(src.parent)
+    return src_path
+
+
 async def _run_copy(
     copy_id: str, src_cluster: str, src_job: str, dest_cluster: str,
     sources: list[str], dest_path_root: str, delete_source: bool,
@@ -599,7 +631,7 @@ async def _run_copy(
                 ),
             )
             if delete_source:
-                await _delete_source(src_cluster, src_path)
+                await _delete_source(src_cluster, _delete_root_for_source(src_path))
 
         state.phase = None
         state.status = "done"

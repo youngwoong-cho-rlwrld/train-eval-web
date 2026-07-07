@@ -11,6 +11,7 @@ const STATUS_RECONNECT_MS = 60_000;
 type ActiveCopy = {
   copyId: string;
   destCluster: string;
+  jobName?: string;
 };
 
 // Some browsers fire multiple events for the same tab; dedupe in-process so
@@ -54,9 +55,9 @@ function removeActive(copyId: string) {
   writeActive(readActive().filter((x) => x.copyId !== copyId));
 }
 
-export function startCopyWatcher(copyId: string, destCluster: string) {
-  addActive({ copyId, destCluster });
-  void watch({ copyId, destCluster });
+export function startCopyWatcher(copyId: string, destCluster: string, jobName?: string) {
+  addActive({ copyId, destCluster, jobName });
+  void watch({ copyId, destCluster, jobName });
 }
 
 /** Resume any copies that were in flight when the page was loaded/refreshed. */
@@ -67,7 +68,7 @@ export function resumeActiveCopies() {
   }
 }
 
-async function watch({ copyId, destCluster }: ActiveCopy) {
+async function watch({ copyId, destCluster, jobName }: ActiveCopy) {
   if (watched.has(copyId)) return;
   watched.add(copyId);
 
@@ -81,11 +82,14 @@ async function watch({ copyId, destCluster }: ActiveCopy) {
   };
 
   const toastId = `copy-checkpoint:${copyId}`;
-  toast.loading("Copying checkpoint...", {
-    id: toastId,
-    duration: Infinity,
-    action: cancelAction,
-  });
+  toast.loading(
+    jobName ? `Copying checkpoint of ${jobName}...` : "Copying checkpoint...",
+    {
+      id: toastId,
+      duration: Infinity,
+      action: cancelAction,
+    },
+  );
   let lastStatusAt = Date.now();
   try {
     while (true) {
@@ -119,7 +123,8 @@ async function watch({ copyId, destCluster }: ActiveCopy) {
       }
       if (s.status === "done") {
         toast.success(
-          `Copied ${s.copies_done} checkpoint${s.copies_done === 1 ? "" : "s"} to ${destCluster}`,
+          `Copied ${s.copies_done} checkpoint${s.copies_done === 1 ? "" : "s"} to ${destCluster}` +
+            (jobName ? ` — ${jobName}` : ""),
           { id: toastId, duration: 6000 },
         );
         removeActive(copyId);
@@ -150,7 +155,13 @@ async function watch({ copyId, destCluster }: ActiveCopy) {
           ? Math.min(100, Math.round((shownDst / src) * 100))
           : null;
       const summary = `${s.copies_done + 1}/${s.copies_total}`;
-      const name = s.current_source ? basename(s.current_source) : null;
+      // Prefer the destination leaf: it is the owning run name, while the
+      // source leaf is often just "checkpoint-N".
+      const name =
+        (s.current_dest ? basename(s.current_dest) : null) ??
+        (s.current_source ? basename(s.current_source) : null) ??
+        jobName ??
+        null;
       const prefix = name
         ? `Copying ${name} (${summary})`
         : `Copying ${summary}`;

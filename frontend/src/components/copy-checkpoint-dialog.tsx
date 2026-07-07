@@ -7,7 +7,9 @@ import {
   api,
   type CheckpointCopyRecord,
   type CheckpointEntry,
+  type CopyJobStatus,
 } from "@/lib/api";
+import { basename } from "@/lib/format";
 import { startCopyWatcher } from "@/lib/copy-watcher";
 import { Button } from "@/components/ui/button";
 import {
@@ -61,6 +63,13 @@ export function CopyCheckpointDialog({
       ),
     enabled: open,
   });
+  const activeCopies = useQuery({
+    queryKey: ["copy-jobs", cluster, jobId],
+    queryFn: () =>
+      api<CopyJobStatus[]>(`/api/jobs/${cluster}/${jobId}/copy-jobs`),
+    enabled: open,
+    refetchInterval: open ? 2000 : false,
+  });
   const [destCluster, setDestCluster] = useState<string>("");
   const [destPathRoot, setDestPathRoot] = useState<string>("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -82,8 +91,17 @@ export function CopyCheckpointDialog({
       ),
     onSuccess: (r) => {
       const dest = destCluster;
+      const names = Array.from(
+        new Set(
+          checkpointOptions
+            .filter((c) => selected.has(c.path))
+            .map((c) => c.job_name),
+        ),
+      );
+      const jobName =
+        names.length > 1 ? `${names[0]} +${names.length - 1}` : names[0];
       resetAndClose();
-      startCopyWatcher(r.copy_id, dest);
+      startCopyWatcher(r.copy_id, dest, jobName);
     },
     onError: (e: Error) => toast.error(e.message),
   });
@@ -201,7 +219,7 @@ export function CopyCheckpointDialog({
             />
             <span>Remove checkpoint after copy</span>
           </label>
-          <PreviousCopies history={copyHistory} />
+          <PreviousCopies history={copyHistory} active={activeCopies.data ?? []} />
         </div>
 
         <DialogFooter>
@@ -234,18 +252,50 @@ function dedupeCheckpoints(rows: CheckpointEntry[]) {
   });
 }
 
+function ActiveCopyRow({ s }: { s: CopyJobStatus }) {
+  const name = basename(s.current_dest ?? s.current_source ?? "") || s.copy_id;
+  const src = s.src_size_bytes;
+  const dst = s.dest_size_bytes;
+  const pct =
+    src && src > 0 && dst != null
+      ? Math.min(100, Math.round((Math.min(dst, src) / src) * 100))
+      : null;
+  return (
+    <div className="flex min-w-0 items-center gap-2 border-b border-slate-100 px-3 py-2 text-xs last:border-0 dark:border-slate-900">
+      <span className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-blue-500" />
+      <span className="min-w-0 truncate font-mono" title={name}>
+        {name}
+      </span>
+      <span className="ml-auto shrink-0 whitespace-nowrap text-slate-500">
+        copying now → {s.dest_cluster ?? "?"}
+        {s.copies_total > 1 ? ` (${s.copies_done + 1}/${s.copies_total})` : ""}
+        {pct != null ? ` · ${pct}%` : ""}
+      </span>
+    </div>
+  );
+}
+
 function PreviousCopies({
   history,
+  active,
 }: {
   history: UseQueryResult<CheckpointCopyRecord[], Error>;
+  active: CopyJobStatus[];
 }) {
   return (
     <div className="min-w-0 border-t border-slate-200 pt-3 dark:border-slate-800">
       <Label>Previous copies</Label>
       <div className="mt-1.5">
+        {active.length > 0 && (
+          <div className="mb-1.5 min-w-0 rounded-md border border-blue-200 dark:border-blue-900">
+            {active.map((s) => (
+              <ActiveCopyRow key={s.copy_id} s={s} />
+            ))}
+          </div>
+        )}
         {history.isLoading && <LoadingState label="Loading previous copies..." rows={1} />}
         {history.error && <ErrorState message={history.error.message} />}
-        {history.data && history.data.length === 0 && (
+        {history.data && history.data.length === 0 && active.length === 0 && (
           <EmptyState message="No copied checkpoints recorded for this job." />
         )}
         {history.data && history.data.length > 0 && (
