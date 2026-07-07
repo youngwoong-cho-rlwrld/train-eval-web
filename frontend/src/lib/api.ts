@@ -1,4 +1,7 @@
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
+// Default to same-origin relative URLs: Next rewrites proxy /api/* to the
+// backend (next.config.ts), which also works when the app is served from a
+// non-localhost host. Cross-origin fetches to :8000 die on CORS there.
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "";
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
