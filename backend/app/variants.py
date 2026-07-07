@@ -424,15 +424,22 @@ _ARRAY_LINE_RE = re.compile(r'^declare -[a-zA-Z\-]+ ([A-Za-z_][A-Za-z0-9_]*)=\((
 _ARRAY_ITEM_RE = re.compile(r'\[\d+\]=(?:"((?:[^"\\]|\\.)*)"|(\S+))')
 
 
+# Callers fan out one bash per variant (100+ per /api/results request); each
+# subprocess costs ~4 fds, so unbounded concurrency blows the default macOS
+# 256-fd soft limit. Bound the spawns; parsing is cheap so 16 is plenty.
+_PARSE_BASH_SEM = asyncio.Semaphore(16)
+
+
 async def _parse_bash(script_text: str) -> tuple[dict[str, str], dict[str, list[str]]]:
     """Source a bash snippet and return (scalars, arrays)."""
     cmd = f"set -a\n{script_text}\nset +a\ndeclare -p"
-    proc = await asyncio.create_subprocess_exec(
-        _BASH, "-c", cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
+    async with _PARSE_BASH_SEM:
+        proc = await asyncio.create_subprocess_exec(
+            _BASH, "-c", cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
     if proc.returncode != 0:
         raise RuntimeError(f"bash failed: {stderr.decode()}")
 

@@ -5,6 +5,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/.." && pwd)"
 export PATH="/opt/homebrew/bin:$PATH"   # so node, npm, uv are visible from Finder/Spotlight-launched terminals
+ulimit -n 4096 2>/dev/null || true      # macOS default soft limit (256) is too low for the backend's subprocess fan-out
 
 cleanup() {
     if [[ -n "${BACKEND_PID:-}" ]]; then
