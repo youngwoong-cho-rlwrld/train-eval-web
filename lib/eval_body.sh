@@ -74,6 +74,7 @@ fi
 # Synthesize a one-element list for single-task so the loop below handles both.
 if [[ "${TASKS+set}" == set ]] && [ "${#TASKS[@]}" -gt 0 ]; then
     MULTI_TASK=1
+    apply_eval_task_selection
     log "Mode: multi-task over ${#TASKS[@]} tasks"
     for entry in "${TASKS[@]}"; do
         IFS='|' read -r tshort tname _tinstr <<<"$entry"

@@ -29,6 +29,14 @@ def eval_shape(
     n_runs = _override_int(overrides.get("eval_n_runs"), variant.vars.get("N_RUNS", "0"))
     n_eps = _override_int(overrides.get("eval_n_episodes"), variant.vars.get("N_EPISODES", "0"))
     tasks = variant.arrays.get("TASKS") or ["__single__"]
+    # Honor the multitask task-subset override (task SHORT labels — first
+    # "|"-field of each TASKS entry) so progress/completion count only the
+    # tasks this submission actually runs, mirroring eval_sets above.
+    selected = set(_override_list(overrides.get("eval_tasks")))
+    if selected:
+        subset = [t for t in tasks if t.split("|", 1)[0] in selected]
+        if subset:
+            tasks = subset
     return eval_sets, n_runs, n_eps, tasks
 
 

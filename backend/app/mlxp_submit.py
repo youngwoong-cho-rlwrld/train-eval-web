@@ -203,6 +203,8 @@ class MlxpSubmitRequest(BaseModel):
     eval_n_episodes: int | None = Field(default=None, ge=1)
     eval_n_runs: int | None = Field(default=None, ge=1)
     eval_sets: list[str] | None = None
+    # Eval-only: multitask task-subset selection (task SHORT labels).
+    eval_tasks: list[str] | None = None
     eval_overwrite_results: bool = False
     # Eval-only: DexJoCo task (yaml stem / env_name) chosen via the task picker.
     # Falls back to the variant's own DEXJOCO_TASK when omitted.
@@ -246,6 +248,7 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
         req.eval_n_episodes is not None,
         req.eval_n_runs is not None,
         req.eval_sets is not None,
+        req.eval_tasks is not None,
         req.eval_overwrite_results,
         bool(req.checkpoint_path and req.checkpoint_path.strip()),
     )):
@@ -476,9 +479,10 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
 def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job_name: str,
                                  node: str, submit_git, model: TrainingModel,
                                  settings: MlxpSettings, train_note: str) -> dict:
-    from .submit import normalize_eval_sets
+    from .submit import normalize_eval_sets, normalize_eval_tasks
 
     eval_sets = normalize_eval_sets(req.eval_sets)
+    eval_tasks = normalize_eval_tasks(req.eval_tasks)
     suffix = req.output_namespace or f"{snapshot_suffix(job_name)}_{job_id}"
     exp_dir = f"{settings.experiments_dir}/{variant.name}"
     path = paths.config_path(exp_dir, suffix)
@@ -496,10 +500,12 @@ def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str
         eval_n_episodes=req.eval_n_episodes,
         eval_n_runs=req.eval_n_runs,
         eval_sets=eval_sets,
+        eval_tasks=eval_tasks,
         eval_overwrite_results=req.eval_overwrite_results,
         checkpoint_path=checkpoint_path,
         extra_args=req.extra_args,
         data_dir=settings.datasets_dir,
+        eval_num_gpus=req.num_gpus,
         eval_unset_cuda_visible_devices_for_server=1,
         train_git_commit=req.train_git_commit,
         train_note=train_note,
@@ -531,6 +537,7 @@ def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str
         "n_episodes": req.eval_n_episodes,
         "n_runs": req.eval_n_runs,
         "eval_sets": eval_sets,
+        "eval_tasks": eval_tasks,
         "overwrite_results": req.eval_overwrite_results,
         "unset_cuda_visible_devices_for_server": 1,
         "dexjoco_task": dexjoco_task,
@@ -545,6 +552,7 @@ def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str
         "config_text": config_text,
         "meta_text": metadata_json(meta),
         "eval_sets": eval_sets,
+        "eval_tasks": eval_tasks,
         "dexjoco_task": dexjoco_task,
         "checkpoint_path": checkpoint_path,
         "git_commit": submit_git.commit,
@@ -1115,6 +1123,8 @@ cat > {shlex.quote(modality_target)} <<'TEW_MODALITY_EOF'
         eval_exports.append(f"export SUBMIT_EVAL_N_RUNS={req.eval_n_runs}")
     if snapshot.get("eval_sets"):
         eval_exports.append(f"export SUBMIT_EVAL_SETS={shlex.quote(' '.join(snapshot['eval_sets']))}")
+    if snapshot.get("eval_tasks"):
+        eval_exports.append(f"export SUBMIT_EVAL_TASKS={shlex.quote(' '.join(snapshot['eval_tasks']))}")
     if req.eval_overwrite_results:
         eval_exports.append("export SUBMIT_EVAL_OVERWRITE_RESULTS=1")
     dexjoco_task = (snapshot.get("dexjoco_task") or "").strip() if is_dexjoco else ""
@@ -1206,6 +1216,8 @@ def _job_comment(req: MlxpSubmitRequest, variant, snapshot: dict, model: Trainin
             fields["eval_n_runs"] = str(req.eval_n_runs)
         if snapshot.get("eval_sets"):
             fields["eval_sets"] = " ".join(snapshot["eval_sets"])
+        if snapshot.get("eval_tasks"):
+            fields["eval_tasks"] = " ".join(snapshot["eval_tasks"])
         if req.eval_overwrite_results:
             fields["eval_overwrite_results"] = "true"
         if snapshot.get("dexjoco_task"):

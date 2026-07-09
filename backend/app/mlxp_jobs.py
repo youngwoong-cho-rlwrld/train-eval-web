@@ -672,6 +672,23 @@ async def cancel_job(name: str) -> None:
     raise RuntimeError(f"kubectl delete failed: {last_error}")
 
 
+async def update_train_note(name: str, note: str) -> None:
+    """Overwrite the job's train-note annotation (the source the details page
+    reads for MLXP). `note` is passed as a subprocess arg, so no shell quoting."""
+    ensure_kubectl()
+    settings = get_settings()
+    proc = await asyncio.create_subprocess_exec(
+        "kubectl", "annotate", "job", name, "-n", settings.namespace,
+        f"train-eval-web/train-note={note}", "--overwrite",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+    if proc.returncode != 0:
+        err = stderr.decode(errors="replace").strip() or stdout.decode(errors="replace").strip()
+        raise RuntimeError(f"kubectl annotate failed: {err}")
+
+
 async def _job_deleted(name: str) -> bool:
     settings = get_settings()
     try:

@@ -99,11 +99,13 @@ export function ConfigCard({
     : null;
   const shownEffectiveConfigPath = showEffectiveConfigPathRows ? effectiveConfigPath : null;
   const shownConfigPath = shownEffectiveConfigPath || configPath;
-  const shownFlags = resolveShownFlags({
-    override: flagsOverride,
-    loaded: flags.data?.flags,
-    editors: flagEditors,
-  });
+  // Show exactly the flags the entrypoint actually receives; editors attach to
+  // matching rows (see flagEditors below). Editable-only knobs that are NOT real
+  // entrypoint flags (EVAL_NUM_GPUS, git commit, checkpoint, …) go through
+  // extraFlagRows instead — we do NOT synthesize phantom rows for editor keys,
+  // which previously produced duplicates like a `--num-gpus` row next to
+  // EVAL_NUM_GPUS on eval jobs.
+  const shownFlags = flagsOverride ?? flags.data?.flags;
   const flagRows = shownFlags ? toFlagRows(shownFlags) : undefined;
   const flagsLoading = !flagsOverride && flags.isLoading;
   const flagsError = !flagsOverride ? (flags.error as Error | null) : null;
@@ -256,33 +258,6 @@ export function ConfigCard({
       </CardContent>
     </Card>
   );
-}
-
-function resolveShownFlags({
-  override,
-  loaded,
-  editors,
-}: {
-  override?: ConfigPreviewFlag[] | null;
-  loaded?: ConfigPreviewFlag[];
-  editors?: Record<string, FlagEditor>;
-}): ConfigPreviewFlag[] | undefined {
-  const base = override ?? loaded;
-  if (base) {
-    const editableFlags = editors ? Object.keys(editors) : [];
-    if (editableFlags.length === 0) return base;
-    const seen = new Set(base.map((entry) => entry.flag));
-    const missingEditableRows = editableFlags
-      .filter((flag) => !seen.has(flag))
-      .map((flag) => ({ flag, value: "" }));
-    return missingEditableRows.length > 0
-      ? [...base, ...missingEditableRows]
-      : base;
-  }
-  const editableFlags = editors ? Object.keys(editors) : [];
-  return editableFlags.length > 0
-    ? editableFlags.map((flag) => ({ flag, value: "" }))
-    : undefined;
 }
 
 function toFlagRows(flags: ConfigPreviewFlag[]): FlagRow[] {

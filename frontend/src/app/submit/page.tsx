@@ -74,6 +74,7 @@ type EvalConfigEdit = {
   nRuns: string;
   numGpus: string;
   evalSets: string;
+  evalTasks: string;
   dexjocoTask: string;
 };
 type TrainConfigEdit = {
@@ -332,6 +333,11 @@ export default function SubmitPage() {
         variant.data?.vars.TRAIN_NUM_GPUS ??
         "1",
       evalSets: formatEvalSetsInput(variant.data?.arrays.EVAL_SETS ?? []),
+      // Multitask task-subset selection defaults to all tasks (the SHORT label,
+      // first "|"-field of each TASKS entry).
+      evalTasks: formatEvalSetsInput(
+        (variant.data?.arrays.TASKS ?? []).map((e) => e.split("|", 1)[0]),
+      ),
       dexjocoTask: variant.data?.vars.DEXJOCO_TASK ?? "",
     }),
     [variant.data],
@@ -365,6 +371,16 @@ export default function SubmitPage() {
       (isSlurm || [1, 2, 4, 8].includes(evalNumGpusParsed)));
   const evalSetValues = parseEvalSetsInput(evalSetsText);
   const evalSetOptions = variant.data?.arrays.EVAL_SETS ?? [];
+  // Multitask task-subset selection (SHORT labels), mirroring eval_sets.
+  const taskShortOptions = (variant.data?.arrays.TASKS ?? []).map(
+    (e) => e.split("|", 1)[0],
+  );
+  const evalTasksText = activeEvalConfigEdit
+    ? activeEvalConfigEdit.evalTasks
+    : evalConfigDefaults.evalTasks;
+  const evalTaskValues = parseEvalSetsInput(evalTasksText);
+  const evalTasksValid =
+    !wantsCheckpoint || !isMultitask || evalTaskValues.length > 0;
   const evalNEpisodesTrimmed = evalNEpisodes.trim();
   const evalNRunsTrimmed = evalNRuns.trim();
   const evalNEpisodesParsed = Number.parseInt(evalNEpisodesTrimmed, 10);
@@ -386,6 +402,7 @@ export default function SubmitPage() {
     evalNRunsValid &&
     evalNumGpusValid &&
     evalSetsValid &&
+    evalTasksValid &&
     dexjocoTaskValid;
   const evalTotalRuns =
     wantsCheckpoint && evalNEpisodesValid && evalNRunsValid && evalSetsValid
@@ -400,6 +417,7 @@ export default function SubmitPage() {
       nRuns: evalConfigDefaults.nRuns,
       numGpus: evalConfigDefaults.numGpus,
       evalSets: evalConfigDefaults.evalSets,
+      evalTasks: evalConfigDefaults.evalTasks,
       dexjocoTask: evalConfigDefaults.dexjocoTask,
     };
     setEvalConfigEdit({ ...base, ...patch, scope: evalConfigScope });
@@ -607,6 +625,7 @@ export default function SubmitPage() {
       eval_n_runs: wantsCheckpoint ? evalNRunsParsed : null,
       eval_num_gpus: wantsCheckpoint ? evalNumGpusParsed : null,
       eval_sets: wantsCheckpoint ? evalSetValues : null,
+      eval_tasks: wantsCheckpoint && isMultitask ? evalTaskValues : null,
       eval_overwrite_results: wantsCheckpoint ? evalOverwriteResults : false,
       dexjoco_task:
         wantsCheckpoint && isDexjoco && !isMultitask
@@ -651,6 +670,7 @@ export default function SubmitPage() {
       evalNEpisodes,
       evalNRuns,
       evalSetValues,
+      evalTaskValues,
       dexjocoTask,
       evalOverwriteResults,
       checkpointPath,
@@ -865,10 +885,13 @@ export default function SubmitPage() {
                   return (
                     <label
                       key={evalSet}
-                      className="flex h-9 items-center justify-between gap-3 rounded border border-slate-200 px-2 text-xs dark:border-slate-800"
+                      className="flex h-9 items-center justify-between gap-2 rounded border border-slate-200 px-2 text-xs dark:border-slate-800"
                     >
-                      <span className="font-mono">{evalSet}</span>
+                      <span className="min-w-0 flex-1 truncate font-mono" title={evalSet}>
+                        {evalSet}
+                      </span>
                       <Switch
+                        className="shrink-0"
                         checked={checked}
                         onCheckedChange={(nextChecked) => {
                           const next = nextChecked
@@ -953,31 +976,12 @@ export default function SubmitPage() {
     : undefined;
   const dexjocoTaskOptions = dexjocoTasks.data?.tasks ?? [];
   const dexjocoTaskError = dexjocoTasks.error as Error | null;
-  const multitaskShorts = (variant.data?.arrays.TASKS ?? []).map(
-    (entry) => entry.split("|", 1)[0],
-  );
+  // Single-task DexJoCo variants pick one task from the cluster's task list.
   const dexjocoTaskEditor: FlagEditor | undefined =
-    wantsCheckpoint && isDexjoco
+    wantsCheckpoint && isDexjoco && !isMultitask
       ? {
           wide: true,
-          content: isMultitask ? (
-            <div className="space-y-1.5">
-              <p className="text-xs text-slate-500 dark:text-slate-400">
-                Multi-task variant: this eval runs all {multitaskShorts.length}{" "}
-                tasks in one job.
-              </p>
-              <div className="flex flex-wrap gap-1">
-                {multitaskShorts.map((t) => (
-                  <span
-                    key={t}
-                    className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] text-slate-600 dark:bg-slate-800 dark:text-slate-300"
-                  >
-                    {t}
-                  </span>
-                ))}
-              </div>
-            </div>
-          ) : (
+          content: (
             <div className="space-y-2">
               <Select
                 value={dexjocoTask}
@@ -1005,6 +1009,55 @@ export default function SubmitPage() {
               {!dexjocoTaskValid && (
                 <p className="text-xs text-red-600 dark:text-red-400">
                   Choose a DexJoCo task.
+                </p>
+              )}
+            </div>
+          ),
+        }
+      : undefined;
+  // Multitask variants (either harness) pick a SUBSET of tasks to run this
+  // submission — a toggle grid mirroring the eval-sets selector.
+  const taskSelectEditor: FlagEditor | undefined =
+    wantsCheckpoint && isMultitask
+      ? {
+          wide: true,
+          content: (
+            <div className="space-y-3">
+              {taskShortOptions.length > 0 && (
+                <div className="grid gap-2 sm:grid-cols-3">
+                  {taskShortOptions.map((task) => {
+                    const checked = evalTaskValues.includes(task);
+                    return (
+                      <label
+                        key={task}
+                        className="flex h-9 items-center justify-between gap-2 rounded border border-slate-200 px-2 text-xs dark:border-slate-800"
+                      >
+                        <span className="min-w-0 flex-1 truncate font-mono" title={task}>
+                          {task}
+                        </span>
+                        <Switch
+                          className="shrink-0"
+                          checked={checked}
+                          onCheckedChange={(next) => {
+                            const nextVals = next
+                              ? [...evalTaskValues, task]
+                              : evalTaskValues.filter((v) => v !== task);
+                            updateEvalConfig({
+                              evalTasks: formatEvalSetsInput(nextVals),
+                            });
+                          }}
+                        />
+                      </label>
+                    );
+                  })}
+                </div>
+              )}
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                {evalTaskValues.length} of {taskShortOptions.length} tasks selected.
+              </p>
+              {!evalTasksValid && (
+                <p className="text-xs text-red-600 dark:text-red-400">
+                  Select at least one task.
                 </p>
               )}
             </div>
@@ -1071,7 +1124,7 @@ export default function SubmitPage() {
     flagEditors["--dataloader-num-workers"] = workersEditor;
   }
   if (wantsCheckpoint) {
-    flagEditors["--n-episodes"] = (
+    const episodesEditor = (
       <NumberCellEditor
         value={evalNEpisodes}
         onChange={(value) => updateEvalConfig({ nEpisodes: value })}
@@ -1079,6 +1132,11 @@ export default function SubmitPage() {
         invalidMessage="Positive integer."
       />
     );
+    // Attach to both harness naming conventions so the editor lands on the real
+    // entrypoint row: Isaac emits --n-episodes / (eval_sets); DexJoCo emits
+    // --episodes / (families). --n-runs is shared.
+    flagEditors["--n-episodes"] = episodesEditor;
+    flagEditors["--episodes"] = episodesEditor;
     flagEditors["--n-runs"] = (
       <NumberCellEditor
         value={evalNRuns}
@@ -1087,7 +1145,10 @@ export default function SubmitPage() {
         invalidMessage="Positive integer."
       />
     );
-    if (evalSetsEditor) flagEditors["(eval_sets)"] = evalSetsEditor;
+    if (evalSetsEditor) {
+      flagEditors["(eval_sets)"] = evalSetsEditor;
+      flagEditors["(families)"] = evalSetsEditor;
+    }
   }
   const extraFlagRows: ExtraFlagRow[] = [];
   if (wantsTrainConfig) {
@@ -1153,6 +1214,14 @@ export default function SubmitPage() {
         editor: dexjocoTaskEditor,
       });
     }
+    if (taskSelectEditor) {
+      extraFlagRows.push({
+        key: "tasks",
+        flag: "(tasks)",
+        value: `${evalTaskValues.length}/${taskShortOptions.length} selected`,
+        editor: taskSelectEditor,
+      });
+    }
     extraFlagRows.push({
       key: "overwrite-results",
       flag: "overwrite results",
@@ -1194,18 +1263,8 @@ export default function SubmitPage() {
       (!!trimmedCkpt &&
         checkpointExistsValue === true &&
         evalConfigInputsValid));
-  const selectedMlxpGpuType =
-    mlxp.data?.find((n) => n.name === mlxpNode)?.gpu_type ||
-    mlxpSettings.data?.gpu_type ||
-    "GPU";
   const submitButtonLabel =
-    submit.isPending || preflightPending
-      ? "Submitting..."
-      : isSlurm
-        ? `Submit ${phase} -> ${cluster}/${selectedPartitionName || "?"}`
-        : mlxpJobClass === "dedicated"
-          ? `Submit ${phase} -> mlxp/${mlxpNode}/${trainNumGpus || "?"}x${selectedMlxpGpuType}`
-          : `Submit ${phase} -> mlxp/${mlxpJobClass} queue/${trainNumGpus || "?"}x${selectedMlxpGpuType}`;
+    submit.isPending || preflightPending ? "Submitting..." : "Submit";
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8 lg:py-12">

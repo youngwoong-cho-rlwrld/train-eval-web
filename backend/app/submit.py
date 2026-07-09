@@ -9,6 +9,7 @@ Flow:
 from __future__ import annotations
 
 
+import base64
 import re
 import shlex
 import tempfile
@@ -106,6 +107,9 @@ class SubmitRequest(BaseModel):
     eval_n_runs: int | None = Field(default=None, ge=1)
     eval_num_gpus: int | None = Field(default=None, ge=1)
     eval_sets: list[str] | None = None
+    # Eval-only: multitask task-subset selection (task SHORT labels). None runs
+    # all TASKS from config.sh; a subset runs only the chosen tasks this submit.
+    eval_tasks: list[str] | None = None
     eval_overwrite_results: bool = False
     # Eval-only: absolute path to the checkpoint dir on the cluster.
     # Eval submissions must provide this explicitly.
@@ -148,6 +152,38 @@ def resolve_job_name(req_job_name: str | None, phase: str, variant: str) -> str:
     return name
 
 
+async def update_slurm_train_note(cluster: str, job_id: str, note: str) -> None:
+    """Rewrite the ``train_note=`` line in a job's sidecar meta — the source the
+    details page reads for slurm jobs. The note is passed base64-encoded via env
+    so arbitrary text can't break shell quoting or the key=value line format;
+    existing meta lines are preserved.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", job_id):
+        raise ValueError(f"invalid job_id {job_id!r}")
+    host = (await load_cluster(cluster)).ssh_alias
+    b64 = base64.b64encode(note.encode()).decode()
+    script = (
+        "import os, base64, pathlib\n"
+        f"p = pathlib.Path(os.path.expanduser('~/.train-eval-web/jobs/{job_id}.meta'))\n"
+        "note = base64.b64decode(os.environ['TEW_NOTE_B64']).decode()\n"
+        "lines = p.read_text().splitlines() if p.exists() else []\n"
+        "out, found = [], False\n"
+        "for ln in lines:\n"
+        "    if ln.startswith('train_note='):\n"
+        "        out.append('train_note=' + note); found = True\n"
+        "    else:\n"
+        "        out.append(ln)\n"
+        "if not found:\n"
+        "    out.append('train_note=' + note)\n"
+        "p.parent.mkdir(parents=True, exist_ok=True)\n"
+        "p.write_text('\\n'.join(out) + '\\n')\n"
+    )
+    cmd = f"TEW_NOTE_B64={shlex.quote(b64)} python3 -c {shlex.quote(script)}"
+    r = await ssh_run(host, cmd, timeout=15.0)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout or "failed to update train_note").strip())
+
+
 def resolve_train_note(requested_note: str | None, variant) -> str:
     requested = requested_note.strip() if requested_note is not None else ""
     raw = requested or variant.vars.get("TRAIN_NOTE", "")
@@ -186,22 +222,36 @@ def slurm_comment_metadata(
     )
 
 
-def normalize_eval_sets(eval_sets: list[str] | None) -> list[str] | None:
-    if eval_sets is None:
+def _normalize_token_list(items: list[str] | None, label: str) -> list[str] | None:
+    """Dedupe + validate a list of identifier-ish tokens (order preserved).
+
+    None → None (use the config default); an all-blank list is an error.
+    Shared by eval-set and eval-task (multitask subset) normalization.
+    """
+    if items is None:
         return None
     out: list[str] = []
     seen: set[str] = set()
-    for raw in eval_sets:
+    for raw in items:
         item = raw.strip()
         if not item or item in seen:
             continue
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", item):
-            raise ValueError(f"invalid eval set {item!r}; use letters, numbers, dot, underscore, or hyphen")
+            raise ValueError(f"invalid {label} {item!r}; use letters, numbers, dot, underscore, or hyphen")
         seen.add(item)
         out.append(item)
     if not out:
-        raise ValueError("eval_sets must contain at least one eval set")
+        raise ValueError(f"{label}s must contain at least one {label}")
     return out
+
+
+def normalize_eval_sets(eval_sets: list[str] | None) -> list[str] | None:
+    return _normalize_token_list(eval_sets, "eval set")
+
+
+def normalize_eval_tasks(eval_tasks: list[str] | None) -> list[str] | None:
+    """Normalize the multitask task-subset selection (task SHORT labels)."""
+    return _normalize_token_list(eval_tasks, "eval task")
 
 
 def require_eval_checkpoint_path(req: SubmitRequest) -> str:
@@ -347,12 +397,14 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         raise ValueError("resume=true is only valid for phase=train")
     eval_num_envs_per_gpu = req.eval_num_envs_per_gpu
     eval_sets = normalize_eval_sets(req.eval_sets)
+    eval_tasks = normalize_eval_tasks(req.eval_tasks)
     eval_checkpoint = require_eval_checkpoint_path(req) if req.phase == "eval" else None
     if req.phase != "eval" and any((
         eval_num_envs_per_gpu is not None,
         req.eval_n_episodes is not None,
         req.eval_n_runs is not None,
         eval_sets is not None,
+        eval_tasks is not None,
         req.eval_overwrite_results,
         bool(req.checkpoint_path and req.checkpoint_path.strip()),
     )):
@@ -548,10 +600,12 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             eval_n_episodes=req.eval_n_episodes,
             eval_n_runs=req.eval_n_runs,
             eval_sets=eval_sets,
+            eval_tasks=eval_tasks,
             eval_overwrite_results=req.eval_overwrite_results,
             checkpoint_path=eval_checkpoint,
             extra_args=req.extra_args,
             train_num_gpus=train_settings.num_gpus,
+            eval_num_gpus=job_num_gpus,
             train_git_commit=train_git_commit,
             train_note=train_note,
             dexjoco_task=req.dexjoco_task,
@@ -763,6 +817,10 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             if req.phase == "eval" and eval_sets is not None else ""
         )
         + (
+            f",SUBMIT_EVAL_TASKS={shlex.quote(' '.join(eval_tasks))}"
+            if req.phase == "eval" and eval_tasks is not None else ""
+        )
+        + (
             ",SUBMIT_EVAL_OVERWRITE_RESULTS=1"
             if req.phase == "eval" and req.eval_overwrite_results else ""
         )
@@ -907,6 +965,11 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         + (
             f"eval_sets={' '.join(eval_sets)}\n"
             if req.phase == "eval" and eval_sets is not None
+            else ""
+        )
+        + (
+            f"eval_tasks={' '.join(eval_tasks)}\n"
+            if req.phase == "eval" and eval_tasks is not None
             else ""
         )
         + (

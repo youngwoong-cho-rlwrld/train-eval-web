@@ -42,7 +42,7 @@ from .mlxp_config import get_settings
 from .mlxp_data_pod import ensure_listing_pod
 from .paths import CLUSTER_STAGING_REL
 from .remote_paths import expand_cluster_home, expand_home_path, remote_home, remote_path_expr, remote_shell_path
-from .submission_snapshot import SubmitGitInfo, render_training_config_snapshot
+from .submission_snapshot import SubmitGitInfo, render_training_config_snapshot, set_scalar
 from .ssh import ssh_run
 from .slurm_meta import read_slurm_meta
 from .training_models import resolve_training_model
@@ -145,6 +145,7 @@ class JobDetails(BaseModel):
     job_name: str
     phase: str            # "train" | "resume" | "eval" | "unknown"
     variant: str | None
+    eval_harness: str | None = None   # "isaac" | "dexjoco" for eval jobs; drives log-tab labels
     resume_of: str | None = None
     resubmit_action: str | None = None
     training_job: TrainingJobRef | None = None
@@ -159,6 +160,24 @@ class JobDetails(BaseModel):
     config_snapshot: ConfigSnapshot | None = None
     data_interface: DataInterfaceSummary | None = None
     eval_runs: list[EvalRun] = Field(default_factory=list)
+
+
+async def _resolve_eval_harness_name(
+    phase: str, variant: str | None, meta: dict[str, str] | None
+) -> str | None:
+    """Eval-harness name ("isaac"/"dexjoco") for an eval job, else None.
+
+    Prefer the variant's EVAL_HARNESS; fall back to the recorded meta value when
+    the config isn't available locally (mirrors _compute_progress's resolution).
+    """
+    if phase != "eval":
+        return None
+    if variant:
+        try:
+            return harness_for(await load_variant(variant)).name
+        except (FileNotFoundError, ValueError):
+            pass
+    return harness_for_name((meta or {}).get("eval_harness")).name
 
 
 async def _read_slurm_scontrol_comment(host: str, job_id: str) -> str | None:
@@ -485,6 +504,7 @@ async def get_details(
     data_interface = None
     if include_config or include_data_interface:
         config_snapshot = await _slurm_config_snapshot(env.ssh_alias, slurm_meta, cluster=cluster)
+        _overlay_train_note(config_snapshot, slurm_meta.get("train_note"))
     if include_data_interface:
         data_interface = await _slurm_data_interface_snapshot(
             env.ssh_alias,
@@ -520,7 +540,9 @@ async def get_details(
 
     return JobDetails(
         cluster=cluster, job_id=job_id, job_name=job_name,
-        phase=phase, variant=variant, resume_of=slurm_meta.get("resume_of") or None,
+        phase=phase, variant=variant,
+        eval_harness=await _resolve_eval_harness_name(phase, variant, slurm_meta),
+        resume_of=slurm_meta.get("resume_of") or None,
         resubmit_action=slurm_meta.get("resubmit_action") or None,
         training_job=training_job,
         train_note=slurm_meta.get("train_note") or None,
@@ -715,6 +737,7 @@ async def _mlxp_details(
     data_interface = None
     if include_config or include_data_interface:
         config_snapshot = await _mlxp_config_snapshot(metadata)
+        _overlay_train_note(config_snapshot, train_note)
     if include_data_interface:
         data_interface = await _mlxp_data_interface_snapshot(
             metadata,
@@ -750,7 +773,9 @@ async def _mlxp_details(
 
     return JobDetails(
         cluster="mlxp", job_id=job_id, job_name=job_name,
-        phase=phase, variant=variant, resume_of=metadata.get("resume_of") or None,
+        phase=phase, variant=variant,
+        eval_harness=await _resolve_eval_harness_name(phase, variant, metadata),
+        resume_of=metadata.get("resume_of") or None,
         resubmit_action=metadata.get("resubmit_action") or None,
         training_job=training_job,
         train_note=train_note,
@@ -767,6 +792,18 @@ def _meta_bool(value: str | None) -> bool | None:
     if value is None or value == "":
         return None
     return value.strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _overlay_train_note(snapshot: ConfigSnapshot | None, note: str | None) -> None:
+    """Reflect an edited TRAIN_NOTE in the config.sh preview text.
+
+    The note is an editable display label; the authoritative store is the sidecar
+    meta (slurm) / annotation (mlxp), which the edit endpoint updates. Rather than
+    rewrite the submitted snapshot file on disk, overlay the current note onto the
+    preview text so it stays consistent with the header.
+    """
+    if snapshot and snapshot.text and note:
+        snapshot.text = set_scalar(snapshot.text, "TRAIN_NOTE", note)
 
 
 async def _slurm_config_snapshot(
@@ -1541,8 +1578,10 @@ async def _mlxp_eval_progress(
     try:
         v = await load_variant(variant)
         eval_sets, n_runs, n_eps, tasks = eval_shape(v, metadata)
-    except Exception:
-        return progress
+        harness = harness_for(v)
+    except (FileNotFoundError, ValueError):
+        eval_sets, n_runs, n_eps, tasks = eval_shape_from_meta(metadata)
+        harness = harness_for_name(metadata.get("eval_harness"))
     total = eval_total(eval_sets, n_runs, tasks)
     progress.total_runs = total or None
     if total <= 0:
@@ -1556,18 +1595,30 @@ async def _mlxp_eval_progress(
     _exp = f"{settings.experiments_dir}/{variant}"
     _ns = metadata.get("output_namespace")
     eval_dir = metadata.get("eval_dir") or (f"{_exp}/eval_results/{_ns}" if _ns else f"{_exp}/eval_results")
+    job_log_dir = metadata.get("job_log_dir") or f"{_exp}/logs"
 
-    cmd = f"find {shlex.quote(eval_dir)} -type f -path '*/run_*/results.json' 2>/dev/null | wc -l"
+    # Run the SAME live probe the Slurm path runs over SSH, but in the data pod
+    # via kubectl exec. This surfaces the mid-run signal (DexJoCo episode_* dirs /
+    # Isaac buffered videos), not just fully-finished runs — MLXP eval jobs
+    # previously sat at 0 until a whole run's results.json landed. eval_dir is an
+    # absolute DDN path, so shell-quote it directly (no $HOME to expand).
+    probe_cmd = harness.progress_probe(
+        eval_dir_expr=shlex.quote(eval_dir),
+        log_dir_q=shlex.quote(job_log_dir),
+        job_id_q=shlex.quote(metadata.get("job_id") or ""),
+    )
     try:
-        _, stdout, _ = await _mlxp_exec("bash", "-lc", cmd, timeout=15.0)
+        rc, stdout, _ = await _mlxp_exec("bash", "-lc", probe_cmd, timeout=15.0)
     except Exception:
         return progress
+    if rc != 0:
+        return progress
     try:
-        completed = int(stdout.strip())
+        completed, current_eps = harness.parse_progress(stdout, n_eps=n_eps)
     except ValueError:
-        completed = 0
+        return progress
     progress.completed_runs = completed
-    _apply_eval_step_shape(progress, completed, total, n_eps, completed * n_eps)
+    _apply_eval_step_shape(progress, completed, total, n_eps, current_eps)
     return progress
 
 

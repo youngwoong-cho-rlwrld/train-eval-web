@@ -864,6 +864,21 @@ def _set_array(config_text: str, name: str, values: list[str]) -> str:
     return f"{config_text}{suffix}{rendered}\n"
 
 
+def _filter_tasks_by_short(config_text: str, selected_shorts: list[str]) -> str:
+    """Rewrite the TASKS array to only entries whose SHORT (first "|"-field) is
+    in ``selected_shorts``, preserving config order. No-op when TASKS is absent
+    or nothing matches (the eval body then fails loudly on the bad selection)."""
+    m = re.search(r"^TASKS=\(.*?^\)\s*$", config_text, flags=re.MULTILINE | re.DOTALL)
+    if not m:
+        return config_text
+    entries = re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(0))
+    wanted = set(selected_shorts)
+    kept = [e for e in entries if e.split("|", 1)[0] in wanted]
+    if not kept:
+        return config_text
+    return _set_array(config_text, "TASKS", kept)
+
+
 def _apply_submission_config_overrides(
     config_text: str,
     *,
@@ -981,11 +996,13 @@ def render_eval_config_preview(
     eval_n_episodes: int | None = None,
     eval_n_runs: int | None = None,
     eval_sets: list[str] | None = None,
+    eval_tasks: list[str] | None = None,
     eval_overwrite_results: bool = False,
     checkpoint_path: str | None = None,
     extra_args: list[str] | None = None,
     data_dir: str | None = None,
     train_num_gpus: int | None = None,
+    eval_num_gpus: int | None = None,
     eval_unset_cuda_visible_devices_for_server: int | None = None,
     train_git_commit: str | None = None,
     train_note: str | None = None,
@@ -1005,12 +1022,19 @@ def render_eval_config_preview(
         text = set_scalar(text, "TRAIN_GIT_COMMIT", train_git_commit)
     if train_num_gpus is not None:
         text = set_scalar(text, "TRAIN_NUM_GPUS", train_num_gpus)
+    if eval_num_gpus is not None:
+        # EVAL_NUM_GPUS drives the eval body's parallel worker count
+        # (EVAL_GPU_COUNT). It must equal the GPUs the job allocates, or the job
+        # reserves N GPUs but only runs one worker on GPU 0.
+        text = set_scalar(text, "EVAL_NUM_GPUS", eval_num_gpus)
     if eval_n_episodes is not None:
         text = set_scalar(text, "N_EPISODES", eval_n_episodes)
     if eval_n_runs is not None:
         text = set_scalar(text, "N_RUNS", eval_n_runs)
     if eval_sets is not None:
         text = _set_array(text, "EVAL_SETS", eval_sets)
+    if eval_tasks is not None:
+        text = _filter_tasks_by_short(text, eval_tasks)
     if eval_unset_cuda_visible_devices_for_server is not None:
         text = set_scalar(
             text,

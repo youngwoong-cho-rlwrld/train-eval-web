@@ -203,6 +203,32 @@ require_eval_checkpoint_path() {
 # OUTPUT_NAMESPACE, EVAL_DIR, RESULTS_PATH, JOB_LOG_DIR, LOG_FILE. Shared by
 # eval_body.sh and eval_body_dexjoco.sh. Requires EXP_DIR, VARIANT and LOG_DIR
 # (from the sourced cluster env) to be set.
+# Filter the global TASKS[] to the subset requested via SUBMIT_EVAL_TASKS (a
+# space-separated list of task SHORT labels — the first "|"-field of each entry).
+# No-op when unset. Powers the submit UI's per-task multi-select; preserves the
+# config.sh task order. Call only in multi-task mode, after TASKS is built.
+apply_eval_task_selection() {
+    [ -n "${SUBMIT_EVAL_TASKS:-}" ] || return 0
+    local -a wanted=() selected=()
+    read -r -a wanted <<< "$SUBMIT_EVAL_TASKS"
+    local entry short w
+    for entry in "${TASKS[@]}"; do
+        short="${entry%%|*}"
+        for w in "${wanted[@]}"; do
+            if [ "$short" = "$w" ]; then
+                selected+=("$entry")
+                break
+            fi
+        done
+    done
+    if [ "${#selected[@]}" -eq 0 ]; then
+        log "ERROR: SUBMIT_EVAL_TASKS='$SUBMIT_EVAL_TASKS' matched none of the variant's TASKS"
+        exit 1
+    fi
+    TASKS=("${selected[@]}")
+    log "Task selection: running ${#TASKS[@]} of the variant's tasks (SUBMIT_EVAL_TASKS)"
+}
+
 resolve_eval_output_paths() {
     GPU_INSTANCE="$(detect_gpu_instance)"
     EXP_NAME="${SLURM_JOB_NAME:-${VARIANT}_eval_${GPU_INSTANCE}_$(date +%Y%m%d%H%M%S)}"

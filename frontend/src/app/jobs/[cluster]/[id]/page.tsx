@@ -10,7 +10,7 @@ import {
   type UseQueryResult,
 } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { ArrowLeft, ExternalLink } from "lucide-react";
+import { ArrowLeft, Check, ExternalLink, Pencil, X } from "lucide-react";
 import {
   api,
   logStreamUrl,
@@ -38,6 +38,7 @@ import {
   resubmitSourceLabel,
 } from "@/lib/job-status";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -170,6 +171,10 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
 
   const phase = details.data?.phase;
   const isEval = phase === "eval";
+  // The third log tab shows the policy/sim server log (server_*.log) — Isaac Sim
+  // for the isaac harness, the MuJoCo policy server for dexjoco.
+  const serverLogLabel =
+    details.data?.eval_harness === "dexjoco" ? "MuJoCo" : "Isaac Sim";
   const stateForActions = sacct.data?.State ?? details.data?.state ?? "";
   const checkpointPath = details.data?.paths.ckpt_dir ?? null;
   const checkpointPathExists = useQuery({
@@ -240,11 +245,11 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
                   <span className="font-mono text-xs">{details.data.variant}</span>
                 )}
               </div>
-              {details.data.train_note && (
-                <div className="max-w-3xl text-sm text-slate-600 dark:text-slate-400">
-                  {details.data.train_note}
-                </div>
-              )}
+              <TrainNoteEditor
+                cluster={cluster}
+                jobId={id}
+                note={details.data.train_note}
+              />
               {isEval && details.data.training_job && (
                 <div className="flex items-center gap-1.5 text-sm text-slate-600 dark:text-slate-400">
                   <span>Training job:</span>
@@ -460,7 +465,7 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
             <Button variant={stream === "err" ? "default" : "outline"} size="sm" onClick={() => setStream("err")}>stderr</Button>
             {isEval && (
               <Button variant={stream === "isaac" ? "default" : "outline"} size="sm" onClick={() => setStream("isaac")}>
-                Isaac Sim
+                {serverLogLabel}
               </Button>
             )}
           </div>
@@ -474,6 +479,91 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
           />
         </CardContent>
       </Card>
+    </div>
+  );
+}
+
+function TrainNoteEditor({
+  cluster,
+  jobId,
+  note,
+}: {
+  cluster: string;
+  jobId: string;
+  note: string | null;
+}) {
+  const qc = useQueryClient();
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(note ?? "");
+  const mutation = useMutation({
+    mutationFn: (value: string) =>
+      api<{ train_note: string }>(
+        `/api/jobs/${cluster}/${jobId}/train-note`,
+        { method: "PATCH", body: JSON.stringify({ train_note: value }) },
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["job-details", cluster, jobId] });
+      qc.invalidateQueries({ queryKey: ["job", cluster, jobId] });
+      // The effective config.sh preview comes from the metadata query.
+      qc.invalidateQueries({ queryKey: ["job-metadata", cluster, jobId] });
+      setEditing(false);
+      toast.success("Training note updated");
+    },
+    onError: (e: unknown) => toast.error((e as Error).message),
+  });
+
+  if (editing) {
+    const trimmed = draft.trim();
+    const save = () => {
+      if (trimmed && !mutation.isPending) mutation.mutate(trimmed);
+    };
+    const cancel = () => {
+      setDraft(note ?? "");
+      setEditing(false);
+    };
+    return (
+      <div className="flex max-w-3xl items-center gap-2">
+        <Input
+          autoFocus
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              save();
+            } else if (e.key === "Escape") {
+              cancel();
+            }
+          }}
+          className="h-8 text-sm"
+          placeholder="Training note"
+        />
+        <Button size="sm" onClick={save} disabled={!trimmed || mutation.isPending}>
+          <Check className="h-4 w-4" />
+        </Button>
+        <Button size="sm" variant="outline" onClick={cancel} disabled={mutation.isPending}>
+          <X className="h-4 w-4" />
+        </Button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex max-w-3xl items-start gap-1.5 text-sm text-slate-600 dark:text-slate-400">
+      <span>
+        {note || <span className="italic text-slate-400">(no training note)</span>}
+      </span>
+      <button
+        type="button"
+        onClick={() => {
+          setDraft(note ?? "");
+          setEditing(true);
+        }}
+        className="mt-0.5 shrink-0 text-slate-400 transition-colors hover:text-slate-700 dark:hover:text-slate-200"
+        title="Edit training note"
+      >
+        <Pencil className="h-3.5 w-3.5" />
+      </button>
     </div>
   );
 }
@@ -816,7 +906,11 @@ function PathsCard({
   if (d?.paths.ckpt_dir) rows.push({ label: "checkpoints", value: d.paths.ckpt_dir });
   if (d?.paths.eval_checkpoint) rows.push({ label: "checkpoint", value: d.paths.eval_checkpoint });
   if (d?.paths.eval_dir) rows.push({ label: "eval results", value: d.paths.eval_dir });
-  if (d?.paths.isaac_logs_glob) rows.push({ label: "isaac sim logs", value: d.paths.isaac_logs_glob });
+  if (d?.paths.isaac_logs_glob)
+    rows.push({
+      label: d?.eval_harness === "dexjoco" ? "mujoco server logs" : "isaac sim logs",
+      value: d.paths.isaac_logs_glob,
+    });
 
   return (
     <Card className="mt-6">

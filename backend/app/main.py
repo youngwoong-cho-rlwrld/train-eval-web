@@ -473,6 +473,14 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
             )
             checkpoint_path = submit.require_eval_checkpoint_path(req)
             eval_sets = submit.normalize_eval_sets(req.eval_sets)
+            eval_tasks = submit.normalize_eval_tasks(req.eval_tasks)
+            try:
+                _eval_gpu_default = int(
+                    variant.vars.get("EVAL_NUM_GPUS") or train_settings.num_gpus
+                )
+            except (ValueError, TypeError):
+                _eval_gpu_default = train_settings.num_gpus
+            eval_num_gpus = req.eval_num_gpus or _eval_gpu_default
             train_git_commit = submit.resolve_train_git_commit(req, variant)
             if req.cluster == "mlxp":
                 suffix = submission_snapshot.snapshot_suffix(job_name)
@@ -489,9 +497,11 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
                 eval_n_episodes=req.eval_n_episodes,
                 eval_n_runs=req.eval_n_runs,
                 eval_sets=eval_sets,
+                eval_tasks=eval_tasks,
                 eval_overwrite_results=req.eval_overwrite_results,
                 checkpoint_path=checkpoint_path,
                 extra_args=req.extra_args,
+                eval_num_gpus=eval_num_gpus,
                 data_dir=mlxp_config.get_settings().datasets_dir if req.cluster == "mlxp" else None,
                 train_num_gpus=train_settings.num_gpus,
                 train_git_commit=train_git_commit,
@@ -529,14 +539,21 @@ async def post_submit(req: submit.SubmitRequest):
     """
     try:
         if req.cluster == "mlxp":
-            # GPU count defaults to TRAIN_NUM_GPUS; submit-time overrides use
-            # the same request fields as Slurm and then map to MLXP CPU/RAM.
+            # The k8s Job's GPU request maps to MLXP CPU/RAM. Eval jobs allocate
+            # EVAL_NUM_GPUS (the harness runs one worker per GPU), train jobs
+            # allocate TRAIN_NUM_GPUS — mirroring the Slurm path. Using the train
+            # count for eval is the bug that made a "1 GPU" eval request run on 2.
             v = await variants.load_variant(req.variant)
             try:
-                num_gpus = req.train_num_gpus or int(v.vars.get("TRAIN_NUM_GPUS", "2"))
+                if req.phase == "eval":
+                    num_gpus = req.eval_num_gpus or int(
+                        v.vars.get("EVAL_NUM_GPUS") or v.vars.get("TRAIN_NUM_GPUS", "2")
+                    )
+                else:
+                    num_gpus = req.train_num_gpus or int(v.vars.get("TRAIN_NUM_GPUS", "2"))
             except ValueError:
                 raise ValueError(
-                    f"variant {req.variant}: TRAIN_NUM_GPUS must be an integer"
+                    f"variant {req.variant}: TRAIN_NUM_GPUS/EVAL_NUM_GPUS must be an integer"
                 )
             mlxp_req = mlxp_submit.MlxpSubmitRequest(
                 variant=req.variant,
@@ -557,6 +574,7 @@ async def post_submit(req: submit.SubmitRequest):
                 eval_n_episodes=req.eval_n_episodes,
                 eval_n_runs=req.eval_n_runs,
                 eval_sets=req.eval_sets,
+                eval_tasks=req.eval_tasks,
                 eval_overwrite_results=req.eval_overwrite_results,
                 dexjoco_task=req.dexjoco_task if req.phase == "eval" else None,
                 checkpoint_path=req.checkpoint_path,
@@ -695,6 +713,37 @@ async def get_resumed_jobs(cluster: str, job_id: str):
         raise HTTPException(404, str(e))
     except RuntimeError as e:
         raise HTTPException(500, str(e))
+
+
+class TrainNoteUpdate(BaseModel):
+    train_note: str
+
+
+@app.patch("/api/jobs/{cluster}/{job_id}/train-note")
+async def patch_train_note(cluster: str, job_id: str, req: TrainNoteUpdate):
+    """Edit a job's TRAIN_NOTE in place (all clusters, train + eval).
+
+    Updates the store the details page reads from: the sidecar meta on slurm,
+    the train-note annotation on MLXP.
+    """
+    note = req.train_note.strip()
+    if not note:
+        raise HTTPException(400, "train_note cannot be empty")
+    if "\n" in note or "\r" in note:
+        raise HTTPException(400, "train_note must be a single line")
+    if len(note) > 500:
+        raise HTTPException(400, "train_note is too long (max 500 chars)")
+    try:
+        if cluster == "mlxp":
+            from . import mlxp_jobs
+            await mlxp_jobs.update_train_note(job_id, note)
+        else:
+            await submit.update_slurm_train_note(cluster, job_id, note)
+    except (ValueError, FileNotFoundError) as e:
+        raise HTTPException(400, str(e))
+    except (RuntimeError, asyncio.TimeoutError) as e:
+        raise HTTPException(500, str(e))
+    return {"train_note": note}
 
 
 @app.delete("/api/jobs/{cluster}/{job_id}")

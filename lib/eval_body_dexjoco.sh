@@ -74,6 +74,7 @@ fi
 # Synthesize a one-element list for single-task so the loop handles both.
 if [[ "${TASKS+set}" == set ]] && [ "${#TASKS[@]}" -gt 0 ]; then
     MULTI_TASK=1
+    apply_eval_task_selection
     log "Mode: multi-task over ${#TASKS[@]} tasks"
 else
     MULTI_TASK=0
@@ -338,13 +339,19 @@ run_eval_one() (
     REPLAN_ARGS=()
     [ -n "${DEXJOCO_REPLAN_RATIO:-}" ] && REPLAN_ARGS=(--replan-ratio "$DEXJOCO_REPLAN_RATIO")
     CLIENT_RC=0
+    # Tee to both the container stdout AND eval.log so the live per-episode eval
+    # output shows up in `kubectl logs` / the job's stdout tab, instead of the
+    # eval going silent for minutes while it wrote only to eval.log. Process
+    # substitution keeps $? as the client's exit status (a `| tee` pipe would not).
+    # PYTHONUNBUFFERED=1 is essential: the client's stdout is a pipe here, so
+    # without it Python block-buffers and nothing streams until the run ends.
     ( cd "$DEXJOCO_DIR" \
-        && CUDA_VISIBLE_DEVICES="$worker_cuda_device" MUJOCO_GL=egl \
+        && CUDA_VISIBLE_DEVICES="$worker_cuda_device" MUJOCO_GL=egl PYTHONUNBUFFERED=1 \
            "$MICROMAMBA_BIN" run -n "$DEXJOCO_EVAL_ENV" dexjoco-openpi-eval \
             --config="./configs/$FAMILY/$DEXJOCO_TASK.yaml" \
             --seed="$RUN_SEED" --port="$PORT" --episodes="$N_EPISODES" \
             --output="$OUT_DIR" "${PAD_ARGS[@]}" "${REPLAN_ARGS[@]}" ) \
-        >> "$LOG_FILE" 2>&1 || CLIENT_RC=$?
+        > >(tee -a "$LOG_FILE") 2>&1 || CLIENT_RC=$?
 
     cleanup_server
 

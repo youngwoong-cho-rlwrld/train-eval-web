@@ -350,6 +350,7 @@ export type JobDetails = {
   job_name: string;
   phase: ApiJobPhase;
   variant: string | null;
+  eval_harness: string | null;
   resume_of: string | null;
   resubmit_action: string | null;
   training_job: TrainingJobRef | null;
