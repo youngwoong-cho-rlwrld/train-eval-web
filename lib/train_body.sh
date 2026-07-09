@@ -203,6 +203,18 @@ else
     log "Datasets (${#DATASET_PATHS[@]}):"
     for p in "${DATASET_PATHS[@]}"; do log "  - $p"; done
 
+    # Optional per-dataset embodiment tags (enum NAMES, parallel to TRAIN_DATASET_NAMES).
+    # Enables mixed-embodiment training; falls back to the single NEW_EMBODIMENT tag.
+    EMB_TAG_ARGS=()
+    if declare -p TRAIN_DATASET_EMBODIMENT_TAGS 2>/dev/null | grep -q "declare -a"; then
+        if [ "${#TRAIN_DATASET_EMBODIMENT_TAGS[@]}" -ne "${#DATASET_PATHS[@]}" ]; then
+            echo "ERROR: TRAIN_DATASET_EMBODIMENT_TAGS length (${#TRAIN_DATASET_EMBODIMENT_TAGS[@]}) != dataset count (${#DATASET_PATHS[@]})"
+            exit 1
+        fi
+        EMB_TAG_ARGS=(--embodiment-tags "${TRAIN_DATASET_EMBODIMENT_TAGS[@]}")
+        log "Embodiment tags: ${TRAIN_DATASET_EMBODIMENT_TAGS[*]}"
+    fi
+
     # ── Per-variant modality config (Python file, copied into experiment dir) ──
     : "${TRAIN_MODALITY_CONFIG:?TRAIN_MODALITY_CONFIG not set in config.sh}"
     MODALITY_CONFIG_FILE="$EXP_DIR/$TRAIN_MODALITY_CONFIG"
@@ -257,6 +269,7 @@ else
         --base-model-path nvidia/GR00T-N1.6-3B \
         --dataset-path "${DATASET_PATHS[@]}" \
         --embodiment-tag NEW_EMBODIMENT \
+        ${EMB_TAG_ARGS[@]+"${EMB_TAG_ARGS[@]}"} \
         --modality-config-path "$MODALITY_CONFIG_FILE" \
         --num-gpus "$TRAIN_NUM_GPUS" \
         --output-dir "$CKPT_DIR" \

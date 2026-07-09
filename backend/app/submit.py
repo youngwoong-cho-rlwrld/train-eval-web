@@ -104,6 +104,7 @@ class SubmitRequest(BaseModel):
     # Eval-only: per-submission overrides for eval_allex.py and eval matrix.
     eval_n_episodes: int | None = Field(default=None, ge=1)
     eval_n_runs: int | None = Field(default=None, ge=1)
+    eval_num_gpus: int | None = Field(default=None, ge=1)
     eval_sets: list[str] | None = None
     eval_overwrite_results: bool = False
     # Eval-only: absolute path to the checkpoint dir on the cluster.
@@ -410,12 +411,18 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         action_horizon_mode,
     ) if req.phase == "train" else None
     train_git_commit = resolve_train_git_commit(req, variant)
-    gpus = str(train_settings.num_gpus)
+    # Eval jobs allocate EVAL_NUM_GPUS (the harness runs one worker per GPU),
+    # not TRAIN_NUM_GPUS. Falls back to the train count when unset so existing
+    # eval variants are unchanged.
+    job_num_gpus = train_settings.num_gpus
+    if req.phase == "eval":
+        job_num_gpus = req.eval_num_gpus or variant_int(variant, "EVAL_NUM_GPUS", train_settings.num_gpus)
+    gpus = str(job_num_gpus)
     slurm_resources = slurm_resources_for(
         cluster=req.cluster,
         partition=partition,
         phase=req.phase,
-        num_gpus=train_settings.num_gpus,
+        num_gpus=job_num_gpus,
     )
 
     # Unified shape across slurm + MLXP. The cluster/partition are shown in

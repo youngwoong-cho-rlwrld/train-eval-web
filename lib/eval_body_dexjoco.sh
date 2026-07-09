@@ -43,6 +43,15 @@ resolve_eval_output_paths
 DEXJOCO_SERVER_TYPE="${DEXJOCO_SERVER_TYPE:-groot}"
 DEXJOCO_TASK="${SUBMIT_DEXJOCO_TASK:-${DEXJOCO_TASK:-}}"
 DEXJOCO_PAD_STATE_DIM46="${DEXJOCO_PAD_STATE_DIM46:-0}"
+# Embodiment tag handed to the GR00T policy server. Multi-embodiment checkpoints
+# set DEXJOCO_EMBODIMENT_TAG (single-arm tasks) and DEXJOCO_EMBODIMENT_TAG_BIMANUAL
+# (bimanual_* tasks); legacy single-tag checkpoints keep the new_embodiment default.
+# Base embodiment tag (single-arm / legacy). bimanual_* tasks use the bimanual
+# tag. Both are resolved per task in the eval loop below so a multi-task run
+# picks the right tag for each task.
+DEXJOCO_EMBODIMENT_TAG_BASE="${DEXJOCO_EMBODIMENT_TAG:-new_embodiment}"
+DEXJOCO_EMBODIMENT_TAG_BIMANUAL="${DEXJOCO_EMBODIMENT_TAG_BIMANUAL:-$DEXJOCO_EMBODIMENT_TAG_BASE}"
+DEXJOCO_EMBODIMENT_TAG="$DEXJOCO_EMBODIMENT_TAG_BASE"
 SERVER_PROMPT="${INSTRUCTION:-${DEXJOCO_PROMPT:-}}"
 N_EPISODES="${SUBMIT_EVAL_N_EPISODES:-${N_EPISODES:-50}}"
 N_RUNS="${SUBMIT_EVAL_N_RUNS:-${N_RUNS:-1}}"
@@ -57,13 +66,27 @@ if [[ "${EVAL_SETS+set}" != set ]] || [ "${#EVAL_SETS[@]}" -eq 0 ]; then
     EVAL_SETS=(rand_obj)
 fi
 
+# Task mode:
+#   (a) TASKS=("short|task_name|instruction" ...) — multi-task eval matrix; the
+#       loop evaluates every task in one job (task_name is the DexJoCo config
+#       stem configs/<family>/<task_name>.yaml, results land under <short>/).
+#   (b) DEXJOCO_TASK + INSTRUCTION — legacy single-task.
+# Synthesize a one-element list for single-task so the loop handles both.
+if [[ "${TASKS+set}" == set ]] && [ "${#TASKS[@]}" -gt 0 ]; then
+    MULTI_TASK=1
+    log "Mode: multi-task over ${#TASKS[@]} tasks"
+else
+    MULTI_TASK=0
+    TASKS=("__single__|${DEXJOCO_TASK}|${SERVER_PROMPT}")
+fi
+
 # ── Validation ──────────────────────────────────────────────────────────────
 : "${DEXJOCO_DIR:?DEXJOCO_DIR not set in cluster env}"
 : "${MICROMAMBA_BIN:?MICROMAMBA_BIN not set in cluster env}"
 : "${MAMBA_ROOT_PREFIX:?MAMBA_ROOT_PREFIX not set in cluster env}"
 : "${DEXJOCO_EVAL_ENV:?DEXJOCO_EVAL_ENV not set in cluster env}"
 export MAMBA_ROOT_PREFIX
-[ -n "$DEXJOCO_TASK" ] || { log "ERROR: DEXJOCO_TASK not set (config.sh or submit picker)"; exit 1; }
+[ "$MULTI_TASK" = "1" ] || [ -n "$DEXJOCO_TASK" ] || { log "ERROR: DEXJOCO_TASK not set (config.sh or submit picker)"; exit 1; }
 [ -d "$DEXJOCO_DIR" ] || { log "ERROR: DEXJOCO_DIR not found: $DEXJOCO_DIR"; exit 1; }
 [ -x "$MICROMAMBA_BIN" ] || { log "ERROR: micromamba not executable: $MICROMAMBA_BIN"; exit 1; }
 # Shared validators (lib/_common.sh): positive-int counts + checkpoint path.
@@ -143,7 +166,8 @@ start_server() {
         ( cd "$REPO_ROOT/lib/dexjoco" \
             && PYTHONPATH="$TRAIN_REPO_DIR${PYTHONPATH:+:$PYTHONPATH}" \
                CUDA_VISIBLE_DEVICES="$cuda_device" "$TRAIN_REPO_DIR/.venv/bin/python" gr00t_dexjoco_server.py \
-                --model_path "$LAST_CKPT" --port "$port" --prompt "$SERVER_PROMPT" "${img_args[@]}" ) \
+                --model_path "$LAST_CKPT" --port "$port" --prompt "$SERVER_PROMPT" \
+                --embodiment_tag "$DEXJOCO_EMBODIMENT_TAG" "${img_args[@]}" ) \
             > "$server_log" 2>&1 &
         SERVER_PID=$!
     else
@@ -265,10 +289,10 @@ run_eval_one() (
     local GPU_SLOT="$4"
     local PORT="$5"
     local START_SLOT="$6"
-    local RUN_DIR="$EVAL_DIR/$FAMILY/run_$RUN_IDX"
+    local RUN_DIR="${CUR_EVAL_DIR:-$EVAL_DIR}/$FAMILY/run_$RUN_IDX"
     local RUN_RESULTS="$RUN_DIR/results.json"
     local OUT_DIR="$RUN_DIR/dexjoco_out"
-    local SERVER_LOG="$JOB_LOG_DIR/server_${FAMILY}_run${RUN_IDX}.log"
+    local SERVER_LOG="$JOB_LOG_DIR/server_${CUR_TASK_TAG:+${CUR_TASK_TAG}_}${FAMILY}_run${RUN_IDX}.log"
     local SERVER_PID=""
     local worker_cuda_device
     worker_cuda_device="$(select_cuda_device "$GPU_SLOT")"
@@ -340,34 +364,58 @@ run_eval_one() (
     return 0
 )
 
-# ── Eval matrix: families (eval_sets) x seeds (runs) ────────────────────────
-for FAMILY in "${EVAL_SETS[@]}"; do
-    CONFIG_YAML="$DEXJOCO_DIR/configs/$FAMILY/$DEXJOCO_TASK.yaml"
-    if [ ! -f "$CONFIG_YAML" ]; then
-        log "ERROR: dexjoco config not found: $CONFIG_YAML"
-        FAILED=1
-        continue
+# ── Eval matrix: tasks x families (eval_sets) x seeds (runs) ────────────────
+# run_eval_one reads DEXJOCO_TASK / SERVER_PROMPT / DEXJOCO_EMBODIMENT_TAG /
+# CUR_EVAL_DIR / CUR_TASK_TAG as globals; it forks as a subshell per launch, so
+# each task's in-flight workers keep the values set at their fork time even as
+# the outer loop advances to the next task.
+for task_entry in "${TASKS[@]}"; do
+    IFS='|' read -r TASK_SHORT TASK_NAME_LOOP TASK_INSTR_LOOP <<<"$task_entry"
+    DEXJOCO_TASK="$TASK_NAME_LOOP"
+    SERVER_PROMPT="$TASK_INSTR_LOOP"
+    DEXJOCO_EMBODIMENT_TAG="$DEXJOCO_EMBODIMENT_TAG_BASE"
+    case "$DEXJOCO_TASK" in
+        bimanual_*) DEXJOCO_EMBODIMENT_TAG="$DEXJOCO_EMBODIMENT_TAG_BIMANUAL" ;;
+    esac
+    if [ "$MULTI_TASK" -eq 1 ]; then
+        CUR_EVAL_DIR="$EVAL_DIR/$TASK_SHORT"
+        CUR_TASK_TAG="$TASK_SHORT"
+        log ""
+        log "========== Task: $TASK_SHORT ($DEXJOCO_TASK)  tag=$DEXJOCO_EMBODIMENT_TAG =========="
+    else
+        CUR_EVAL_DIR="$EVAL_DIR"
+        CUR_TASK_TAG=""
     fi
-    for i in $(seq 1 "$N_RUNS"); do
-        RUN_SEED=$((EVAL_BASE_SEED + (i - 1)))
-        RUN_DIR="$EVAL_DIR/$FAMILY/run_$i"
-        RUN_RESULTS="$RUN_DIR/results.json"
-        if [ "$EVAL_OVERWRITE_RESULTS" != "1" ] && [ -f "$RUN_RESULTS" ]; then
-            log ""
-            log "  family=$FAMILY run=$i/$N_RUNS seed=$RUN_SEED"
-            log "  SKIP (results.json already exists): $RUN_DIR"
+    mkdir -p "$CUR_EVAL_DIR"
+
+    for FAMILY in "${EVAL_SETS[@]}"; do
+        CONFIG_YAML="$DEXJOCO_DIR/configs/$FAMILY/$DEXJOCO_TASK.yaml"
+        if [ ! -f "$CONFIG_YAML" ]; then
+            log "ERROR: dexjoco config not found: $CONFIG_YAML"
+            FAILED=1
             continue
         fi
+        for i in $(seq 1 "$N_RUNS"); do
+            RUN_SEED=$((EVAL_BASE_SEED + (i - 1)))
+            RUN_DIR="$CUR_EVAL_DIR/$FAMILY/run_$i"
+            RUN_RESULTS="$RUN_DIR/results.json"
+            if [ "$EVAL_OVERWRITE_RESULTS" != "1" ] && [ -f "$RUN_RESULTS" ]; then
+                log ""
+                log "  task=${CUR_TASK_TAG:-$DEXJOCO_TASK} family=$FAMILY run=$i/$N_RUNS seed=$RUN_SEED"
+                log "  SKIP (results.json already exists): $RUN_DIR"
+                continue
+            fi
 
-        wait_for_slot
-        acquire_gpu_slot
-        GPU_SLOT="$ACQUIRED_SLOT"
-        START_SLOT="$GPU_SLOT"
-        PORT="$(find_eval_port)"
-        run_eval_one "$FAMILY" "$i" "$RUN_SEED" "$GPU_SLOT" "$PORT" "$START_SLOT" &
-        PIDS+=("$!")
-        PID_SLOTS+=("$GPU_SLOT")
-        EVAL_LAUNCHED=$((EVAL_LAUNCHED + 1))
+            wait_for_slot
+            acquire_gpu_slot
+            GPU_SLOT="$ACQUIRED_SLOT"
+            START_SLOT="$GPU_SLOT"
+            PORT="$(find_eval_port)"
+            run_eval_one "$FAMILY" "$i" "$RUN_SEED" "$GPU_SLOT" "$PORT" "$START_SLOT" &
+            PIDS+=("$!")
+            PID_SLOTS+=("$GPU_SLOT")
+            EVAL_LAUNCHED=$((EVAL_LAUNCHED + 1))
+        done
     done
 done
 
@@ -382,11 +430,29 @@ finish_eval_launch_phase "$EVAL_LAUNCHED" "$FAILED" "$RESULTS_PATH"
 # (TRAIN_NOTE, paths, names) cannot break Python parsing. EVAL_SETS is variadic
 # at the tail.
 log "Aggregating results..."
+# Dump TASKS as JSON so the aggregator iterates it without quoting free-text
+# instructions through the heredoc (mirrors _common.sh's aggregate_eval_results).
+TASKS_JSON="$EVAL_DIR/.eval_tasks.json"
+python3 - "$TASKS_JSON" "${TASKS[@]}" <<'PYDUMP'
+import json, sys
+out_path = sys.argv[1]
+tasks = []
+for entry in sys.argv[2:]:
+    parts = entry.split('|', 2)
+    tasks.append({
+        'short': parts[0],
+        'task_name': parts[1] if len(parts) > 1 else parts[0],
+        'instruction': parts[2] if len(parts) > 2 else '',
+    })
+with open(out_path, 'w') as f:
+    json.dump(tasks, f)
+PYDUMP
+
 python3 - \
     "$EVAL_DIR" "$RESULTS_PATH" "$N_RUNS" "$N_EPISODES" "$EVAL_BASE_SEED" \
     "$EXP_NAME" "$OUTPUT_NAMESPACE" "$CLUSTER" "$GPU_INSTANCE" \
     "$LAST_CKPT" "$DEXJOCO_TASK" "$DEXJOCO_SERVER_TYPE" "${TRAIN_NOTE:-}" \
-    "$EVAL_PARALLEL_WORKERS" \
+    "$EVAL_PARALLEL_WORKERS" "$MULTI_TASK" "$TASKS_JSON" \
     "${EVAL_SETS[@]}" <<'PYEOF'
 import json, sys
 from pathlib import Path
@@ -394,11 +460,14 @@ from pathlib import Path
 (eval_dir, results_path, n_runs, n_episodes, base_seed,
  exp_name, output_namespace, cluster, gpu,
  checkpoint, task_name, server_type, note,
- server_workers) = sys.argv[1:15]
-eval_sets = sys.argv[15:]
+ server_workers, multi_task, tasks_json) = sys.argv[1:17]
+eval_sets = sys.argv[17:]
 n_runs = int(n_runs)
 server_workers = int(server_workers)
+multi_task = multi_task == '1'
 base = Path(eval_dir)
+with open(tasks_json) as f:
+    tasks = json.load(f)
 
 def aggregate(family_dir):
     rates, counts, totals = [], [], []
@@ -423,6 +492,15 @@ def aggregate(family_dir):
         'std_success_rate': var ** 0.5,
     }
 
+def aggregate_sets(task_base):
+    out = {}
+    for es in eval_sets:
+        res = aggregate(task_base / es)
+        if res is not None:
+            out[es] = res
+            print(f"  {es}: {res['mean_success_rate']:.4f} +/- {res['std_success_rate']:.4f}  {res['per_run_success_rate']}")
+    return out
+
 agg = {
     'experiment': exp_name,
     'output_namespace': output_namespace,
@@ -430,7 +508,6 @@ agg = {
     'gpu': gpu,
     'note': note,
     'checkpoint': checkpoint,
-    'task_name': task_name,
     'server_type': server_type,
     'n_episodes': int(n_episodes),
     'n_runs': n_runs,
@@ -438,13 +515,21 @@ agg = {
     'num_envs_per_gpu': 1,
     'total_num_envs': server_workers,
     'eval_base_seed': int(base_seed),
-    'eval_sets': {},
 }
-for es in eval_sets:
-    res = aggregate(base / es)
-    if res is not None:
-        agg['eval_sets'][es] = res
-        print(f"  {es}: {res['mean_success_rate']:.4f} +/- {res['std_success_rate']:.4f}  {res['per_run_success_rate']}")
+if multi_task:
+    tasks_out = {}
+    for t in tasks:
+        ts = t['short']
+        print(f'=== {ts} ({t["task_name"]}) ===')
+        tasks_out[ts] = {
+            'task_name': t['task_name'],
+            'instruction': t['instruction'],
+            'eval_sets': aggregate_sets(base / ts),
+        }
+    agg['tasks'] = tasks_out
+else:
+    agg['task_name'] = task_name
+    agg['eval_sets'] = aggregate_sets(base)
 
 out = Path(results_path)
 out.parent.mkdir(parents=True, exist_ok=True)

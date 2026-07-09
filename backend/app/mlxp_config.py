@@ -40,6 +40,15 @@ def _defaults_for(user: str | None = None) -> dict[str, Any]:
         "hf_home": f"{ddn_home}/.cache/huggingface",
         "workspace_dir": f"{ddn_home}/workspace",
         "isaac_dir": f"{ddn_home}/workspace/rlwrld_isaac",
+        # DexJoCo (MuJoCo benchmark) eval deps on the DDN. Mirrors the kakao
+        # cluster.env layout: a dexjoco repo (configs + openpi + eval client) and
+        # a micromamba root holding the `dexjoco` (MuJoCo client) and `openpi`
+        # (pi0.5 server) envs. Defaults follow the same tree used on kakao.
+        "dexjoco_dir": f"{ddn_home}/workspace/dexjoco",
+        "micromamba_bin": f"{ddn_home}/bin/micromamba",
+        "mamba_root_prefix": f"{ddn_home}/micromamba",
+        "dexjoco_eval_env": "dexjoco",
+        "dexjoco_openpi_env": "openpi",
         "data_pod_name": f"{u}-data-pod",
         "ddn_pvc": "ddn-rlwrld-shared",
         "image": "mlxp.kr.ncr.ntruss.com/rlwrld-gpu-base:latest",
@@ -67,6 +76,11 @@ class MlxpSettings(BaseModel):
     hf_home: str = Field(min_length=1)
     workspace_dir: str = Field(min_length=1)
     isaac_dir: str = Field(min_length=1)
+    dexjoco_dir: str = Field(min_length=1)
+    micromamba_bin: str = Field(min_length=1)
+    mamba_root_prefix: str = Field(min_length=1)
+    dexjoco_eval_env: str = Field(min_length=1)
+    dexjoco_openpi_env: str = Field(min_length=1)
     data_pod_name: str = Field(min_length=1)
     ddn_pvc: str = Field(min_length=1)
     image: str = Field(min_length=1)
@@ -95,6 +109,11 @@ _ENV_FIELDS = {
     "TRAIN_EVAL_MLXP_HF_HOME": "hf_home",
     "TRAIN_EVAL_MLXP_WORKSPACE_DIR": "workspace_dir",
     "TRAIN_EVAL_MLXP_ISAAC_DIR": "isaac_dir",
+    "TRAIN_EVAL_MLXP_DEXJOCO_DIR": "dexjoco_dir",
+    "TRAIN_EVAL_MLXP_MICROMAMBA_BIN": "micromamba_bin",
+    "TRAIN_EVAL_MLXP_MAMBA_ROOT_PREFIX": "mamba_root_prefix",
+    "TRAIN_EVAL_MLXP_DEXJOCO_EVAL_ENV": "dexjoco_eval_env",
+    "TRAIN_EVAL_MLXP_DEXJOCO_OPENPI_ENV": "dexjoco_openpi_env",
     "TRAIN_EVAL_MLXP_DATA_POD": "data_pod_name",
     "TRAIN_EVAL_MLXP_DDN_PVC": "ddn_pvc",
     "TRAIN_EVAL_MLXP_IMAGE": "image",

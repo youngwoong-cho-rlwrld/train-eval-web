@@ -496,6 +496,7 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
                 train_num_gpus=train_settings.num_gpus,
                 train_git_commit=train_git_commit,
                 train_note=train_note,
+                dexjoco_task=req.dexjoco_task,
             )
         else:
             raise ValueError(f"unsupported phase: {req.phase}")
@@ -557,6 +558,7 @@ async def post_submit(req: submit.SubmitRequest):
                 eval_n_runs=req.eval_n_runs,
                 eval_sets=req.eval_sets,
                 eval_overwrite_results=req.eval_overwrite_results,
+                dexjoco_task=req.dexjoco_task if req.phase == "eval" else None,
                 checkpoint_path=req.checkpoint_path,
                 job_name=req.job_name,
                 commit_dirty_changes=req.commit_dirty_changes,

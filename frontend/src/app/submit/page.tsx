@@ -72,6 +72,7 @@ type EvalConfigEdit = {
   scope: string;
   nEpisodes: string;
   nRuns: string;
+  numGpus: string;
   evalSets: string;
   dexjocoTask: string;
 };
@@ -326,6 +327,10 @@ export default function SubmitPage() {
     () => ({
       nEpisodes: variant.data?.vars.N_EPISODES ?? "",
       nRuns: variant.data?.vars.N_RUNS ?? "",
+      numGpus:
+        variant.data?.vars.EVAL_NUM_GPUS ??
+        variant.data?.vars.TRAIN_NUM_GPUS ??
+        "1",
       evalSets: formatEvalSetsInput(variant.data?.arrays.EVAL_SETS ?? []),
       dexjocoTask: variant.data?.vars.DEXJOCO_TASK ?? "",
     }),
@@ -345,8 +350,19 @@ export default function SubmitPage() {
   const dexjocoTask = activeEvalConfigEdit
     ? activeEvalConfigEdit.dexjocoTask
     : evalConfigDefaults.dexjocoTask;
+  // A TASKS array marks a multi-task variant: the eval harness runs every task
+  // in one job, so no single task is picked (or required).
+  const isMultitask = (variant.data?.arrays.TASKS?.length ?? 0) > 0;
   const dexjocoTaskValid =
-    !(wantsCheckpoint && isDexjoco) || dexjocoTask.trim().length > 0;
+    !(wantsCheckpoint && isDexjoco) || isMultitask || dexjocoTask.trim().length > 0;
+  const evalNumGpus = activeEvalConfigEdit
+    ? activeEvalConfigEdit.numGpus
+    : evalConfigDefaults.numGpus;
+  const evalNumGpusParsed = Number.parseInt(evalNumGpus.trim(), 10);
+  const evalNumGpusValid =
+    !wantsCheckpoint ||
+    (isPositiveInteger(evalNumGpus) &&
+      (isSlurm || [1, 2, 4, 8].includes(evalNumGpusParsed)));
   const evalSetValues = parseEvalSetsInput(evalSetsText);
   const evalSetOptions = variant.data?.arrays.EVAL_SETS ?? [];
   const evalNEpisodesTrimmed = evalNEpisodes.trim();
@@ -373,6 +389,7 @@ export default function SubmitPage() {
       scope: evalConfigScope,
       nEpisodes: evalConfigDefaults.nEpisodes,
       nRuns: evalConfigDefaults.nRuns,
+      numGpus: evalConfigDefaults.numGpus,
       evalSets: evalConfigDefaults.evalSets,
       dexjocoTask: evalConfigDefaults.dexjocoTask,
     };
@@ -579,10 +596,13 @@ export default function SubmitPage() {
       train_git_commit: submittedGitCommit,
       eval_n_episodes: wantsCheckpoint ? evalNEpisodesParsed : null,
       eval_n_runs: wantsCheckpoint ? evalNRunsParsed : null,
+      eval_num_gpus: wantsCheckpoint ? evalNumGpusParsed : null,
       eval_sets: wantsCheckpoint ? evalSetValues : null,
       eval_overwrite_results: wantsCheckpoint ? evalOverwriteResults : false,
       dexjoco_task:
-        wantsCheckpoint && isDexjoco ? dexjocoTask.trim() || null : null,
+        wantsCheckpoint && isDexjoco && !isMultitask
+          ? dexjocoTask.trim() || null
+          : null,
       checkpoint_path: wantsCheckpoint ? trimmedCkpt : null,
       job_name: shownJobName.trim() || null,
       commit_dirty_changes: commitDirtyChanges,
@@ -600,6 +620,7 @@ export default function SubmitPage() {
         checkpointExistsValue === true &&
         evalNEpisodesValid &&
         evalNRunsValid &&
+        evalNumGpusValid &&
         evalSetsValid &&
         dexjocoTaskValid));
   const configPreview = useQuery({
@@ -930,11 +951,31 @@ export default function SubmitPage() {
     : undefined;
   const dexjocoTaskOptions = dexjocoTasks.data?.tasks ?? [];
   const dexjocoTaskError = dexjocoTasks.error as Error | null;
+  const multitaskShorts = (variant.data?.arrays.TASKS ?? []).map(
+    (entry) => entry.split("|", 1)[0],
+  );
   const dexjocoTaskEditor: FlagEditor | undefined =
     wantsCheckpoint && isDexjoco
       ? {
           wide: true,
-          content: (
+          content: isMultitask ? (
+            <div className="space-y-1.5">
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Multi-task variant: this eval runs all {multitaskShorts.length}{" "}
+                tasks in one job.
+              </p>
+              <div className="flex flex-wrap gap-1">
+                {multitaskShorts.map((t) => (
+                  <span
+                    key={t}
+                    className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] text-slate-600 dark:bg-slate-800 dark:text-slate-300"
+                  >
+                    {t}
+                  </span>
+                ))}
+              </div>
+            </div>
+          ) : (
             <div className="space-y-2">
               <Select
                 value={dexjocoTask}
@@ -976,9 +1017,13 @@ export default function SubmitPage() {
   const gpuCountEditor =
     hasVariant && variant.data ? (
       <NumberCellEditor
-        value={trainNumGpus}
-        onChange={(value) => updateTrainConfig({ numGpus: value })}
-        valid={trainNumGpusValid}
+        value={wantsCheckpoint ? evalNumGpus : trainNumGpus}
+        onChange={(value) =>
+          wantsCheckpoint
+            ? updateEvalConfig({ numGpus: value })
+            : updateTrainConfig({ numGpus: value })
+        }
+        valid={wantsCheckpoint ? evalNumGpusValid : trainNumGpusValid}
         invalidMessage={isSlurm ? "Positive integer." : "Use 1, 2, 4, or 8."}
       />
     ) : undefined;
@@ -1068,8 +1113,8 @@ export default function SubmitPage() {
   if (phase === "eval" && hasVariant) {
     extraFlagRows.push({
       key: "eval-num-gpus",
-      flag: "TRAIN_NUM_GPUS",
-      value: trainNumGpus || "(unset)",
+      flag: "EVAL_NUM_GPUS",
+      value: evalNumGpus || "(unset)",
       editor: gpuCountEditor,
     });
   }
@@ -1148,6 +1193,7 @@ export default function SubmitPage() {
         checkpointExistsValue === true &&
         evalNEpisodesValid &&
         evalNRunsValid &&
+        evalNumGpusValid &&
         evalSetsValid &&
         dexjocoTaskValid));
   const selectedMlxpGpuType =

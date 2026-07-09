@@ -14,6 +14,7 @@ the picker just shows nothing rather than erroring.
 from __future__ import annotations
 
 
+import asyncio
 import shlex
 
 from pydantic import BaseModel
@@ -68,11 +69,49 @@ def _parse_lines(text: str) -> DexjocoTasks:
     return DexjocoTasks(families=families, tasks=sorted(union))
 
 
-async def list_dexjoco_tasks(cluster: str) -> DexjocoTasks:
-    """List DexJoCo config families + tasks for `cluster` over SSH.
+async def _list_dexjoco_tasks_mlxp() -> DexjocoTasks:
+    """List DexJoCo families + tasks on the MLXP DDN via the listing pod.
 
-    Returns empty lists when DEXJOCO_DIR is unset for the cluster.
+    MLXP has no SSH; the dexjoco repo lives on the DDN (MlxpSettings.dexjoco_dir).
+    Walk configs/ with the same python snippet, run inside the CPU data pod.
     """
+    from .mlxp_config import get_settings
+    from .mlxp_data_pod import ensure_listing_pod
+
+    settings = get_settings()
+    dexjoco_dir = (settings.dexjoco_dir or "").strip()
+    if not dexjoco_dir:
+        return DexjocoTasks(families=[], tasks=[])
+    pod = await ensure_listing_pod()
+    script = _list_py(dexjoco_dir)
+    proc = await asyncio.create_subprocess_exec(
+        "kubectl", "exec", "-i", "-n", settings.namespace, pod, "--",
+        "python3", "-c", script,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise RuntimeError("list_dexjoco_tasks(mlxp) timed out")
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"list_dexjoco_tasks(mlxp, {dexjoco_dir}) failed: "
+            f"{stderr.decode(errors='replace').strip()}"
+        )
+    return _parse_lines(stdout.decode(errors="replace"))
+
+
+async def list_dexjoco_tasks(cluster: str) -> DexjocoTasks:
+    """List DexJoCo config families + tasks for `cluster`.
+
+    Slurm clusters scan ``$DEXJOCO_DIR/configs`` over SSH; MLXP scans the DDN
+    copy via the data pod. Returns empty lists when DEXJOCO_DIR is unset.
+    """
+    if cluster == "mlxp":
+        return await _list_dexjoco_tasks_mlxp()
     env = await load_cluster(cluster)
     dexjoco_dir = (env.vars.get("DEXJOCO_DIR") or "").strip()
     if not dexjoco_dir:

@@ -204,6 +204,9 @@ class MlxpSubmitRequest(BaseModel):
     eval_n_runs: int | None = Field(default=None, ge=1)
     eval_sets: list[str] | None = None
     eval_overwrite_results: bool = False
+    # Eval-only: DexJoCo task (yaml stem / env_name) chosen via the task picker.
+    # Falls back to the variant's own DEXJOCO_TASK when omitted.
+    dexjoco_task: str | None = None
     checkpoint_path: str | None = None
     # Optional override for the auto-generated display job_name. Validated
     # against the unified regex in submit.resolve_job_name.
@@ -499,6 +502,7 @@ def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str
         eval_unset_cuda_visible_devices_for_server=1,
         train_git_commit=req.train_git_commit,
         train_note=train_note,
+        dexjoco_task=req.dexjoco_task,
     )
     meta = snapshot_metadata(
         job_id=job_id,
@@ -528,6 +532,7 @@ def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str
         "eval_sets": eval_sets,
         "overwrite_results": req.eval_overwrite_results,
         "unset_cuda_visible_devices_for_server": 1,
+        "dexjoco_task": (req.dexjoco_task or "").strip() or None,
     }
     return {
         "job_id": job_id,
@@ -539,6 +544,7 @@ def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str
         "config_text": config_text,
         "meta_text": metadata_json(meta),
         "eval_sets": eval_sets,
+        "dexjoco_task": (req.dexjoco_task or "").strip() or None,
         "checkpoint_path": checkpoint_path,
         "git_commit": submit_git.commit,
         "git_commit_subject": submit_git.commit_subject,
@@ -905,6 +911,19 @@ def _render_body_n16(*, variant, req: MlxpSubmitRequest, job_name: str,
     dataset_paths_arg = " \\\n        ".join(
         f"{settings.datasets_dir}/{n}" for n in names
     )
+    # Optional per-dataset embodiment tags (mixed-embodiment training). Build a
+    # name->tag map from the parallel config arrays and resolve tags for the
+    # datasets actually being trained (which may be a submit-time subset via
+    # dataset_override). Emitted only when every dataset resolves to a tag, so a
+    # missing/unmapped dataset fails loudly rather than silently mis-tagging.
+    cfg_names = variant.arrays.get("TRAIN_DATASET_NAMES")
+    cfg_tags = variant.arrays.get("TRAIN_DATASET_EMBODIMENT_TAGS")
+    embodiment_tags_line = ""
+    if cfg_names and cfg_tags and len(cfg_names) == len(cfg_tags):
+        tag_by_name = dict(zip(cfg_names, cfg_tags))
+        if all(n in tag_by_name for n in names):
+            resolved = " ".join(tag_by_name[n] for n in names)
+            embodiment_tags_line = f"--embodiment-tags {resolved} \\\n    "
     global_batch = req.global_batch_size or int(batch_size) * req.num_gpus
     run_log_dir = f"{ckpt_dir}/logs"
     wandb_project = shlex.quote(_wandb_project())
@@ -958,7 +977,7 @@ uv run $UV_RUN_ARGS torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/la
     --dataset-path \\
         {dataset_paths_arg} \\
     --embodiment-tag NEW_EMBODIMENT \\
-    --modality-config-path /tmp/modality_config.py \\
+    {embodiment_tags_line}--modality-config-path /tmp/modality_config.py \\
     --num-gpus {req.num_gpus} \\
     --output-dir {output_parent} \\
     --global-batch-size {global_batch} \\
@@ -977,6 +996,30 @@ uv run $UV_RUN_ARGS torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/la
 """
 
 
+def _mlxp_dexjoco_lib_block(runtime_root: str) -> str:
+    """Stage lib/dexjoco/ (the policy-server adapter + helpers) into the runtime.
+
+    eval_body_dexjoco.sh runs ``$REPO_ROOT/lib/dexjoco/gr00t_dexjoco_server.py``;
+    the MLXP pod has no rsync step, so inline every ``.py`` under lib/dexjoco/
+    (mirrors how the Isaac path inlines isaac_server_runner.py).
+    """
+    dexjoco_src = LIB_DIR / "dexjoco"
+    if not dexjoco_src.is_dir():
+        raise FileNotFoundError(f"lib/dexjoco not found: {dexjoco_src}")
+    py_files = sorted(dexjoco_src.glob("*.py"))
+    if not any(p.name == "gr00t_dexjoco_server.py" for p in py_files):
+        raise FileNotFoundError(f"gr00t_dexjoco_server.py not found under {dexjoco_src}")
+    dest_dir = f"{runtime_root}/lib/dexjoco"
+    blocks = [f"mkdir -p {shlex.quote(dest_dir)}"]
+    for idx, p in enumerate(py_files):
+        text = ensure_trailing_newline(p.read_text())
+        marker = f"TEW_DEXJOCO_LIB_{idx}_EOF"
+        blocks.append(
+            f"cat > {shlex.quote(f'{dest_dir}/{p.name}')} <<'{marker}'\n{text}{marker}"
+        )
+    return "\n".join(blocks) + "\n"
+
+
 def _render_eval_body_script(
     variant,
     req: MlxpSubmitRequest,
@@ -986,25 +1029,22 @@ def _render_eval_body_script(
     repo_path: str,
     settings: MlxpSettings,
 ) -> str:
-    """Render MLXP eval by staging the same eval body script used on Slurm."""
-    # DexJoCo eval drives an Isaac-side server from lib/dexjoco/, which MLXP does
-    # not stage into the pod. DexJoCo eval is Slurm-only for now; fail fast rather
-    # than launch a job that cannot find the server.
-    if model.eval_body_script == "eval_body_dexjoco.sh":
-        raise ValueError(
-            "DexJoCo eval is not supported on MLXP yet "
-            "(lib/dexjoco/ is not staged into the MLXP pod); run DexJoCo eval on a Slurm cluster"
-        )
+    """Render MLXP eval by staging the same eval body script used on Slurm.
+
+    Two harnesses are supported, differing only in what extra runtime files +
+    cluster-env vars each needs:
+      - Isaac (eval_body.sh): stages isaac_server_runner.py and links the
+        DDN-stored ALLEX assets into the eval image.
+      - DexJoCo (eval_body_dexjoco.sh): stages lib/dexjoco/ and points the body
+        at the DDN-resident dexjoco repo + micromamba envs (see MlxpSettings).
+    """
+    is_dexjoco = model.eval_body_script == "eval_body_dexjoco.sh"
     eval_body_path = LIB_DIR / model.eval_body_script
     common_path = LIB_DIR / "_common.sh"
-    isaac_runner_path = LIB_DIR / "isaac_server_runner.py"
     if not eval_body_path.is_file():
         raise FileNotFoundError(f"eval body script not found: {eval_body_path}")
-    if not isaac_runner_path.is_file():
-        raise FileNotFoundError(f"Isaac server runner not found: {isaac_runner_path}")
     common_text = ensure_trailing_newline(common_path.read_text())
     eval_body_text = ensure_trailing_newline(eval_body_path.read_text())
-    isaac_runner_text = ensure_trailing_newline(isaac_runner_path.read_text())
 
     exp_dir = f"{settings.experiments_dir}/{variant.name}"
     output_namespace = str(snapshot.get("output_namespace") or _path_slug(job_name))
@@ -1031,10 +1071,22 @@ cat > {shlex.quote(modality_target)} <<'TEW_MODALITY_EOF'
         f"export GROOT_N16_DIR={shlex.quote(repo_path)}",
         f"export PHYSIXEL_DIR={shlex.quote(repo_path)}",
         f"export TRAIN_REPO_DIR={shlex.quote(repo_path)}",
-        f"export ISAAC_DIR={shlex.quote(settings.isaac_dir)}",
         f"export DATA_DIR={shlex.quote(settings.datasets_dir)}",
         f"export LOG_DIR={shlex.quote(f'{exp_dir}/logs')}",
     ]
+    if is_dexjoco:
+        # DexJoCo body sources these from clusters/mlxp.env (same names as the
+        # kakao cluster.env). The MuJoCo client runs in the `dexjoco` micromamba
+        # env; the pi0.5 baseline server runs in `openpi`.
+        env_lines += [
+            f"export DEXJOCO_DIR={shlex.quote(settings.dexjoco_dir)}",
+            f"export MICROMAMBA_BIN={shlex.quote(settings.micromamba_bin)}",
+            f"export MAMBA_ROOT_PREFIX={shlex.quote(settings.mamba_root_prefix)}",
+            f"export DEXJOCO_EVAL_ENV={shlex.quote(settings.dexjoco_eval_env)}",
+            f"export DEXJOCO_OPENPI_ENV={shlex.quote(settings.dexjoco_openpi_env)}",
+        ]
+    else:
+        env_lines.append(f"export ISAAC_DIR={shlex.quote(settings.isaac_dir)}")
     cluster_env = "\n".join(env_lines) + "\n"
 
     eval_exports = [
@@ -1064,6 +1116,25 @@ cat > {shlex.quote(modality_target)} <<'TEW_MODALITY_EOF'
         eval_exports.append(f"export SUBMIT_EVAL_SETS={shlex.quote(' '.join(snapshot['eval_sets']))}")
     if req.eval_overwrite_results:
         eval_exports.append("export SUBMIT_EVAL_OVERWRITE_RESULTS=1")
+    dexjoco_task = (snapshot.get("dexjoco_task") or "").strip() if is_dexjoco else ""
+    if dexjoco_task:
+        eval_exports.append(f"export SUBMIT_DEXJOCO_TASK={shlex.quote(dexjoco_task)}")
+
+    # Harness-specific staging + post-stage env, spliced into the heredoc below.
+    if is_dexjoco:
+        stage_block = _mlxp_dexjoco_lib_block(runtime_root) + modality_block
+    else:
+        isaac_runner_path = LIB_DIR / "isaac_server_runner.py"
+        if not isaac_runner_path.is_file():
+            raise FileNotFoundError(f"Isaac server runner not found: {isaac_runner_path}")
+        isaac_runner_text = ensure_trailing_newline(isaac_runner_path.read_text())
+        stage_block = f"""\
+cat > {shlex.quote(runtime_root)}/lib/isaac_server_runner.py <<'TEW_ISAAC_RUNNER_EOF'
+{isaac_runner_text}TEW_ISAAC_RUNNER_EOF
+chmod +x {shlex.quote(runtime_root)}/lib/isaac_server_runner.py
+{modality_block}
+export ISAAC_DIR={shlex.quote(settings.isaac_dir)}
+{_mlxp_isaac_assets_block(settings)}"""
 
     uv_bin_dir = shlex.quote(f"{settings.ddn_user_home}/.local/bin")
 
@@ -1089,12 +1160,7 @@ cat > {shlex.quote(runtime_root)}/lib/_common.sh <<'TEW_COMMON_EOF'
 cat > {shlex.quote(runtime_root)}/lib/{model.eval_body_script} <<'TEW_EVAL_BODY_EOF'
 {eval_body_text}TEW_EVAL_BODY_EOF
 chmod +x {shlex.quote(runtime_root)}/lib/{model.eval_body_script}
-cat > {shlex.quote(runtime_root)}/lib/isaac_server_runner.py <<'TEW_ISAAC_RUNNER_EOF'
-{isaac_runner_text}TEW_ISAAC_RUNNER_EOF
-chmod +x {shlex.quote(runtime_root)}/lib/isaac_server_runner.py
-{modality_block}
-export ISAAC_DIR={shlex.quote(settings.isaac_dir)}
-{_mlxp_isaac_assets_block(settings)}
+{stage_block}
 export SUBMIT_TRAIN_REPO_DIR="$TRAIN_REPO_WORKTREE"
 {chr(10).join(eval_exports)}
 
@@ -1141,6 +1207,8 @@ def _job_comment(req: MlxpSubmitRequest, variant, snapshot: dict, model: Trainin
             fields["eval_sets"] = " ".join(snapshot["eval_sets"])
         if req.eval_overwrite_results:
             fields["eval_overwrite_results"] = "true"
+        if snapshot.get("dexjoco_task"):
+            fields["dexjoco_task"] = str(snapshot["dexjoco_task"])
         if req.checkpoint_path:
             fields["checkpoint_path"] = req.checkpoint_path.strip()
         eval_dir = paths.eval_dir(exp_dir, output_namespace)
