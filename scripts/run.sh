@@ -7,6 +7,17 @@ ROOT="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/.." && pwd)"
 export PATH="/opt/homebrew/bin:$PATH"   # so node, npm, uv are visible from Finder/Spotlight-launched terminals
 ulimit -n 4096 2>/dev/null || true      # macOS default soft limit (256) is too low for the backend's subprocess fan-out
 
+# Pull the latest code before booting. --ff-only so we never create a merge
+# commit or clobber local work; if it can't fast-forward (dirty tree, diverged
+# branch, offline), warn and start the servers with whatever is checked out
+# rather than blocking the dev loop.
+echo "==> Pulling latest ($(git -C "$ROOT" rev-parse --abbrev-ref HEAD))..."
+if git -C "$ROOT" pull --ff-only; then
+    echo "==> Up to date."
+else
+    echo "!!! git pull --ff-only failed (dirty tree, diverged, or offline) — starting with the current checkout." >&2
+fi
+
 cleanup() {
     if [[ -n "${BACKEND_PID:-}" ]]; then
         kill -TERM "$BACKEND_PID" 2>/dev/null || true
