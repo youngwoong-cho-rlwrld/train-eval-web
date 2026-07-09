@@ -484,6 +484,7 @@ def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str
     path = paths.config_path(exp_dir, suffix)
     meta_path = paths.meta_path(exp_dir, suffix)
     checkpoint_path = (req.checkpoint_path or "").strip()
+    dexjoco_task = (req.dexjoco_task or "").strip() or None
     config_text = render_eval_config_preview(
         base_config=variant.raw,
         variant=variant.name,
@@ -532,7 +533,7 @@ def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str
         "eval_sets": eval_sets,
         "overwrite_results": req.eval_overwrite_results,
         "unset_cuda_visible_devices_for_server": 1,
-        "dexjoco_task": (req.dexjoco_task or "").strip() or None,
+        "dexjoco_task": dexjoco_task,
     }
     return {
         "job_id": job_id,
@@ -544,7 +545,7 @@ def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str
         "config_text": config_text,
         "meta_text": metadata_json(meta),
         "eval_sets": eval_sets,
-        "dexjoco_task": (req.dexjoco_task or "").strip() or None,
+        "dexjoco_task": dexjoco_task,
         "checkpoint_path": checkpoint_path,
         "git_commit": submit_git.commit,
         "git_commit_subject": submit_git.commit_subject,

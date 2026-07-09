@@ -378,6 +378,15 @@ export default function SubmitPage() {
   );
   const evalSetsValid =
     !wantsCheckpoint || (evalSetValues.length > 0 && evalSetsCharactersValid);
+  // Shared eval-config input validity, used by the preview, submit, and review
+  // gates below so they stay in lockstep (they previously drifted — canSubmit
+  // omitted evalNumGpusValid).
+  const evalConfigInputsValid =
+    evalNEpisodesValid &&
+    evalNRunsValid &&
+    evalNumGpusValid &&
+    evalSetsValid &&
+    dexjocoTaskValid;
   const evalTotalRuns =
     wantsCheckpoint && evalNEpisodesValid && evalNRunsValid && evalSetsValid
       ? evalNRunsParsed * evalSetValues.length
@@ -618,11 +627,7 @@ export default function SubmitPage() {
     (!wantsCheckpoint ||
       (!!trimmedCkpt &&
         checkpointExistsValue === true &&
-        evalNEpisodesValid &&
-        evalNRunsValid &&
-        evalNumGpusValid &&
-        evalSetsValid &&
-        dexjocoTaskValid));
+        evalConfigInputsValid));
   const configPreview = useQuery({
     queryKey: [
       "submit-config-preview",
@@ -802,10 +807,7 @@ export default function SubmitPage() {
     (!wantsCheckpoint ||
       (!!trimmedCkpt &&
         checkpointExistsValue !== false &&
-        evalNEpisodesValid &&
-        evalNRunsValid &&
-        evalSetsValid &&
-        dexjocoTaskValid)) &&
+        evalConfigInputsValid)) &&
     trainConfigValid &&
     !modelRepoError &&
     !configPreview.error &&
@@ -1191,11 +1193,7 @@ export default function SubmitPage() {
     (!wantsCheckpoint ||
       (!!trimmedCkpt &&
         checkpointExistsValue === true &&
-        evalNEpisodesValid &&
-        evalNRunsValid &&
-        evalNumGpusValid &&
-        evalSetsValid &&
-        dexjocoTaskValid));
+        evalConfigInputsValid));
   const selectedMlxpGpuType =
     mlxp.data?.find((n) => n.name === mlxpNode)?.gpu_type ||
     mlxpSettings.data?.gpu_type ||
