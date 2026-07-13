@@ -10,6 +10,7 @@ from __future__ import annotations
 
 
 from .eval_harness import harness_for
+from .train_overrides import DEFAULT_TRAIN_NUM_WORKERS
 from .training_models import resolve_training_model
 from .variants import Variant
 from .wandb_config import get_project
@@ -49,7 +50,7 @@ def _train_n15(v: Variant) -> list[tuple[str, str]]:
         ("--data-config", "$EXP_DIR/data_config.yaml"),
         ("--max-steps", v.vars.get("MAX_STEPS", "")),
         ("--save-steps", v.vars.get("SAVE_STEPS", "")),
-        ("--dataloader_num_workers", v.vars.get("TRAIN_NUM_WORKERS", "16")),
+        ("--dataloader_num_workers", v.vars.get("TRAIN_NUM_WORKERS", str(DEFAULT_TRAIN_NUM_WORKERS))),
         ("--dataloader-prefetch-factor", "10"),
         ("--video-backend", "torchcodec"),
         ("--resume", "(if checkpoint exists)"),
@@ -87,7 +88,7 @@ def _train_n16(v: Variant) -> list[tuple[str, str]]:
         ("--max-steps", v.vars.get("MAX_STEPS", "")),
         ("--save-steps", v.vars.get("SAVE_STEPS", "")),
         ("--save-total-limit", "5"),
-        ("--dataloader-num-workers", v.vars.get("TRAIN_NUM_WORKERS", "16")),
+        ("--dataloader-num-workers", v.vars.get("TRAIN_NUM_WORKERS", str(DEFAULT_TRAIN_NUM_WORKERS))),
         ("--experiment-name", "<output-namespace>"),
         ("--use-wandb", ""),
         ("--color-jitter-params", "brightness 0.2 contrast 0.2 saturation 0.2 hue 0.1"),

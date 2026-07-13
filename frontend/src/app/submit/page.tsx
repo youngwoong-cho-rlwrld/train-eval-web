@@ -425,7 +425,7 @@ export default function SubmitPage() {
   const trainConfigDefaults = useMemo<TrainConfigValues>(() => {
     const vars = variant.data?.vars;
     const numGpus = vars?.TRAIN_NUM_GPUS ?? "2";
-    const { model } = resolveModel(vars);
+    const { model } = resolveModel(vars, variant.data?.model_family);
     const perGpuBatch = vars?.TRAIN_BATCH_SIZE ?? "";
     const globalBatch =
       vars?.TRAIN_GLOBAL_BATCH_SIZE ?? vars?.GLOBAL_BATCH_SIZE ?? "";
@@ -501,7 +501,7 @@ export default function SubmitPage() {
     trainActionHorizon.trim(),
     10,
   );
-  const { model: trainModel } = resolveModel(variant.data?.vars);
+  const { model: trainModel } = resolveModel(variant.data?.vars, variant.data?.model_family);
   const wantsTrainConfig = phase === "train" && !!variantName;
   const hasVariant = !!variantName;
   const trainActionHorizonEnabled = wantsTrainConfig && trainModel === "n1.6";
@@ -614,7 +614,9 @@ export default function SubmitPage() {
         multiDatasets,
       }),
       extra_args: phase === "eval" && !isSlurm ? [] : splitArgs(extraArgs),
-      train_num_gpus: hasVariant ? trainNumGpusParsed : null,
+      // Only meaningful for train submissions: on eval the backend allocates
+      // from eval_num_gpus (always sent below) and would ignore this anyway.
+      train_num_gpus: wantsTrainConfig ? trainNumGpusParsed : null,
       train_global_batch_size: submittedTrainGlobalBatchSize,
       train_max_steps: phase === "train" ? trainMaxStepsParsed : null,
       train_save_steps: phase === "train" ? trainSaveStepsParsed : null,
@@ -1082,7 +1084,9 @@ export default function SubmitPage() {
         invalidMessage={isSlurm ? "Positive integer." : "Use 1, 2, 4, or 8."}
       />
     ) : undefined;
-  if (gpuCountEditor) {
+  if (gpuCountEditor && wantsTrainConfig) {
+    // Eval flag lists never contain --num-gpus; the eval GPU editor attaches
+    // via the EVAL_NUM_GPUS extra row instead.
     flagEditors["--num-gpus"] = gpuCountEditor;
   }
   if (wantsTrainConfig && variant.data) {

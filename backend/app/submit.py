@@ -53,6 +53,11 @@ from .training_models import (
     rewrites_modality_action_horizon,
 )
 from .train_overrides import (
+    DEFAULT_TRAIN_BATCH_SIZE,
+    DEFAULT_TRAIN_MAX_STEPS,
+    DEFAULT_TRAIN_NUM_GPUS,
+    DEFAULT_TRAIN_NUM_WORKERS,
+    DEFAULT_TRAIN_SAVE_STEPS,
     resolve_train_action_horizon as resolve_action_horizon_override,
     validate_global_batch_divisible,
 )
@@ -275,10 +280,10 @@ def resolve_train_settings(variant, model_family: str, *, num_gpus_override: int
                            save_steps_override: int | None,
                            num_workers_override: int | None) -> TrainSettings:
     """Resolve train-time override values exactly once for submit and preview."""
-    train_num_gpus = num_gpus_override or variant_int(variant, "TRAIN_NUM_GPUS", 2)
-    train_max_steps = max_steps_override or variant_int(variant, "MAX_STEPS", 30000)
-    train_save_steps = save_steps_override or variant_int(variant, "SAVE_STEPS", 1000)
-    train_num_workers = num_workers_override or variant_int(variant, "TRAIN_NUM_WORKERS", 16)
+    train_num_gpus = num_gpus_override or variant_int(variant, "TRAIN_NUM_GPUS", DEFAULT_TRAIN_NUM_GPUS)
+    train_max_steps = max_steps_override or variant_int(variant, "MAX_STEPS", DEFAULT_TRAIN_MAX_STEPS)
+    train_save_steps = save_steps_override or variant_int(variant, "SAVE_STEPS", DEFAULT_TRAIN_SAVE_STEPS)
+    train_num_workers = num_workers_override or variant_int(variant, "TRAIN_NUM_WORKERS", DEFAULT_TRAIN_NUM_WORKERS)
     train_global_batch_size = global_batch_override
 
     if train_global_batch_size is None:
@@ -291,7 +296,7 @@ def resolve_train_settings(variant, model_family: str, *, num_gpus_override: int
                 except ValueError:
                     pass
         if train_global_batch_size is None:
-            train_global_batch_size = variant_int(variant, "TRAIN_BATCH_SIZE", 64) * train_num_gpus
+            train_global_batch_size = variant_int(variant, "TRAIN_BATCH_SIZE", DEFAULT_TRAIN_BATCH_SIZE) * train_num_gpus
 
     validate_global_batch_divisible(model_family, train_global_batch_size, train_num_gpus)
 
@@ -302,6 +307,13 @@ def resolve_train_settings(variant, model_family: str, *, num_gpus_override: int
         save_steps=train_save_steps,
         num_workers=train_num_workers,
     )
+
+
+def resolve_eval_num_gpus(variant, override: int | None, default_num_gpus: int) -> int:
+    """Resolve an eval job's GPU allocation: request override > variant
+    EVAL_NUM_GPUS > the train GPU count. Single source for submit, the config
+    preview, and the MLXP dispatch so the three can't drift."""
+    return override or variant_int(variant, "EVAL_NUM_GPUS", default_num_gpus)
 
 
 def resolve_train_action_horizon(
@@ -468,7 +480,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     # eval variants are unchanged.
     job_num_gpus = train_settings.num_gpus
     if req.phase == "eval":
-        job_num_gpus = req.eval_num_gpus or variant_int(variant, "EVAL_NUM_GPUS", train_settings.num_gpus)
+        job_num_gpus = resolve_eval_num_gpus(variant, req.eval_num_gpus, train_settings.num_gpus)
     gpus = str(job_num_gpus)
     slurm_resources = slurm_resources_for(
         cluster=req.cluster,
@@ -890,7 +902,10 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             else ""
         )
         + (
-            f"eval_num_gpus={train_settings.num_gpus}\n"
+            # The allocation actually passed to sbatch (eval override / variant
+            # EVAL_NUM_GPUS / train count) — NOT train_settings.num_gpus, which
+            # made the Jobs-page GPU fallback and resume rebuild the wrong count.
+            f"eval_num_gpus={job_num_gpus}\n"
             if req.phase == "eval"
             else ""
         )
@@ -970,6 +985,13 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         + (
             f"eval_tasks={' '.join(eval_tasks)}\n"
             if req.phase == "eval" and eval_tasks is not None
+            else ""
+        )
+        + (
+            # Persist the picked DexJoCo task so resume/retry re-runs the same
+            # task instead of falling back to the variant's DEXJOCO_TASK default.
+            f"dexjoco_task={(req.dexjoco_task or '').strip()}\n"
+            if req.phase == "eval" and (req.dexjoco_task or "").strip()
             else ""
         )
         + (

@@ -35,6 +35,9 @@ export type Variant = {
   raw: string;
   vars: Record<string, string>;
   arrays: Record<string, string[]>;
+  // Authoritative family from the backend model registry
+  // (configs/models/<MODEL_ID>.env); null when the MODEL_ID is unknown.
+  model_family?: string | null;
 };
 
 export type Job = {

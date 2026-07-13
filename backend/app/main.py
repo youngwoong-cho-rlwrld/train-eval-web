@@ -33,7 +33,9 @@ from . import (
     submission_snapshot,
     submit,
     training_models,
+    train_overrides,
     user_config,
+    variant_values,
     variants,
     wandb_auth,
 )
@@ -209,9 +211,17 @@ async def get_variants():
 @app.get("/api/variants/{name}")
 async def get_variant(name: str):
     try:
-        return await variants.load_variant(name)
+        v = await variants.load_variant(name)
     except FileNotFoundError:
         raise HTTPException(404, f"variant {name} not found")
+    # Ship the registry's model family (configs/models/<MODEL_ID>.env) so the
+    # UI doesn't re-derive it from MODEL_ID string heuristics — that heuristic
+    # silently missed dexjoco-* ids and hid the action-horizon editor for them.
+    try:
+        family = training_models.resolve_training_model(v).family
+    except Exception:
+        family = None
+    return {**v.model_dump(), "model_family": family}
 
 
 @app.get("/api/variants/{name}/files", response_model=variants.VariantFiles)
@@ -474,13 +484,9 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
             checkpoint_path = submit.require_eval_checkpoint_path(req)
             eval_sets = submit.normalize_eval_sets(req.eval_sets)
             eval_tasks = submit.normalize_eval_tasks(req.eval_tasks)
-            try:
-                _eval_gpu_default = int(
-                    variant.vars.get("EVAL_NUM_GPUS") or train_settings.num_gpus
-                )
-            except (ValueError, TypeError):
-                _eval_gpu_default = train_settings.num_gpus
-            eval_num_gpus = req.eval_num_gpus or _eval_gpu_default
+            eval_num_gpus = submit.resolve_eval_num_gpus(
+                variant, req.eval_num_gpus, train_settings.num_gpus
+            )
             train_git_commit = submit.resolve_train_git_commit(req, variant)
             if req.cluster == "mlxp":
                 suffix = submission_snapshot.snapshot_suffix(job_name)
@@ -544,17 +550,13 @@ async def post_submit(req: submit.SubmitRequest):
             # allocate TRAIN_NUM_GPUS — mirroring the Slurm path. Using the train
             # count for eval is the bug that made a "1 GPU" eval request run on 2.
             v = await variants.load_variant(req.variant)
-            try:
-                if req.phase == "eval":
-                    num_gpus = req.eval_num_gpus or int(
-                        v.vars.get("EVAL_NUM_GPUS") or v.vars.get("TRAIN_NUM_GPUS", "2")
-                    )
-                else:
-                    num_gpus = req.train_num_gpus or int(v.vars.get("TRAIN_NUM_GPUS", "2"))
-            except ValueError:
-                raise ValueError(
-                    f"variant {req.variant}: TRAIN_NUM_GPUS/EVAL_NUM_GPUS must be an integer"
-                )
+            train_gpu_default = variant_values.variant_int(
+                v, "TRAIN_NUM_GPUS", train_overrides.DEFAULT_TRAIN_NUM_GPUS
+            )
+            if req.phase == "eval":
+                num_gpus = submit.resolve_eval_num_gpus(v, req.eval_num_gpus, train_gpu_default)
+            else:
+                num_gpus = req.train_num_gpus or train_gpu_default
             mlxp_req = mlxp_submit.MlxpSubmitRequest(
                 variant=req.variant,
                 phase=req.phase,
@@ -579,6 +581,10 @@ async def post_submit(req: submit.SubmitRequest):
                 dexjoco_task=req.dexjoco_task if req.phase == "eval" else None,
                 checkpoint_path=req.checkpoint_path,
                 job_name=req.job_name,
+                # Parity with slurm: an explicit namespace (resubmit-into-same-
+                # eval-dir flows) must survive the dispatch, or the eval body
+                # can't skip already-completed runs.
+                output_namespace=req.output_namespace,
                 commit_dirty_changes=req.commit_dirty_changes,
             )
             r = await mlxp_submit.submit_mlxp(mlxp_req)
@@ -841,10 +847,15 @@ async def stream_logs(request: Request, cluster: str, job_id: str, stream: str =
       isaac — Isaac Sim server logs ($EXP_DIR/logs/server_*.log)
     MLXP has a single container log, so `stream` is ignored.
     """
+    # no-transform is load-bearing: the Next dev/prod proxy gzips responses
+    # when the browser advertises Accept-Encoding, and compressing an SSE
+    # stream buffers it — the client connects but no events ever flush.
+    # (curl doesn't send Accept-Encoding, which made this invisible to curl.)
+    sse_headers = {"Cache-Control": "no-cache, no-transform"}
     start_line = _sse_next_line(request)
     if cluster == "mlxp":
         from . import mlxp_jobs
-        return EventSourceResponse(_sse_log_stream(
+        return EventSourceResponse(headers=sse_headers, content=_sse_log_stream(
             request,
             start_line,
             lambda line_no: mlxp_jobs.tail_logs(job_id, start_line=line_no),
@@ -868,7 +879,7 @@ async def stream_logs(request: Request, cluster: str, job_id: str, stream: str =
         log_dir = env.vars["LOG_DIR"]
         pattern = f"{log_dir}/*_{job_id}.{stream}"
 
-    return EventSourceResponse(_sse_log_stream(
+    return EventSourceResponse(headers=sse_headers, content=_sse_log_stream(
         request,
         start_line,
         lambda line_no: ssh_tail_lines(env.ssh_alias, pattern, start_line=line_no),

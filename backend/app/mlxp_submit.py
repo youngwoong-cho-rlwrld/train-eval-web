@@ -60,8 +60,7 @@ from .training_models import (
     resolve_training_model,
     rewrites_modality_action_horizon,
 )
-from .train_overrides import resolve_train_action_horizon, validate_global_batch_divisible
-from .variant_values import variant_int
+from .train_overrides import DEFAULT_TRAIN_NUM_GPUS, resolve_train_action_horizon
 from .wandb_config import get_project as _wandb_project
 from .variants import DEFAULT_DATA_CONFIG, load_variant
 
@@ -96,7 +95,14 @@ def _mlxp_job_id(settings: MlxpSettings, job_name: str) -> str:
     prefix = _k8s_name_segment(settings.user)
     body = _k8s_name_segment(job_name)
     digest = hashlib.sha1(job_name.encode()).hexdigest()[:8]
-    name = f"{prefix}-{body}"
+    # The default job_name already starts with the username (make_default_job_name
+    # -> "<user>_<phase>_..."), so prepending the user again produced a doubled
+    # "youngwoong-youngwoong-..." k8s name. Only add the prefix when the body
+    # doesn't already carry it, keeping the required <user>-scoped name.
+    if body == prefix or body.startswith(f"{prefix}-"):
+        name = body
+    else:
+        name = f"{prefix}-{body}"
     keep = 63 - len(digest) - 1
     return f"{name[:keep].rstrip('-')}-{digest}"
 
@@ -182,7 +188,7 @@ class MlxpSubmitRequest(BaseModel):
     variant: str
     phase: Literal["train", "eval"] = "train"
     train_note: str | None = None
-    num_gpus: int = 2
+    num_gpus: int = DEFAULT_TRAIN_NUM_GPUS
     global_batch_size: int | None = None
     max_steps: int | None = None
     save_steps: int | None = None
@@ -198,7 +204,6 @@ class MlxpSubmitRequest(BaseModel):
     job_class: Literal["dedicated", "normal", "background"] = "normal"
     dataset_override: str | list[str] | None = None
     extra_args: list[str] = Field(default_factory=list)
-    wandb_secret: str | None = None
     eval_num_envs_per_gpu: int | None = Field(default=None, ge=1)
     eval_n_episodes: int | None = Field(default=None, ge=1)
     eval_n_runs: int | None = Field(default=None, ge=1)
@@ -220,8 +225,6 @@ class MlxpSubmitRequest(BaseModel):
 class MlxpSubmitResponse(BaseModel):
     job_id: str             # 6-char k8s Job name, used in /jobs/<cluster>/<id>
     job_name: str           # human-readable {phase}_{variant}_{ts}, same shape as slurm
-    pod_name: str | None = None
-    yaml: str
     apply_stdout: str
 
 
@@ -277,8 +280,22 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
             action_horizon_mode=action_horizon_mode,
             requested=req.action_horizon,
         )
+    # Resolve train overrides ONCE. The config snapshot, the job-comment
+    # metadata, and the executed torchrun command must all see the same values;
+    # the body renderer previously re-derived the batch from TRAIN_BATCH_SIZE
+    # and could run a different global batch than the snapshot recorded.
+    train_settings = None
     if req.phase == "train":
-        validate_global_batch_divisible(model.family, req.global_batch_size, req.num_gpus)
+        from .submit import resolve_train_settings
+        train_settings = resolve_train_settings(
+            variant,
+            model.family,
+            num_gpus_override=req.num_gpus,
+            global_batch_override=req.global_batch_size,
+            max_steps_override=req.max_steps,
+            save_steps_override=req.save_steps,
+            num_workers_override=req.num_workers,
+        )
     # job_id is the k8s Job resource name. MLXP's guide requires
     # `<user>-<job-name>`; job_name stays as the display name carried in
     # annotations with the same shape as slurm's job_name.
@@ -330,12 +347,13 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
             settings=settings,
             train_note=train_note,
             action_horizon_mode=action_horizon_mode,
+            train_settings=train_settings,
         )
     await _write_snapshot_to_ddn(snapshot)
     if req.phase == "eval":
         body_script = _render_eval_body_script(variant, req, job_name, snapshot, model, repo_path, settings)
     else:
-        body_script = _render_body_script(variant, req, job_name, snapshot, model, repo_path, settings)
+        body_script = _render_body_script(variant, req, job_name, snapshot, model, repo_path, settings, train_settings)
     spec = _render_job_yaml(
         job_id,
         job_name,
@@ -343,10 +361,10 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
         req.num_gpus,
         cpu,
         mem,
-        req.wandb_secret or settings.wandb_secret,
+        settings.wandb_secret,
         node,
         req.job_class,
-        _job_comment(req, variant, snapshot, model),
+        _job_comment(req, variant, snapshot, model, train_settings),
         train_note,
         settings,
     )
@@ -365,8 +383,6 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
     return MlxpSubmitResponse(
         job_id=job_id,
         job_name=job_name,
-        pod_name=None,
-        yaml=yaml_text,
         apply_stdout=stdout.decode(errors="replace").strip(),
     )
 
@@ -374,18 +390,7 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
 def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job_name: str,
                             node: str, submit_git, model: TrainingModel,
                             settings: MlxpSettings, train_note: str,
-                            action_horizon_mode: str) -> dict:
-    from .submit import resolve_train_settings
-
-    train_settings = resolve_train_settings(
-        variant,
-        model.family,
-        num_gpus_override=req.num_gpus,
-        global_batch_override=req.global_batch_size,
-        max_steps_override=req.max_steps,
-        save_steps_override=req.save_steps,
-        num_workers_override=req.num_workers,
-    )
+                            action_horizon_mode: str, train_settings) -> dict:
     train_num_gpus = train_settings.num_gpus
     train_max_steps = train_settings.max_steps
     train_save_steps = train_settings.save_steps
@@ -565,23 +570,14 @@ def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str
     }
 
 
-def _path_slug(value: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-")
-    return slug or "job"
-
-
 def _shell_words(args: list[str]) -> str:
     return " ".join(shlex.quote(arg) for arg in args)
 
 
 def _mlxp_worktree_path(snapshot: dict) -> str:
+    # Both snapshot builders always set job_id (submit_mlxp passes it in).
     settings = get_settings()
-    job_id = snapshot.get("job_id")
-    if isinstance(job_id, str) and job_id:
-        leaf = job_id
-    else:
-        leaf = _path_slug(str(snapshot.get("job_name") or "job"))
-    return f"{settings.experiments_dir}/.worktrees/{leaf}"
+    return f"{settings.experiments_dir}/.worktrees/{snapshot['job_id']}"
 
 
 def _repo_checkout_preamble(repo_path: str, snapshot: dict) -> str:
@@ -730,6 +726,7 @@ def _render_body_script(
     model: TrainingModel,
     repo_path: str,
     settings: MlxpSettings,
+    train_settings,
 ) -> str:
     """Render the inline bash the container runs.
 
@@ -768,16 +765,19 @@ def _render_body_script(
                 f"variant {variant.name} has no DATASET_NAME / DATASETS / TRAIN_DATASET_NAMES"
             )
 
-    max_steps = str(req.max_steps or variant_int(variant, "MAX_STEPS", 30000))
-    save_steps = str(req.save_steps or variant_int(variant, "SAVE_STEPS", 1000))
-    num_workers = str(req.num_workers or variant_int(variant, "TRAIN_NUM_WORKERS", 16))
-    batch_size = variant.vars.get("TRAIN_BATCH_SIZE", "64")
-    if family == "n1.5" and req.global_batch_size is not None:
-        batch_size = str(req.global_batch_size // req.num_gpus)
+    # Values come from the SAME TrainSettings the snapshot recorded, so the
+    # executed command can never diverge from the recorded config (the batch
+    # was previously re-derived from TRAIN_BATCH_SIZE, ignoring the variant's
+    # TRAIN_GLOBAL_BATCH_SIZE).
+    max_steps = str(train_settings.max_steps)
+    save_steps = str(train_settings.save_steps)
+    num_workers = str(train_settings.num_workers)
+    global_batch = int(train_settings.global_batch_size)
     train_extra = _shell_words(variant.arrays.get("TRAIN_EXTRA_ARGS") or [])
     user_extra = _shell_words(req.extra_args)
 
-    output_namespace = req.output_namespace or _path_slug(job_name)
+    # submit_mlxp fills req.output_namespace before any render runs.
+    output_namespace = req.output_namespace
     ckpt_dir = paths.checkpoint_dir(f"{settings.experiments_dir}/{variant.name}", output_namespace)
     run_log_dir = f"{ckpt_dir}/logs"
     wandb_project = shlex.quote(_wandb_project())
@@ -786,12 +786,16 @@ def _render_body_script(
         return _render_body_n16(
             variant=variant, req=req, job_name=job_name, names=names,
             max_steps=max_steps, save_steps=save_steps, num_workers=num_workers,
-            batch_size=batch_size,
+            global_batch=global_batch,
             train_extra=train_extra, user_extra=user_extra, ckpt_dir=ckpt_dir,
             snapshot=snapshot, model=model, repo_path=repo_path, settings=settings,
         )
     if family != "n1.5":
         raise ValueError(f"unsupported MLXP model family: {family}")
+
+    # n1.5 takes a per-GPU batch; divisibility was validated by
+    # resolve_train_settings at submit time.
+    batch_size = str(global_batch // req.num_gpus)
 
     # ── N1.5: build the data_config.yaml rows ──
     if override_full is not None and isinstance(override, list) and any("|" in e for e in override):
@@ -902,7 +906,7 @@ def _n15_data_config_yaml(
 def _render_body_n16(*, variant, req: MlxpSubmitRequest, job_name: str,
                      names: list[str], max_steps: str, save_steps: str,
                      num_workers: str,
-                     batch_size: str, train_extra: str, user_extra: str,
+                     global_batch: int, train_extra: str, user_extra: str,
                      ckpt_dir: str, snapshot: dict, model: TrainingModel, repo_path: str,
                      settings: MlxpSettings) -> str:
     """Body script for GR00T N1.6 (launch_finetune.py).
@@ -933,7 +937,6 @@ def _render_body_n16(*, variant, req: MlxpSubmitRequest, job_name: str,
         if all(n in tag_by_name for n in names):
             resolved = " ".join(tag_by_name[n] for n in names)
             embodiment_tags_line = f"--embodiment-tags {resolved} \\\n    "
-    global_batch = req.global_batch_size or int(batch_size) * req.num_gpus
     run_log_dir = f"{ckpt_dir}/logs"
     wandb_project = shlex.quote(_wandb_project())
     uv_bin_dir = shlex.quote(f"{settings.ddn_user_home}/.local/bin")
@@ -1056,7 +1059,7 @@ def _render_eval_body_script(
     eval_body_text = ensure_trailing_newline(eval_body_path.read_text())
 
     exp_dir = f"{settings.experiments_dir}/{variant.name}"
-    output_namespace = str(snapshot.get("output_namespace") or _path_slug(job_name))
+    output_namespace = str(snapshot["output_namespace"])
     eval_dir = paths.eval_dir(exp_dir, output_namespace)
     results_path = paths.results_path(eval_dir)
     runtime_root = f"{settings.experiments_dir}/.runtime/{snapshot['job_id']}"
@@ -1179,9 +1182,10 @@ bash {shlex.quote(runtime_root)}/lib/{model.eval_body_script}
 """
 
 
-def _job_comment(req: MlxpSubmitRequest, variant, snapshot: dict, model: TrainingModel) -> str:
+def _job_comment(req: MlxpSubmitRequest, variant, snapshot: dict, model: TrainingModel,
+                 train_settings=None) -> str:
     settings = get_settings()
-    output_namespace = str(snapshot.get("output_namespace") or req.output_namespace or _path_slug(snapshot.get("job_name") or "job"))
+    output_namespace = str(snapshot["output_namespace"])
     exp_dir = f"{settings.experiments_dir}/{variant.name}"
     # Use the resolved model identity (same as slurm's meta) rather than raw
     # variant vars: a variant that sets only TRAIN_MODEL — or nothing — would
@@ -1195,13 +1199,10 @@ def _job_comment(req: MlxpSubmitRequest, variant, snapshot: dict, model: Trainin
         "output_namespace": output_namespace,
     }
     if req.phase == "train":
-        max_steps = req.max_steps or variant_int(variant, "MAX_STEPS", 30000)
-        save_steps = req.save_steps or variant_int(variant, "SAVE_STEPS", 1000)
-        num_workers = req.num_workers or variant_int(variant, "TRAIN_NUM_WORKERS", 16)
-        fields["train_num_gpus"] = str(req.num_gpus)
-        fields["train_max_steps"] = str(max_steps)
-        fields["train_save_steps"] = str(save_steps)
-        fields["train_num_workers"] = str(num_workers)
+        fields["train_num_gpus"] = str(train_settings.num_gpus)
+        fields["train_max_steps"] = str(train_settings.max_steps)
+        fields["train_save_steps"] = str(train_settings.save_steps)
+        fields["train_num_workers"] = str(train_settings.num_workers)
         if req.global_batch_size is not None:
             fields["train_global_batch_size"] = str(req.global_batch_size)
         if req.action_horizon is not None:

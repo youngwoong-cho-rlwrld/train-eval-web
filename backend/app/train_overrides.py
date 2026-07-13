@@ -11,6 +11,14 @@ from .training_models import (
 )
 from .variant_values import variant_int_opt
 
+# Submission defaults shared by submit, the config preview, the MLXP dispatch,
+# and the details-page fallbacks — previously repeated as magic numbers in each.
+DEFAULT_TRAIN_NUM_GPUS = 2
+DEFAULT_TRAIN_MAX_STEPS = 30000
+DEFAULT_TRAIN_SAVE_STEPS = 1000
+DEFAULT_TRAIN_NUM_WORKERS = 16
+DEFAULT_TRAIN_BATCH_SIZE = 64
+
 
 def resolve_train_action_horizon(
     *,

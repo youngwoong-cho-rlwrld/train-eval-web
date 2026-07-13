@@ -144,11 +144,16 @@ async def _resubmit_slurm_job(
             phase="eval",
             train_note=(meta.get("train_note") or "").strip() or None,
             partition=partition,
-            train_num_gpus=int_meta("eval_num_gpus"),
+            # The sidecar records the eval allocation actually passed to sbatch;
+            # thread it back as the eval override (it used to be smuggled in as
+            # train_num_gpus, which skewed batch validation and SUBMIT_TRAIN_*).
+            eval_num_gpus=int_meta("eval_num_gpus"),
             eval_num_envs_per_gpu=eval_num_envs_per_gpu,
             eval_n_episodes=eval_n_episodes,
             eval_n_runs=eval_n_runs,
             eval_sets=eval_sets,
+            eval_tasks=[t for t in (meta.get("eval_tasks") or "").split() if t] or None,
+            dexjoco_task=(meta.get("dexjoco_task") or "").strip() or None,
             checkpoint_path=checkpoint,
             seed_eval_results_from=seed_eval_dirs,
             job_name=resolved_job_name,
