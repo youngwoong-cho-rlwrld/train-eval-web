@@ -35,7 +35,6 @@ CONFIG_FILE="${SUBMIT_CONFIG_FILE:-$EXP_DIR/config.sh}"
 source "$CONFIG_FILE"
 
 TRAIN_REPO_DIR="${SUBMIT_TRAIN_REPO_DIR:-${TRAIN_REPO_DIR:-}}"
-TRAIN_NUM_GPUS="${SUBMIT_TRAIN_NUM_GPUS:-${TRAIN_NUM_GPUS:-1}}"
 
 resolve_eval_output_paths
 
@@ -123,25 +122,12 @@ log "========================================================"
 
 [ "$EVAL_OVERWRITE_RESULTS" = "1" ] && rm -f "$RESULTS_PATH"
 
-EVAL_GPU_COUNT="${EVAL_NUM_GPUS:-$TRAIN_NUM_GPUS}"
-if ! [[ "$EVAL_GPU_COUNT" =~ ^[0-9]+$ ]] || [ "$EVAL_GPU_COUNT" -lt 1 ]; then
-    EVAL_GPU_COUNT=1
-fi
-EVAL_PARALLEL_WORKERS="$EVAL_GPU_COUNT"
-EVAL_SIM_START_STAGGER_SECONDS="${EVAL_SIM_START_STAGGER_SECONDS:-2}"
-if ! [[ "$EVAL_SIM_START_STAGGER_SECONDS" =~ ^[0-9]+$ ]]; then
-    log "ERROR: EVAL_SIM_START_STAGGER_SECONDS must be a non-negative integer, got '$EVAL_SIM_START_STAGGER_SECONDS'"
-    exit 1
-fi
-log "MuJoCo eval workers: $EVAL_PARALLEL_WORKERS total (1 sim env per GPU x $EVAL_GPU_COUNT GPUs)"
-
-PIDS=()
-PORTS=()
 FAILED=0
 EVAL_LAUNCHED=0
-init_gpu_slot_pool
-trap cleanup_all EXIT
-trap 'cleanup_all; exit 130' INT TERM
+SERVER_PID=""
+PORT=""
+trap cleanup_server EXIT
+trap 'cleanup_server; exit 130' INT TERM
 
 # Derive the pi0.5 serve_policy --policy.config name from task + family.
 openpi_policy_config() {
@@ -160,13 +146,12 @@ start_server() {
     local family="$1"
     local port="$2"
     local server_log="$3"
-    local cuda_device="$4"
     if [ "$DEXJOCO_SERVER_TYPE" = "groot" ]; then
         local img_args=()
         [ -n "${DEXJOCO_IMAGE_SIZE:-}" ] && img_args=(--image_size "$DEXJOCO_IMAGE_SIZE")
         ( cd "$REPO_ROOT/lib/dexjoco" \
             && PYTHONPATH="$TRAIN_REPO_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-               CUDA_VISIBLE_DEVICES="$cuda_device" "$TRAIN_REPO_DIR/.venv/bin/python" gr00t_dexjoco_server.py \
+               CUDA_VISIBLE_DEVICES=0 "$TRAIN_REPO_DIR/.venv/bin/python" gr00t_dexjoco_server.py \
                 --model_path "$LAST_CKPT" --port "$port" --prompt "$SERVER_PROMPT" \
                 --embodiment_tag "$DEXJOCO_EMBODIMENT_TAG" "${img_args[@]}" ) \
             > "$server_log" 2>&1 &
@@ -175,7 +160,7 @@ start_server() {
         local pcfg; pcfg="$(openpi_policy_config "$family")"
         log "  openpi policy.config=$pcfg"
         ( cd "$DEXJOCO_DIR/openpi" \
-            && XLA_PYTHON_CLIENT_MEM_FRACTION=0.6 CUDA_VISIBLE_DEVICES="$cuda_device" \
+            && XLA_PYTHON_CLIENT_MEM_FRACTION=0.6 CUDA_VISIBLE_DEVICES=0 \
                "$MICROMAMBA_BIN" run -n "$DEXJOCO_OPENPI_ENV" python ./scripts/serve_policy.py \
                 --port="$port" policy:checkpoint --policy.config="$pcfg" --policy.dir="$LAST_CKPT" ) \
             > "$server_log" 2>&1 &
@@ -287,16 +272,12 @@ run_eval_one() (
     local FAMILY="$1"
     local RUN_IDX="$2"
     local RUN_SEED="$3"
-    local GPU_SLOT="$4"
-    local PORT="$5"
-    local START_SLOT="$6"
+    local PORT
     local RUN_DIR="${CUR_EVAL_DIR:-$EVAL_DIR}/$FAMILY/run_$RUN_IDX"
     local RUN_RESULTS="$RUN_DIR/results.json"
     local OUT_DIR="$RUN_DIR/dexjoco_out"
     local SERVER_LOG="$JOB_LOG_DIR/server_${CUR_TASK_TAG:+${CUR_TASK_TAG}_}${FAMILY}_run${RUN_IDX}.log"
     local SERVER_PID=""
-    local worker_cuda_device
-    worker_cuda_device="$(select_cuda_device "$GPU_SLOT")"
 
     trap cleanup_server EXIT
     trap 'cleanup_server; exit 130' INT TERM
@@ -310,19 +291,14 @@ run_eval_one() (
         exit 0
     fi
 
-    local start_delay=$((START_SLOT * EVAL_SIM_START_STAGGER_SECONDS))
-    if [ "$start_delay" -gt 0 ]; then
-        log "  Staggering MuJoCo worker startup by ${start_delay}s"
-        sleep "$start_delay"
-    fi
-
     mkdir -p "$RUN_DIR"
     rm -rf -- "$OUT_DIR"
+    PORT="$(find_available_port)"
 
     log ""
-    log "  family=$FAMILY run=$RUN_IDX/$N_RUNS seed=$RUN_SEED port=$PORT cuda=$worker_cuda_device"
+    log "  family=$FAMILY run=$RUN_IDX/$N_RUNS seed=$RUN_SEED port=$PORT"
     log "  starting $DEXJOCO_SERVER_TYPE policy server (log: $SERVER_LOG)"
-    start_server "$FAMILY" "$PORT" "$SERVER_LOG" "$worker_cuda_device"
+    start_server "$FAMILY" "$PORT" "$SERVER_LOG"
     sleep 2
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then
         log "ERROR: policy server died within 2s of launch (family=$FAMILY run=$RUN_IDX)"
@@ -333,25 +309,18 @@ run_eval_one() (
         return 1
     fi
 
-    log "  running dexjoco-openpi-eval on CUDA_VISIBLE_DEVICES=$worker_cuda_device"
+    log "  running dexjoco-openpi-eval"
     PAD_ARGS=()
     [ "$DEXJOCO_PAD_STATE_DIM46" = "1" ] && PAD_ARGS=(--pad-state-dim46)
     REPLAN_ARGS=()
     [ -n "${DEXJOCO_REPLAN_RATIO:-}" ] && REPLAN_ARGS=(--replan-ratio "$DEXJOCO_REPLAN_RATIO")
     CLIENT_RC=0
-    # Tee to both the container stdout AND eval.log so the live per-episode eval
-    # output shows up in `kubectl logs` / the job's stdout tab, instead of the
-    # eval going silent for minutes while it wrote only to eval.log. Process
-    # substitution keeps $? as the client's exit status (a `| tee` pipe would not).
-    # PYTHONUNBUFFERED=1 is essential: the client's stdout is a pipe here, so
-    # without it Python block-buffers and nothing streams until the run ends.
     ( cd "$DEXJOCO_DIR" \
-        && CUDA_VISIBLE_DEVICES="$worker_cuda_device" MUJOCO_GL=egl PYTHONUNBUFFERED=1 \
-           "$MICROMAMBA_BIN" run -n "$DEXJOCO_EVAL_ENV" dexjoco-openpi-eval \
+        && MUJOCO_GL=egl "$MICROMAMBA_BIN" run -n "$DEXJOCO_EVAL_ENV" dexjoco-openpi-eval \
             --config="./configs/$FAMILY/$DEXJOCO_TASK.yaml" \
             --seed="$RUN_SEED" --port="$PORT" --episodes="$N_EPISODES" \
             --output="$OUT_DIR" "${PAD_ARGS[@]}" "${REPLAN_ARGS[@]}" ) \
-        > >(tee -a "$LOG_FILE") 2>&1 || CLIENT_RC=$?
+        >> "$LOG_FILE" 2>&1 || CLIENT_RC=$?
 
     cleanup_server
 
@@ -373,9 +342,7 @@ run_eval_one() (
 
 # ── Eval matrix: tasks x families (eval_sets) x seeds (runs) ────────────────
 # run_eval_one reads DEXJOCO_TASK / SERVER_PROMPT / DEXJOCO_EMBODIMENT_TAG /
-# CUR_EVAL_DIR / CUR_TASK_TAG as globals; it forks as a subshell per launch, so
-# each task's in-flight workers keep the values set at their fork time even as
-# the outer loop advances to the next task.
+# CUR_EVAL_DIR / CUR_TASK_TAG as globals and evaluates each unit serially.
 for task_entry in "${TASKS[@]}"; do
     IFS='|' read -r TASK_SHORT TASK_NAME_LOOP TASK_INSTR_LOOP <<<"$task_entry"
     DEXJOCO_TASK="$TASK_NAME_LOOP"
@@ -413,22 +380,14 @@ for task_entry in "${TASKS[@]}"; do
                 continue
             fi
 
-            wait_for_slot
-            acquire_gpu_slot
-            GPU_SLOT="$ACQUIRED_SLOT"
-            START_SLOT="$GPU_SLOT"
-            PORT="$(find_eval_port)"
-            run_eval_one "$FAMILY" "$i" "$RUN_SEED" "$GPU_SLOT" "$PORT" "$START_SLOT" &
-            PIDS+=("$!")
-            PID_SLOTS+=("$GPU_SLOT")
             EVAL_LAUNCHED=$((EVAL_LAUNCHED + 1))
+            if ! run_eval_one "$FAMILY" "$i" "$RUN_SEED"; then
+                FAILED=1
+            fi
         done
     done
 done
 
-if ! wait_for_all; then
-    FAILED=1
-fi
 trap - EXIT
 finish_eval_launch_phase "$EVAL_LAUNCHED" "$FAILED" "$RESULTS_PATH"
 
@@ -459,7 +418,7 @@ python3 - \
     "$EVAL_DIR" "$RESULTS_PATH" "$N_RUNS" "$N_EPISODES" "$EVAL_BASE_SEED" \
     "$EXP_NAME" "$OUTPUT_NAMESPACE" "$CLUSTER" "$GPU_INSTANCE" \
     "$LAST_CKPT" "$DEXJOCO_TASK" "$DEXJOCO_SERVER_TYPE" "${TRAIN_NOTE:-}" \
-    "$EVAL_PARALLEL_WORKERS" "$MULTI_TASK" "$TASKS_JSON" \
+    "1" "$MULTI_TASK" "$TASKS_JSON" \
     "${EVAL_SETS[@]}" <<'PYEOF'
 import json, sys
 from pathlib import Path
