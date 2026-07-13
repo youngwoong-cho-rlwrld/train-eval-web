@@ -15,6 +15,7 @@ Your new variant directory is automatically picked up by the Submit page (via `/
 |---|---|---|
 | `config.sh` | always | The variant definition (plain bash, sourced on the cluster). |
 | `modality_config.py` | n1.6 models only | Declares the video/state/action/language keys + action representation. `TRAIN_MODALITY_CONFIG` points at it. n1.5 variants don't use it and can delete it. |
+| `dexjoco_config.py` / `dexjoco_config_dual_arm.py` | DexJoCo models only | Modality-config templates for single-arm / bimanual DexJoCo variants. Keep the one `TRAIN_MODALITY_CONFIG` points at; delete both for non-DexJoCo variants. |
 
 `config.sh` is heavily commented — read it top to bottom; it's the real documentation. Highlights below.
 
