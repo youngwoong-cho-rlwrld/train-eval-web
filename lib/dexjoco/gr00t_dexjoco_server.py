@@ -112,7 +112,12 @@ class WebsocketPolicyServer:
         while True:
             try:
                 obs = msgpack_numpy.unpackb(await ws.recv())
-                action = self._policy.infer(obs)
+                # Worker thread, NOT inline: the first get_action can spend
+                # 10-20+ min in torch.compile, and blocking the event loop
+                # there left the client's keepalive pings unanswered — the
+                # client dropped the connection mid-compile and hung forever
+                # (the 2026-07-09/10 episode-0 "stalls").
+                action = await asyncio.to_thread(self._policy.infer, obs)
                 await ws.send(packer.pack(action))
             except websockets.ConnectionClosed:
                 logger.info("Connection from %s closed", ws.remote_address)
