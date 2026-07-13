@@ -8,7 +8,6 @@ dependencies = [
     "uvicorn[standard]>=0.32",
     "pydantic>=2.9",
     "sse-starlette>=2.1",
-    "python-multipart>=0.0.18",
     "wandb>=0.27.0",
 ]
 
