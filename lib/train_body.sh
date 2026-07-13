@@ -23,11 +23,9 @@ source "$REPO_ROOT/clusters/${CLUSTER}.env"
 REPO_ROOT="$SUBMIT_REPO_ROOT"
 source "$REPO_ROOT/lib/_common.sh"
 
-EXP_DIR="$REPO_ROOT/experiments/$VARIANT"
-[ -d "$EXP_DIR" ] || { echo "ERROR: experiment dir not found: $EXP_DIR"; exit 1; }
-CONFIG_FILE="${SUBMIT_CONFIG_FILE:-$EXP_DIR/config.sh}"
-[ -f "$CONFIG_FILE" ] || { echo "ERROR: config not found: $CONFIG_FILE"; exit 1; }
-source "$CONFIG_FILE"
+# SUBMIT_EXP_DIR is only ever exported for eval jobs, so honoring it here is a
+# no-op for train — kept uniform via the shared helper.
+resolve_exp_and_config
 
 # Resolve the model family: MODEL_FAMILY > MODEL_VERSION > n1.5 default.
 MODEL_FAMILY="${MODEL_FAMILY:-${MODEL_VERSION:-n1.5}}"

@@ -23,11 +23,7 @@ source "$REPO_ROOT/clusters/${CLUSTER}.env"
 REPO_ROOT="$SUBMIT_REPO_ROOT"
 source "$REPO_ROOT/lib/_common.sh"
 
-EXP_DIR="${SUBMIT_EXP_DIR:-$REPO_ROOT/experiments/$VARIANT}"
-[ -d "$EXP_DIR" ] || { echo "ERROR: experiment dir not found: $EXP_DIR"; exit 1; }
-CONFIG_FILE="${SUBMIT_CONFIG_FILE:-$EXP_DIR/config.sh}"
-[ -f "$CONFIG_FILE" ] || { echo "ERROR: config not found: $CONFIG_FILE"; exit 1; }
-source "$CONFIG_FILE"
+resolve_exp_and_config
 
 # Resolve the model family: MODEL_FAMILY > MODEL_VERSION > n1.5 default.
 MODEL_FAMILY="${MODEL_FAMILY:-${MODEL_VERSION:-n1.5}}"
@@ -116,6 +112,11 @@ print(shape[1], shape[2])
         EVAL_IMG_W=224
         log "Could not locate info.json; defaulting input resolution to ${EVAL_IMG_H}x${EVAL_IMG_W}"
     fi
+else
+    # n1.6 always serves 640x480 (previously hardcoded in a duplicated
+    # server-launch block below).
+    EVAL_IMG_H=480
+    EVAL_IMG_W=640
 fi
 
 ###############################################################################
@@ -151,17 +152,23 @@ for seed_var in EVAL_SEED_RUN_STRIDE EVAL_SEED_SET_STRIDE EVAL_SEED_TASK_STRIDE;
 done
 log "Eval seed ranges: base=$EVAL_BASE_SEED run_stride=$EVAL_SEED_RUN_STRIDE eval_set_stride=$EVAL_SEED_SET_STRIDE task_stride=$EVAL_SEED_TASK_STRIDE"
 
-EVAL_GPU_COUNT="${TRAIN_NUM_GPUS:-1}"
+# One worker per ALLOCATED GPU. Eval jobs request EVAL_NUM_GPUS (submit writes
+# it into the config snapshot; falls back to the train count) — sizing the pool
+# from TRAIN_NUM_GPUS left reserved GPUs idle whenever the two differed.
+# Mirrors eval_body_dexjoco.sh.
+EVAL_GPU_COUNT="${EVAL_NUM_GPUS:-${TRAIN_NUM_GPUS:-1}}"
 if ! [[ "$EVAL_GPU_COUNT" =~ ^[0-9]+$ ]] || [ "$EVAL_GPU_COUNT" -lt 1 ]; then
     EVAL_GPU_COUNT=1
 fi
 
+# Submit override > config EVAL_NUM_ENVS_PER_GPU > 1. (A 4-deep chain of
+# legacy aliases — EVAL_NATIVE_NUM_ENVS_PER_SERVER / EVAL_NUM_ENVS_PER_SERVER /
+# EVAL_PARALLEL_SIMS_PER_GPU / EVAL_PARALLEL_SIMS — was never set by any
+# renderer or variant config.)
 if [ -n "${SUBMIT_EVAL_NUM_ENVS_PER_GPU:-}" ]; then
     EVAL_NUM_ENVS_PER_GPU="$SUBMIT_EVAL_NUM_ENVS_PER_GPU"
-elif [ -n "${SUBMIT_EVAL_PARALLEL_SIMS_PER_GPU:-}" ]; then
-    EVAL_NUM_ENVS_PER_GPU="$SUBMIT_EVAL_PARALLEL_SIMS_PER_GPU"
 fi
-EVAL_NUM_ENVS_PER_GPU="${EVAL_NUM_ENVS_PER_GPU:-${EVAL_NATIVE_NUM_ENVS_PER_SERVER:-${EVAL_NUM_ENVS_PER_SERVER:-${EVAL_PARALLEL_SIMS_PER_GPU:-${EVAL_PARALLEL_SIMS:-1}}}}}"
+EVAL_NUM_ENVS_PER_GPU="${EVAL_NUM_ENVS_PER_GPU:-1}"
 if ! [[ "$EVAL_NUM_ENVS_PER_GPU" =~ ^[0-9]+$ ]] || [ "$EVAL_NUM_ENVS_PER_GPU" -lt 1 ]; then
     log "ERROR: EVAL_NUM_ENVS_PER_GPU must be a positive integer, got '$EVAL_NUM_ENVS_PER_GPU'"
     exit 1
@@ -337,50 +344,29 @@ run_eval_one() (
     fi
     log "  Isaac Sim server starting on port $PORT with CUDA_VISIBLE_DEVICES=${server_cuda_devices}, num_envs=${EVAL_NUM_ENVS_PER_GPU}"
 
-    if [ "$MODEL_FAMILY" = "n1.5" ]; then
-        setsid bash -c "
-            if [ '${EVAL_UNSET_CUDA_VISIBLE_DEVICES_FOR_SERVER}' = '1' ]; then
-                unset CUDA_VISIBLE_DEVICES
-            fi
-            source '${ISAAC_DIR}/.venv/bin/activate'
-            cd '${ISAAC_DIR}'
-            exec python '${REPO_ROOT}/lib/isaac_server_runner.py' scripts/environments/server_v2.py \
-                --task 'Isaac-UniPickPlace-ALLEX-JointAction-VisualStereo-Abs-v0' \
-                --task_name '${TASK_NAME_LOOP}' \
-                --max-episode-steps ${MAX_EPISODE_STEPS} \
-                --image_crop_ratio 1.0 \
-                --image_resize_height $EVAL_IMG_H \
-                --image_resize_width $EVAL_IMG_W \
-                --port $PORT \
-                --num_envs ${EVAL_NUM_ENVS_PER_GPU} \
-                --device cpu \
-                --eval_set "$EVAL_SET" \
-                --app_launcher.headless
-        " > "$SERVER_LOG" 2>&1 &
-        SERVER_PID=$!
-    else
-        # Server: run from rlwrld_isaac venv (Python 3.11 + isaac-sim).
-        setsid bash -c "
-            if [ '${EVAL_UNSET_CUDA_VISIBLE_DEVICES_FOR_SERVER}' = '1' ]; then
-                unset CUDA_VISIBLE_DEVICES
-            fi
-            source '${ISAAC_DIR}/.venv/bin/activate'
-            cd '${ISAAC_DIR}'
-            exec python '${REPO_ROOT}/lib/isaac_server_runner.py' scripts/environments/server_v2.py \
-                --task 'Isaac-UniPickPlace-ALLEX-JointAction-VisualStereo-Abs-v0' \
-                --task_name '${TASK_NAME_LOOP}' \
-                --max-episode-steps ${MAX_EPISODE_STEPS} \
-                --image_crop_ratio 1.0 \
-                --image_resize_height 480 \
-                --image_resize_width 640 \
-                --port $PORT \
-                --num_envs ${EVAL_NUM_ENVS_PER_GPU} \
-                --device cpu \
-                --eval_set "$EVAL_SET" \
-                --app_launcher.headless
-        " > "$SERVER_LOG" 2>&1 &
-        SERVER_PID=$!
-    fi
+    # Server: run from the rlwrld_isaac venv (Python 3.11 + isaac-sim). One
+    # launch block for both families — only the resize resolution differs and
+    # it is resolved into EVAL_IMG_H/W above (n1.5 auto-detects, n1.6 640x480).
+    setsid bash -c "
+        if [ '${EVAL_UNSET_CUDA_VISIBLE_DEVICES_FOR_SERVER}' = '1' ]; then
+            unset CUDA_VISIBLE_DEVICES
+        fi
+        source '${ISAAC_DIR}/.venv/bin/activate'
+        cd '${ISAAC_DIR}'
+        exec python '${REPO_ROOT}/lib/isaac_server_runner.py' scripts/environments/server_v2.py \
+            --task 'Isaac-UniPickPlace-ALLEX-JointAction-VisualStereo-Abs-v0' \
+            --task_name '${TASK_NAME_LOOP}' \
+            --max-episode-steps ${MAX_EPISODE_STEPS} \
+            --image_crop_ratio 1.0 \
+            --image_resize_height $EVAL_IMG_H \
+            --image_resize_width $EVAL_IMG_W \
+            --port $PORT \
+            --num_envs ${EVAL_NUM_ENVS_PER_GPU} \
+            --device cpu \
+            --eval_set "$EVAL_SET" \
+            --app_launcher.headless
+    " > "$SERVER_LOG" 2>&1 &
+    SERVER_PID=$!
 
     log "  Waiting for server readiness..."
     wait_for_server_ready
@@ -488,7 +474,14 @@ for task_entry in "${TASKS[@]}"; do
             wait_for_slot
             acquire_gpu_slot
             GPU_SLOT="$ACQUIRED_SLOT"
-            START_SLOT="$GPU_SLOT"
+            # Stagger only the cold-start wave (the first EVAL_PARALLEL_WORKERS
+            # launches, where slot == launch order): re-sleeping slot*STAGGER on
+            # every reuse of a slot is pure GPU idle once the pool is warm.
+            if [ "$EVAL_LAUNCHED" -lt "$EVAL_PARALLEL_WORKERS" ]; then
+                START_SLOT="$GPU_SLOT"
+            else
+                START_SLOT=0
+            fi
             PORT="$(find_eval_port)"
             run_eval_one \
                 "$TASK_SHORT_LOOP" \
