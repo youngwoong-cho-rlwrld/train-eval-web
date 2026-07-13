@@ -1,3 +1,5 @@
+import { isSlurmCluster } from "./cluster-env";
+
 export type JobPhase = "train" | "resume" | "eval" | "unknown" | "other";
 
 const ACTIVE_STATES = new Set([
@@ -78,7 +80,8 @@ export function canResumeJob({
   cluster: string;
   state?: string | null;
 }): boolean {
-  return cluster !== "mlxp" && isTimeoutJobState(state);
+  // Resume/retry rebuild from the Slurm sidecar meta; MLXP has no equivalent.
+  return isSlurmCluster(cluster) && isTimeoutJobState(state);
 }
 
 export function canRetryJob({
@@ -88,7 +91,7 @@ export function canRetryJob({
   cluster: string;
   state?: string | null;
 }): boolean {
-  return cluster !== "mlxp" && isFailedJobState(state);
+  return isSlurmCluster(cluster) && isFailedJobState(state);
 }
 
 export function canCopyCheckpoint({

@@ -9,6 +9,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { RefreshButton } from "@/components/refresh-button";
 import { EmptyState, ErrorState, LoadingState } from "@/components/loading-state";
 import { GpuQueueTooltipContent } from "@/components/gpu-queue-visualization";
+import { isSlurmCluster } from "@/lib/cluster-env";
 import { sumGpu } from "@/lib/gpu";
 import { cn } from "@/lib/utils";
 
@@ -24,7 +25,7 @@ export default function MonitorPage() {
     queryFn: () => api<{ clusters: string[] }>("/api/clusters").then((d) => d.clusters),
   });
   // mlxp is k8s, not slurm — it has its own panel below.
-  const slurm = (clusters.data ?? []).filter((c) => c !== "mlxp");
+  const slurm = (clusters.data ?? []).filter(isSlurmCluster);
 
   const refreshAll = () => {
     qc.invalidateQueries({ queryKey: ["clusters"] });

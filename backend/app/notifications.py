@@ -17,6 +17,7 @@ replay old history.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import os
 import urllib.error
@@ -229,6 +230,32 @@ class _Monitor:
 
 _monitor = _Monitor()
 
+_LOCK_FILE = _STATE_FILE.parent / "notify.lock"
+
 
 async def run_monitor() -> None:
+    """Run the poller, but only in ONE backend process per machine.
+
+    Two backends sharing a webhook (a stray second uvicorn, a dev copy on
+    another port) each poll and diff independently, so every transition posts
+    twice. An advisory flock elects a single sender; the others stand by and
+    take over if the holder exits (the lock dies with its process).
+    """
+    _LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lock_handle = _LOCK_FILE.open("w")  # held for process lifetime
+    standby_logged = False
+    while True:
+        try:
+            fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if not standby_logged:
+                standby_logged = True
+                print(
+                    "[notifications] another train-eval-web backend holds "
+                    f"{_LOCK_FILE}; notification monitor on standby in this process"
+                )
+            await asyncio.sleep(_POLL_INTERVAL)
+    if standby_logged:
+        print("[notifications] lock acquired; notification monitor active")
     await _monitor.run()

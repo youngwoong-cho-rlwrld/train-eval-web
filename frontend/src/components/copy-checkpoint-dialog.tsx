@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { useMutation, useQuery, type UseQueryResult } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
@@ -116,10 +116,10 @@ export function CopyCheckpointDialog({
 
   const clusterOptions = Array.isArray(clusters.data) ? clusters.data : [];
   const options = clusterOptions.filter((c) => c !== cluster);
-  const checkpointOptions = useMemo(
-    () => dedupeCheckpoints(checkpoints.data ?? []),
-    [checkpoints.data],
-  );
+  // No manual useMemo: the React Compiler memoizes this itself (and rejects
+  // the hand-written version as unpreservable — see eslint
+  // react-hooks/preserve-manual-memoization).
+  const checkpointOptions = dedupeCheckpoints(checkpoints.data ?? []);
 
   function toggle(path: string) {
     const next = new Set(selected);

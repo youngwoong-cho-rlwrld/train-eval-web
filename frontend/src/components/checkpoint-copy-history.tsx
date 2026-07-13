@@ -2,6 +2,7 @@
 
 import type { CheckpointCopyRecord } from "@/lib/api";
 import { CopyButton } from "@/components/copy-button";
+import { KST_TIME_ZONE } from "@/lib/job-time";
 
 export function CheckpointCopyList({
   records,
@@ -56,9 +57,9 @@ function CheckpointPath({
 
 function formatCopyTime(seconds: number) {
   if (!Number.isFinite(seconds)) return "";
-  // Match the Asia/Seoul convention used for all other job timestamps
-  // (see lib/job-time.ts) rather than the viewer's local timezone.
+  // Match the KST convention used for all other job timestamps. Keeps the
+  // locale-default full date+time shape (unlike job-time's fixed field set).
   return new Date(seconds * 1000).toLocaleString(undefined, {
-    timeZone: "Asia/Seoul",
+    timeZone: KST_TIME_ZONE,
   });
 }

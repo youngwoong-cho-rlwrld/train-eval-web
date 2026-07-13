@@ -17,6 +17,8 @@ import { ErrorState, InlineLoading, LoadingState } from "@/components/loading-st
 import { ImmediateTooltip } from "@/components/immediate-tooltip";
 import { JobStateBadge } from "@/components/job-state-badge";
 import { isActiveJobState, primaryJobState } from "@/lib/job-status";
+import { isSlurmCluster } from "@/lib/cluster-env";
+import { formatKstShort, formatKstShortWithYear } from "@/lib/job-time";
 import { Th } from "@/components/table";
 import { jobDetailHref } from "@/lib/job-links";
 import { basename, formatPct } from "@/lib/format";
@@ -50,7 +52,7 @@ export default function ResultsPage() {
     staleTime: 5 * 60_000,
   });
   const clusterNames = clustersQuery.data ?? [];
-  const clusterOptions = clusterNames.filter((c) => c !== "mlxp");
+  const clusterOptions = clusterNames.filter(isSlurmCluster);
 
   // One query per cluster so each cluster's results render as soon as its
   // probe returns, instead of first paint waiting on the slowest cluster.
@@ -258,27 +260,12 @@ function resultRecency(variant: ResultVariant): number {
 }
 
 function formatCompletedAt(seconds: number): string {
-  return new Intl.DateTimeFormat(undefined, {
-    timeZone: "Asia/Seoul",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).format(new Date(seconds * 1000));
+  return formatKstShortWithYear(seconds * 1000);
 }
 
 function formatGroupRecency(ts: number): string | null {
   if (ts < 1e12) return null; // job-id fallback, not a real timestamp
-  return new Intl.DateTimeFormat(undefined, {
-    timeZone: "Asia/Seoul",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).format(new Date(ts));
+  return formatKstShort(ts);
 }
 
 function ExperimentGroup({
@@ -736,4 +723,3 @@ function episodeWeightedAverage(cells: ResultCell[]) {
   if (episodes > 0) return successes / episodes;
   return null;
 }
-

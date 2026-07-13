@@ -43,12 +43,22 @@ const MLXP_ENV_FIELDS: EnvField[] = [
   { key: "TRAIN_EVAL_MLXP_WANDB_SECRET", description: "Kubernetes secret containing the W&B key." },
 ];
 
+// Single predicate for the k8s-vs-slurm split; the "mlxp" literal was
+// previously compared inline across five modules.
+export function isMlxpCluster(name: string): boolean {
+  return name === "mlxp";
+}
+
+export function isSlurmCluster(name: string): boolean {
+  return !isMlxpCluster(name);
+}
+
 export function fieldsForClusterEnv(
   clusterName: string,
   saved: Record<string, string>,
   draft: Record<string, string>,
 ): EnvField[] {
-  const base = clusterName === "mlxp" ? MLXP_ENV_FIELDS : SLURM_ENV_FIELDS;
+  const base = isMlxpCluster(clusterName) ? MLXP_ENV_FIELDS : SLURM_ENV_FIELDS;
   const known = new Set(base.map((field) => field.key));
   const extras = Array.from(new Set([...Object.keys(saved), ...Object.keys(draft)]))
     .filter((key) => !known.has(key))

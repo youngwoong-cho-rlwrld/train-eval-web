@@ -128,7 +128,12 @@ async def _list_datasets_mlxp(dir_path: str) -> list[DatasetInfo]:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise RuntimeError(f"list_datasets(mlxp, {dir_path}) timed out")
     if proc.returncode != 0:
         raise RuntimeError(
             f"list_datasets(mlxp, {dir_path}) failed in pod {pod}: "

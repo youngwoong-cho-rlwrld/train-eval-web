@@ -425,6 +425,10 @@ done
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20.0)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return []
     except Exception:
         return []
 
@@ -502,6 +506,10 @@ fi
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20.0)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return {}
     except Exception:
         return {}
 
@@ -536,6 +544,10 @@ async def _copy_history_index(pod: str) -> dict[str, dict[str, Any]]:
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return {}
     except Exception:
         return {}
 
@@ -564,7 +576,57 @@ async def _copy_history_index(pod: str) -> dict[str, dict[str, Any]]:
     return index
 
 
+# The job-detail page resolves the SAME job id from ~6 endpoints in one burst
+# (sacct + details + progress + metadata + gpu + eval-runs). Uncached, each does
+# 2 kubectl gets, so a single page load fires ~12 slow (1-3s) subprocesses that
+# saturate the browser's ~6-connection-per-origin pool alongside the permanent
+# log SSE — the page looks hung and the log stream stays "pending". A short TTL
+# collapses that burst to a single kubectl pair.
+_GET_JOB_TTL = 3.0
+_job_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_job_locks: dict[str, asyncio.Lock] = {}
+
+
+def _job_lock(name: str) -> asyncio.Lock:
+    lock = _job_locks.get(name)
+    if lock is None:
+        lock = asyncio.Lock()
+        _job_locks[name] = lock
+    return lock
+
+
+def invalidate_job_cache(name: str | None = None) -> None:
+    """Drop cached job records so the next read reflects a mutation (cancel /
+    train-note edit). Pass None to clear everything."""
+    if name is None:
+        _job_cache.clear()
+    else:
+        _job_cache.pop(name, None)
+
+
 async def get_job(name: str) -> dict[str, Any]:
+    """TTL-cached wrapper around :func:`_get_job_uncached`.
+
+    The lock is PER-NAME, not global: a slow/hung kubectl for one job must not
+    stall detail pages (or the SSE terminal-state poll) for other jobs. Returns
+    a copy so callers can't mutate the cached record (all values are strings, so
+    a shallow copy is a full copy).
+    """
+    loop = asyncio.get_running_loop()
+    hit = _job_cache.get(name)
+    if hit and loop.time() - hit[0] < _GET_JOB_TTL:
+        return dict(hit[1])
+    async with _job_lock(name):
+        # A concurrent caller may have populated the cache while we waited.
+        hit = _job_cache.get(name)
+        if hit and loop.time() - hit[0] < _GET_JOB_TTL:
+            return dict(hit[1])
+        record = await _get_job_uncached(name)
+        _job_cache[name] = (loop.time(), record)
+        return dict(record)
+
+
+async def _get_job_uncached(name: str) -> dict[str, Any]:
     """Return a slurm-sacct-shaped dict for one MLXP job.
 
     Falls back to the archived-on-DDN view when the k8s Job is gone

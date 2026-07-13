@@ -1,3 +1,28 @@
+// Every job timestamp in the UI renders in KST regardless of the viewer's
+// locale; results/checkpoint-history formatters share these instead of
+// re-declaring the timezone and field set.
+export const KST_TIME_ZONE = "Asia/Seoul";
+
+const KST_SHORT_FIELDS: Intl.DateTimeFormatOptions = {
+  timeZone: KST_TIME_ZONE,
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+};
+
+export function formatKstShort(ms: number): string {
+  return new Intl.DateTimeFormat(undefined, KST_SHORT_FIELDS).format(new Date(ms));
+}
+
+export function formatKstShortWithYear(ms: number): string {
+  return new Intl.DateTimeFormat(undefined, {
+    ...KST_SHORT_FIELDS,
+    year: "numeric",
+  }).format(new Date(ms));
+}
+
 export function parseJobTimestampMs(value?: string | null): number {
   const normalized = normalizeJobTimestamp(value);
   if (!normalized) return 0;
@@ -16,16 +41,9 @@ export function formatJobTimestamp(
     return { short: normalized, full: normalized };
   }
 
-  const short = new Intl.DateTimeFormat(undefined, {
-    timeZone: "Asia/Seoul",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).format(date);
+  const short = formatKstShort(date.getTime());
   const full = new Intl.DateTimeFormat(undefined, {
-    timeZone: "Asia/Seoul",
+    timeZone: KST_TIME_ZONE,
     year: "numeric",
     month: "2-digit",
     day: "2-digit",

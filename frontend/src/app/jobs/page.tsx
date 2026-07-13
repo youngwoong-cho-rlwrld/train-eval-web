@@ -32,6 +32,7 @@ import {
   isTrainJobPhase,
   jobPhase,
   normalizeJobPhase,
+  primaryJobState,
   resubmitSourceLabel,
   type JobPhase,
 } from "@/lib/job-status";
@@ -131,7 +132,7 @@ export default function JobsPage() {
       .sort((a, b) => compareEndedDesc(a, b));
   }, [recentMerged.jobs]);
   const recentStateOptions = useMemo(() => {
-    const values = new Set(finished.map((j) => normalizeStateFilterValue(j.state)));
+    const values = new Set(finished.map((j) => stateFilterValue(j.state)));
     return Array.from(values).sort();
   }, [finished]);
   const filteredFinished = useMemo(
@@ -301,9 +302,12 @@ type RecentJobFilters = {
   state: string;
 };
 
-function normalizeStateFilterValue(state: string) {
-  const head = state.trim().split(/\s+/)[0] ?? "";
-  return head.toUpperCase() || "UNKNOWN";
+function stateFilterValue(state: string) {
+  return primaryJobState(state.trim()) || "UNKNOWN";
+}
+
+function resolveJobPhase(job: Job): JobPhase {
+  return normalizeJobPhase(job.phase) ?? jobPhase(job.job_name);
 }
 
 function recentJobMatchesFilters(job: Job, filters: RecentJobFilters) {
@@ -319,9 +323,9 @@ function recentJobMatchesFilters(job: Job, filters: RecentJobFilters) {
     ].join(" ").toLowerCase();
     if (!haystack.includes(name)) return false;
   }
-  const phase = normalizeJobPhase(job.phase) ?? jobPhase(job.job_name);
+  const phase = resolveJobPhase(job);
   if (filters.phase !== "all" && phase !== filters.phase) return false;
-  if (filters.state !== "all" && normalizeStateFilterValue(job.state) !== filters.state) return false;
+  if (filters.state !== "all" && stateFilterValue(job.state) !== filters.state) return false;
   return true;
 }
 
@@ -413,7 +417,7 @@ function JobTable({
         </thead>
         <tbody>
           {rows.map((j) => {
-            const phase = normalizeJobPhase(j.phase) ?? jobPhase(j.job_name);
+            const phase = resolveJobPhase(j);
             return (
               <tr key={`${j.cluster}-${j.job_id}`} className="border-b border-slate-100 last:border-0 hover:bg-slate-50 dark:border-slate-900 dark:hover:bg-slate-900/40">
                 <td className="py-2 pr-4 font-mono">

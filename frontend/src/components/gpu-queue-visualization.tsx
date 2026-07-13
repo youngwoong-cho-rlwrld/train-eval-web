@@ -36,7 +36,7 @@ export function GpuQueueTooltipContent({
   );
 }
 
-export function GpuQueueVisualization({
+function GpuQueueVisualization({
   snapshot,
   currentJobId,
 }: {

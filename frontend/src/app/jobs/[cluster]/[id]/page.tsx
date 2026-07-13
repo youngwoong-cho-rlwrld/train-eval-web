@@ -16,6 +16,7 @@ import {
   logStreamUrl,
   type CheckpointCopyRecord,
   type EvalRun,
+  type LogStream as LogStreamKind,
   type GpuUsage,
   type JobEvalRuns,
   type JobDetails,
@@ -194,7 +195,7 @@ export default function JobDetail({ params }: { params: Promise<{ cluster: strin
   const metadataError = metadata.error as Error | null;
   const gpuError = gpu.error as Error | null;
   const evalRunsError = evalRuns.error as Error | null;
-  const [stream, setStream] = useState<"out" | "err" | "isaac">("out");
+  const [stream, setStream] = useState<LogStreamKind>("out");
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [copyOpen, setCopyOpen] = useState(false);
 
@@ -1087,11 +1088,17 @@ function LogStream({
 }: {
   cluster: string;
   jobId: string;
-  stream: "out" | "err" | "isaac";
+  stream: LogStreamKind;
 }) {
   const [visibleLines, setVisibleLines] = useState<string[]>([]);
   const [receivedCount, setReceivedCount] = useState(0);
   const [hiddenOlderCount, setHiddenOlderCount] = useState(0);
+  // Distinguish "EventSource still queued behind the browser's ~6-per-origin
+  // connection cap" from "connected but the log is genuinely silent" — an
+  // eternal generic placeholder made pool starvation undiagnosable.
+  const [connState, setConnState] = useState<
+    "connecting" | "open" | "retrying" | "done"
+  >("connecting");
   const preRef = useRef<HTMLPreElement>(null);
   const allLinesRef = useRef<string[]>([]);
   const visibleStartRef = useRef(0);
@@ -1131,10 +1138,7 @@ function LogStream({
   }, [renderLatestWindow]);
 
   useEffect(() => {
-    allLinesRef.current = [];
-    visibleStartRef.current = 0;
-    visibleEndRef.current = 0;
-    stickToBottomRef.current = true;
+    let es: EventSource | null = null;
 
     function scheduleFlush() {
       if (frameRef.current !== null) return;
@@ -1144,30 +1148,66 @@ function LogStream({
       });
     }
 
-    const es = new EventSource(logStreamUrl(cluster, jobId, stream));
-    es.addEventListener("line", (e: MessageEvent) => {
-      // Sample scroll position before the state update — once React
-      // re-renders with the new line, scrollHeight has already grown and
-      // we can't tell whether the user was at the bottom.
-      const el = preRef.current;
-      if (el) {
-        stickToBottomRef.current =
-          el.scrollHeight - el.scrollTop - el.clientHeight < 8;
-      }
-      allLinesRef.current.push(e.data as string);
-      scheduleFlush();
-    });
-    // Backend signals terminal job + drained log. Close so finished-job tabs
-    // stop holding one of the browser's 6 per-origin connections.
-    es.addEventListener("done", () => es.close());
+    function connect() {
+      if (es) return;
+      // Fresh stream on each (re)connect; the backend replays the full backlog
+      // from line 1, so reset the accumulator and the visible window.
+      allLinesRef.current = [];
+      visibleStartRef.current = 0;
+      visibleEndRef.current = 0;
+      stickToBottomRef.current = true;
+      renderWindow(0, 0);
+      setConnState("connecting");
+      const src = new EventSource(logStreamUrl(cluster, jobId, stream));
+      es = src;
+      src.onopen = () => setConnState("open");
+      src.onerror = () => setConnState("retrying");
+      src.addEventListener("line", (e: MessageEvent) => {
+        // Sample scroll position before the state update — once React
+        // re-renders with the new line, scrollHeight has already grown and
+        // we can't tell whether the user was at the bottom.
+        const el = preRef.current;
+        if (el) {
+          stickToBottomRef.current =
+            el.scrollHeight - el.scrollTop - el.clientHeight < 8;
+        }
+        allLinesRef.current.push(e.data as string);
+        scheduleFlush();
+      });
+      // Backend signals terminal job + drained log. Close so finished-job tabs
+      // stop holding one of the browser's 6 per-origin connections.
+      src.addEventListener("done", () => {
+        src.close();
+        if (es === src) es = null;
+        setConnState("done");
+      });
+    }
+
+    function disconnect() {
+      es?.close();
+      es = null;
+    }
+
+    // Only hold a connection while the tab is visible. Browsers cap ~6
+    // connections per origin; releasing hidden tabs keeps several open job tabs
+    // from exhausting the pool and stalling the active tab's log stream.
+    function onVisibility() {
+      if (document.visibilityState === "hidden") disconnect();
+      else connect();
+    }
+
+    if (document.visibilityState !== "hidden") connect();
+    document.addEventListener("visibilitychange", onVisibility);
+
     return () => {
-      es.close();
+      document.removeEventListener("visibilitychange", onVisibility);
+      disconnect();
       if (frameRef.current !== null) {
         window.cancelAnimationFrame(frameRef.current);
         frameRef.current = null;
       }
     };
-  }, [cluster, jobId, stream, flushReceivedLines]);
+  }, [cluster, jobId, stream, flushReceivedLines, renderWindow]);
 
   useEffect(() => {
     const el = preRef.current;
@@ -1204,7 +1244,13 @@ function LogStream({
 
   const logText =
     receivedCount === 0
-      ? "(waiting for log lines...)"
+      ? connState === "open"
+        ? "(connected — no log output yet...)"
+        : connState === "done"
+          ? "(stream ended — no log output)"
+          : connState === "retrying"
+            ? "(log stream disconnected — retrying... too many open job tabs can exhaust the browser's connection pool; close or reload stale tabs)"
+            : "(connecting to log stream...)"
       : [
           hiddenOlderCount > 0
             ? `(${hiddenOlderCount.toLocaleString()} earlier lines hidden - scroll to top to load ${Math.min(LOG_PAGE_SIZE, hiddenOlderCount)} more)`
