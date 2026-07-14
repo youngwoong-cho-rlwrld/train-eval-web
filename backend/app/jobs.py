@@ -34,11 +34,22 @@ class Job(BaseModel):
     variant: str | None = None
     resume_of: str | None = None
     resubmit_action: str | None = None
+    restarts: int | None = None
 
 
 _SQUEUE_FMT = "%i|%j|%P|%T|%M|%R|%L|%S"
-_SACCT_LIST_FMT = "JobID,JobName,Partition,State,Elapsed,Start,End,NodeList"
+_SACCT_LIST_FMT = "JobID,JobName,Partition,State,Elapsed,Start,End,NodeList,Restarts"
 ACTIVE_STATES = {"RUNNING", "PENDING", "COMPLETING", "CONFIGURING", "SUSPENDED"}
+
+
+def _squeue_parts(line: str) -> list[str] | None:
+    parts = line.split("|")
+    return parts if len(parts) >= 8 else None
+
+
+def _sacct_list_parts(line: str) -> list[str] | None:
+    parts = line.split("|")
+    return parts if len(parts) >= 9 else None
 
 # Slurm terminal-state prefix groups (sacct may suffix states, e.g.
 # "CANCELLED by <uid>"), so classify by uppercase prefix.
@@ -67,6 +78,23 @@ def is_timeout(state: str) -> bool:
 
 def is_retryable_failure(state: str) -> bool:
     return state.upper().startswith(RETRYABLE_FAILURE_PREFIXES)
+
+
+def is_exhausted_requeue(record: dict) -> bool:
+    """True only for Slurm's automatic requeue-limit cancellation.
+
+    User ``scancel`` normally records ``CANCELLED by <uid>``.  A preemptible
+    job that exhausts Kakao's five automatic requeues records exact
+    ``CANCELLED``, five restarts, and a zero exit code.  Keep this deliberately
+    strict so an intentional cancellation is never silently resurrected.
+    """
+    state = str(record.get("State") or record.get("state") or "").strip().upper()
+    exit_code = str(record.get("ExitCode") or record.get("exit_code") or "").strip()
+    try:
+        restarts = int(record.get("Restarts") or record.get("restarts") or 0)
+    except (TypeError, ValueError):
+        return False
+    return state == "CANCELLED" and restarts >= 5 and exit_code in {"", "0:0"}
 
 
 def is_terminal_non_completed(state: str) -> bool:
@@ -185,8 +213,8 @@ async def list_jobs(
         seen: set[str] = set()
         by_id: dict[str, Job] = {}
         for line in sq_out.strip().splitlines():
-            parts = line.split("|")
-            if len(parts) < 8:
+            parts = _squeue_parts(line)
+            if parts is None:
                 continue
             seen.add(parts[0])
             time_left = parts[6] if parts[6] not in ("", "N/A") else None
@@ -200,8 +228,8 @@ async def list_jobs(
             local.append(job)
             by_id[parts[0]] = job
         for line in sa_out.strip().splitlines():
-            parts = line.split("|")
-            if len(parts) < 8:
+            parts = _sacct_list_parts(line)
+            if parts is None:
                 continue
             jid = parts[0]
             # Truncate sacct's CANCELLED+by labels for cleaner display.
@@ -226,6 +254,7 @@ async def list_jobs(
                 cluster=c, job_id=jid, job_name=parts[1], partition=parts[2],
                 state=state, elapsed=parts[4], nodelist=parts[7],
                 start=job_start, end=job_end,
+                restarts=int(parts[8]) if parts[8].strip().isdigit() else None,
             ))
         meta_by_job_id = await read_slurm_meta_many(host, [j.job_id for j in local])
         _attach_phase_metadata(local, meta_by_job_id)
@@ -250,7 +279,7 @@ def _attach_phase_metadata(rows: list[Job], meta_by_job_id: dict[str, dict[str, 
         job.resubmit_action = meta.get("resubmit_action") or None
 
 
-_SACCT_DETAIL_FMT = "JobID,JobName,Partition,State,ExitCode,Start,End,Elapsed,NodeList,Reason"
+_SACCT_DETAIL_FMT = "JobID,JobName,Partition,State,ExitCode,Start,End,Elapsed,NodeList,Reason,Restarts"
 _SACCT_GPU_DETAIL_FMT = f"{_SACCT_DETAIL_FMT},AllocTRES,ReqTRES"
 _SQUEUE_DETAIL_FMT = "%i|%j|%P|%T|%V|%S|%M|%N|%R|%b"
 

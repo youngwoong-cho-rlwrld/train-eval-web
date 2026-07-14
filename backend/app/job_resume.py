@@ -39,6 +39,32 @@ def _retry_job_name(original: str | None) -> str | None:
     return f"{name}_{stamp}"
 
 
+def _resume_job_name(original: str | None, parent_job_id: str) -> str:
+    """Return the stable child name for one direct resume operation.
+
+    The same parent always yields the same child name, which makes Slurm itself
+    a durable reconciliation source if the backend loses the response or the
+    sidecar write. Replace an earlier ``_r<job>`` suffix so resume chains do not
+    grow the name indefinitely.
+    """
+    safe_parent = re.sub(r"[^A-Za-z0-9.-]+", "-", parent_job_id).strip(".-")
+    if not safe_parent:
+        raise ValueError(f"invalid parent job id {parent_job_id!r}")
+    name = (original or "").strip()
+    if not name:
+        candidate = f"resubmission_unknown_job_r{safe_parent}_20000101_000000"
+    else:
+        match = _TIMESTAMP_SUFFIX.search(name)
+        if not match:
+            candidate = f"{name}_r{safe_parent}_20000101_000000"
+        else:
+            stem = re.sub(r"_r[A-Za-z0-9.-]+$", "", name[:match.start()])
+            candidate = f"{stem}_r{safe_parent}{match.group(0)}"
+    if len(candidate) < 50:
+        candidate = f"openclaw_recovered_{candidate}"
+    return candidate
+
+
 async def resume_timed_out_job(cluster: str, job_id: str) -> submit.SubmitResponse:
     return await _resubmit_slurm_job(cluster, job_id, action="resume")
 
@@ -53,6 +79,17 @@ async def _resubmit_slurm_job(
     *,
     action: str,
 ) -> submit.SubmitResponse:
+    request = await build_resubmit_request(cluster, job_id, action=action)
+    return await submit.submit(request)
+
+
+async def build_resubmit_request(
+    cluster: str,
+    job_id: str,
+    *,
+    action: str,
+) -> submit.SubmitRequest:
+    """Reconstruct and validate one resubmission without submitting it."""
     if action not in {"resume", "retry"}:
         raise ValueError(f"unsupported job resubmit action: {action}")
     if cluster == "mlxp":
@@ -60,8 +97,13 @@ async def _resubmit_slurm_job(
 
     record = await jobs.get_job(cluster, job_id)
     state = str(record.get("State") or "")
-    if action == "resume" and not jobs.is_timeout(state):
-        raise ValueError(f"job {job_id} on {cluster} is {state or 'unknown'}, not TIMEOUT")
+    if action == "resume" and not (
+        jobs.is_timeout(state) or jobs.is_exhausted_requeue(record)
+    ):
+        raise ValueError(
+            f"job {job_id} on {cluster} is not TIMEOUT or an exhausted "
+            "automatic requeue"
+        )
     if action == "retry" and not jobs.is_retryable_failure(state):
         raise ValueError(f"job {job_id} on {cluster} is {state or 'unknown'}, not FAILED")
 
@@ -85,11 +127,15 @@ async def _resubmit_slurm_job(
     partition = str(record.get("Partition") or "").strip() or None
     job_name = det.job_name or str(record.get("JobName") or "").strip() or None
     retrying = action == "retry"
-    # Every scheduler submission gets a fresh display/log name. The immutable
-    # output_namespace below is what makes an eval resume reuse and seed the
-    # prior results directory; reusing the old job_name only collides log and
-    # snapshot paths and makes lost-response recovery ambiguous.
-    resolved_job_name = _retry_job_name(job_name)
+    # Each direct parent gets one stable child display/log name. The immutable
+    # output_namespace below makes eval resumes reuse and seed prior results;
+    # the stable name makes a lost submission response safely reconcilable.
+    resolved_job_name = (
+        _resume_job_name(job_name, job_id)
+        if action == "resume"
+        else _retry_job_name(job_name)
+    )
+    idempotency_key = f"resume:{cluster}:{job_id}" if action == "resume" else None
 
     env = await load_cluster(cluster)
     meta = await read_slurm_meta(env.ssh_alias, job_id)
@@ -102,25 +148,24 @@ async def _resubmit_slurm_job(
             return None
 
     if phase == "train":
-        return await submit.submit(
-            submit.SubmitRequest(
-                cluster=cluster,
-                variant=variant,
-                phase="train",
-                train_note=(meta.get("train_note") or "").strip() or None,
-                partition=partition,
-                train_num_gpus=int_meta("train_num_gpus"),
-                train_global_batch_size=int_meta("train_global_batch_size"),
-                train_max_steps=int_meta("train_max_steps"),
-                train_save_steps=int_meta("train_save_steps"),
-                train_num_workers=int_meta("train_num_workers"),
-                train_action_horizon=int_meta("train_action_horizon"),
-                job_name=resolved_job_name,
-                output_namespace=(meta.get("output_namespace") or "").strip() or None,
-                resume=not retrying,
-                resume_of=job_id,
-                resubmit_action=action,
-            )
+        return submit.SubmitRequest(
+            cluster=cluster,
+            variant=variant,
+            phase="train",
+            train_note=(meta.get("train_note") or "").strip() or None,
+            partition=partition,
+            train_num_gpus=int_meta("train_num_gpus"),
+            train_global_batch_size=int_meta("train_global_batch_size"),
+            train_max_steps=int_meta("train_max_steps"),
+            train_save_steps=int_meta("train_save_steps"),
+            train_num_workers=int_meta("train_num_workers"),
+            train_action_horizon=int_meta("train_action_horizon"),
+            job_name=resolved_job_name,
+            output_namespace=(meta.get("output_namespace") or "").strip() or None,
+            resume=not retrying,
+            resume_of=job_id,
+            resubmit_action=action,
+            idempotency_key=idempotency_key,
         )
 
     checkpoint = det.paths.eval_checkpoint
@@ -141,30 +186,29 @@ async def _resubmit_slurm_job(
         except Exception:
             pass
 
-    return await submit.submit(
-        submit.SubmitRequest(
-            cluster=cluster,
-            variant=variant,
-            phase="eval",
-            train_note=(meta.get("train_note") or "").strip() or None,
-            partition=partition,
-            # The sidecar records the eval allocation actually passed to sbatch;
-            # thread it back as the eval override (it used to be smuggled in as
-            # train_num_gpus, which skewed batch validation and SUBMIT_TRAIN_*).
-            eval_num_gpus=int_meta("eval_num_gpus"),
-            eval_num_envs_per_gpu=eval_num_envs_per_gpu,
-            eval_n_episodes=eval_n_episodes,
-            eval_n_runs=eval_n_runs,
-            eval_sets=eval_sets,
-            eval_tasks=[t for t in (meta.get("eval_tasks") or "").split() if t] or None,
-            dexjoco_task=(meta.get("dexjoco_task") or "").strip() or None,
-            checkpoint_path=checkpoint,
-            seed_eval_results_from=seed_eval_dirs,
-            job_name=resolved_job_name,
-            output_namespace=(meta.get("output_namespace") or "").strip() or None,
-            resume_of=job_id,
-            resubmit_action=action,
-        )
+    return submit.SubmitRequest(
+        cluster=cluster,
+        variant=variant,
+        phase="eval",
+        train_note=(meta.get("train_note") or "").strip() or None,
+        partition=partition,
+        # The sidecar records the eval allocation actually passed to sbatch;
+        # thread it back as the eval override (it used to be smuggled in as
+        # train_num_gpus, which skewed batch validation and SUBMIT_TRAIN_*).
+        eval_num_gpus=int_meta("eval_num_gpus"),
+        eval_num_envs_per_gpu=eval_num_envs_per_gpu,
+        eval_n_episodes=eval_n_episodes,
+        eval_n_runs=eval_n_runs,
+        eval_sets=eval_sets,
+        eval_tasks=[t for t in (meta.get("eval_tasks") or "").split() if t] or None,
+        dexjoco_task=(meta.get("dexjoco_task") or "").strip() or None,
+        checkpoint_path=checkpoint,
+        seed_eval_results_from=seed_eval_dirs,
+        job_name=resolved_job_name,
+        output_namespace=(meta.get("output_namespace") or "").strip() or None,
+        resume_of=job_id,
+        resubmit_action=action,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -188,7 +232,10 @@ async def list_resumed_jobs(cluster: str, job_id: str) -> list[jobs.Job]:
     )
     r = await ssh_run(env.ssh_alias, cmd, timeout=15.0)
     if r.returncode != 0:
-        return []
+        raise RuntimeError(
+            f"failed to reconcile resumed jobs on {cluster}: "
+            f"{(r.stderr or r.stdout or 'unknown error').strip()}"
+        )
 
     child_ids = sorted({line.strip() for line in r.stdout.splitlines() if line.strip()}, reverse=True)
     if not child_ids:

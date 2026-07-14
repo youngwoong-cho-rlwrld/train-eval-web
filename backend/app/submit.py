@@ -10,6 +10,7 @@ from __future__ import annotations
 
 
 import base64
+import hashlib
 import re
 import shlex
 import tempfile
@@ -414,6 +415,203 @@ async def _rsync_text(host: str, text: str, remote_rel: str) -> None:
             raise RuntimeError(f"rsync snapshot failed: {r.stderr}")
     finally:
         Path(tmp_path).unlink(missing_ok=True)
+
+
+def _submission_transaction_rel(req: SubmitRequest, job_name: str) -> str | None:
+    """Durable remote transaction path for exactly-once submissions."""
+    if not req.idempotency_key:
+        return None
+    identity = f"{req.cluster}:job-name:{job_name}"
+    digest = hashlib.sha256(identity.encode()).hexdigest()
+    return f"{CLUSTER_STAGING_REL}/submissions/{digest}"
+
+
+def _parse_transaction(text: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            fields[key.strip()] = value.strip()
+    return fields
+
+
+async def read_submission_transaction(req: SubmitRequest) -> dict[str, str]:
+    """Read the durable transaction before any submission side effects.
+
+    Missing is a normal first-submit condition. Transport/read failures raise
+    so callers fail closed rather than creating a second scheduler job.
+    """
+    job_name = (req.job_name or "").strip()
+    rel = _submission_transaction_rel(req, job_name) if job_name else None
+    if rel is None:
+        return {}
+    cluster = await load_cluster(req.cluster)
+    intent = f"$HOME/{rel}.meta"
+    command = (
+        f'if [ -s {intent} ]; then cat {intent}; '
+        "else echo __TRAIN_EVAL_TRANSACTION_MISSING__; fi"
+    )
+    result = await ssh_run(cluster.ssh_alias, command, timeout=15.0)
+    if result.returncode != 0:
+        raise RuntimeError(
+            "failed to read submission transaction: "
+            + (result.stderr or result.stdout or "unknown error").strip()
+        )
+    if "__TRAIN_EVAL_TRANSACTION_MISSING__" in result.stdout:
+        return {}
+    return _parse_transaction(result.stdout)
+
+
+def transaction_sbatch_stdout(transaction: dict[str, str]) -> str:
+    encoded = transaction.get("sbatch_stdout_b64", "")
+    try:
+        return base64.b64decode(encoded).decode(errors="replace")
+    except ValueError:
+        return ""
+
+
+async def _run_idempotent_sbatch(
+    *,
+    host: str,
+    req: SubmitRequest,
+    job_name: str,
+    sbatch_cmd: str,
+    meta: str,
+) -> tuple[str, str]:
+    """Run sbatch in a detached remote transaction and persist its result.
+
+    The transaction owns both scheduler submission and sidecar finalization.
+    It survives a local HTTP/backend/SSH disconnect, is serialized by a remote
+    flock, and records the job id before reporting success to the caller.
+    """
+    rel = _submission_transaction_rel(req, job_name)
+    if rel is None:
+        raise ValueError("idempotent transaction requires idempotency_key")
+    root = f"$HOME/{rel}"
+    intent = f"{root}.meta"
+    script_path = f"{root}.sh"
+    log_path = f"{root}.log"
+    meta_b64 = base64.b64encode(meta.encode()).decode()
+    script = f"""#!/usr/bin/env bash
+set -euo pipefail
+intent="$HOME/{rel}.meta"
+lock_path="$HOME/{rel}.lock"
+mkdir -p "$HOME/{CLUSTER_STAGING_REL}/submissions" "$HOME/{CLUSTER_STAGING_REL}/jobs"
+exec 9>"$lock_path"
+flock -x 9
+existing_id="$(sed -n 's/^job_id=//p' "$intent" 2>/dev/null | head -n1 || true)"
+if [[ -n "$existing_id" ]]; then
+    tmp="$HOME/{CLUSTER_STAGING_REL}/jobs/${{existing_id}}.meta.tmp.$$"
+    cp "$intent" "$tmp" && mv "$tmp" "$HOME/{CLUSTER_STAGING_REL}/jobs/${{existing_id}}.meta"
+    exit 0
+fi
+status="$(sed -n 's/^transaction_status=//p' "$intent" 2>/dev/null | head -n1 || true)"
+if [[ "$status" == "submitting" ]]; then
+    exit 75
+fi
+tmp="${{intent}}.tmp.$$"
+{{
+    printf 'transaction_status=submitting\n'
+    printf 'idempotency_key=%s\n' {shlex.quote(req.idempotency_key or '')}
+    printf '%s' {shlex.quote(meta_b64)} | base64 -d
+}} > "$tmp" && mv "$tmp" "$intent"
+set +e
+sbatch_output="$({sbatch_cmd} 2>&1)"
+sbatch_rc=$?
+set -e
+output_b64="$(printf '%s' "$sbatch_output" | base64 | tr -d '\n')"
+if [[ $sbatch_rc -ne 0 ]]; then
+    tmp="${{intent}}.tmp.$$"
+    {{
+        printf 'transaction_status=error\n'
+        printf 'sbatch_returncode=%s\n' "$sbatch_rc"
+        printf 'sbatch_stdout_b64=%s\n' "$output_b64"
+        printf 'idempotency_key=%s\n' {shlex.quote(req.idempotency_key or '')}
+        printf '%s' {shlex.quote(meta_b64)} | base64 -d
+    }} > "$tmp" && mv "$tmp" "$intent"
+    exit "$sbatch_rc"
+fi
+job_id="$(printf '%s\n' "$sbatch_output" | sed -n 's/.*Submitted batch job \\([0-9][0-9]*\\).*/\\1/p' | tail -n1)"
+if [[ -z "$job_id" ]]; then
+    tmp="${{intent}}.tmp.$$"
+    {{
+        printf 'transaction_status=error\n'
+        printf 'sbatch_returncode=1\n'
+        printf 'sbatch_stdout_b64=%s\n' "$output_b64"
+        printf 'idempotency_key=%s\n' {shlex.quote(req.idempotency_key or '')}
+        printf '%s' {shlex.quote(meta_b64)} | base64 -d
+    }} > "$tmp" && mv "$tmp" "$intent"
+    exit 1
+fi
+tmp="${{intent}}.tmp.$$"
+{{
+    printf 'job_id=%s\n' "$job_id"
+    printf 'transaction_status=submitted\n'
+    printf 'sbatch_stdout_b64=%s\n' "$output_b64"
+    printf 'idempotency_key=%s\n' {shlex.quote(req.idempotency_key or '')}
+    printf '%s' {shlex.quote(meta_b64)} | base64 -d
+}} > "$tmp" && mv "$tmp" "$intent"
+sidecar="$HOME/{CLUSTER_STAGING_REL}/jobs/${{job_id}}.meta"
+tmp="${{sidecar}}.tmp.$$"
+cp "$intent" "$tmp" && mv "$tmp" "$sidecar"
+"""
+    install_cmd = (
+        f"mkdir -p $HOME/{CLUSTER_STAGING_REL}/submissions; "
+        f'script={script_path}.$$; cat > "$script"; chmod 700 "$script"; '
+        f'nohup bash "$script" >> {log_path} 2>&1 < /dev/null & '
+        "pid=$!; wait \"$pid\"; rc=$?; "
+        f'rm -f "$script"; cat {intent} 2>/dev/null || true; exit "$rc"'
+    )
+    result = await ssh_run(host, install_cmd, timeout=60.0, input_text=script)
+    fields = _parse_transaction(result.stdout)
+    sbatch_stdout = transaction_sbatch_stdout(fields)
+    if result.returncode != 0:
+        if result.returncode == 75:
+            raise RuntimeError(
+                "submission transaction is still in progress; refusing a second sbatch"
+            )
+        message = sbatch_stdout or result.stderr or result.stdout or "sbatch failed"
+        raise RuntimeError(message.strip())
+    job_id = fields.get("job_id", "")
+    if not job_id:
+        raise RuntimeError("submission transaction completed without a durable job id")
+    return job_id, sbatch_stdout or f"Submitted batch job {job_id}"
+
+
+async def recover_submission_metadata(req: SubmitRequest, job_id: str) -> bool:
+    """Backfill a sidecar from a pre-sbatch transaction after response loss.
+
+    Returns False for submissions made before transaction records existed.
+    A conflicting recorded job id fails closed.
+    """
+    job_name = (req.job_name or "").strip()
+    rel = _submission_transaction_rel(req, job_name) if job_name else None
+    if rel is None:
+        return False
+    cluster = await load_cluster(req.cluster)
+    intent = f"$HOME/{rel}.meta"
+    sidecar = f"$HOME/{CLUSTER_STAGING_REL}/jobs/{shlex.quote(job_id)}.meta"
+    command = (
+        f'intent={intent}; sidecar={sidecar}; '
+        'if [ ! -s "$intent" ]; then echo MISSING; exit 0; fi; '
+        'recorded="$(sed -n \'s/^job_id=//p\' "$intent" | head -n1)"; '
+        f'if [ -n "$recorded" ] && [ "$recorded" != {shlex.quote(job_id)} ]; then '
+        'echo "transaction job id mismatch: $recorded" >&2; exit 2; fi; '
+        'if [ -z "$recorded" ]; then tmp="${intent}.tmp.$$"; '
+        f'{{ printf "job_id=%s\\n" {shlex.quote(job_id)}; '
+        'sed -e \'/^job_id=/d\' '
+        '-e \'s/^transaction_status=.*/transaction_status=recovered/\' "$intent"; } '
+        '> "$tmp" && mv "$tmp" "$intent"; fi; '
+        'mkdir -p "$(dirname "$sidecar")"; tmp="${sidecar}.tmp.$$"; '
+        'cp "$intent" "$tmp" && mv "$tmp" "$sidecar"; echo RECOVERED'
+    )
+    result = await ssh_run(cluster.ssh_alias, command, timeout=15.0)
+    if result.returncode != 0:
+        raise RuntimeError(
+            "failed to recover submission metadata: "
+            + (result.stderr or result.stdout or "unknown error").strip()
+        )
+    return "RECOVERED" in result.stdout
 
 
 async def submit(req: SubmitRequest) -> SubmitResponse:
@@ -866,15 +1064,6 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         + " ".join(sbatch_parts).replace("/opt/slurm/bin/sbatch", "$SBATCH_BIN", 1)
     )
 
-    sb = await ssh_run(host, sbatch_cmd, timeout=30.0)
-    if sb.returncode != 0:
-        raise RuntimeError(f"sbatch failed: {sb.stderr or sb.stdout}")
-
-    m = re.search(r"Submitted batch job (\d+)", sb.stdout)
-    if not m:
-        raise RuntimeError(f"could not parse sbatch output: {sb.stdout!r}")
-    job_id = m.group(1)
-
     # Persistent sidecar so the details page can recover phase/variant for
     # this job_id forever. Slurm's --comment is unreliable: it's on the
     # live controller (scontrol) but most slurmdbd setups (kakao's
@@ -889,6 +1078,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         f"wandb_project={submitted_wandb_project}\n"
         f"train_note={train_note}\n"
         f"job_name={job_name}\n"
+        f"partition={partition}\n"
         + (
             f"output_namespace={output_namespace}\n"
             if output_namespace else ""
@@ -1023,11 +1213,33 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             else ""
         )
     )
-    meta_cmd = (
-        f"mkdir -p {meta_dir} && "
-        f"cat > {meta_dir}/{job_id}.meta <<'EOF'\n{meta}EOF"
-    )
-    await ssh_run(host, meta_cmd, timeout=15.0)
+    if req.idempotency_key:
+        job_id, sbatch_stdout = await _run_idempotent_sbatch(
+            host=host,
+            req=req,
+            job_name=job_name,
+            sbatch_cmd=sbatch_cmd,
+            meta=meta,
+        )
+    else:
+        sb = await ssh_run(host, sbatch_cmd, timeout=30.0)
+        if sb.returncode != 0:
+            raise RuntimeError(f"sbatch failed: {sb.stderr or sb.stdout}")
+        m = re.search(r"Submitted batch job (\d+)", sb.stdout)
+        if not m:
+            raise RuntimeError(f"could not parse sbatch output: {sb.stdout!r}")
+        job_id = m.group(1)
+        sbatch_stdout = sb.stdout
+        meta_cmd = (
+            f"mkdir -p {meta_dir} && "
+            f"cat > {meta_dir}/{job_id}.meta <<'EOF'\n{meta}EOF"
+        )
+        meta_result = await ssh_run(host, meta_cmd, timeout=15.0)
+        if meta_result.returncode != 0:
+            raise RuntimeError(
+                "job submitted but metadata persistence failed: "
+                + (meta_result.stderr or meta_result.stdout or "unknown error").strip()
+            )
 
     return SubmitResponse(
         job_id=job_id,
@@ -1035,5 +1247,5 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         partition=partition,
         sbatch_cmd=sbatch_cmd,
         rsync_stdout="\n".join(r.stdout for r in rsync_results),
-        sbatch_stdout=sb.stdout,
+        sbatch_stdout=sbatch_stdout,
     )

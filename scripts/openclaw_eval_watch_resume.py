@@ -6,13 +6,15 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import os
 import subprocess
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 RESUMABLE_OUTCOMES = {
@@ -109,39 +111,57 @@ def build_worker_command(
     return command
 
 
-def _api_request(base_url: str, method: str, path: str) -> Any:
+def _api_request(
+    base_url: str,
+    method: str,
+    path: str,
+    *,
+    timeout_seconds: float = 60.0,
+) -> Any:
     request = urllib.request.Request(
         f"{base_url.rstrip('/')}{path}",
         data=b"{}" if method == "POST" else None,
         method=method,
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=300) as response:
+    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
         raw = response.read()
     return json.loads(raw) if raw else None
 
 
-def watcher_owned_job_ids(state: dict[str, Any]) -> set[str]:
-    """Eval job ids any watcher workflow owns (including stalled chains).
+JobKey = tuple[str, str]
+
+
+def watcher_owned_jobs(state: dict[str, Any]) -> set[JobKey]:
+    """Cluster-scoped eval jobs owned by watcher workflows.
 
     The sweep must not resume these: live workflows resume their own evals
     with progress-based stall detection, and a stalled chain was stopped on
-    purpose.
+    purpose. Slurm job ids are cluster-local, so a bare id is never a valid
+    ownership key.
     """
-    owned: set[str] = set()
+    owned: set[JobKey] = set()
     for value in state.values():
         if not isinstance(value, dict):
+            continue
+        if (
+            value.get("eval_terminal_notified_at")
+            and value.get("outcome") != "eval_resume_stalled"
+        ):
+            continue
+        cluster = str(value.get("dest_cluster") or "").strip()
+        if not cluster:
             continue
         for key in ("eval_job_id", "eval_resume_parent_job_id"):
             job_id = str(value.get(key) or "")
             if job_id:
-                owned.add(job_id)
+                owned.add((cluster, job_id))
         for hop in value.get("eval_resume_chain") or []:
             if isinstance(hop, dict):
                 for key in ("old_job_id", "new_job_id"):
                     job_id = str(hop.get(key) or "")
                     if job_id:
-                        owned.add(job_id)
+                        owned.add((cluster, job_id))
     return owned
 
 
@@ -156,6 +176,16 @@ def _chain_depth(job_id: str, rows_by_id: dict[str, dict[str, Any]]) -> int:
     return depth
 
 
+def _is_exhausted_requeue_detail(row: dict[str, Any]) -> bool:
+    state = str(row.get("State") or row.get("state") or "").strip().upper()
+    exit_code = str(row.get("ExitCode") or row.get("exit_code") or "").strip()
+    try:
+        restarts = int(row.get("Restarts") or row.get("restarts") or 0)
+    except (TypeError, ValueError):
+        return False
+    return state == "CANCELLED" and restarts >= 5 and exit_code in {"", "0:0"}
+
+
 def sweep_timed_out_evals(
     *,
     api_base: str,
@@ -163,13 +193,16 @@ def sweep_timed_out_evals(
     hours: int,
     name_prefix: str,
     max_chain: int,
-    owned_job_ids: set[str],
+    owned_jobs: set[JobKey],
+    notifier: Callable[[str], None] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Resume TIMEOUT evals that no watcher workflow owns.
+    """Resume interrupted evals that no watcher workflow owns.
 
     Relies on the backend's idempotent resume endpoint (one child per parent),
-    so a rerun of the sweep recovers instead of duplicating. The chain-depth
-    cap is the stateless stand-in for the watcher's progress-based stall stop.
+    so a rerun of the sweep recovers instead of duplicating. TIMEOUT chains
+    retain the safety cap. Exact ``CANCELLED`` jobs with >=5 Slurm restarts are
+    automatic background-preemption exhaustion, not an intentional scancel;
+    those are resubmitted even after the timeout chain cap.
     """
     swept: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
@@ -195,15 +228,33 @@ def sweep_timed_out_evals(
             job_name = str(row.get("job_name") or "")
             state = str(row.get("state") or "").upper()
             phase = row.get("phase")
-            if not state.startswith("TIMEOUT"):
+            is_timeout = state.startswith("TIMEOUT")
+            is_requeue_cancel = state.startswith("CANCEL")
+            if not (is_timeout or is_requeue_cancel):
                 continue
             if not job_name.startswith(name_prefix):
                 continue
             if phase not in (None, "eval"):
                 continue
-            if job_id in owned_job_ids or job_id in resumed_parents:
+            if (cluster, job_id) in owned_jobs or job_id in resumed_parents:
                 continue
-            if _chain_depth(job_id, rows_by_id) >= max_chain:
+            cluster_q = urllib.parse.quote(cluster, safe="")
+            job_q = urllib.parse.quote(job_id, safe="")
+            if is_requeue_cancel:
+                try:
+                    detail = _api_request(
+                        api_base, "GET", f"/api/jobs/{cluster_q}/{job_q}"
+                    )
+                except Exception as exc:
+                    errors.append({
+                        "cluster": cluster,
+                        "job_id": job_id,
+                        "error": f"cancel classification failed: {exc}",
+                    })
+                    continue
+                if not isinstance(detail, dict) or not _is_exhausted_requeue_detail(detail):
+                    continue
+            if is_timeout and _chain_depth(job_id, rows_by_id) >= max_chain:
                 errors.append({
                     "cluster": cluster,
                     "job_id": job_id,
@@ -211,8 +262,6 @@ def sweep_timed_out_evals(
                 })
                 continue
             try:
-                cluster_q = urllib.parse.quote(cluster, safe="")
-                job_q = urllib.parse.quote(job_id, safe="")
                 response = _api_request(
                     api_base, "POST", f"/api/jobs/{cluster_q}/{job_q}/resume"
                 )
@@ -225,6 +274,24 @@ def sweep_timed_out_evals(
                 "resumed_as": str((response or {}).get("job_id") or ""),
                 "recovered": bool((response or {}).get("recovered")),
             })
+            if notifier is not None:
+                try:
+                    reason = (
+                        "Slurm exhausted 5 automatic requeues"
+                        if is_requeue_cancel
+                        else "Slurm TIMEOUT"
+                    )
+                    notifier(
+                        f"♻️ Eval resubmitted after {reason}: "
+                        f"`{cluster}/{job_id}` → "
+                        f"`{cluster}/{str((response or {}).get('job_id') or '')}`."
+                    )
+                except Exception as exc:
+                    errors.append({
+                        "cluster": cluster,
+                        "job_id": job_id,
+                        "error": f"Slack notification failed: {exc}",
+                    })
     return swept, errors
 
 
@@ -239,6 +306,177 @@ def watcher_is_running(state_dir: Path, request_id: str) -> bool:
             return True
         fcntl.flock(lease.fileno(), fcntl.LOCK_UN)
     return False
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text())
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _read_workflow_state(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"workflow state is unreadable: {exc}") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError("workflow state root must be a JSON object")
+    return value
+
+
+def _write_json(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp, path)
+
+
+def _now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def sweep_is_running(state_dir: Path) -> bool:
+    lease_path = state_dir / "eval-watch-resume.sweep.lock"
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    with lease_path.open("a+") as lease:
+        try:
+            fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(lease.fileno(), fcntl.LOCK_UN)
+    return False
+
+
+def run_sweep_worker(args: argparse.Namespace) -> int:
+    """Run one potentially slow cluster sweep outside the cron time budget."""
+    state_file = Path(args.state_file).expanduser().resolve()
+    state_dir = state_file.parent
+    health_file = Path(
+        args.sweep_health_file or state_dir / "eval-watch-resume.health.json"
+    ).expanduser()
+    lease_path = state_dir / "eval-watch-resume.sweep.lock"
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    with lease_path.open("a+") as lease:
+        try:
+            fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print(json.dumps({"status": "already_running"}, sort_keys=True))
+            return 0
+
+        previous_health = _read_json(health_file)
+        started_at = _now_iso()
+        clusters = [c.strip() for c in args.sweep_clusters.split(",") if c.strip()]
+        try:
+            state = _read_workflow_state(state_file)
+            swept, errors = sweep_timed_out_evals(
+                api_base=args.api_base,
+                clusters=clusters,
+                hours=args.sweep_hours,
+                name_prefix=args.sweep_name_prefix,
+                max_chain=args.sweep_max_chain,
+                owned_jobs=watcher_owned_jobs(state),
+                notifier=lambda message: notify_slack(args.slack_channel, message),
+            )
+        except Exception as exc:
+            swept, errors = [], [{"worker": f"unexpected sweep failure: {exc}"}]
+        status = "error" if errors else "ok"
+        health = {
+            "status": status,
+            "started_at": started_at,
+            "finished_at": _now_iso(),
+            "swept": swept,
+            "errors": errors,
+        }
+
+        # Alert on a new/changed failure and once when service recovers. The
+        # scheduler remains at one-minute cadence because this detached worker,
+        # not the cron supervisor, owns slow network operations and health.
+        error_fingerprint = json.dumps(errors, sort_keys=True)
+        previous_fingerprint = str(previous_health.get("error_fingerprint") or "")
+        failure_alert_recorded = error_fingerprint == previous_fingerprint
+        try:
+            if errors and error_fingerprint != previous_fingerprint:
+                notify_slack(
+                    args.slack_channel,
+                    "⚠️ Eval recovery sweep failed: " + "; ".join(
+                        str(item.get("error") or item) for item in errors
+                    ),
+                )
+                health["failure_notified_at"] = _now_iso()
+                failure_alert_recorded = True
+            elif not errors and previous_health.get("status") == "error":
+                notify_slack(args.slack_channel, "✅ Eval recovery sweep recovered.")
+                health["recovery_notified_at"] = _now_iso()
+        except Exception as exc:
+            health["health_notification_error"] = str(exc)
+        if errors and failure_alert_recorded:
+            health["error_fingerprint"] = error_fingerprint
+        _write_json(health_file, health)
+        print(json.dumps(health, sort_keys=True))
+        return 1 if errors else 0
+
+
+def spawn_sweep_worker(args: argparse.Namespace, log_path: Path) -> int:
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--sweep-worker",
+        "--state-file",
+        str(Path(args.state_file).expanduser().resolve()),
+        "--api-base",
+        args.api_base,
+        "--slack-channel",
+        args.slack_channel,
+        "--sweep-clusters",
+        args.sweep_clusters,
+        "--sweep-hours",
+        str(args.sweep_hours),
+        "--sweep-name-prefix",
+        args.sweep_name_prefix,
+        "--sweep-max-chain",
+        str(args.sweep_max_chain),
+    ]
+    if args.sweep_health_file:
+        command.extend(["--sweep-health-file", args.sweep_health_file])
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("ab", buffering=0) as log:
+        child = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+        )
+    return child.pid
+
+
+def notify_slack(channel: str, message: str) -> None:
+    result = subprocess.run(
+        [
+            "openclaw",
+            "message",
+            "send",
+            "--channel",
+            "slack",
+            "--target",
+            channel,
+            "--message",
+            message,
+        ],
+        text=True,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            (result.stderr or result.stdout).strip() or "Slack notification failed"
+        )
 
 
 def main() -> int:
@@ -266,14 +504,16 @@ def main() -> int:
         default=3,
         help="stop auto-resuming a job after this many chained resumes",
     )
+    parser.add_argument("--sweep-worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--sweep-health-file")
     args = parser.parse_args()
+
+    if args.sweep_worker:
+        return run_sweep_worker(args)
 
     state_file = Path(args.state_file).expanduser().resolve()
     worker = Path(args.worker).expanduser().resolve()
-    try:
-        state = json.loads(state_file.read_text())
-    except FileNotFoundError:
-        state = {}
+    state = _read_workflow_state(state_file)
 
     resumed = []
     errors = []
@@ -304,19 +544,29 @@ def main() -> int:
         except Exception as exc:
             errors.append({"state_key": state_key, "error": str(exc)})
 
-    swept: list[dict[str, Any]] = []
+    sweep_worker: dict[str, Any] = {"status": "disabled"}
     if not args.no_sweep:
-        clusters = [c.strip() for c in args.sweep_clusters.split(",") if c.strip()]
-        swept, sweep_errors = sweep_timed_out_evals(
-            api_base=args.api_base,
-            clusters=clusters,
-            hours=args.sweep_hours,
-            name_prefix=args.sweep_name_prefix,
-            max_chain=args.sweep_max_chain,
-            owned_job_ids=watcher_owned_job_ids(state),
-        )
-        errors.extend(sweep_errors)
-    print(json.dumps({"resumed": resumed, "swept": swept, "errors": errors}, sort_keys=True))
+        if sweep_is_running(state_file.parent):
+            sweep_worker = {"status": "running"}
+        else:
+            try:
+                pid = spawn_sweep_worker(
+                    args, state_file.parent / "eval-watch-resume.sweep.log"
+                )
+                sweep_worker = {"status": "started", "pid": pid}
+            except Exception as exc:
+                errors.append({"sweep_worker": str(exc)})
+                sweep_worker = {"status": "failed"}
+    health_path = Path(
+        args.sweep_health_file
+        or state_file.parent / "eval-watch-resume.health.json"
+    ).expanduser()
+    print(json.dumps({
+        "resumed": resumed,
+        "sweep_worker": sweep_worker,
+        "sweep_health": _read_json(health_path),
+        "errors": errors,
+    }, sort_keys=True))
     return 1 if errors else 0
 
 

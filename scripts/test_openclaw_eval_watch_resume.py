@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import argparse
 import importlib.util
+import json
 import sys
+import tempfile
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -15,6 +18,18 @@ SPEC.loader.exec_module(resume)
 
 
 class ResumeTests(unittest.TestCase):
+    def sweep_args(self, state_file: Path) -> argparse.Namespace:
+        return argparse.Namespace(
+            state_file=str(state_file),
+            sweep_health_file=str(state_file.with_name("health.json")),
+            sweep_clusters="kakao,skt",
+            sweep_hours=48,
+            sweep_name_prefix="youngwoong_eval_",
+            sweep_max_chain=3,
+            api_base="http://unused",
+            slack_channel="channel:test",
+        )
+
     def test_selects_only_unnotified_workflows(self):
         state = {
             "mlxp/copy": {"request_id": "a", "outcome": "copying_checkpoint"},
@@ -109,6 +124,7 @@ class ResumeTests(unittest.TestCase):
         state = {
             "mlxp/a": {
                 "request_id": "a",
+                "dest_cluster": "skt",
                 "eval_job_id": "300",
                 "eval_resume_parent_job_id": "200",
                 "eval_resume_chain": [
@@ -117,12 +133,34 @@ class ResumeTests(unittest.TestCase):
                 ],
                 "outcome": "eval_resume_stalled",
             },
-            "mlxp/b": {"request_id": "b", "eval_job_id": "400"},
+            "mlxp/b": {
+                "request_id": "b",
+                "dest_cluster": "kakao",
+                "eval_job_id": "400",
+            },
+            "mlxp/done": {
+                "request_id": "done",
+                "dest_cluster": "skt",
+                "eval_job_id": "500",
+                "outcome": "eval_completed",
+                "eval_terminal_notified_at": "now",
+            },
             "mlxp/c": "not-a-dict",
         }
         self.assertEqual(
-            resume.watcher_owned_job_ids(state), {"100", "200", "300", "400"}
+            resume.watcher_owned_jobs(state),
+            {("skt", "100"), ("skt", "200"), ("skt", "300"), ("kakao", "400")},
         )
+
+    def test_watcher_ownership_does_not_cross_cluster_boundary(self):
+        state = {
+            "mlxp/a": {
+                "request_id": "a",
+                "dest_cluster": "skt",
+                "eval_job_id": "501",
+            }
+        }
+        self.assertNotIn(("kakao", "501"), resume.watcher_owned_jobs(state))
 
     def test_sweep_resumes_only_unowned_timed_out_evals(self):
         rows = [
@@ -160,7 +198,7 @@ class ResumeTests(unittest.TestCase):
                 hours=48,
                 name_prefix="youngwoong_eval_",
                 max_chain=3,
-                owned_job_ids={"501"},
+                owned_jobs={("kakao", "501")},
             )
 
         self.assertEqual(errors, [])
@@ -196,7 +234,7 @@ class ResumeTests(unittest.TestCase):
                 hours=48,
                 name_prefix="youngwoong_eval_",
                 max_chain=2,
-                owned_job_ids=set(),
+                owned_jobs=set(),
             )
 
         # 700 and 701 already have children; 702 is at depth 2 (the cap).
@@ -204,6 +242,76 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertEqual(errors[0]["job_id"], "702")
         self.assertIn("chain reached 2", errors[0]["error"])
+
+    def test_sweep_resubmits_exact_cancelled_after_five_requeues(self):
+        rows = [
+            {
+                "job_id": "411903",
+                "job_name": "youngwoong_eval_v_20260714_111024",
+                "state": "CANCELLED",
+                "phase": "eval",
+                "restarts": 5,
+                "resume_of": "411516",
+            }
+        ]
+        notices = []
+
+        def fake_api(_base, method, path):
+            if path.startswith("/api/jobs?"):
+                return {"jobs": rows}
+            if method == "GET":
+                return {"State": "CANCELLED", "Restarts": "5", "ExitCode": "0:0"}
+            return {"job_id": "411999", "recovered": False}
+
+        with unittest.mock.patch.object(resume, "_api_request", fake_api):
+            swept, errors = resume.sweep_timed_out_evals(
+                api_base="http://unused",
+                clusters=["kakao"],
+                hours=48,
+                name_prefix="youngwoong_eval_",
+                max_chain=0,
+                owned_jobs=set(),
+                notifier=notices.append,
+            )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(swept[0]["resumed_as"], "411999")
+        self.assertIn("exhausted 5 automatic requeues", notices[0])
+
+    def test_sweep_does_not_resubmit_user_cancel(self):
+        rows = [
+            {
+                "job_id": "411904",
+                "job_name": "youngwoong_eval_v_20260714_111025",
+                "state": "CANCELLED",
+                "phase": "eval",
+                "restarts": 5,
+            }
+        ]
+        calls = []
+
+        def fake_api(_base, method, path):
+            calls.append((method, path))
+            if path.startswith("/api/jobs?"):
+                return {"jobs": rows}
+            return {
+                "State": "CANCELLED by 501",
+                "Restarts": "5",
+                "ExitCode": "0:0",
+            }
+
+        with unittest.mock.patch.object(resume, "_api_request", fake_api):
+            swept, errors = resume.sweep_timed_out_evals(
+                api_base="http://unused",
+                clusters=["kakao"],
+                hours=48,
+                name_prefix="youngwoong_eval_",
+                max_chain=3,
+                owned_jobs=set(),
+            )
+
+        self.assertEqual((swept, errors), ([], []))
+        self.assertEqual([call for call in calls if call[0] == "POST"], [])
 
     def test_persisted_dexjoco_task_is_forwarded(self):
         entry = {
@@ -225,6 +333,73 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(
             command[command.index("--dexjoco-task") + 1], "pick_and_place"
         )
+
+    def test_detached_sweep_persists_and_alerts_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "state.json"
+            state_file.write_text(json.dumps({}))
+            notices = []
+            failure = [{"cluster": "kakao", "error": "job list failed"}]
+            with (
+                unittest.mock.patch.object(
+                    resume,
+                    "sweep_timed_out_evals",
+                    return_value=([], failure),
+                ),
+                unittest.mock.patch.object(
+                    resume, "notify_slack", side_effect=lambda _c, m: notices.append(m)
+                ),
+            ):
+                code = resume.run_sweep_worker(self.sweep_args(state_file))
+
+            health = json.loads(state_file.with_name("health.json").read_text())
+            self.assertEqual(code, 1)
+            self.assertEqual(health["status"], "error")
+            self.assertEqual(health["errors"], failure)
+            self.assertIn("recovery sweep failed", notices[0].lower())
+
+    def test_detached_sweep_reports_recovery_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "state.json"
+            health_file = state_file.with_name("health.json")
+            state_file.write_text(json.dumps({}))
+            health_file.write_text(json.dumps({
+                "status": "error",
+                "error_fingerprint": "old",
+            }))
+            notices = []
+            with (
+                unittest.mock.patch.object(
+                    resume,
+                    "sweep_timed_out_evals",
+                    return_value=([], []),
+                ),
+                unittest.mock.patch.object(
+                    resume, "notify_slack", side_effect=lambda _c, m: notices.append(m)
+                ),
+            ):
+                code = resume.run_sweep_worker(self.sweep_args(state_file))
+
+            self.assertEqual(code, 0)
+            self.assertEqual(len(notices), 1)
+            self.assertIn("recovered", notices[0].lower())
+
+    def test_corrupt_workflow_state_fails_closed_without_sweeping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "state.json"
+            state_file.write_text("{broken")
+            sweep = unittest.mock.Mock()
+            with (
+                unittest.mock.patch.object(resume, "sweep_timed_out_evals", sweep),
+                unittest.mock.patch.object(resume, "notify_slack"),
+            ):
+                code = resume.run_sweep_worker(self.sweep_args(state_file))
+
+            health = json.loads(state_file.with_name("health.json").read_text())
+            self.assertEqual(code, 1)
+            self.assertEqual(health["status"], "error")
+            self.assertIn("workflow state is unreadable", health["errors"][0]["worker"])
+            sweep.assert_not_called()
 
 
 if __name__ == "__main__":

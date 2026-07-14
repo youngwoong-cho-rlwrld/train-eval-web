@@ -140,7 +140,7 @@ def _job_id_order(job: jobs.Job) -> tuple[int, int | str]:
     return (0, int(raw)) if raw.isdigit() else (1, raw)
 
 
-async def _find_existing_named_eval(req: submit.SubmitRequest) -> jobs.Job | None:
+async def _find_existing_named_job(req: submit.SubmitRequest) -> jobs.Job | None:
     """Return the first Slurm job with this exact deterministic name.
 
     Every state counts, including FAILED/CANCELLED: idempotency means a retry
@@ -167,6 +167,35 @@ def _recovered_submit_response(job: jobs.Job) -> submit.SubmitResponse:
     )
 
 
+def _recovered_transaction_response(
+    req: submit.SubmitRequest,
+    transaction: dict[str, str],
+) -> submit.SubmitResponse:
+    job_id = transaction.get("job_id", "")
+    job_name = transaction.get("job_name") or (req.job_name or "")
+    if not job_id or not job_name:
+        raise RuntimeError("submission transaction is missing job identity")
+    return submit.SubmitResponse(
+        job_id=job_id,
+        job_name=job_name,
+        partition=transaction.get("partition") or req.partition or "",
+        sbatch_cmd="",
+        rsync_stdout="",
+        sbatch_stdout=(
+            submit.transaction_sbatch_stdout(transaction)
+            or f"recovered durable submission transaction for job {job_id}"
+        ),
+        recovered=True,
+    )
+
+
+def _fail_if_transaction_in_progress(transaction: dict[str, str]) -> None:
+    if transaction.get("transaction_status") == "submitting":
+        raise RuntimeError(
+            "submission transaction is still in progress; refusing a second sbatch"
+        )
+
+
 async def _submit_slurm_once(
     req: submit.SubmitRequest,
 ) -> tuple[submit.SubmitResponse, bool]:
@@ -176,11 +205,17 @@ async def _submit_slurm_once(
         return await submit.submit(req), True
 
     async with _eval_submission_lock(identity):
+        transaction = await submit.read_submission_transaction(req)
+        if transaction.get("job_id"):
+            await submit.recover_submission_metadata(req, transaction["job_id"])
+            return _recovered_transaction_response(req, transaction), False
         # Fail closed if Slurm cannot be queried. Submitting while reconciliation
         # is unavailable is exactly how duplicate jobs are created.
-        existing = await _find_existing_named_eval(req)
+        existing = await _find_existing_named_job(req)
         if existing is not None:
+            await submit.recover_submission_metadata(req, existing.job_id)
             return _recovered_submit_response(existing), False
+        _fail_if_transaction_in_progress(transaction)
         return await submit.submit(req), True
 
 
@@ -188,10 +223,10 @@ async def _resume_slurm_once(
     cluster: str,
     job_id: str,
 ) -> tuple[submit.SubmitResponse, bool]:
-    """Resume one timed-out job at most once per direct parent job.
+    """Resume at most once per direct parent across failures and workers.
 
-    The child sidecar persists ``resume_of=<job_id>``, so reconciliation works
-    after HTTP response loss, backend restart, and across uvicorn workers.
+    Reconciliation checks the sidecar link, the stable scheduler job name, and
+    the pre-sbatch remote transaction before another submission is possible.
     """
     identity = f"resume:{cluster}:{job_id}"
     async with _eval_submission_lock(identity):
@@ -200,7 +235,25 @@ async def _resume_slurm_once(
             return _recovered_submit_response(
                 min(existing, key=_job_id_order)
             ), False
-        return await job_resume.resume_timed_out_job(cluster, job_id), True
+        request = await job_resume.build_resubmit_request(
+            cluster, job_id, action="resume"
+        )
+        transaction = await submit.read_submission_transaction(request)
+        if transaction.get("job_id"):
+            await submit.recover_submission_metadata(
+                request, transaction["job_id"]
+            )
+            return _recovered_transaction_response(request, transaction), False
+        # The sidecar may be absent only if the backend/client disappeared in
+        # the narrow period after Slurm accepted the job. The stable resume
+        # name and pre-sbatch transaction record provide independent durable
+        # reconciliation sources before another sbatch is allowed.
+        named = await _find_existing_named_job(request)
+        if named is not None:
+            await submit.recover_submission_metadata(request, named.job_id)
+            return _recovered_submit_response(named), False
+        _fail_if_transaction_in_progress(transaction)
+        return await submit.submit(request), True
 
 
 # ── clusters ──

@@ -337,6 +337,27 @@ def eval_terminal_kind(state: str) -> str | None:
     return None
 
 
+def is_exhausted_requeue_job(job: dict[str, Any]) -> bool:
+    state = str(job.get("State") or job.get("state") or "").strip().upper()
+    exit_code = str(job.get("ExitCode") or job.get("exit_code") or "").strip()
+    try:
+        restarts = int(job.get("Restarts") or job.get("restarts") or 0)
+    except (TypeError, ValueError):
+        return False
+    return state == "CANCELLED" and restarts >= 5 and exit_code in {"", "0:0"}
+
+
+def eval_interruption_kind(job: dict[str, Any]) -> str | None:
+    """Classify only terminal states that policy allows us to resubmit."""
+    state = str(job.get("State") or job.get("state") or "")
+    kind = eval_terminal_kind(state)
+    if kind == "timeout":
+        return "timeout"
+    if kind == "cancelled" and is_exhausted_requeue_job(job):
+        return "requeue_exhausted"
+    return None
+
+
 def _positive_int(value: Any, default: int = 1) -> int:
     try:
         parsed = int(value)
@@ -424,15 +445,24 @@ def _oldest_resumed_job(rows: Any) -> dict[str, Any] | None:
     )
 
 
-def resume_timed_out_eval(
+def resume_interrupted_eval(
     args: argparse.Namespace,
     *,
     api: ApiClient,
     notifier: Callable[[str, str], None],
     sleep: Callable[[float], None],
     job: dict[str, Any],
+    interruption: str,
 ) -> dict[str, Any] | None:
-    """Resume one TIMEOUT, or stop after a resumed window made no progress."""
+    """Resume one scheduler interruption under the matching safety policy.
+
+    TIMEOUT is an allocation-budget failure, so repeated windows with no
+    completed runs stop for human inspection. Requeue exhaustion is a sequence
+    of scheduler preemptions; zero completed runs is expected and must not turn
+    an automatic recovery into a permanent stall.
+    """
+    if interruption not in {"timeout", "requeue_exhausted"}:
+        raise ValueError(f"unsupported eval interruption: {interruption}")
     state_path = Path(args.state_file).expanduser()
     entry = read_entry(state_path, args.state_key, args.request_id)
     parent_id = str(entry.get("eval_job_id") or "")
@@ -459,7 +489,12 @@ def resume_timed_out_eval(
         and str(entry.get("eval_resume_parent_job_id") or "") == parent_id
     )
     previous_completed = entry.get("eval_resume_last_completed_runs")
-    if child is None and not attempt_in_flight and previous_completed is not None:
+    if (
+        interruption == "timeout"
+        and child is None
+        and not attempt_in_flight
+        and previous_completed is not None
+    ):
         try:
             made_progress = completed > int(previous_completed)
         except (TypeError, ValueError):
@@ -468,14 +503,14 @@ def resume_timed_out_eval(
             total_text = str(total) if total is not None else "?"
             message = (
                 f"⚠️ Eval auto-resume stopped: `{args.dest_cluster}/{parent_id}` "
-                f"timed out with no new completed runs ({completed}/{total_text})."
+                f"was interrupted with no new completed runs ({completed}/{total_text})."
             )
             update_entry(
                 state_path,
                 args.state_key,
                 args.request_id,
                 outcome="eval_resume_stalled",
-                eval_state="TIMEOUT",
+                eval_state=str(job.get("State") or job.get("state") or "").upper(),
                 eval_terminal_at=job.get("End") or job.get("end") or now_iso(),
                 eval_total_runs=total,
                 eval_resume_stalled_at=now_iso(),
@@ -500,7 +535,7 @@ def resume_timed_out_eval(
             args.state_key,
             args.request_id,
             outcome="eval_resuming",
-            eval_state="TIMEOUT",
+            eval_state=str(job.get("State") or job.get("state") or "").upper(),
             eval_terminal_at=job.get("End") or job.get("end") or now_iso(),
             eval_resume_parent_job_id=parent_id,
             eval_resume_last_completed_runs=completed,
@@ -621,13 +656,15 @@ def monitor_and_report_eval(
                 timeout_seconds=args.eval_timeout_seconds,
                 sleep=sleep,
             )
-            if kind == "timeout":
-                resumed = resume_timed_out_eval(
+            interruption = eval_interruption_kind(job)
+            if interruption is not None:
+                resumed = resume_interrupted_eval(
                     args,
                     api=api,
                     notifier=notifier,
                     sleep=sleep,
                     job=job,
+                    interruption=interruption,
                 )
                 if resumed and resumed.get("outcome") == "eval_resume_stalled":
                     return resumed

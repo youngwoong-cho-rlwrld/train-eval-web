@@ -24,6 +24,8 @@ class FakeApi:
         source_exists=False,
         dest_exists=True,
         eval_state="COMPLETED",
+        eval_restarts=0,
+        eval_exit_code="0:0",
         eval_states=None,
         eval_runs=None,
         resumes=None,
@@ -36,6 +38,8 @@ class FakeApi:
         self.source_exists = source_exists
         self.dest_exists = dest_exists
         self.eval_state = eval_state
+        self.eval_restarts = eval_restarts
+        self.eval_exit_code = eval_exit_code
         self.eval_states = dict(eval_states or {})
         self.eval_runs = dict(eval_runs or {})
         self.resumes = {str(key): list(value) for key, value in (resumes or {}).items()}
@@ -84,6 +88,8 @@ class FakeApi:
             return {
                 "JobID": job_id,
                 "State": state,
+                "Restarts": self.eval_restarts,
+                "ExitCode": self.eval_exit_code,
                 "End": "2026-07-13T17:00:00+09:00",
             }
         raise AssertionError(path)
@@ -372,6 +378,67 @@ class WatcherTests(unittest.TestCase):
             self.assertEqual([path for path, _ in api.posts], ["/api/jobs/skt/100/resume"])
             self.assertIn("2/6", notices[0])
             self.assertIn("completed", notices[1].lower())
+
+    def test_exhausted_automatic_requeue_is_resumed_not_treated_as_user_cancel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "state.json"
+            self.write_state(state_file, eval_job_id="100")
+            api = FakeApi(
+                eval_states={"100": "CANCELLED", "12346": "COMPLETED"},
+                eval_restarts=5,
+                eval_runs={"100": 2},
+            )
+            notices = []
+            result = watcher.run_workflow(
+                self.make_args(state_file),
+                api=api,
+                notifier=lambda _channel, message: notices.append(message),
+                sleep=lambda _: None,
+            )
+            self.assertEqual(result["outcome"], "eval_completed")
+            self.assertEqual(result["eval_job_id"], "12346")
+            self.assertEqual([path for path, _ in api.posts], ["/api/jobs/skt/100/resume"])
+
+    def test_requeue_exhaustion_resumes_even_when_previous_window_made_no_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "state.json"
+            self.write_state(
+                state_file,
+                eval_job_id="200",
+                eval_resume_parent_job_id="100",
+                eval_resume_last_completed_runs=2,
+                eval_total_runs=6,
+            )
+            api = FakeApi(
+                eval_states={"200": "CANCELLED", "12346": "COMPLETED"},
+                eval_restarts=5,
+                eval_runs={"200": 2},
+            )
+            result = watcher.run_workflow(
+                self.make_args(state_file),
+                api=api,
+                notifier=lambda _channel, _message: None,
+                sleep=lambda _: None,
+            )
+            self.assertEqual(result["outcome"], "eval_completed")
+            self.assertEqual(result["eval_job_id"], "12346")
+            self.assertEqual(
+                [path for path, _ in api.posts], ["/api/jobs/skt/200/resume"]
+            )
+
+    def test_intentional_cancel_is_not_resumed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "state.json"
+            self.write_state(state_file, eval_job_id="100")
+            api = FakeApi(eval_state="CANCELLED by 501", eval_restarts=5)
+            result = watcher.run_workflow(
+                self.make_args(state_file),
+                api=api,
+                notifier=lambda _channel, _message: None,
+                sleep=lambda _: None,
+            )
+            self.assertEqual(result["outcome"], "eval_cancelled")
+            self.assertEqual(api.posts, [])
 
     def test_second_timeout_without_progress_stops_instead_of_resuming(self):
         with tempfile.TemporaryDirectory() as tmp:
