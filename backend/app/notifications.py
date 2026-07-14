@@ -172,7 +172,10 @@ class _Monitor:
                         current[jid] = dict(ent)
                 continue
             for j in js:
-                current[j.job_id] = {
+                # Slurm job ids are only unique within one cluster. Kakao and
+                # SKT can both have (for example) job 153064; keying by the bare
+                # id silently overwrote one transition and lost its Slack ping.
+                current[f"{c}/{j.job_id}"] = {
                     "cluster": c,
                     "event": _event_for_state(j.state),
                     "_job": j,  # transient; stripped before persist
@@ -197,8 +200,8 @@ class _Monitor:
             self.primed = True
             self._persist()
             return
-        for jid, e in current.items():
-            previous = self.state.get(jid)
+        for state_key, e in current.items():
+            previous = self.state.get(state_key)
             if previous is None:
                 continue
             new = e["event"]
@@ -206,7 +209,7 @@ class _Monitor:
             if new and new != old and notifications_config.event_enabled(new):
                 j = e.get("_job")
                 await _post(_job_line(
-                    e["cluster"], jid,
+                    e["cluster"], getattr(j, "job_id", "") if j else "",
                     getattr(j, "job_name", "") if j else "",
                     getattr(j, "phase", None) if j else None,
                     getattr(j, "variant", None) if j else None,
