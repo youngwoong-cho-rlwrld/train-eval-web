@@ -66,6 +66,9 @@ export type SubmitResponse = {
   sbatch_cmd: string;
   rsync_stdout: string;
   sbatch_stdout: string;
+  // True when the backend recovered an already-submitted job instead of
+  // calling sbatch again (idempotent submit/resume reconciliation).
+  recovered?: boolean;
 };
 
 export type ConfigPreviewFlag = {

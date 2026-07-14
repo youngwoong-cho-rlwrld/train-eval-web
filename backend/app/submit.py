@@ -131,6 +131,17 @@ class SubmitRequest(BaseModel):
     # `[<prefix>_]{train|eval}_<anything>_<YYYYMMDD>_<HHMMSS>` so the
     # parser keeps working. None → server builds the default.
     job_name: str | None = None
+    # Stable caller-generated key for an exactly-once submission. The API
+    # serializes requests with the same key and reconciles the explicit
+    # job_name against Slurm before it is allowed to call sbatch again. This is
+    # primarily used by detached automation where the HTTP response can be
+    # lost after Slurm accepted the job.
+    idempotency_key: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=160,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    )
     # Train-only: set after explicit user approval when the repo is dirty.
     commit_dirty_changes: bool = False
 
@@ -344,6 +355,7 @@ class SubmitResponse(BaseModel):
     sbatch_cmd: str
     rsync_stdout: str
     sbatch_stdout: str
+    recovered: bool = False
 
 
 MAX_EVAL_NUM_ENVS_PER_GPU = 1

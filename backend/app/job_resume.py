@@ -85,7 +85,11 @@ async def _resubmit_slurm_job(
     partition = str(record.get("Partition") or "").strip() or None
     job_name = det.job_name or str(record.get("JobName") or "").strip() or None
     retrying = action == "retry"
-    resolved_job_name = _retry_job_name(job_name) if retrying else job_name
+    # Every scheduler submission gets a fresh display/log name. The immutable
+    # output_namespace below is what makes an eval resume reuse and seed the
+    # prior results directory; reusing the old job_name only collides log and
+    # snapshot paths and makes lost-response recovery ambiguous.
+    resolved_job_name = _retry_job_name(job_name)
 
     env = await load_cluster(cluster)
     meta = await read_slurm_meta(env.ssh_alias, job_id)

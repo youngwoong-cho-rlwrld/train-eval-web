@@ -52,7 +52,11 @@ export function ResumeJobButton({
         method: "POST",
       }),
     onSuccess: (data) => {
-      toast.success(`Submitted ${action} job ${data.job_id} on ${cluster}`);
+      toast.success(
+        data.recovered
+          ? `Job was already ${action === "retry" ? "retried" : "resumed"} as ${data.job_id} on ${cluster}`
+          : `Submitted ${action} job ${data.job_id} on ${cluster}`,
+      );
       setOpen(false);
       qc.invalidateQueries({ queryKey: ["jobs"] });
       qc.invalidateQueries({ queryKey: ["job", cluster, jobId] });

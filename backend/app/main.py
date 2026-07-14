@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
+import hashlib
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -76,6 +79,128 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# A caller can lose the HTTP response after Slurm accepted a job.  Serialize
+# deterministic eval submissions in-process and across uvicorn workers, then
+# reconcile the explicit job name against Slurm while holding the lock.  The
+# Slurm lookup makes this restart-safe; the file lock makes it process-safe.
+_eval_submit_locks: dict[str, asyncio.Lock] = {}
+
+
+def _eval_submission_identity(req: submit.SubmitRequest) -> str | None:
+    if req.phase != "eval":
+        return None
+    job_name = (req.job_name or "").strip()
+    if not job_name:
+        if req.idempotency_key:
+            raise ValueError("idempotency_key requires an explicit job_name")
+        return None
+    if not req.idempotency_key:
+        # The submit UI also sends explicit job names (memoized, so a stale
+        # name can be resent minutes later). Recover-instead-of-submit must
+        # stay opt-in, or a human resubmit silently returns the old job.
+        return None
+    # The deterministic Slurm name is the durable identity discoverable after
+    # a backend restart. Lock on it even if buggy callers send different keys.
+    return f"{req.cluster}:job-name:{job_name}"
+
+
+@asynccontextmanager
+async def _eval_submission_lock(identity: str):
+    local_lock = _eval_submit_locks.setdefault(identity, asyncio.Lock())
+    async with local_lock:
+        lock_dir = Path(
+            os.environ.get(
+                "TRAIN_EVAL_SUBMIT_LOCK_DIR",
+                "~/.train-eval-web/submit-locks",
+            )
+        ).expanduser()
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(identity.encode()).hexdigest()
+        lock_file = (lock_dir / f"{digest}.lock").open("a+")
+        try:
+            while True:
+                try:
+                    fcntl.flock(
+                        lock_file.fileno(),
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                    break
+                except BlockingIOError:
+                    await asyncio.sleep(0.1)
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            lock_file.close()
+
+
+def _job_id_order(job: jobs.Job) -> tuple[int, int | str]:
+    raw = str(job.job_id)
+    return (0, int(raw)) if raw.isdigit() else (1, raw)
+
+
+async def _find_existing_named_eval(req: submit.SubmitRequest) -> jobs.Job | None:
+    """Return the first Slurm job with this exact deterministic name.
+
+    Every state counts, including FAILED/CANCELLED: idempotency means a retry
+    observes the original outcome instead of silently creating a replacement.
+    An explicit replacement must use the dedicated replacement flow/new name.
+    """
+    job_name = (req.job_name or "").strip()
+    if not job_name:
+        return None
+    rows = await jobs.list_jobs([req.cluster], hours=168)
+    matches = [row for row in rows if row.job_name == job_name]
+    return min(matches, key=_job_id_order) if matches else None
+
+
+def _recovered_submit_response(job: jobs.Job) -> submit.SubmitResponse:
+    return submit.SubmitResponse(
+        job_id=job.job_id,
+        job_name=job.job_name,
+        partition=job.partition,
+        sbatch_cmd="",
+        rsync_stdout="",
+        sbatch_stdout="recovered existing job with the same deterministic name",
+        recovered=True,
+    )
+
+
+async def _submit_slurm_once(
+    req: submit.SubmitRequest,
+) -> tuple[submit.SubmitResponse, bool]:
+    """Submit a Slurm eval at most once; return (response, was_created)."""
+    identity = _eval_submission_identity(req)
+    if identity is None:
+        return await submit.submit(req), True
+
+    async with _eval_submission_lock(identity):
+        # Fail closed if Slurm cannot be queried. Submitting while reconciliation
+        # is unavailable is exactly how duplicate jobs are created.
+        existing = await _find_existing_named_eval(req)
+        if existing is not None:
+            return _recovered_submit_response(existing), False
+        return await submit.submit(req), True
+
+
+async def _resume_slurm_once(
+    cluster: str,
+    job_id: str,
+) -> tuple[submit.SubmitResponse, bool]:
+    """Resume one timed-out job at most once per direct parent job.
+
+    The child sidecar persists ``resume_of=<job_id>``, so reconciliation works
+    after HTTP response loss, backend restart, and across uvicorn workers.
+    """
+    identity = f"resume:{cluster}:{job_id}"
+    async with _eval_submission_lock(identity):
+        existing = await job_resume.list_resumed_jobs(cluster, job_id)
+        if existing:
+            return _recovered_submit_response(
+                min(existing, key=_job_id_order)
+            ), False
+        return await job_resume.resume_timed_out_job(cluster, job_id), True
 
 
 # ── clusters ──
@@ -599,10 +724,11 @@ async def post_submit(req: submit.SubmitRequest):
                 "rsync_stdout": "",
                 "sbatch_stdout": r.apply_stdout,
             }
-        resp = await submit.submit(req)
-        await notifications.note_submitted(
-            req.cluster, resp.job_id, resp.job_name, req.phase, req.variant
-        )
+        resp, created = await _submit_slurm_once(req)
+        if created:
+            await notifications.note_submitted(
+                req.cluster, resp.job_id, resp.job_name, req.phase, req.variant
+            )
         return resp
     except (FileNotFoundError, ValueError) as e:
         raise HTTPException(400, str(e))
@@ -690,7 +816,8 @@ async def get_job_eval_runs(cluster: str, job_id: str):
 @app.post("/api/jobs/{cluster}/{job_id}/resume", response_model=submit.SubmitResponse)
 async def post_resume_job(cluster: str, job_id: str):
     try:
-        return await job_resume.resume_timed_out_job(cluster, job_id)
+        response, _created = await _resume_slurm_once(cluster, job_id)
+        return response
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
     except ValueError as e:
