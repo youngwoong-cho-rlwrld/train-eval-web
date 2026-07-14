@@ -107,18 +107,25 @@ if ! [[ "$DEXJOCO_WORKER_START_STAGGER_SECONDS" =~ ^[0-9]+$ ]]; then
 fi
 require_eval_checkpoint_path
 
-ADAPTER="$REPO_ROOT/lib/dexjoco/gr00t_dexjoco_server.py"
-if [ "$DEXJOCO_SERVER_TYPE" = "groot" ]; then
-    [ -n "$TRAIN_REPO_DIR" ] || { log "ERROR: SUBMIT_TRAIN_REPO_DIR not set for groot server"; exit 1; }
+GROOT_ADAPTER="$REPO_ROOT/lib/dexjoco/gr00t_dexjoco_server.py"
+GAM_ADAPTER="$REPO_ROOT/lib/dexjoco/gam_dexjoco_server.py"
+# groot and gam are both served from the training repo's .venv python against a
+# staged adapter in lib/dexjoco; only the adapter file and CLI shape differ.
+if [ "$DEXJOCO_SERVER_TYPE" = "groot" ] || [ "$DEXJOCO_SERVER_TYPE" = "gam" ]; then
+    [ -n "$TRAIN_REPO_DIR" ] || { log "ERROR: SUBMIT_TRAIN_REPO_DIR not set for $DEXJOCO_SERVER_TYPE server"; exit 1; }
     SUBMIT_GIT_COMMIT="${SUBMIT_GIT_COMMIT:-${TRAIN_GIT_COMMIT:-}}"
     pin_training_repo_dir "$TRAIN_REPO_DIR" "$SUBMIT_GIT_COMMIT" "${SLURM_JOB_ID:-$OUTPUT_NAMESPACE}"
     [ -x "$TRAIN_REPO_DIR/.venv/bin/python" ] || { log "ERROR: model venv python not found: $TRAIN_REPO_DIR/.venv/bin/python"; exit 1; }
-    [ -f "$ADAPTER" ] || { log "ERROR: adapter not found: $ADAPTER"; exit 1; }
+    if [ "$DEXJOCO_SERVER_TYPE" = "gam" ]; then
+        [ -f "$GAM_ADAPTER" ] || { log "ERROR: adapter not found: $GAM_ADAPTER"; exit 1; }
+    else
+        [ -f "$GROOT_ADAPTER" ] || { log "ERROR: adapter not found: $GROOT_ADAPTER"; exit 1; }
+    fi
 elif [ "$DEXJOCO_SERVER_TYPE" = "openpi" ]; then
     : "${DEXJOCO_OPENPI_ENV:?DEXJOCO_OPENPI_ENV not set in cluster env}"
     [ -f "$DEXJOCO_DIR/openpi/scripts/serve_policy.py" ] || { log "ERROR: serve_policy.py not found under $DEXJOCO_DIR/openpi"; exit 1; }
 else
-    log "ERROR: DEXJOCO_SERVER_TYPE must be 'groot' or 'openpi', got '$DEXJOCO_SERVER_TYPE'"; exit 1
+    log "ERROR: DEXJOCO_SERVER_TYPE must be 'groot', 'gam' or 'openpi', got '$DEXJOCO_SERVER_TYPE'"; exit 1
 fi
 
 log "========================================================"
@@ -236,6 +243,17 @@ wait_for_server() {
     return 0
 }
 
+# Count the completed-episode prefix of a dexjoco output dir, deleting any
+# in-flight episode_*_temp leftovers first. Episodes run strictly in order, so
+# the count is also the index the next invocation should start from.
+count_completed_episodes() {
+    local out_dir="$1"
+    [ -d "$out_dir" ] || { echo 0; return 0; }
+    find "$out_dir" -maxdepth 1 -type d -name 'episode_*_temp' -exec rm -rf -- {} + 2>/dev/null || true
+    find "$out_dir" -maxdepth 1 -type d 2>/dev/null \
+        | grep -cE '/episode_[0-9]+_(success|failure)(_|$)' || true
+}
+
 # Parse DexJoCo's output dir into a results.json. Counts episode_*_success vs
 # episode_*_failure dirs; cross-checks the success_rate_<pass>_<total>.txt name.
 write_results_json() {
@@ -309,11 +327,13 @@ run_client_once() {
     local run_seed="$2"
     local out_dir="$3"
     local cuda_device="$4"
+    local start_episode="${5:-0}"
     local client_pid client_rc now last_progress signature previous_signature
     local stalled=0
-    local -a pad_args=() replan_args=()
+    local -a pad_args=() replan_args=() resume_args=()
     [ "$DEXJOCO_PAD_STATE_DIM46" = "1" ] && pad_args=(--pad-state-dim46)
     [ -n "${DEXJOCO_REPLAN_RATIO:-}" ] && replan_args=(--replan-ratio "$DEXJOCO_REPLAN_RATIO")
+    [ "$start_episode" -gt 0 ] && resume_args=(--start-episode="$start_episode")
 
     ( cd "$DEXJOCO_DIR" \
         && exec env CUDA_VISIBLE_DEVICES="$cuda_device" \
@@ -322,7 +342,7 @@ run_client_once() {
             dexjoco-openpi-eval \
             --config="./configs/$family/$DEXJOCO_TASK.yaml" \
             --seed="$run_seed" --port="$PORT" --episodes="$N_EPISODES" \
-            --output="$out_dir" "${pad_args[@]}" "${replan_args[@]}" ) \
+            --output="$out_dir" "${pad_args[@]}" "${replan_args[@]}" "${resume_args[@]}" ) \
         >> "$LOG_FILE" 2>&1 &
     client_pid=$!
     CLIENT_PID="$client_pid"
@@ -384,7 +404,7 @@ run_unit_on_worker() {
     local unit_idx="$1"
     local cuda_device="$2"
     local gpu_slot="$3"
-    local attempt client_rc summary
+    local attempt client_rc summary completed_eps effective_seed
 
     DEXJOCO_TASK="${UNIT_TASK_NAME[$unit_idx]}"
     SERVER_PROMPT="${UNIT_INSTRUCTION[$unit_idx]}"
@@ -407,14 +427,29 @@ run_unit_on_worker() {
         return 0
     fi
     mkdir -p "$RUN_DIR"
-    rm -rf -- "$OUT_DIR"
 
     for attempt in 1 2; do
+        # Completed episodes survive timeouts, crashes, and the retry below;
+        # only the in-flight episode is ever redone.
+        completed_eps="$(count_completed_episodes "$OUT_DIR")"
+        if [ "$completed_eps" -ge "$N_EPISODES" ]; then
+            log "  RESUME: all $N_EPISODES episodes already present; synthesising results"
+            client_rc=0
+            break
+        fi
+        effective_seed="$RUN_SEED"
+        if [ "$completed_eps" -gt 0 ]; then
+            # The client seeds its RNG once at startup, so restarting a segment
+            # with the run seed would replay episode 0's initial conditions
+            # into the remaining slots. Shift far past the base-seed band.
+            effective_seed=$((RUN_SEED + 1000000 + completed_eps))
+            log "  RESUME: $completed_eps/$N_EPISODES episodes done; continuing from episode $((completed_eps + 1)) (seed=$effective_seed)"
+        fi
         if ! ensure_worker_server "$SERVER_KEY" "$FAMILY" "$cuda_device" "$gpu_slot"; then
             client_rc=1
         else
-            log "  gpu_slot=$gpu_slot task=${CUR_TASK_TAG:-$DEXJOCO_TASK} family=$FAMILY run=$RUN_IDX/$N_RUNS seed=$RUN_SEED attempt=$attempt"
-            if run_client_once "$FAMILY" "$RUN_SEED" "$OUT_DIR" "$cuda_device"; then
+            log "  gpu_slot=$gpu_slot task=${CUR_TASK_TAG:-$DEXJOCO_TASK} family=$FAMILY run=$RUN_IDX/$N_RUNS seed=$effective_seed attempt=$attempt"
+            if run_client_once "$FAMILY" "$effective_seed" "$OUT_DIR" "$cuda_device" "$completed_eps"; then
                 client_rc=0
             else
                 client_rc=$?
@@ -428,7 +463,6 @@ run_unit_on_worker() {
         ACTIVE_SERVER_KEY=""
         if [ "$attempt" -eq 1 ]; then
             log "  retrying failed unit with a fresh server (gpu_slot=$gpu_slot rc=$client_rc)"
-            rm -rf -- "$OUT_DIR"
             continue
         fi
         log "ERROR: eval unit failed twice (task=${CUR_TASK_TAG:-$DEXJOCO_TASK} family=$FAMILY run=$RUN_IDX rc=$client_rc)"
