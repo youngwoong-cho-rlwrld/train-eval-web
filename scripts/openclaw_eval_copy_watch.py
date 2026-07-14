@@ -424,6 +424,43 @@ def eval_run_progress(
     return completed, task_count * set_count * run_count
 
 
+def eval_episode_progress(
+    api: ApiClient,
+    *,
+    cluster: str,
+    job_id: str,
+) -> tuple[int, int | None]:
+    """Return cumulative completed episodes and the configured episode total.
+
+    The backend progress probe counts finished ``episode_NN_<status>`` dirs on
+    disk, so this advances mid-run and is cumulative across the resume chain
+    (the namespace, hence the eval dir, is preserved). Unlike the run count it
+    still moves when a long run spans several allocation windows without ever
+    producing a results.json — which is exactly the stall signal a mid-episode
+    resume needs. Returns ``(0, None)`` when progress cannot be read.
+    """
+    cluster_q = urllib.parse.quote(cluster, safe="")
+    job_q = urllib.parse.quote(job_id, safe="")
+    try:
+        payload = api.get(f"/api/jobs/{cluster_q}/{job_q}/progress")
+    except ApiError:
+        return 0, None
+    progress = payload.get("progress") if isinstance(payload, dict) else None
+    if not isinstance(progress, dict):
+        return 0, None
+    current = progress.get("current_step")
+    total = progress.get("max_steps")
+    try:
+        current_eps = int(current) if current is not None else 0
+    except (TypeError, ValueError):
+        current_eps = 0
+    try:
+        total_eps = int(total) if total is not None else None
+    except (TypeError, ValueError):
+        total_eps = None
+    return max(0, current_eps), total_eps
+
+
 def _resumed_job_id(job: dict[str, Any]) -> str:
     return str(job.get("job_id") or job.get("JobID") or "")
 
@@ -476,6 +513,14 @@ def resume_interrupted_eval(
         variant=args.variant,
         entry=entry,
     )
+    # Stall detection is episode-based, not run-based: a large multi-task eval
+    # can burn a whole allocation window without finishing a single run, so
+    # comparing completed runs would falsely stall a chain that is in fact
+    # advancing episode by episode. Episodes only stop growing when the eval
+    # genuinely makes no progress in a window.
+    completed_eps, total_eps = eval_episode_progress(
+        api, cluster=args.dest_cluster, job_id=parent_id
+    )
     parent_q = urllib.parse.quote(parent_id, safe="")
     cluster_q = urllib.parse.quote(args.dest_cluster, safe="")
     resume_path = f"/api/jobs/{cluster_q}/{parent_q}/resume"
@@ -488,22 +533,24 @@ def resume_interrupted_eval(
         entry.get("outcome") == "eval_resuming"
         and str(entry.get("eval_resume_parent_job_id") or "") == parent_id
     )
-    previous_completed = entry.get("eval_resume_last_completed_runs")
+    previous_eps = entry.get("eval_resume_last_completed_episodes")
     if (
         interruption == "timeout"
         and child is None
         and not attempt_in_flight
-        and previous_completed is not None
+        and previous_eps is not None
     ):
         try:
-            made_progress = completed > int(previous_completed)
+            made_progress = completed_eps > int(previous_eps)
         except (TypeError, ValueError):
             made_progress = True
         if not made_progress:
-            total_text = str(total) if total is not None else "?"
+            eps_total_text = str(total_eps) if total_eps is not None else "?"
             message = (
                 f"⚠️ Eval auto-resume stopped: `{args.dest_cluster}/{parent_id}` "
-                f"was interrupted with no new completed runs ({completed}/{total_text})."
+                f"was interrupted with no new completed episodes "
+                f"({completed_eps}/{eps_total_text} episodes, "
+                f"{completed} runs done)."
             )
             update_entry(
                 state_path,
@@ -513,6 +560,7 @@ def resume_interrupted_eval(
                 eval_state=str(job.get("State") or job.get("state") or "").upper(),
                 eval_terminal_at=job.get("End") or job.get("end") or now_iso(),
                 eval_total_runs=total,
+                eval_resume_last_completed_episodes=completed_eps,
                 eval_resume_stalled_at=now_iso(),
             )
             notify_with_retry(
@@ -539,6 +587,7 @@ def resume_interrupted_eval(
             eval_terminal_at=job.get("End") or job.get("end") or now_iso(),
             eval_resume_parent_job_id=parent_id,
             eval_resume_last_completed_runs=completed,
+            eval_resume_last_completed_episodes=completed_eps,
             eval_total_runs=total,
             eval_resume_attempted_at=now_iso(),
             eval_terminal_notified_at=None,
@@ -565,6 +614,7 @@ def resume_interrupted_eval(
                 "old_job_id": parent_id,
                 "new_job_id": child_id,
                 "completed_runs": completed,
+                "completed_episodes": completed_eps,
                 "total_runs": total,
                 "resumed_at": now_iso(),
             }
@@ -579,6 +629,7 @@ def resume_interrupted_eval(
         eval_resume_chain=chain,
         eval_resume_parent_job_id=parent_id,
         eval_resume_last_completed_runs=completed,
+        eval_resume_last_completed_episodes=completed_eps,
         eval_total_runs=total,
         eval_resumed_at=now_iso(),
         eval_state=None,
@@ -589,12 +640,14 @@ def resume_interrupted_eval(
         eval_monitor_failure_notified_at=None,
     )
     total_text = str(total) if total is not None else "?"
+    eps_total_text = str(total_eps) if total_eps is not None else "?"
     notify_with_retry(
         notifier,
         args.slack_channel,
         (
             f"♻️ Eval resumed: `{args.dest_cluster}/{parent_id}` → "
-            f"`{args.dest_cluster}/{child_id}`, {completed}/{total_text} runs done."
+            f"`{args.dest_cluster}/{child_id}`, {completed}/{total_text} runs "
+            f"({completed_eps}/{eps_total_text} episodes) done."
         ),
         sleep=sleep,
         timeout_seconds=args.slack_timeout_seconds,

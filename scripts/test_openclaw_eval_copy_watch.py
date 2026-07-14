@@ -28,6 +28,8 @@ class FakeApi:
         eval_exit_code="0:0",
         eval_states=None,
         eval_runs=None,
+        eval_episodes=None,
+        episode_total=300,
         resumes=None,
         resume_job_ids=None,
         lose_resume_response=False,
@@ -42,6 +44,8 @@ class FakeApi:
         self.eval_exit_code = eval_exit_code
         self.eval_states = dict(eval_states or {})
         self.eval_runs = dict(eval_runs or {})
+        self.eval_episodes = {str(k): int(v) for k, v in (eval_episodes or {}).items()}
+        self.episode_total = episode_total
         self.resumes = {str(key): list(value) for key, value in (resumes or {}).items()}
         self.resume_job_ids = list(resume_job_ids or ["12346"])
         self.lose_resume_response = lose_resume_response
@@ -72,6 +76,14 @@ class FakeApi:
             job_id = path.split("/")[-2]
             count = int(self.eval_runs.get(job_id, 0))
             return {"eval_runs": [{"run": index} for index in range(count)]}
+        if path.endswith("/progress"):
+            job_id = path.split("/")[-2]
+            return {
+                "progress": {
+                    "current_step": self.eval_episodes.get(job_id, 0),
+                    "max_steps": self.episode_total,
+                }
+            }
         if path.endswith("/resumes"):
             job_id = path.split("/")[-2]
             return list(self.resumes.get(job_id, []))
@@ -440,17 +452,23 @@ class WatcherTests(unittest.TestCase):
             self.assertEqual(result["outcome"], "eval_cancelled")
             self.assertEqual(api.posts, [])
 
-    def test_second_timeout_without_progress_stops_instead_of_resuming(self):
+    def test_second_timeout_without_episode_progress_stops_instead_of_resuming(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_file = Path(tmp) / "state.json"
             self.write_state(
                 state_file,
                 eval_job_id="200",
                 eval_resume_parent_job_id="100",
-                eval_resume_last_completed_runs=2,
+                eval_resume_last_completed_runs=0,
+                eval_resume_last_completed_episodes=40,
                 eval_total_runs=6,
             )
-            api = FakeApi(eval_states={"200": "TIMEOUT"}, eval_runs={"200": 2})
+            # Same 40 episodes as the previous window: genuine stall.
+            api = FakeApi(
+                eval_states={"200": "TIMEOUT"},
+                eval_runs={"200": 0},
+                eval_episodes={"200": 40},
+            )
             notices = []
             result = watcher.run_workflow(
                 self.make_args(state_file),
@@ -460,7 +478,39 @@ class WatcherTests(unittest.TestCase):
             )
             self.assertEqual(result["outcome"], "eval_resume_stalled")
             self.assertEqual(api.posts, [])
-            self.assertIn("no new completed runs", notices[0])
+            self.assertIn("no new completed episodes", notices[0])
+
+    def test_timeout_resumes_when_episodes_advanced_without_completed_runs(self):
+        # The regression that made 153556 restart from scratch: a big eval can
+        # burn a whole window advancing episodes without finishing a single
+        # run. Run-based stall detection would stop here; episode-based must not.
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "state.json"
+            self.write_state(
+                state_file,
+                eval_job_id="200",
+                eval_resume_parent_job_id="100",
+                eval_resume_last_completed_runs=0,
+                eval_resume_last_completed_episodes=40,
+                eval_total_runs=6,
+            )
+            # 0 completed runs, but episodes climbed 40 -> 95: real progress.
+            api = FakeApi(
+                eval_states={"200": ["TIMEOUT", "TIMEOUT"], "12346": "COMPLETED"},
+                eval_runs={"200": 0},
+                eval_episodes={"200": 95},
+            )
+            notices = []
+            result = watcher.run_workflow(
+                self.make_args(state_file),
+                api=api,
+                notifier=lambda _channel, message: notices.append(message),
+                sleep=lambda _: None,
+            )
+            self.assertEqual(result["outcome"], "eval_completed")
+            self.assertEqual(result["eval_job_id"], "12346")
+            self.assertEqual(result["eval_resume_last_completed_episodes"], 95)
+            self.assertEqual([p for p, _ in api.posts], ["/api/jobs/skt/200/resume"])
 
     def test_lost_resume_response_recovers_existing_child_without_duplicate(self):
         with tempfile.TemporaryDirectory() as tmp:
