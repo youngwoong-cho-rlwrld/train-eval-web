@@ -764,7 +764,7 @@ async def _mlxp_details(
         else None
     )
     progress = (
-        await _mlxp_progress(job_name, variant, phase, metadata, project=job_wandb_project)
+        await _mlxp_progress(job_name, variant, phase, metadata, project=job_wandb_project, job_id=job_id)
         if include_progress
         else Progress(phase=phase)
     )
@@ -1485,23 +1485,71 @@ async def _mlxp_gpu_usage(
     return usage or GpuUsage(node=fallback_node, error="MLXP GPU sample returned no devices")
 
 
+# GAM (dexjoco-gam family) prints one `[step=NNNNNNN] total=... action_l1=...`
+# line per training step. Leading zeros are stripped by the capture group.
+_TRAIN_LOG_STEP_RE = re.compile(r"\[step=0*(\d+)\]")
+
+
+async def _mlxp_pod_log_step(job_id: str, tail: int = 200) -> int | None:
+    """Latest training step parsed from the job pod's stdout, or None.
+
+    GAM launches train_robot.py without `--wandb`, so it logs nothing to wandb
+    and its only live step signal is the per-step `[step=N]` stdout line. Fetch
+    the pod log tail via the label selector (job-name == k8s job_id) and return
+    the highest step seen. Returns None when kubectl is unavailable, the fetch
+    fails, or no `[step=N]` line is present (e.g. gr00t, which uses wandb and
+    never prints this line). Uses max() so multi-pod aggregation still yields
+    the latest step regardless of kubectl's per-pod output ordering.
+    """
+    if not job_id or shutil.which("kubectl") is None:
+        return None
+    settings = get_settings()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "kubectl", "logs", "-n", settings.namespace,
+            "-l", f"job-name={job_id}", f"--tail={tail}", "--prefix=false",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+        except BaseException:
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()
+            raise
+    except Exception:
+        return None
+    matches = _TRAIN_LOG_STEP_RE.findall(stdout.decode(errors="replace"))
+    if not matches:
+        return None
+    return max(int(m) for m in matches)
+
+
 async def _mlxp_progress(
     run_id: str,
     variant: str | None,
     phase: str,
     metadata: dict[str, str] | None = None,
     project: str | None = None,
+    job_id: str | None = None,
 ) -> Progress:
     """Progress for an MLXP training job.
 
-    Primary source: the run's wandb summary `train/global_step` (the true
-    training-loop step), falling back to `global_step` then wandb's built-in
-    `_step` — which counts wandb.log() calls (~10x coarser for gr00t-n16) and
-    is only the last-resort fallback. See _wandb_step for the exact order.
-    Fallback: highest `checkpoint-N` dir on DDN (SAVE_STEPS granularity).
+    Step sources, in order (first that resolves wins):
+      1. wandb summary `train/global_step` (the true training-loop step),
+         falling back to `global_step` then wandb's built-in `_step` — which
+         counts wandb.log() calls (~10x coarser for gr00t-n16) and is only the
+         last-resort fallback. See _wandb_step for the exact order.
+      2. the training pod's `[step=N]` stdout line — GAM's only live signal,
+         since it trains without --wandb. Harmless for gr00t, which resolves at
+         source 1 and never prints this line. Needs the k8s `job_id`.
+      3. highest checkpoint on DDN (SAVE_STEPS granularity): gr00t's
+         `checkpoint-N` dirs and GAM's `checkpoints/NNNNNNN.pt` files.
 
-    `run_id` is the wandb run id — the job_name (display name) for MLXP,
-    not the k8s job_id which has no wandb run behind it.
+    `run_id` is the wandb run id — the job_name (display name) for MLXP; the
+    k8s `job_id` (== the pod's job-name label) is passed separately for the log
+    probe because it has no wandb run behind it.
     """
     progress = Progress(phase=phase)
     if not variant:
@@ -1535,7 +1583,18 @@ async def _mlxp_progress(
             progress.current_label = f"step {step:,}"
         return progress
 
-    # 2. checkpoint dir count — coarse (SAVE_STEPS granularity).
+    # 2. training-log step — GAM's only live signal (it trains without --wandb).
+    step = await _mlxp_pod_log_step(job_id) if job_id else None
+    if step is not None:
+        progress.current_step = step
+        if progress.max_steps:
+            progress.percent = round(100.0 * step / progress.max_steps, 1)
+            progress.current_label = f"step {step:,}/{progress.max_steps:,}"
+        else:
+            progress.current_label = f"step {step:,}"
+        return progress
+
+    # 3. highest checkpoint on DDN — coarse (SAVE_STEPS granularity).
     if shutil.which("kubectl") is None:
         return progress
     settings = get_settings()
@@ -1553,10 +1612,14 @@ async def _mlxp_progress(
         if d
     ]
     dirs = " ".join(shlex.quote(d) for d in ckpt_dirs)
+    # gr00t writes `checkpoint-<N>` dirs; GAM writes `checkpoints/NNNNNNN.pt`
+    # (and sometimes top-level `NNNNNNN.pt`) files. Emit the step number from
+    # both schemes, keep only pure-digit lines, numeric-sort, take the max.
     cmd = (
         f"for d in {dirs}; do "
-        'ls -d "$d"/checkpoint-* 2>/dev/null; '
-        "done | sed 's:.*checkpoint-::' | sort -n | tail -1"
+        'ls -d "$d"/checkpoint-* 2>/dev/null | sed "s:.*checkpoint-::"; '
+        'ls "$d"/checkpoints/*.pt "$d"/*.pt 2>/dev/null | sed "s:.*/::;s:[.]pt::"; '
+        "done | grep -E '^[0-9]+$' | sort -n | tail -1"
     )
     try:
         _, stdout, _ = await _mlxp_exec("bash", "-lc", cmd, timeout=15.0)
@@ -1691,7 +1754,17 @@ async def _wandb_url(run_id: str, project: str | None = None) -> str | None:
             api = wandb.Api(timeout=10)
             run = api.run(f"{entity}/{resolved_project}/{run_id}")
             return _append_wandb_workspace(run.url or fallback, workspace)
-        except Exception:
+        except Exception as exc:
+            # Hide the link only when the run is CONFIRMED missing (wandb raises
+            # "Could not find run ..." — e.g. GAM trained without --wandb and no
+            # run was ever created). For any other failure (transient API /
+            # network / in-process wandb hiccup) fall back to the constructed
+            # URL, which resolves for runs that DO exist (incl. backfilled ones).
+            # Returning None on every exception wrongly hides valid links when
+            # the backend's wandb call flakes.
+            msg = str(exc).lower()
+            if any(s in msg for s in ("not find", "not found", "does not exist")):
+                return None
             return fallback
 
     return await asyncio.to_thread(_query)

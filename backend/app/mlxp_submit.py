@@ -790,6 +790,13 @@ def _render_body_script(
             train_extra=train_extra, user_extra=user_extra, ckpt_dir=ckpt_dir,
             snapshot=snapshot, model=model, repo_path=repo_path, settings=settings,
         )
+    if family == "gam":
+        return _render_body_gam(
+            variant=variant, req=req, job_name=job_name,
+            max_steps=max_steps, save_steps=save_steps, num_workers=num_workers,
+            global_batch=global_batch, ckpt_dir=ckpt_dir,
+            snapshot=snapshot, model=model, repo_path=repo_path, settings=settings,
+        )
     if family != "n1.5":
         raise ValueError(f"unsupported MLXP model family: {family}")
 
@@ -1005,6 +1012,97 @@ uv run $UV_RUN_ARGS torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/la
     $RESUME_FLAG{action_horizon_arg} {train_extra} {user_extra}
 
 {_strip_resume_state_block(ckpt_dir, max_steps)}
+"""
+
+
+def _render_body_gam(*, variant, req: MlxpSubmitRequest, job_name: str,
+                     max_steps: str, save_steps: str, num_workers: str,
+                     global_batch: int, ckpt_dir: str, snapshot: dict,
+                     model: TrainingModel, repo_path: str,
+                     settings: MlxpSettings) -> str:
+    """Body script for the GAM family (slurm-only lib/train_body_gam.sh port).
+
+    GAM does not use torchrun / launch_finetune.py. This reproduces
+    lib/train_body_gam.sh in the MLXP pod: after the repo checkout preamble
+    (cwd = pinned worktree, .venv symlinked, PYTHONPATH set) it stages the
+    variant's gam_config.yaml into the pod and hands the launch to the fork's
+    wrapper `dexjoco/train_dexjoco.sh`, driven entirely by GAM_* env vars. The
+    wrapper writes a single-file checkpoint-final.pt into GAM_RESULTS_DIR; that
+    file is the completion/skip marker. gr00t-only knobs (action horizon,
+    TRAIN_EXTRA_ARGS, user extra_args) do not apply and are ignored.
+    """
+    # The variant's second file is the GAM OmegaConf config; inline it into the
+    # pod the same way n1.6 inlines its modality .py (no rsync step on MLXP).
+    second_rel = (variant.vars.get("TRAIN_MODALITY_CONFIG") or "gam_config.yaml").strip()
+    if not is_safe_relpath(second_rel, {".yaml", ".yml"}):
+        raise ValueError(
+            f"variant {variant.name}: GAM TRAIN_MODALITY_CONFIG must be a .yaml/.yml file, got {second_rel!r}"
+        )
+    second_path = EXPERIMENTS_DIR / variant.name / second_rel
+    if not second_path.is_file():
+        raise FileNotFoundError(f"GAM config not found: {second_path}")
+    gam_config_text = ensure_trailing_newline(second_path.read_text())
+
+    run_log_dir = f"{ckpt_dir}/logs"
+    wandb_project = shlex.quote(_wandb_project())
+    output_namespace = ckpt_dir.rstrip("/").rsplit("/", 1)[-1]
+    datasets_dir = settings.datasets_dir
+
+    return f"""\
+set -euo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+export WANDB_PROJECT={wandb_project}
+export WANDB_RUN_ID="{job_name}"
+export WANDB_RESUME=allow
+export NO_ALBUMENTATIONS_UPDATE=1
+export TOKENIZERS_PARALLELISM=false
+export OMNI_KIT_ACCEPT_EULA=Y
+{_hf_cache_exports(settings)}
+
+{_repo_runtime_preamble(repo_path, snapshot)}
+
+{_snapshot_preamble(snapshot)}
+mkdir -p {ckpt_dir}
+RUN_LOG_DIR={shlex.quote(run_log_dir)}
+mkdir -p "$RUN_LOG_DIR"
+exec > >(tee -a "$RUN_LOG_DIR/training.log") 2>&1
+echo "[mlxp] run namespace: {output_namespace}"
+
+# checkpoint-final.pt is the wrapper's completion marker (see the contract).
+if [ -f "{ckpt_dir}/checkpoint-final.pt" ]; then
+    echo "[mlxp] {ckpt_dir}/checkpoint-final.pt exists — training already complete; skipping."
+    exit 0
+fi
+
+# Stage the GAM training config (variant second file) into the pod.
+cat > /tmp/gam_config.yaml <<'GAM_CONFIG_EOF'
+{gam_config_text}GAM_CONFIG_EOF
+
+# DA3 backbone + GAM init checkpoint are untracked assets that live only in the
+# main checkout, not the per-job worktree the wrapper defaults to. Point them at
+# the main repo so stage_1 finds checkpoints/track4world_da3.pth and training
+# starts from the pretrained init.
+export DA3_ROOT={shlex.quote(repo_path)}
+export GAM_INIT_CKPT={shlex.quote(f"{repo_path}/checkpoints/pretrained-gam.pt")}
+
+# GAM_WANDB_RUN_ID == the display job name: the wrapper enables --wandb with
+# id==job_name (project pinned to dexjoco) so the backend resolves the run link.
+GAM_CONFIG_YAML=/tmp/gam_config.yaml \\
+GAM_DATA_ROOT={shlex.quote(datasets_dir)} \\
+GAM_RESULTS_DIR={shlex.quote(ckpt_dir)} \\
+GAM_NUM_GPUS={req.num_gpus} \\
+GAM_GLOBAL_BATCH_SIZE={global_batch} \\
+GAM_MAX_STEPS={max_steps} \\
+GAM_SAVE_STEPS={save_steps} \\
+GAM_NUM_WORKERS={num_workers} \\
+GAM_WANDB_RUN_ID={shlex.quote(job_name)} \\
+    bash dexjoco/train_dexjoco.sh
+
+if [ ! -f "{ckpt_dir}/checkpoint-final.pt" ]; then
+    echo "[mlxp] ERROR: GAM wrapper exited 0 but {ckpt_dir}/checkpoint-final.pt is missing" >&2
+    exit 1
+fi
+echo "[mlxp] training complete: {ckpt_dir}/checkpoint-final.pt"
 """
 
 

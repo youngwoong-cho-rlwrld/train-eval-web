@@ -16,7 +16,7 @@ from .cluster_settings import parse_env_text
 from .paths import MODELS_DIR
 
 ACTION_HORIZON_MODES = {"none", "modality", "cli", "modality_and_cli"}
-SUPPORTED_FAMILIES = frozenset({"n1.5", "n1.6"})  # training families flags.py + variants.py know how to render; pi0.5 is eval-only (dexjoco harness)
+SUPPORTED_FAMILIES = frozenset({"n1.5", "n1.6", "gam"})  # training families flags.py + variants.py know how to render; pi0.5 is eval-only (dexjoco harness)
 
 
 @dataclass(frozen=True)

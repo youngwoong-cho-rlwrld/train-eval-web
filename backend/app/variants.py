@@ -331,6 +331,17 @@ def _validate_n15_data_config_yaml(text: str, title: str) -> None:
             )
 
 
+def _validate_gam_config_yaml(text: str, title: str) -> None:
+    # GAM's second file is an OmegaConf training config whose schema is owned by
+    # the GAM fork; webapp only guarantees it parses as a non-empty YAML mapping.
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        raise ValueError(f"{title}: YAML syntax error: {e}")
+    if not isinstance(data, dict) or not data:
+        raise ValueError(f"{title}: expected a non-empty YAML mapping")
+
+
 def _validate_python(text: str, title: str) -> None:
     try:
         compile(text, title, "exec")
@@ -370,11 +381,24 @@ _SECOND_FILE_SPECS: dict[str, SecondFileSpec] = {
         purpose="Python modality config passed to GR00T N1.6/Physixel as --modality-config-path for train and --modality-config for eval.",
         validator=_validate_python,
     ),
+    "gam": SecondFileSpec(
+        config_var="TRAIN_MODALITY_CONFIG",
+        suffixes=frozenset({".yaml", ".yml"}),
+        default_name="gam_config.yaml",
+        kind="gam_config_yaml",
+        label="gam_config.yaml",
+        purpose="GAM OmegaConf training config passed via GAM_CONFIG_YAML to dexjoco/train_dexjoco.sh; lists datasets/weights/dims and the action chunk size.",
+        validator=_validate_gam_config_yaml,
+    ),
 }
 
 
 def _spec_for(model_family: str) -> SecondFileSpec:
-    return _SECOND_FILE_SPECS["n1.5"] if model_family == "n1.5" else _SECOND_FILE_SPECS["n1.6"]
+    # n1.6 stays the default for any unmapped non-n1.5 family (preserves the
+    # original else semantics); families with an explicit entry (gam) win.
+    if model_family == "n1.5":
+        return _SECOND_FILE_SPECS["n1.5"]
+    return _SECOND_FILE_SPECS.get(model_family, _SECOND_FILE_SPECS["n1.6"])
 
 
 def _set_second_file_ref(config_text: str, second_title: str, model_family: str) -> str:

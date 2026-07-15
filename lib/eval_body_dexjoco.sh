@@ -114,6 +114,11 @@ GAM_ADAPTER="$REPO_ROOT/lib/dexjoco/gam_dexjoco_server.py"
 if [ "$DEXJOCO_SERVER_TYPE" = "groot" ] || [ "$DEXJOCO_SERVER_TYPE" = "gam" ]; then
     [ -n "$TRAIN_REPO_DIR" ] || { log "ERROR: SUBMIT_TRAIN_REPO_DIR not set for $DEXJOCO_SERVER_TYPE server"; exit 1; }
     SUBMIT_GIT_COMMIT="${SUBMIT_GIT_COMMIT:-${TRAIN_GIT_COMMIT:-}}"
+    # Capture the main checkout before pin_training_repo_dir swaps TRAIN_REPO_DIR
+    # for a per-job worktree. The GAM server builds the DA3 backbone from
+    # checkpoints/track4world_da3.pth, an untracked asset present only in the
+    # main repo — the gam start_server branch points DA3_ROOT here.
+    GAM_MAIN_REPO_DIR="$TRAIN_REPO_DIR"
     pin_training_repo_dir "$TRAIN_REPO_DIR" "$SUBMIT_GIT_COMMIT" "${SLURM_JOB_ID:-$OUTPUT_NAMESPACE}"
     [ -x "$TRAIN_REPO_DIR/.venv/bin/python" ] || { log "ERROR: model venv python not found: $TRAIN_REPO_DIR/.venv/bin/python"; exit 1; }
     if [ "$DEXJOCO_SERVER_TYPE" = "gam" ]; then
@@ -178,6 +183,20 @@ start_server() {
                CUDA_VISIBLE_DEVICES="$cuda_device" "$TRAIN_REPO_DIR/.venv/bin/python" gr00t_dexjoco_server.py \
                 --model_path "$LAST_CKPT" --port "$port" --prompt "$SERVER_PROMPT" \
                 --embodiment_tag "$DEXJOCO_EMBODIMENT_TAG" "${img_args[@]}" ) \
+            > "$server_log" 2>&1 &
+        SERVER_PID=$!
+    elif [ "$DEXJOCO_SERVER_TYPE" = "gam" ]; then
+        # GAM server: resolves checkpoint-final.pt + config.yaml + action_stats/
+        # from the checkpoint dir and maps the embodiment tag to dims itself.
+        # PYTHONPATH is the fork's src/; the adapter is staged in lib/dexjoco.
+        # DA3_ROOT points at the main checkout (not the worktree) so the server
+        # finds the untracked DA3 backbone ckpt checkpoints/track4world_da3.pth.
+        ( cd "$REPO_ROOT/lib/dexjoco" \
+            && PYTHONPATH="$TRAIN_REPO_DIR/src${PYTHONPATH:+:$PYTHONPATH}" \
+               DA3_ROOT="${GAM_MAIN_REPO_DIR:-$TRAIN_REPO_DIR}" \
+               CUDA_VISIBLE_DEVICES="$cuda_device" "$TRAIN_REPO_DIR/.venv/bin/python" gam_dexjoco_server.py \
+                --checkpoint-path "$LAST_CKPT" --port "$port" \
+                --embodiment-tag "$DEXJOCO_EMBODIMENT_TAG" --host 127.0.0.1 ) \
             > "$server_log" 2>&1 &
         SERVER_PID=$!
     else
@@ -544,6 +563,8 @@ for task_entry in "${TASKS[@]}"; do
         if [ "$DEXJOCO_SERVER_TYPE" = "openpi" ]; then
             SERVER_KEY="$DEXJOCO_SERVER_TYPE:$TASK_SHORT:$(openpi_policy_config "$FAMILY")"
         else
+            # groot and gam both reuse one persistent server per embodiment tag
+            # (single-arm vs dual-arm), so the tag is the grouping key.
             SERVER_KEY="$DEXJOCO_SERVER_TYPE:$TASK_SHORT:$DEXJOCO_EMBODIMENT_TAG"
         fi
         if [[ "${GROUP_ID_BY_KEY[$SERVER_KEY]+present}" != present ]]; then

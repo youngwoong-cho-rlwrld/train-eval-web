@@ -3,6 +3,10 @@
 Source layouts:
 - mlxp:   <MLXP experiments dir>/<variant>/checkpoints/<job_name>/checkpoint-N
 - slurm:  $EXP_DIR/checkpoints/checkpoint-N
+- gam:    <run dir>/checkpoint-final.pt — a single-file checkpoint. The run
+  directory is the copy unit: it also holds config.yaml + action_stats/ that
+  the GAM eval server reads, plus a large intermediate checkpoints/ tree and
+  logs that are excluded. See the GAM artifact helpers below.
 
 Destination layout:
 - explicit destination root: <root>/<run-name> when the selected source is
@@ -235,6 +239,18 @@ for m in "$root"/checkpoint-*; do
     [[ "$step" =~ ^[0-9]+$ ]] || continue
     printf '%s|%s\n' "$m" "$step"
 done
+# GAM single-file checkpoint: the run dir itself is the copy unit (holds
+# checkpoint-final.pt + config.yaml + action_stats/). Emit it, stepped by the
+# highest intermediate checkpoints/NNNNNNN.pt (0 if none yet). checkpoint-final.pt
+# is skipped by the loop above (non-numeric step), so there is no double count.
+if [[ -f "$root"/checkpoint-final.pt ]]; then
+    gstep=0
+    for f in "$root"/checkpoints/*.pt; do
+        b=$(basename "$f" .pt)
+        [[ "$b" =~ ^[0-9]+$ ]] && (( 10#$b > gstep )) && gstep=$((10#$b))
+    done
+    printf '%s|%s\n' "$root" "$gstep"
+fi
 """.replace("__CHECKPOINT_DIR__", checkpoint_dir))
         out_text = await _kubectl_exec_text(pod, "bash", "-c", script)
         result: list[CheckpointEntry] = []
@@ -266,7 +282,27 @@ done
         job_glob = shlex.quote(det.job_name) + "*"
         cmds += f" ; ls -d {root_expr}/{job_glob}/checkpoint-* 2>/dev/null"
     r = await ssh_run(env.ssh_alias, cmds, timeout=15.0)
-    return _parse_paths(r.stdout, fallback_job=job_id)
+    entries = _parse_paths(r.stdout, fallback_job=job_id)
+
+    # GAM single-file checkpoint: surface the run dir itself (holds
+    # checkpoint-final.pt + config.yaml + action_stats/), stepped by the highest
+    # intermediate checkpoints/NNNNNNN.pt (0 if none). The ls above skips
+    # checkpoint-final.pt because it is not a checkpoint-<N> directory.
+    gam_cmd = (
+        f"if [ -f {root_expr}/checkpoint-final.pt ]; then "
+        f"ls {root_expr}/checkpoints/*.pt 2>/dev/null "
+        f"| sed 's:.*/::; s:[.]pt$::' | grep -E '^[0-9]+$' | sort -n | tail -1; "
+        f"echo __GAM_FINAL__; fi"
+    )
+    gr = await ssh_run(env.ssh_alias, gam_cmd, timeout=15.0)
+    lines = [ln.strip() for ln in gr.stdout.splitlines() if ln.strip()]
+    if "__GAM_FINAL__" in lines:
+        nums = [int(ln) for ln in lines if ln.isdigit()]
+        job_name = checkpoint_leaf(root) or det.job_name or job_id
+        entries.append(CheckpointEntry(
+            path=root, job_name=job_name, step=max(nums) if nums else 0,
+        ))
+    return _dedupe_checkpoints(entries)
 
 
 def _parse_paths(stdout: str, *, fallback_job: str = "") -> list[CheckpointEntry]:
@@ -525,6 +561,60 @@ def _select_model_artifact_files(parent_basename: str, names: list[str]) -> list
     ]
 
 
+# ── GAM (dexjoco-gam) single-file checkpoints ─────────────────────────────
+# GAM training writes a run directory whose deployable payload is a single
+# `checkpoint-final.pt` plus `config.yaml` and `action_stats/` (all resolved
+# from the checkpoint dir by lib/dexjoco/gam_dexjoco_server.py at eval). The
+# same dir also holds a large intermediate `checkpoints/` tree (DeepSpeed
+# shards, tens of GB) and training logs that must NOT ship. gr00t's artifact
+# rules are wrong here twice over: `_should_copy_model_artifact` DROPS
+# `checkpoint-final.pt` (it starts with "checkpoint-") and KEEPS `checkpoints/`.
+# Detect GAM by its marker file and use GAM-specific selection instead.
+GAM_MARKER_FILE = "checkpoint-final.pt"
+_GAM_ARTIFACT_EXCLUDES = frozenset({"checkpoints", "logs", "log.txt"})
+
+
+def _is_gam_checkpoint_dir(names: list[str]) -> bool:
+    return GAM_MARKER_FILE in names
+
+
+def _should_copy_gam_artifact(name: str) -> bool:
+    if name in _GAM_ARTIFACT_EXCLUDES:
+        return False
+    # Intermediate step checkpoints sometimes also land at the run-dir top level
+    # as `NNNNNNN.pt`; only checkpoint-final.pt is deployable.
+    if name.endswith(".pt") and name[: -len(".pt")].isdigit():
+        return False
+    return True
+
+
+def _select_gam_artifact_files(parent_basename: str, names: list[str]) -> list[str]:
+    """Deployable GAM artifacts (checkpoint-final.pt, config.yaml, action_stats,
+    …) relative to the source parent, excluding the intermediate checkpoints
+    tree and logs."""
+    return [
+        f"{parent_basename}/{n}"
+        for n in names
+        if _should_copy_gam_artifact(n)
+    ]
+
+
+def _normalize_gam_source(src_path: str) -> str:
+    """Map a `.../checkpoint-final.pt` file source to its run directory.
+
+    GAM's deployable checkpoint is the run directory (it carries config.yaml +
+    action_stats/ that eval also needs), but callers sometimes pass the concrete
+    `.pt` file. Feeding a file into the directory-oriented copy pipeline builds a
+    bogus artifact list (ls-on-a-file), a ~0-byte transfer, and — with
+    delete-source — still resolves the delete root to the run dir. Normalize to
+    the run dir up front so every stage sees a real directory.
+    """
+    p = src_path.rstrip("/")
+    if Path(p).name == GAM_MARKER_FILE:
+        return str(Path(p).parent)
+    return src_path
+
+
 def _dest_leaf_for_source(src_path: str) -> str:
     """Return the destination directory name for a selected checkpoint.
 
@@ -563,6 +653,7 @@ async def _run_copy(
     state = _COPY_JOBS[copy_id]
     try:
         for i, src_path in enumerate(sources):
+            src_path = _normalize_gam_source(src_path)
             src_path = await _resolve_model_source_path(src_cluster, src_path)
             src_path = await expand_cluster_home(src_cluster, src_path) or src_path
             leaf = Path(src_path).name
@@ -578,7 +669,10 @@ async def _run_copy(
             names = await _children_of(src_cluster, src_path)
             include_only = None
             if names:
-                include_only = _select_model_artifact_files(leaf, names)
+                if _is_gam_checkpoint_dir(names):
+                    include_only = _select_gam_artifact_files(leaf, names)
+                else:
+                    include_only = _select_model_artifact_files(leaf, names)
                 picks = [item.split("/", 1)[1] for item in include_only]
                 sizes = await asyncio.gather(*[
                     _size(src_cluster, f"{src_path}/{name}") for name in picks

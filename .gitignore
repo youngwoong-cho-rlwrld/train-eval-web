@@ -28,3 +28,6 @@ configs/experiments/*/.versions/**
 
 # OMC tooling state (oh-my-claudecode session/state files)
 .omc/
+
+# wandb local run cache (e.g. from GAM backfill run in backend cwd)
+backend/wandb/
