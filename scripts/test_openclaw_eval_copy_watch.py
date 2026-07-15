@@ -452,6 +452,28 @@ class WatcherTests(unittest.TestCase):
             self.assertEqual(result["outcome"], "eval_cancelled")
             self.assertEqual(api.posts, [])
 
+    def test_preempted_is_transient_not_terminal(self):
+        # A preemptible-partition job goes PREEMPTED and slurm requeues it under
+        # the same id; the watcher must wait through it, not report failure.
+        self.assertIsNone(watcher.eval_terminal_kind("PREEMPTED"))
+
+    def test_preemption_then_requeue_completes_without_failure_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "state.json"
+            self.write_state(state_file, eval_job_id="100")
+            # Preempted -> requeued (RUNNING) -> COMPLETED: one clean finish.
+            api = FakeApi(eval_states={"100": ["PREEMPTED", "RUNNING", "COMPLETED"]})
+            notices = []
+            result = watcher.run_workflow(
+                self.make_args(state_file),
+                api=api,
+                notifier=lambda _channel, message: notices.append(message),
+                sleep=lambda _: None,
+            )
+            self.assertEqual(result["outcome"], "eval_completed")
+            self.assertEqual(api.posts, [])
+            self.assertTrue(all("failed" not in m.lower() for m in notices))
+
     def test_second_timeout_without_episode_progress_stops_instead_of_resuming(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_file = Path(tmp) / "state.json"

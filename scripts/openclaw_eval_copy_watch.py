@@ -29,13 +29,17 @@ ALLOWED_EVAL_TARGETS = {
     "kakao": {"background", "h100"},
     "skt": {"l40s-gpu_background", "rlwrld-gpu_background"},
 }
+# PREEMPTED is deliberately absent: on a preemptible (background) partition
+# slurm requeues a preempted job under the same id, so it is a transient state
+# to wait through, not a terminal failure. Treating it as terminal made the
+# watcher post "eval failed" and abandon a job that slurm then brought back —
+# leaving it running unmonitored and restarting from scratch each requeue.
 EVAL_TERMINAL_FAILURE_PREFIXES = (
     "FAILED",
     "CANCELLED",
     "TIMEOUT",
     "OUT_OF_MEMORY",
     "NODE_FAIL",
-    "PREEMPTED",
     "BOOT_FAIL",
     "DEADLINE",
     "ERROR",
