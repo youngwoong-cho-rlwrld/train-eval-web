@@ -28,11 +28,11 @@ source "$REPO_ROOT/clusters/${CLUSTER}.env"
 REPO_ROOT="$SUBMIT_REPO_ROOT"
 source "$REPO_ROOT/lib/_common.sh"
 
-EXP_DIR="${SUBMIT_EXP_DIR:-$REPO_ROOT/experiments/$VARIANT}"
-[ -d "$EXP_DIR" ] || { echo "ERROR: experiment dir not found: $EXP_DIR"; exit 1; }
-CONFIG_FILE="${SUBMIT_CONFIG_FILE:-$EXP_DIR/config.sh}"
-[ -f "$CONFIG_FILE" ] || { echo "ERROR: config not found: $CONFIG_FILE"; exit 1; }
-source "$CONFIG_FILE"
+# Keep experiment/config/output-root resolution identical to the Isaac eval
+# harness. In particular, this initializes OUT_DIR before
+# resolve_eval_output_paths when unified retention exports
+# SUBMIT_OUTPUT_EXP_DIR.
+resolve_exp_and_config
 
 TRAIN_REPO_DIR="${SUBMIT_TRAIN_REPO_DIR:-${TRAIN_REPO_DIR:-}}"
 TRAIN_NUM_GPUS="${SUBMIT_TRAIN_NUM_GPUS:-${TRAIN_NUM_GPUS:-1}}"

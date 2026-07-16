@@ -170,6 +170,11 @@ class DexjocoRolloutContractTests(unittest.TestCase):
 
     def test_shell_harness_contains_client_capability_preflight_and_gam_cleanup(self):
         body = (ROOT / "lib" / "eval_body_dexjoco.sh").read_text()
+        self.assertLess(
+            body.index("\nresolve_exp_and_config\n"),
+            body.index("\nresolve_eval_output_paths\n"),
+            "DexJoCo eval must initialize EXP_DIR and OUT_DIR before output paths",
+        )
         for required in (
             "dexjoco-openpi-eval --help",
             'commit="${DEXJOCO_GIT_COMMIT:-}"',
