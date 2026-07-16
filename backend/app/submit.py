@@ -26,6 +26,7 @@ from . import paths
 from . import user_config
 from .clusters import load_cluster
 from .data_interface import rewrite_action_horizon
+from .dexjoco_rollout import rollout_for_variant
 from .eval_harness import harness_for
 from .job_identity import comment_field_fragment
 from .output_namespace import make_output_namespace, validate_output_namespace
@@ -653,7 +654,13 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     train_note = resolve_train_note(req.train_note, variant)
 
     if req.phase == "eval":
-        harness_for(variant).validate_submit(req, variant)
+        eval_harness = harness_for(variant)
+        eval_harness.validate_submit(req, variant)
+        eval_rollout = (
+            rollout_for_variant(variant) if eval_harness.name == "dexjoco" else None
+        )
+    else:
+        eval_rollout = None
 
     # ── Resolve partition + model + body script + walltime ──
     model = resolve_training_model(variant)
@@ -846,6 +853,7 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
             train_git_commit=train_git_commit,
             train_note=train_note,
             wandb_project=submitted_wandb_project,
+            eval_rollout=eval_rollout.metadata() if eval_rollout else None,
             git=submit_git,
         ))
 
@@ -1187,6 +1195,13 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         + (
             f"eval_tasks={' '.join(eval_tasks)}\n"
             if req.phase == "eval" and eval_tasks is not None
+            else ""
+        )
+        + (
+            f"dexjoco_inference_mode={eval_rollout.inference_mode}\n"
+            f"dexjoco_action_horizon={eval_rollout.action_horizon}\n"
+            f"dexjoco_replan_ratio={eval_rollout.replan_ratio}\n"
+            if req.phase == "eval" and eval_rollout is not None
             else ""
         )
         + (

@@ -43,6 +43,9 @@ resolve_eval_output_paths
 DEXJOCO_SERVER_TYPE="${DEXJOCO_SERVER_TYPE:-groot}"
 DEXJOCO_TASK="${SUBMIT_DEXJOCO_TASK:-${DEXJOCO_TASK:-}}"
 DEXJOCO_PAD_STATE_DIM46="${DEXJOCO_PAD_STATE_DIM46:-0}"
+DEXJOCO_INFERENCE_MODE="${DEXJOCO_INFERENCE_MODE:-sync}"
+DEXJOCO_ACTION_HORIZON="${DEXJOCO_ACTION_HORIZON:-auto}"
+DEXJOCO_REPLAN_RATIO="${DEXJOCO_REPLAN_RATIO:-0.8}"
 # Embodiment tag handed to the GR00T policy server. Multi-embodiment checkpoints
 # set DEXJOCO_EMBODIMENT_TAG (single-arm tasks) and DEXJOCO_EMBODIMENT_TAG_BIMANUAL
 # (bimanual_* tasks); legacy single-tag checkpoints keep the new_embodiment default.
@@ -101,11 +104,85 @@ require_positive_int "N_EPISODES" "$N_EPISODES"
 require_positive_int "N_RUNS" "$N_RUNS"
 require_positive_int "DEXJOCO_NO_PROGRESS_TIMEOUT_SECONDS" "$DEXJOCO_NO_PROGRESS_TIMEOUT_SECONDS"
 require_positive_int "DEXJOCO_WATCHDOG_POLL_SECONDS" "$DEXJOCO_WATCHDOG_POLL_SECONDS"
+case "$DEXJOCO_INFERENCE_MODE" in
+    async|sync|blocking_overlap) ;;
+    *) log "ERROR: DEXJOCO_INFERENCE_MODE must be async, sync, or blocking_overlap"; exit 1 ;;
+esac
+if [ "$DEXJOCO_ACTION_HORIZON" != "auto" ] \
+    && { ! [[ "$DEXJOCO_ACTION_HORIZON" =~ ^[1-9][0-9]*$ ]]; }; then
+    log "ERROR: DEXJOCO_ACTION_HORIZON must be a positive integer or auto"
+    exit 1
+fi
+if ! [[ "$DEXJOCO_REPLAN_RATIO" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] \
+    || ! awk -v value="$DEXJOCO_REPLAN_RATIO" 'BEGIN { exit !(value >= 0 && value <= 1) }'; then
+    log "ERROR: DEXJOCO_REPLAN_RATIO must be in [0, 1]"
+    exit 1
+fi
 if ! [[ "$DEXJOCO_WORKER_START_STAGGER_SECONDS" =~ ^[0-9]+$ ]]; then
     log "ERROR: DEXJOCO_WORKER_START_STAGGER_SECONDS must be a non-negative integer"
     exit 1
 fi
 require_eval_checkpoint_path
+
+# Optionally pin the external DexJoCo client itself. Its console entrypoint
+# imports from the nested <checkout>/dexjoco package root, so prepend that exact
+# directory to PYTHONPATH; merely changing cwd would still allow an editable
+# site-packages install to resolve the mutable main checkout.
+pin_dexjoco_client_repo() {
+    local commit="${DEXJOCO_GIT_COMMIT:-}"
+    local repo_src="$DEXJOCO_DIR"
+    local namespace safe_namespace worktree current expected
+    DEXJOCO_CLIENT_PYTHONPATH="$repo_src/dexjoco"
+    [ -n "$commit" ] || return 0
+
+    namespace="${SLURM_JOB_ID:-${OUTPUT_NAMESPACE:-job}}"
+    safe_namespace="$(printf '%s' "$namespace" | sed -E 's/[^A-Za-z0-9_.-]+/_/g' | sed -E 's/^_+|_+$//g')"
+    safe_namespace="${safe_namespace:-job}"
+    worktree="$REPO_ROOT/.worktrees/dexjoco_$safe_namespace"
+    mkdir -p "$REPO_ROOT/.worktrees"
+    git -c safe.directory="$repo_src" -C "$repo_src" worktree prune || true
+    if [ ! -e "$worktree/.git" ]; then
+        [ ! -e "$worktree" ] || { log "ERROR: refusing non-git DexJoCo worktree: $worktree"; exit 1; }
+        git -c safe.directory="$repo_src" -C "$repo_src" worktree add --detach "$worktree" "$commit"
+    fi
+    current="$(git -c safe.directory="$worktree" -C "$worktree" rev-parse HEAD)"
+    expected="$(git -c safe.directory="$repo_src" -C "$repo_src" rev-parse "$commit^{commit}")"
+    [ "$current" = "$expected" ] || {
+        log "ERROR: DexJoCo worktree commit mismatch: expected $expected got $current"
+        exit 1
+    }
+    DEXJOCO_DIR="$worktree"
+    DEXJOCO_CLIENT_PYTHONPATH="$worktree/dexjoco"
+    log "Pinned DexJoCo client repo: $DEXJOCO_DIR ($current)"
+}
+pin_dexjoco_client_repo
+
+# Fail before loading a multi-GB policy when the external evaluator is older
+# than this harness's rollout contract. The DexJoCo checkout/env is managed
+# outside train-eval-web, so a runtime capability check is more reliable than
+# assuming its mutable working tree contains the required client revision.
+DEXJOCO_CLIENT_HELP="$({
+    cd "$DEXJOCO_DIR" && NO_COLOR=1 PYTHONPATH="$DEXJOCO_CLIENT_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}" \
+        "$MICROMAMBA_BIN" run -n "$DEXJOCO_EVAL_ENV" \
+        dexjoco-openpi-eval --help
+} 2>&1)" || {
+    log "ERROR: could not run dexjoco-openpi-eval --help"
+    printf '%s\n' "$DEXJOCO_CLIENT_HELP" | tail -n 40 | tee -a "$LOG_FILE"
+    exit 1
+}
+for required in --inference-mode --action-horizon --replan-ratio; do
+    if ! grep -Fq -- "$required" <<< "$DEXJOCO_CLIENT_HELP"; then
+        log "ERROR: dexjoco-openpi-eval lacks required rollout capability: $required"
+        exit 1
+    fi
+done
+for required_mode in async sync blocking_overlap; do
+    if ! grep -Eq "(^|[^[:alnum:]_])${required_mode}([^[:alnum:]_]|$)" \
+        <<< "$DEXJOCO_CLIENT_HELP"; then
+        log "ERROR: dexjoco-openpi-eval lacks required inference mode: $required_mode"
+        exit 1
+    fi
+done
 
 GROOT_ADAPTER="$REPO_ROOT/lib/dexjoco/gr00t_dexjoco_server.py"
 GAM_ADAPTER="$REPO_ROOT/lib/dexjoco/gam_dexjoco_server.py"
@@ -138,6 +215,7 @@ log "$EXP_NAME - DexJoCo eval ($DEXJOCO_SERVER_TYPE)"
 log "  cluster=$CLUSTER  partition=${SUBMIT_PARTITION:-$PARTITION}  gpu=$GPU_INSTANCE"
 log "  task=$DEXJOCO_TASK  families(eval_sets)=${EVAL_SETS[*]}"
 log "  episodes=$N_EPISODES  runs=$N_RUNS  base_seed=$EVAL_BASE_SEED"
+log "  rollout mode=$DEXJOCO_INFERENCE_MODE  action_horizon=$DEXJOCO_ACTION_HORIZON  replan_ratio=$DEXJOCO_REPLAN_RATIO"
 if [ "$DEXJOCO_SERVER_TYPE" = "groot" ]; then
     log "  train repo=$TRAIN_REPO_DIR"
 fi
@@ -216,6 +294,7 @@ cleanup_server() {
     [ -n "${SERVER_PID:-}" ] && kill -9 "$SERVER_PID" 2>/dev/null || true
     if [ -n "${PORT:-}" ]; then
         pkill -9 -f "gr00t_dexjoco_server.py.*--port $PORT" 2>/dev/null || true
+        pkill -9 -f "gam_dexjoco_server.py.*--port $PORT" 2>/dev/null || true
         pkill -9 -f "serve_policy.py.*--port=$PORT" 2>/dev/null || true
     fi
     SERVER_PID=""
@@ -349,19 +428,22 @@ run_client_once() {
     local start_episode="${5:-0}"
     local client_pid client_rc now last_progress signature previous_signature
     local stalled=0
-    local -a pad_args=() replan_args=() resume_args=()
+    local -a pad_args=() resume_args=()
     [ "$DEXJOCO_PAD_STATE_DIM46" = "1" ] && pad_args=(--pad-state-dim46)
-    [ -n "${DEXJOCO_REPLAN_RATIO:-}" ] && replan_args=(--replan-ratio "$DEXJOCO_REPLAN_RATIO")
     [ "$start_episode" -gt 0 ] && resume_args=(--start-episode="$start_episode")
 
     ( cd "$DEXJOCO_DIR" \
         && exec env CUDA_VISIBLE_DEVICES="$cuda_device" \
            MUJOCO_GL="$DEXJOCO_MUJOCO_GL" MUJOCO_EGL_DEVICE_ID="$cuda_device" \
+           PYTHONPATH="$DEXJOCO_CLIENT_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}" \
            PYTHONUNBUFFERED=1 setsid "$MICROMAMBA_BIN" run -n "$DEXJOCO_EVAL_ENV" \
             dexjoco-openpi-eval \
             --config="./configs/$family/$DEXJOCO_TASK.yaml" \
             --seed="$run_seed" --port="$PORT" --episodes="$N_EPISODES" \
-            --output="$out_dir" "${pad_args[@]}" "${replan_args[@]}" "${resume_args[@]}" ) \
+            --output="$out_dir" --inference-mode="$DEXJOCO_INFERENCE_MODE" \
+            --replan-ratio="$DEXJOCO_REPLAN_RATIO" \
+            --action-horizon="$DEXJOCO_ACTION_HORIZON" \
+            "${pad_args[@]}" "${resume_args[@]}" ) \
         >> "$LOG_FILE" 2>&1 &
     client_pid=$!
     CLIENT_PID="$client_pid"

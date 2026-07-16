@@ -484,6 +484,8 @@ def _build_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job
 def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str, job_name: str,
                                  node: str, submit_git, model: TrainingModel,
                                  settings: MlxpSettings, train_note: str) -> dict:
+    from .dexjoco_rollout import rollout_for_variant
+    from .eval_harness import harness_for
     from .submit import normalize_eval_sets, normalize_eval_tasks
 
     eval_sets = normalize_eval_sets(req.eval_sets)
@@ -494,6 +496,11 @@ def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str
     meta_path = paths.meta_path(exp_dir, suffix)
     checkpoint_path = (req.checkpoint_path or "").strip()
     dexjoco_task = (req.dexjoco_task or "").strip() or None
+    rollout = (
+        rollout_for_variant(variant)
+        if harness_for(variant).name == "dexjoco"
+        else None
+    )
     config_text = render_eval_config_preview(
         base_config=variant.raw,
         variant=variant.name,
@@ -530,6 +537,7 @@ def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str
         train_git_commit=req.train_git_commit,
         train_note=train_note,
         wandb_project=_wandb_project(),
+        eval_rollout=rollout.metadata() if rollout else None,
         git=submit_git,
     )
     meta["output_namespace"] = req.output_namespace
@@ -546,6 +554,7 @@ def _build_eval_snapshot_payload(*, variant, req: MlxpSubmitRequest, job_id: str
         "overwrite_results": req.eval_overwrite_results,
         "unset_cuda_visible_devices_for_server": 1,
         "dexjoco_task": dexjoco_task,
+        "rollout": rollout.metadata() if rollout else None,
     }
     return {
         "job_id": job_id,
@@ -1323,6 +1332,11 @@ def _job_comment(req: MlxpSubmitRequest, variant, snapshot: dict, model: Trainin
             fields["dexjoco_task"] = str(snapshot["dexjoco_task"])
         if req.checkpoint_path:
             fields["checkpoint_path"] = req.checkpoint_path.strip()
+        rollout = snapshot.get("eval", {}).get("rollout", {})
+        if rollout:
+            fields["dexjoco_inference_mode"] = str(rollout.get("inference_mode") or "")
+            fields["dexjoco_action_horizon"] = str(rollout.get("action_horizon") or "")
+            fields["dexjoco_replan_ratio"] = str(rollout.get("replan_ratio") or "")
         eval_dir = paths.eval_dir(exp_dir, output_namespace)
         fields["eval_dir"] = eval_dir
         fields["results_path"] = paths.results_path(eval_dir)

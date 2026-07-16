@@ -1097,6 +1097,7 @@ def snapshot_metadata(
     train_git_commit: str | None = None,
     train_note: str | None = None,
     wandb_project: str | None = None,
+    eval_rollout: dict[str, str] | None = None,
     git: SubmitGitInfo | None = None,
 ) -> dict[str, Any]:
     return {
@@ -1124,6 +1125,7 @@ def snapshot_metadata(
         },
         "dataset_override": dataset_override,
         "extra_args": extra_args or [],
+        "eval_rollout": eval_rollout,
         "git": {
             "repo_path": git.repo_path if git else None,
             "repo_label": git.repo_label if git else None,

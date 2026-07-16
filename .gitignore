@@ -18,6 +18,12 @@ frontend/.env
 configs/experiments/*
 !configs/experiments/_sample/
 !configs/experiments/_sample/**
+# DexJoCo rollout configs are a cross-repository runtime contract. Keep their
+# shell defaults—and GAM's model-facing YAML—reviewable and immutable in Git.
+!configs/experiments/dexjoco_*/
+configs/experiments/dexjoco_*/*
+!configs/experiments/dexjoco_*/config.sh
+!configs/experiments/dexjoco_gam_*/gam_config.yaml
 configs/experiments/*/.versions/
 configs/experiments/*/.versions/**
 

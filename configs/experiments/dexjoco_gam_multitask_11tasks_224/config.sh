@@ -1,0 +1,77 @@
+# Experiment: dexjoco_gam_multitask_11tasks_224
+# DexJoCo all-task multitask GAM fine-tune at 224x224.
+
+# ----- model -----
+MODEL_ID=dexjoco-gam
+MODEL_VERSION=gam
+# GAM training config (second file, owned by the GAM-port workstream). Lists
+# datasets/weights/dims and the action chunk size; consumed via GAM_CONFIG_YAML.
+# Single-arm samples are zero-padded into the dual-arm layout (see the GAM
+# fork's DEXJOCO_INTEGRATION.md for the exact mapping).
+TRAIN_MODALITY_CONFIG=gam_config.yaml
+TRAIN_ACTION_HORIZON=16
+TRAIN_NOTE="DexJoCo 11-task multitask - GAM 224x224, mixed embodiment (dual_arm 46/44 + single_arm 23/22 zero-padded)"
+
+# ----- datasets -----
+export DATA_DIR="$HOME/workspace/dexjoco_n16/src_v30/dexjoco_lerobot_datasets"
+
+# Informational for GAM: the authoritative dataset list/weights/dims live in
+# gam_config.yaml. GAM's train wrapper does not read these bash arrays.
+TRAIN_DATASET_NAMES=(
+    bimanual_assembly
+    bimanual_hanoi
+    bimanual_microwave_cook
+    bimanual_photograph
+    bimanual_unlock_ipad
+    click_mouse
+    fold_glasses
+    hammer_nail
+    pick_bucket
+    pinch_tongs
+    water_plant
+)
+
+# ----- tasks -----
+TASKS=(
+    "bimanual_assembly|bimanual_assembly|Grasp the tray with the left hand and the peg with the right hand, then insert the peg into the hole."
+    "bimanual_hanoi|bimanual_hanoi|Execute the final two moves of the three-level Tower of Hanoi: move the medium disk from the middle peg to the right peg with the right hand, then move the small disk from the left peg to the right peg with the left hand."
+    "bimanual_microwave_cook|bimanual_microwave_cook|Open the microwave door, place the food inside the microwave, close the door, and press the start button."
+    "bimanual_photograph|bimanual_photograph|Grasp the camera with the left hand, align it with the logo, and press the shutter button with the right hand."
+    "bimanual_unlock_ipad|bimanual_unlock_ipad|Grasp the iPad and enter the password 123 to unlock the device."
+    "click_mouse|click_mouse|Move the mouse to the purple mouse pad and click the left mouse button."
+    "fold_glasses|fold_glasses|Fold the glasses and place them into the case."
+    "hammer_nail|hammer_nail|Use the hammer to drive the nail into the wooden board."
+    "pick_bucket|pick_bucket|Place the boxed food into the bucket and then lift the bucket."
+    "pinch_tongs|pinch_tongs|Grasp the tongs and perform three consecutive open-close motions."
+    "water_plant|water_plant|Grasp the watering can and apply water to the plant."
+)
+
+# DexJoCo eval still runs one task per submission. This default keeps the
+# variant submittable; use the submit-time task override for per-task evals.
+DEXJOCO_TASK=water_plant
+TASK_NAME=water_plant
+INSTRUCTION="Grasp the watering can and apply water to the plant."
+
+# ----- training -----
+MAX_STEPS=30000
+SAVE_STEPS=10000
+TRAIN_NUM_GPUS=8
+TRAIN_GLOBAL_BATCH_SIZE=512
+
+# ----- eval (DexJoCo MuJoCo harness) -----
+EVAL_HARNESS=dexjoco
+DEXJOCO_SERVER_TYPE=gam
+DEXJOCO_IMAGE_SIZE=224
+# Multi-embodiment checkpoint: single-arm tasks are served with the
+# dexjoco_single_arm tag, bimanual_* tasks with dexjoco_dual_arm. The GAM server
+# pads single-arm obs 23->46 and slices actions 44->22 for the single-arm tag.
+DEXJOCO_EMBODIMENT_TAG=dexjoco_single_arm
+DEXJOCO_EMBODIMENT_TAG_BIMANUAL=dexjoco_dual_arm
+EVAL_NUM_GPUS=4
+N_EPISODES=50
+N_RUNS=3
+EVAL_BASE_SEED=0
+EVAL_SETS=(rand_obj)
+DEXJOCO_INFERENCE_MODE=blocking_overlap
+DEXJOCO_ACTION_HORIZON=16
+DEXJOCO_REPLAN_RATIO=0.5

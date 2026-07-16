@@ -22,6 +22,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
+from .dexjoco_rollout import rollout_for_variant
+
 if TYPE_CHECKING:
     from .submit import SubmitRequest
     from .variants import Variant
@@ -108,6 +110,7 @@ class DexjocoHarness(EvalHarness):
 
     def eval_flags(self, variant: "Variant") -> list[tuple[str, str]]:
         v = variant
+        rollout = rollout_for_variant(v)
         return [
             ("--task", v.vars.get("DEXJOCO_TASK", "")),
             ("--server", v.vars.get("DEXJOCO_SERVER_TYPE", "groot")),
@@ -115,10 +118,14 @@ class DexjocoHarness(EvalHarness):
             ("--episodes", v.vars.get("N_EPISODES", "")),
             ("--n-runs", v.vars.get("N_RUNS", "")),
             ("--seed", v.vars.get("EVAL_BASE_SEED", "")),
+            ("--inference-mode", rollout.inference_mode),
+            ("--action-horizon", rollout.action_horizon),
+            ("--replan-ratio", rollout.replan_ratio),
             ("--checkpoint", "<eval-checkpoint>"),
         ]
 
     def validate_submit(self, req: "SubmitRequest", variant: "Variant") -> None:
+        rollout_for_variant(variant)
         # The task can come from the submit request (UI picker) or fall back to
         # the variant's own DEXJOCO_TASK (set in config.sh). The fallback is what
         # lets retries / programmatic resubmits work without re-specifying it —
