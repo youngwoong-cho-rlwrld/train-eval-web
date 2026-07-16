@@ -4,15 +4,17 @@ Date: 2026-07-16 (Asia/Seoul)
 
 ## Executive summary
 
-The current rollout implementation does not have the same sync semantics as the
-`simon` reference implementation, and the DexJoCo-related source and runtime
-environments are not synchronized across Kakao, SKT, and MLXP.
+The initial audit found that the deployed rollout did not have the same sync
+semantics as the `simon` reference implementation and that DexJoCo source and
+runtime environments had drifted across Kakao, SKT, and MLXP. The baseline
+sections below preserve that evidence. The remediation is now implemented and
+deployed as described in **Remediation and deployment result**.
 
-The current `--inference-mode=sync --action-horizon=16
---replan-ratio=0.5` behavior is a blocking overlap rollout: it waits for the
-new chunk, but requests it before the old chunk drains and blends the overlap.
-The reference sync implementation executes the full chunk, waits only after the
-buffer drains, and has zero overlap.
+The old `--inference-mode=sync --action-horizon=16 --replan-ratio=0.5`
+behavior was a blocking overlap rollout: it waited for the new chunk, but
+requested it before the old chunk drained and blended the overlap. The new
+contract names that behavior `blocking_overlap`; true `sync` now executes the
+full chunk, waits only after the buffer drains, and has zero overlap.
 
 The cancelled SKT GAM eval jobs 156609 and 156610 should not be used as valid
 GAM results. In addition to the rollout-semantics mismatch, they pinned a clean
@@ -41,6 +43,9 @@ commits rather than in the previously dirty cluster checkouts:
 - train-eval-web implements `sync`, `async`, and `blocking_overlap`, validates
   their arguments, records their effective values in submission metadata, and
   can pin the external DexJoCo checkout by commit.
+- All 29 DexJoCo experiment configs pin the canonical DexJoCo client. The three
+  GAM configs pin the corrected GAM source, and the saved Kakao, SKT, and MLXP
+  settings select the isolated canonical client and OpenPI environments.
 
 The final rollout contract is:
 
@@ -52,6 +57,68 @@ The final rollout contract is:
 - `blocking_overlap`: use the same `<=` threshold, block for the replacement,
   and blend the overlapping suffix. With horizon 16 and ratio 0.5, replanning
   occurs after exactly eight actions.
+
+## Remediation and deployment result
+
+### Source and configuration
+
+- Canonical DexJoCo commit `6a6d1b2c28459aab6067b25bcd38003dfa491017`
+  is present in all three clusters and checked out in clean, stable worktrees:
+  - Kakao: `/rlwrld2/home/youngwoong_cho/workspace/dexjoco-canonical-6a6d1b2c`
+  - SKT: `/fsx/rlwrld/youngwoong_cho/workspace/dexjoco-canonical-6a6d1b2c`
+  - MLXP: `/data/youngwoong/workspace/dexjoco-canonical-6a6d1b2c`
+- Corrected GAM commit `69afa536658198a22750b5618322edf68fdea93a`
+  is available to all clusters. Evaluation and training create a detached
+  worktree at the configured commit, so mutable main-checkout changes cannot
+  leak into a job.
+- The SKT cluster template now exposes the same five DexJoCo environment fields
+  as Kakao: repo, micromamba binary/root, client environment, and OpenPI server
+  environment.
+- GAM and PhysiXel use `blocking_overlap`, horizon 16, ratio 0.5. pi0.5 uses
+  horizon 30 and ratio 0.8; N1.6 uses horizon 16 and ratio 0.8. True `sync`
+  remains the default for a config that does not explicitly request overlap.
+
+### Runtime environment parity
+
+The path-independent package manifests are tracked under
+[`docs/manifests`](manifests/README.md). Every row below was reproduced with the
+same package count and SHA-256 on Kakao, SKT, and MLXP.
+
+| Runtime | Environment/source | Packages | Manifest SHA-256 |
+| --- | --- | ---: | --- |
+| MuJoCo client | `dexjoco-canonical-6a6d1b2c` | 47 | `78b2329bae8d52538407ef86438b03b6dcad6af90cb33016852190b29d945913` |
+| OpenPI policy server | `openpi-canonical-6a6d1b2c` | 175 | `ed6ed24cf77b6510b4c396cbabaf176105cedc0a32b377430645f06fc7ce6f74` |
+| GAM policy runtime | GAM `.venv` with source `69afa536` | 149 | `bfcdc86fea8eb7e66a542ea78de35bab2a93d102768a441041f6509e9e5f97d3` |
+
+The OpenPI environment does not install the incompatible `openpi-client`
+distribution, which pins NumPy 1.26.4 while OpenPI requires NumPy greater than
+2. It exposes the canonical client source through an absolute `.pth` and pins
+the two required client runtime dependencies (`tree==0.2.4` and
+`websockets==16.1`). `serve_policy.py --help`, representative single-arm and
+bimanual policy configs, JAX import, module provenance, and source cleanliness
+were verified independently on every cluster.
+
+LeRobot 0.4.4 is intentionally installed with `--no-deps`, matching the source
+repo's `install.bash`. Raw `pip check` therefore reports the same eleven
+LeRobot-only metadata issues on every cluster; there are no other broken
+requirements, and the imports used by the dataset and policy server pass.
+
+The saved train-eval-web settings now select the canonical repo plus
+`dexjoco-canonical-6a6d1b2c` and `openpi-canonical-6a6d1b2c` environments on all
+three clusters. The settings were updated and read back through the web API.
+
+### Job remediation state at 2026-07-16 13:45 KST
+
+- Invalid/stale GAM evaluations, including 156609 and 156610, are cancelled.
+- Corrected GAM retraining uses eight H200 GPUs, global batch size 512, 30k
+  steps, and source `69afa536`. Single-arm job `...-93a00434` and bimanual job
+  `...-d5f717f1` are producing healthy loss; multitask job `...-3ca6aff1` is
+  pending only for eight-GPU capacity.
+- Canonical PhysiXel evaluations 157772, 157774, and 157775 request SKT L40S,
+  four GPUs, three runs, and the exact 11/6/5 task subsets. Their submission
+  metadata records `blocking_overlap`, horizon 16, and ratio 0.5. They have not
+  reached batch startup because SKT dynamic L40S nodes are repeatedly failing
+  scheduler health checks; no rollout-code error or job stdout exists yet.
 
 ## Reference commits
 
@@ -123,7 +190,7 @@ true full-chunk `sync`. All 29 DexJoCo configs and the three GAM YAMLs are now
 tracked by Git, and GAM/PhysiXel use horizon 16 and ratio 0.5 while pi0.5 and
 N1.6 retain ratio 0.8 with horizons 30 and 16 respectively.
 
-## DexJoCo source parity
+## Audit baseline: DexJoCo source parity before remediation
 
 All three DexJoCo checkouts currently report the same base revision:
 
@@ -158,7 +225,7 @@ Other relevant differences:
   `simon` commits live in `RLWRLD/dexjoco` and are not part of the installed
   canonical history.
 
-## train-eval-web staging parity
+## Audit baseline: train-eval-web staging parity before remediation
 
 | Component | Local | Kakao staging | SKT staging | MLXP |
 | --- | --- | --- | --- | --- |
@@ -176,7 +243,7 @@ The three GAM `gam_config.yaml` files are byte-identical between local, Kakao,
 and SKT. The drift is in the shell configuration and harness rather than those
 training YAMLs.
 
-## DexJoCo evaluation environment parity
+## Audit baseline: DexJoCo evaluation environment parity before remediation
 
 The key client runtime versions match:
 
@@ -202,7 +269,7 @@ saved `DEXJOCO_OPENPI_ENV` setting nor the environment, and MLXP's defaults name
 an `openpi` environment that is absent. pi0.5 evaluation is therefore not
 portable across the three clusters in the present state.
 
-## GAM source and environment parity
+## Audit baseline: GAM source and environment parity before remediation
 
 ### Checkpoint provenance
 
