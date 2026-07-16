@@ -55,6 +55,11 @@ class DexjocoRolloutContractTests(unittest.TestCase):
         }
         for name, wanted in expected.items():
             variant = asyncio.run(load_variant(name))
+            self.assertEqual(
+                variant.vars["TRAIN_GIT_COMMIT"],
+                "69afa536658198a22750b5618322edf68fdea93a",
+                name,
+            )
             actual = {entry.split("|", 1)[0] for entry in variant.arrays["TASKS"]}
             self.assertEqual(actual, wanted, name)
             self.assertEqual(variant.vars["EVAL_NUM_GPUS"], "4", name)

@@ -4,6 +4,7 @@
 # ----- model -----
 MODEL_ID=dexjoco-gam
 MODEL_VERSION=gam
+TRAIN_GIT_COMMIT=69afa536658198a22750b5618322edf68fdea93a
 # GAM training config (second file, owned by the GAM-port workstream). Lists
 # datasets/weights/dims and the action chunk size; consumed via GAM_CONFIG_YAML.
 TRAIN_MODALITY_CONFIG=gam_config.yaml
