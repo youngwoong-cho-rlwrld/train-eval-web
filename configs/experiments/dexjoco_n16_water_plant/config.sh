@@ -4,6 +4,7 @@
 # ───── model ─────
 MODEL_ID=dexjoco-n16
 MODEL_VERSION=n1.6
+DEXJOCO_GIT_COMMIT=6a6d1b2c28459aab6067b25bcd38003dfa491017
 TRAIN_MODALITY_CONFIG=dexjoco_config.py            # n1.6 modality config (path relative to this dir)
 TRAIN_ACTION_HORIZON=16
 ACTION_HORIZON_MODE=modality

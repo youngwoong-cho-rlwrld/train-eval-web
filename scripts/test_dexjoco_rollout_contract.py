@@ -19,6 +19,7 @@ from app.variants import load_variant  # noqa: E402
 
 
 EXPERIMENTS = ROOT / "configs" / "experiments"
+DEXJOCO_CLIENT_COMMIT = "6a6d1b2c28459aab6067b25bcd38003dfa491017"
 
 
 def dexjoco_config_paths() -> list[Path]:
@@ -72,6 +73,9 @@ class DexjocoRolloutContractTests(unittest.TestCase):
 
         for path in configs:
             variant = asyncio.run(load_variant(path.parent.name))
+            self.assertEqual(
+                variant.vars["DEXJOCO_GIT_COMMIT"], DEXJOCO_CLIENT_COMMIT, path
+            )
             rollout = rollout_for_variant(variant)
             self.assertEqual(rollout.inference_mode, "blocking_overlap", path)
 
@@ -169,7 +173,8 @@ class DexjocoRolloutContractTests(unittest.TestCase):
         for required in (
             "dexjoco-openpi-eval --help",
             'commit="${DEXJOCO_GIT_COMMIT:-}"',
-            'DEXJOCO_CLIENT_PYTHONPATH="$worktree/dexjoco"',
+            'DEXJOCO_CLIENT_PYTHONPATH="$repo_src/dexjoco:$repo_src/openpi/packages/openpi-client/src"',
+            'DEXJOCO_CLIENT_PYTHONPATH="$worktree/dexjoco:$worktree/openpi/packages/openpi-client/src"',
             '--inference-mode="$DEXJOCO_INFERENCE_MODE"',
             '--action-horizon="$DEXJOCO_ACTION_HORIZON"',
             '--replan-ratio="$DEXJOCO_REPLAN_RATIO"',

@@ -124,15 +124,15 @@ if ! [[ "$DEXJOCO_WORKER_START_STAGGER_SECONDS" =~ ^[0-9]+$ ]]; then
 fi
 require_eval_checkpoint_path
 
-# Optionally pin the external DexJoCo client itself. Its console entrypoint
-# imports from the nested <checkout>/dexjoco package root, so prepend that exact
-# directory to PYTHONPATH; merely changing cwd would still allow an editable
-# site-packages install to resolve the mutable main checkout.
+# Optionally pin the external DexJoCo client itself. Its console entrypoint and
+# websocket policy live in two nested package roots, so prepend both from the
+# same checkout. Merely changing cwd would still allow editable site-packages
+# installs to resolve either package from the mutable main checkout.
 pin_dexjoco_client_repo() {
     local commit="${DEXJOCO_GIT_COMMIT:-}"
     local repo_src="$DEXJOCO_DIR"
     local namespace safe_namespace worktree current expected
-    DEXJOCO_CLIENT_PYTHONPATH="$repo_src/dexjoco"
+    DEXJOCO_CLIENT_PYTHONPATH="$repo_src/dexjoco:$repo_src/openpi/packages/openpi-client/src"
     [ -n "$commit" ] || return 0
 
     namespace="${SLURM_JOB_ID:-${OUTPUT_NAMESPACE:-job}}"
@@ -152,7 +152,7 @@ pin_dexjoco_client_repo() {
         exit 1
     }
     DEXJOCO_DIR="$worktree"
-    DEXJOCO_CLIENT_PYTHONPATH="$worktree/dexjoco"
+    DEXJOCO_CLIENT_PYTHONPATH="$worktree/dexjoco:$worktree/openpi/packages/openpi-client/src"
     log "Pinned DexJoCo client repo: $DEXJOCO_DIR ($current)"
 }
 pin_dexjoco_client_repo

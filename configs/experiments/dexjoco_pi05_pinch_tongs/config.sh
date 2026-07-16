@@ -4,6 +4,7 @@
 # ───── model ─────
 MODEL_ID=dexjoco-pi05
 MODEL_VERSION=n1.6
+DEXJOCO_GIT_COMMIT=6a6d1b2c28459aab6067b25bcd38003dfa491017
 TRAIN_NOTE="DexJoCo pinch_tongs - pi0.5 baseline"
 
 # ───── task (eval-time policy prompt) ─────
