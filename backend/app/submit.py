@@ -30,7 +30,7 @@ from .dexjoco_rollout import rollout_for_variant
 from .eval_harness import harness_for
 from .job_identity import comment_field_fragment
 from .output_namespace import make_output_namespace, validate_output_namespace
-from .partitions import is_background_partition
+from .partitions import is_background_partition, partition_max_time, walltime_seconds
 from .paths import CLUSTER_STAGING_REL, CONFIGS_DIR, LIB_DIR
 from .resource_presets import slurm_resources_for
 from .ssh import rsync_to, ssh_run
@@ -669,6 +669,19 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     training_repo = slurm_training_repo_path(cluster.vars, model)
 
     partition = req.partition or cluster.vars["PARTITION"]
+
+    # Adhere to the scheduler's own limit: clamp the requested walltime to the
+    # partition's MaxTime so a submission never asks for more than slurm
+    # allows (e.g. 48h TRAIN_WALLTIME on a 3h debug partition). Lookup is
+    # best-effort; on failure the configured walltime passes through and
+    # slurm remains the final authority.
+    partition_cap = await partition_max_time(cluster.ssh_alias, partition)
+    if partition_cap:
+        requested_secs = walltime_seconds(walltime)
+        cap_secs = walltime_seconds(partition_cap)
+        if requested_secs is not None and cap_secs is not None and requested_secs > cap_secs:
+            walltime = partition_cap
+
     sbatch_flags: list[str] = []
     if is_background_partition(partition):
         sbatch_flags.append("--requeue")
@@ -717,18 +730,24 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
     host = cluster.ssh_alias
     submitted_wandb_project = wandb_project()
     exp_dir_remote = f"$HOME/{CLUSTER_STAGING_REL}/experiments/{req.variant}"
+    # Output-retention policy: when the cluster env pins a unified outputs root
+    # (e.g. SKT /fsx/rlwrld-unified-checkpoints/<user>/experiments), write
+    # checkpoints/eval/logs there while config/inputs still come from the
+    # staging exp dir. Clusters without it (kakao) keep the legacy home path.
+    unified_exp_root = (cluster.vars.get("UNIFIED_EXPERIMENTS_DIR") or "").strip()
+    exp_out_dir = f"{unified_exp_root}/{req.variant}" if unified_exp_root else exp_dir_remote
     checkpoint_dir = (
-        paths.checkpoint_dir(exp_dir_remote, output_namespace)
+        paths.checkpoint_dir(exp_out_dir, output_namespace)
         if req.phase == "train" and output_namespace
         else None
     )
     eval_dir = (
-        paths.eval_dir(exp_dir_remote, output_namespace)
+        paths.eval_dir(exp_out_dir, output_namespace)
         if req.phase == "eval" and output_namespace
-        else (f"{exp_dir_remote}/eval_results" if req.phase == "eval" else None)
+        else (f"{exp_out_dir}/eval_results" if req.phase == "eval" else None)
     )
     results_path = paths.results_path(eval_dir) if eval_dir else None
-    job_log_dir = paths.job_log_dir(exp_dir_remote, output_namespace) if output_namespace else ""
+    job_log_dir = paths.job_log_dir(exp_out_dir, output_namespace) if output_namespace else ""
     snapshot_paths = config_snapshot_paths(req.variant, job_name)
 
     snapshot_rel = snapshot_paths.rel
@@ -997,6 +1016,10 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         f"SUBMIT_WANDB_PROJECT={shlex.quote(submitted_wandb_project)}"
         + f",SUBMIT_CONFIG_FILE=$HOME/{shlex.quote(snapshot_rel)}"
         + (
+            f",SUBMIT_OUTPUT_EXP_DIR={shlex.quote(exp_out_dir)}"
+            if unified_exp_root else ""
+        )
+        + (
             f",SUBMIT_OUTPUT_NAMESPACE={shlex.quote(output_namespace)}"
             if output_namespace else ""
         )
@@ -1057,10 +1080,6 @@ async def submit(req: SubmitRequest) -> SubmitResponse:
         + (
             f",EVAL_CHECKPOINT={shlex.quote(eval_checkpoint)}"
             if req.phase == "eval" and eval_checkpoint else ""
-        )
-        + (
-            f",SUBMIT_DEXJOCO_TASK={shlex.quote(req.dexjoco_task)}"
-            if req.phase == "eval" and req.dexjoco_task else ""
         ),
         *sbatch_flags,
         *([] if req.phase == "train" else [shlex.quote(a) for a in req.extra_args]),

@@ -23,6 +23,55 @@ def is_background_partition(name: str) -> bool:
     return name == "background" or name.endswith("_background")
 
 
+def walltime_seconds(value: str) -> int | None:
+    """Parse a slurm duration (D-HH:MM:SS, HH:MM:SS, MM:SS, MM) to seconds.
+
+    Returns None for unlimited/unparseable values ("infinite", "UNLIMITED",
+    "n/a", empty) so callers can treat them as "no limit".
+    """
+    v = (value or "").strip().lower()
+    if not v or v in ("infinite", "unlimited", "n/a", "none"):
+        return None
+    days = 0
+    if "-" in v:
+        day_part, _, v = v.partition("-")
+        try:
+            days = int(day_part)
+        except ValueError:
+            return None
+    try:
+        nums = [int(p) for p in v.split(":")]
+    except ValueError:
+        return None
+    if len(nums) == 3:
+        hours, minutes, seconds = nums
+    elif len(nums) == 2:
+        hours, minutes, seconds = 0, nums[0], nums[1]
+    elif len(nums) == 1:
+        hours, minutes, seconds = 0, nums[0], 0
+    else:
+        return None
+    return ((days * 24 + hours) * 60 + minutes) * 60 + seconds
+
+
+async def partition_max_time(ssh_alias: str, partition: str) -> str | None:
+    """Return the partition's slurm time limit (%l) or None when unlimited/unknown.
+
+    Best-effort: any ssh/sinfo failure yields None so submission proceeds with
+    the configured walltime (slurm itself remains the final authority).
+    """
+    result = await ssh_run(
+        ssh_alias, f"sinfo -h -p {shlex.quote(partition)} -o '%l'", timeout=15.0
+    )
+    if result.returncode != 0:
+        return None
+    for line in (result.stdout or "").splitlines():
+        line = line.strip()
+        if line:
+            return line if walltime_seconds(line) is not None else None
+    return None
+
+
 _GPU_PER_NODE_RE = re.compile(r"gpu(?::[A-Za-z0-9_-]+)?:(\d+)")
 _GPU_TYPE_RE = re.compile(r"gpu:([A-Za-z0-9_-]+):\d+")
 _GPU_TRES_RE = re.compile(r"(?:^|,)gres/gpu=(\d+)(?:,|$)")
