@@ -36,7 +36,10 @@ def _defaults_for(user: str | None = None) -> dict[str, Any]:
         "ddn_mount": ddn_mount,
         "ddn_user_home": ddn_home,
         "datasets_dir": f"{ddn_home}/datasets",
-        "experiments_dir": f"{ddn_home}/experiments",
+        # Training outputs go to the org unified checkpoints root (per-user
+        # folder), not the legacy per-user home. The per-user override
+        # TRAIN_EVAL_MLXP_EXPERIMENTS_DIR still wins when set.
+        "experiments_dir": f"{ddn_mount}/rlwrld-unified-checkpoints/{u}/experiments",
         "hf_home": f"{ddn_home}/.cache/huggingface",
         "workspace_dir": f"{ddn_home}/workspace",
         "isaac_dir": f"{ddn_home}/workspace/rlwrld_isaac",

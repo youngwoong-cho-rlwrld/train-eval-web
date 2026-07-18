@@ -460,7 +460,19 @@ async def start_copy(
         if dest_cluster == "mlxp":
             dest_path_root = f"{get_settings().experiments_dir}/{variant}/checkpoints"
         else:
-            dest_path_root = f"$HOME/.train-eval-web/experiments/{variant}/checkpoints"
+            # Honor the destination cluster's unified outputs root (same env
+            # submit.py uses to redirect writes). Fall back to the legacy home
+            # path only when the cluster does not set it (e.g. kakao today).
+            unified_root = ""
+            try:
+                dest_env = await load_cluster(dest_cluster)
+                unified_root = (dest_env.vars.get("UNIFIED_EXPERIMENTS_DIR") or "").strip()
+            except (FileNotFoundError, RuntimeError):
+                unified_root = ""
+            if unified_root:
+                dest_path_root = f"{unified_root}/{variant}/checkpoints"
+            else:
+                dest_path_root = f"$HOME/.train-eval-web/experiments/{variant}/checkpoints"
     dest_path_root = await expand_cluster_home(dest_cluster, dest_path_root) or dest_path_root
 
     copy_id = uuid.uuid4().hex[:12]

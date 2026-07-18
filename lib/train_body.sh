@@ -44,7 +44,15 @@ if [ "$MODEL_FAMILY" = "n1.5" ]; then
         TRAIN_BATCH_SIZE=$((SUBMIT_TRAIN_GLOBAL_BATCH_SIZE / TRAIN_NUM_GPUS))
     fi
 else
-    TRAIN_REPO_DIR="${SUBMIT_TRAIN_REPO_DIR:-${TRAIN_REPO_DIR:-$GROOT_N16_DIR}}"
+    # n1.6 and n1.7 share this prologue; only the training repo default and the
+    # final launcher differ. Webapp submissions always set SUBMIT_TRAIN_REPO_DIR
+    # (resolved from the model's SLURM_REPO_VAR), so the fallback below only
+    # matters for ad-hoc runs.
+    if [ "$MODEL_FAMILY" = "n1.7" ]; then
+        TRAIN_REPO_DIR="${SUBMIT_TRAIN_REPO_DIR:-${TRAIN_REPO_DIR:-${GROOT_N17_DIR:-}}}"
+    else
+        TRAIN_REPO_DIR="${SUBMIT_TRAIN_REPO_DIR:-${TRAIN_REPO_DIR:-$GROOT_N16_DIR}}"
+    fi
     TRAIN_NUM_GPUS="${SUBMIT_TRAIN_NUM_GPUS:-$TRAIN_NUM_GPUS}"
     MAX_STEPS="${SUBMIT_TRAIN_MAX_STEPS:-$MAX_STEPS}"
     SAVE_STEPS="${SUBMIT_TRAIN_SAVE_STEPS:-$SAVE_STEPS}"
@@ -58,9 +66,12 @@ EXP_NAME="${SLURM_JOB_NAME:-${VARIANT}_${GPU_INSTANCE}_$(date +%Y%m%d%H%M%S)}"
 OUTPUT_NAMESPACE="${SUBMIT_OUTPUT_NAMESPACE:-$EXP_NAME}"
 
 if [ "$MODEL_FAMILY" = "n1.5" ]; then
-    CKPT_DIR="$EXP_DIR/checkpoints/$OUTPUT_NAMESPACE"
-    mkdir -p "$EXP_DIR/logs" "$LOG_DIR" "$CKPT_DIR"
-    LOG_FILE="$EXP_DIR/logs/train.log"
+    CKPT_DIR="$OUT_DIR/checkpoints/$OUTPUT_NAMESPACE"
+    # Org policy: the training output path is exported as MODEL_OUTPUT_DIR and
+    # consumed by the python --output-dir argument below.
+    export MODEL_OUTPUT_DIR="$CKPT_DIR"
+    mkdir -p "$OUT_DIR/logs" "$LOG_DIR" "$CKPT_DIR"
+    LOG_FILE="$OUT_DIR/logs/train.log"
     SUBMIT_GIT_COMMIT="${SUBMIT_GIT_COMMIT:-${TRAIN_GIT_COMMIT:-}}"
     pin_training_repo_dir "$TRAIN_REPO_DIR" "$SUBMIT_GIT_COMMIT" "${SLURM_JOB_ID:-$OUTPUT_NAMESPACE}"
 
@@ -157,7 +168,7 @@ if [ "$MODEL_FAMILY" = "n1.5" ]; then
         --num-gpus "$TRAIN_NUM_GPUS" \
         --batch-size "$TRAIN_BATCH_SIZE" \
         --learning_rate 1e-4 \
-        --output-dir "$CKPT_DIR" \
+        --output-dir "$MODEL_OUTPUT_DIR" \
         --data-config "$DATA_CONFIG_YAML" \
         --max-steps "$MAX_STEPS" \
         --save-steps "$SAVE_STEPS" \
@@ -174,10 +185,15 @@ if [ "$MODEL_FAMILY" = "n1.5" ]; then
     log "Training completed."
     cleanup_trainer_state "$CKPT_DIR" "$MAX_STEPS"
 else
-    CKPT_DIR="$EXP_DIR/checkpoints"
+    CKPT_DIR="$OUT_DIR/checkpoints"
     RUN_CKPT_DIR="$CKPT_DIR/$OUTPUT_NAMESPACE"
-    mkdir -p "$EXP_DIR/logs" "$LOG_DIR" "$CKPT_DIR"
-    LOG_FILE="$EXP_DIR/logs/train.log"
+    # Org policy: the training output path is exported as MODEL_OUTPUT_DIR and
+    # consumed by the python --output-dir argument below. For n1.6/n1.7 the
+    # launcher takes the parent "checkpoints" dir plus --experiment-name, so
+    # MODEL_OUTPUT_DIR is that parent (the per-run dir is $RUN_CKPT_DIR).
+    export MODEL_OUTPUT_DIR="$CKPT_DIR"
+    mkdir -p "$OUT_DIR/logs" "$LOG_DIR" "$CKPT_DIR"
+    LOG_FILE="$OUT_DIR/logs/train.log"
     SUBMIT_GIT_COMMIT="${SUBMIT_GIT_COMMIT:-${TRAIN_GIT_COMMIT:-}}"
     pin_training_repo_dir "$TRAIN_REPO_DIR" "$SUBMIT_GIT_COMMIT" "${SLURM_JOB_ID:-$OUTPUT_NAMESPACE}"
 
@@ -214,10 +230,20 @@ else
     fi
 
     # ── Per-variant modality config (Python file, copied into experiment dir) ──
-    : "${TRAIN_MODALITY_CONFIG:?TRAIN_MODALITY_CONFIG not set in config.sh}"
-    MODALITY_CONFIG_FILE="$EXP_DIR/$TRAIN_MODALITY_CONFIG"
-    [ -f "$MODALITY_CONFIG_FILE" ] || { echo "ERROR: modality config not found: $MODALITY_CONFIG_FILE"; exit 1; }
-    log "Modality config: $MODALITY_CONFIG_FILE"
+    # n1.7 multi-dataset (launch_finetune_multi.py) references its modality
+    # configs through the data YAML's per-row `data_config` names, so it does
+    # not need a standalone modality .py. Every other path (n1.6, and n1.7
+    # single via launch_finetune.py) requires one.
+    N17_DATA_YAML="${TRAIN_DATA_YAML:-}"
+    if [ "$MODEL_FAMILY" = "n1.7" ] && [ -n "$N17_DATA_YAML" ]; then
+        MODALITY_CONFIG_FILE=""
+        log "Multi-dataset n1.7: modality configs resolved via data YAML rows"
+    else
+        : "${TRAIN_MODALITY_CONFIG:?TRAIN_MODALITY_CONFIG not set in config.sh}"
+        MODALITY_CONFIG_FILE="$EXP_DIR/$TRAIN_MODALITY_CONFIG"
+        [ -f "$MODALITY_CONFIG_FILE" ] || { echo "ERROR: modality config not found: $MODALITY_CONFIG_FILE"; exit 1; }
+        log "Modality config: $MODALITY_CONFIG_FILE"
+    fi
 
     # ── Per-device → global batch size (default: keep TRAIN_BATCH_SIZE per-device) ──
     GLOBAL_BATCH_SIZE="${SUBMIT_TRAIN_GLOBAL_BATCH_SIZE:-$((TRAIN_NUM_GPUS * TRAIN_BATCH_SIZE))}"
@@ -263,26 +289,78 @@ else
     fi
     log "Torchrun master port: $MASTER_PORT"
 
-    uv run torchrun --nproc_per_node="$TRAIN_NUM_GPUS" --master-port "$MASTER_PORT" gr00t/experiment/launch_finetune.py \
-        --base-model-path nvidia/GR00T-N1.6-3B \
-        --dataset-path "${DATASET_PATHS[@]}" \
-        --embodiment-tag NEW_EMBODIMENT \
-        ${EMB_TAG_ARGS[@]+"${EMB_TAG_ARGS[@]}"} \
-        --modality-config-path "$MODALITY_CONFIG_FILE" \
-        --num-gpus "$TRAIN_NUM_GPUS" \
-        --output-dir "$CKPT_DIR" \
-        --global-batch-size "$GLOBAL_BATCH_SIZE" \
-        --learning-rate 1e-4 \
-        --max-steps "$MAX_STEPS" \
-        --save-steps "$SAVE_STEPS" \
-        --save-total-limit 5 \
-        --dataloader-num-workers "$TRAIN_NUM_WORKERS" \
-        --experiment-name "$OUTPUT_NAMESPACE" \
-        --use-wandb \
-        --wandb-project "$WANDB_PROJECT" \
-        --color-jitter-params brightness 0.2 contrast 0.2 saturation 0.2 hue 0.1 \
-        "${ACTION_HORIZON_ARGS[@]}" \
-        "${TRAIN_EXTRA_ARGS[@]}"
+    if [ "$MODEL_FAMILY" = "n1.7" ]; then
+        # GR00T N1.7. The base model is passed explicitly for both launchers
+        # (launch_finetune.py requires it; launch_finetune_multi.py would
+        # otherwise default to the 2B checkpoint). --output-dir is the parent
+        # "checkpoints" dir; --experiment-name makes the trainer write into
+        # $CKPT_DIR/$OUTPUT_NAMESPACE, matching the n1.6 layout.
+        if [ -n "$N17_DATA_YAML" ]; then
+            # Multi-dataset via launch_finetune_multi.py (--data-yaml). Only this
+            # launcher accepts --action-horizon.
+            N17_AH_ARGS=()
+            [ -n "$TRAIN_ACTION_HORIZON" ] && N17_AH_ARGS=(--action-horizon "$TRAIN_ACTION_HORIZON")
+            uv run torchrun --nproc_per_node="$TRAIN_NUM_GPUS" --master-port "$MASTER_PORT" gr00t/experiment/launch_finetune_multi.py \
+                --base-model-path nvidia/GR00T-N1.7-3B \
+                --data-yaml "$EXP_DIR/$N17_DATA_YAML" \
+                --num-gpus "$TRAIN_NUM_GPUS" \
+                --output-dir "$MODEL_OUTPUT_DIR" \
+                --global-batch-size "$GLOBAL_BATCH_SIZE" \
+                --learning-rate 1e-4 \
+                --max-steps "$MAX_STEPS" \
+                --save-steps "$SAVE_STEPS" \
+                --save-total-limit 5 \
+                --dataloader-num-workers "$TRAIN_NUM_WORKERS" \
+                --experiment-name "$OUTPUT_NAMESPACE" \
+                --use-wandb \
+                --wandb-project "$WANDB_PROJECT" \
+                --color-jitter-params brightness 0.2 contrast 0.2 saturation 0.2 hue 0.1 \
+                ${N17_AH_ARGS[@]+"${N17_AH_ARGS[@]}"} \
+                "${TRAIN_EXTRA_ARGS[@]}"
+        else
+            # Single-dataset via launch_finetune.py (--dataset-path singular +
+            # --modality-config-path; no --action-horizon on this launcher).
+            uv run torchrun --nproc_per_node="$TRAIN_NUM_GPUS" --master-port "$MASTER_PORT" gr00t/experiment/launch_finetune.py \
+                --base-model-path nvidia/GR00T-N1.7-3B \
+                --dataset-path "${DATASET_PATHS[0]}" \
+                --embodiment-tag NEW_EMBODIMENT \
+                --modality-config-path "$MODALITY_CONFIG_FILE" \
+                --num-gpus "$TRAIN_NUM_GPUS" \
+                --output-dir "$MODEL_OUTPUT_DIR" \
+                --global-batch-size "$GLOBAL_BATCH_SIZE" \
+                --learning-rate 1e-4 \
+                --max-steps "$MAX_STEPS" \
+                --save-steps "$SAVE_STEPS" \
+                --save-total-limit 5 \
+                --dataloader-num-workers "$TRAIN_NUM_WORKERS" \
+                --experiment-name "$OUTPUT_NAMESPACE" \
+                --use-wandb \
+                --wandb-project "$WANDB_PROJECT" \
+                --color-jitter-params brightness 0.2 contrast 0.2 saturation 0.2 hue 0.1 \
+                "${TRAIN_EXTRA_ARGS[@]}"
+        fi
+    else
+        uv run torchrun --nproc_per_node="$TRAIN_NUM_GPUS" --master-port "$MASTER_PORT" gr00t/experiment/launch_finetune.py \
+            --base-model-path nvidia/GR00T-N1.6-3B \
+            --dataset-path "${DATASET_PATHS[@]}" \
+            --embodiment-tag NEW_EMBODIMENT \
+            ${EMB_TAG_ARGS[@]+"${EMB_TAG_ARGS[@]}"} \
+            --modality-config-path "$MODALITY_CONFIG_FILE" \
+            --num-gpus "$TRAIN_NUM_GPUS" \
+            --output-dir "$MODEL_OUTPUT_DIR" \
+            --global-batch-size "$GLOBAL_BATCH_SIZE" \
+            --learning-rate 1e-4 \
+            --max-steps "$MAX_STEPS" \
+            --save-steps "$SAVE_STEPS" \
+            --save-total-limit 5 \
+            --dataloader-num-workers "$TRAIN_NUM_WORKERS" \
+            --experiment-name "$OUTPUT_NAMESPACE" \
+            --use-wandb \
+            --wandb-project "$WANDB_PROJECT" \
+            --color-jitter-params brightness 0.2 contrast 0.2 saturation 0.2 hue 0.1 \
+            "${ACTION_HORIZON_ARGS[@]}" \
+            "${TRAIN_EXTRA_ARGS[@]}"
+    fi
 
     log "Training completed."
     cleanup_trainer_state "$RUN_CKPT_DIR" "$MAX_STEPS"

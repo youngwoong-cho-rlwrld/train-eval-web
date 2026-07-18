@@ -47,11 +47,14 @@ GPU_INSTANCE="$(detect_gpu_instance)"
 EXP_NAME="${SLURM_JOB_NAME:-${VARIANT}_${GPU_INSTANCE}_$(date +%Y%m%d%H%M%S)}"
 OUTPUT_NAMESPACE="${SUBMIT_OUTPUT_NAMESPACE:-$EXP_NAME}"
 
-# Checkpoint layout matches the shared convention: $EXP_DIR/checkpoints/$OUTPUT_NAMESPACE.
-CKPT_DIR="$EXP_DIR/checkpoints"
+# Checkpoint layout matches the shared convention: $OUT_DIR/checkpoints/$OUTPUT_NAMESPACE.
+CKPT_DIR="$OUT_DIR/checkpoints"
 RUN_CKPT_DIR="$CKPT_DIR/$OUTPUT_NAMESPACE"
-mkdir -p "$EXP_DIR/logs" "$LOG_DIR" "$RUN_CKPT_DIR"
-LOG_FILE="$EXP_DIR/logs/train.log"
+# Org policy: the training output path is exported as MODEL_OUTPUT_DIR and
+# consumed by the launch argument below (GAM_RESULTS_DIR).
+export MODEL_OUTPUT_DIR="$RUN_CKPT_DIR"
+mkdir -p "$OUT_DIR/logs" "$LOG_DIR" "$RUN_CKPT_DIR"
+LOG_FILE="$OUT_DIR/logs/train.log"
 
 # Capture the main checkout before pin_training_repo_dir swaps TRAIN_REPO_DIR
 # for a per-job git worktree. GAM's untracked assets (the DA3 backbone ckpt and
@@ -113,7 +116,7 @@ log "  DA3_ROOT=$DA3_ROOT  GAM_INIT_CKPT=$GAM_INIT_CKPT"
 # id==job_name (project pinned to dexjoco) so the backend resolves the run link.
 GAM_CONFIG_YAML="$GAM_CONFIG_YAML" \
 GAM_DATA_ROOT="$DATA_DIR" \
-GAM_RESULTS_DIR="$RUN_CKPT_DIR" \
+GAM_RESULTS_DIR="$MODEL_OUTPUT_DIR" \
 GAM_NUM_GPUS="$TRAIN_NUM_GPUS" \
 GAM_GLOBAL_BATCH_SIZE="$GLOBAL_BATCH_SIZE" \
 GAM_MAX_STEPS="$MAX_STEPS" \

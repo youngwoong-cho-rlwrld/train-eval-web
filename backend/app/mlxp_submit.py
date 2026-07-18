@@ -350,10 +350,17 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
             train_settings=train_settings,
         )
     await _write_snapshot_to_ddn(snapshot)
+    model_output_dir: str | None = None
     if req.phase == "eval":
         body_script = _render_eval_body_script(variant, req, job_name, snapshot, model, repo_path, settings)
     else:
         body_script = _render_body_script(variant, req, job_name, snapshot, model, repo_path, settings, train_settings)
+        # Org policy: expose the per-job checkpoint output dir as MODEL_OUTPUT_DIR
+        # so the rendered training command consumes the env rather than a spliced
+        # literal. Same path the body scripts compute from settings.experiments_dir.
+        model_output_dir = paths.checkpoint_dir(
+            f"{settings.experiments_dir}/{variant.name}", req.output_namespace
+        )
     spec = _render_job_yaml(
         job_id,
         job_name,
@@ -367,6 +374,7 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
         _job_comment(req, variant, snapshot, model, train_settings),
         train_note,
         settings,
+        model_output_dir=model_output_dir,
     )
     yaml_text = yaml.safe_dump(spec, sort_keys=False)
 
@@ -799,6 +807,14 @@ def _render_body_script(
             train_extra=train_extra, user_extra=user_extra, ckpt_dir=ckpt_dir,
             snapshot=snapshot, model=model, repo_path=repo_path, settings=settings,
         )
+    if family == "n1.7":
+        return _render_body_n17(
+            variant=variant, req=req, job_name=job_name, names=names,
+            max_steps=max_steps, save_steps=save_steps, num_workers=num_workers,
+            global_batch=global_batch,
+            train_extra=train_extra, user_extra=user_extra, ckpt_dir=ckpt_dir,
+            snapshot=snapshot, model=model, repo_path=repo_path, settings=settings,
+        )
     if family == "gam":
         return _render_body_gam(
             variant=variant, req=req, job_name=job_name,
@@ -871,7 +887,7 @@ torchrun --nproc_per_node={req.num_gpus} scripts/gr00t_finetune.py \\
     --num-gpus {req.num_gpus} \\
     --batch-size {batch_size} \\
     --learning_rate 1e-4 \\
-    --output-dir {ckpt_dir} \\
+    --output-dir "$MODEL_OUTPUT_DIR" \\
     --data-config /tmp/data_config.yaml \\
     --max-steps {max_steps} \\
     --save-steps {save_steps} \\
@@ -957,7 +973,6 @@ def _render_body_n16(*, variant, req: MlxpSubmitRequest, job_name: str,
     wandb_project = shlex.quote(_wandb_project())
     uv_bin_dir = shlex.quote(f"{settings.ddn_user_home}/.local/bin")
     output_namespace = ckpt_dir.rstrip("/").rsplit("/", 1)[-1]
-    output_parent = ckpt_dir.rsplit("/", 1)[0]
     action_horizon_mode = str(snapshot.get("action_horizon_mode") or model.action_horizon_mode)
     action_horizon_arg = (
         f" --action-horizon {req.action_horizon}"
@@ -1007,7 +1022,7 @@ uv run $UV_RUN_ARGS torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/la
     --embodiment-tag NEW_EMBODIMENT \\
     {embodiment_tags_line}--modality-config-path /tmp/modality_config.py \\
     --num-gpus {req.num_gpus} \\
-    --output-dir {output_parent} \\
+    --output-dir "$(dirname "$MODEL_OUTPUT_DIR")" \\
     --global-batch-size {global_batch} \\
     --learning-rate 1e-4 \\
     --max-steps {max_steps} \\
@@ -1019,6 +1034,134 @@ uv run $UV_RUN_ARGS torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/la
     --wandb-project {wandb_project} \\
     --color-jitter-params brightness 0.2 contrast 0.2 saturation 0.2 hue 0.1 \\
     $RESUME_FLAG{action_horizon_arg} {train_extra} {user_extra}
+
+{_strip_resume_state_block(ckpt_dir, max_steps)}
+"""
+
+
+def _render_body_n17(*, variant, req: MlxpSubmitRequest, job_name: str,
+                     names: list[str], max_steps: str, save_steps: str,
+                     num_workers: str,
+                     global_batch: int, train_extra: str, user_extra: str,
+                     ckpt_dir: str, snapshot: dict, model: TrainingModel, repo_path: str,
+                     settings: MlxpSettings) -> str:
+    """Body script for GR00T N1.7.
+
+    Two launchers share this renderer:
+      - single-dataset (default): gr00t/experiment/launch_finetune.py with a
+        singular --dataset-path + an inlined --modality-config-path (.py), no
+        --action-horizon (that flag does not exist on the single launcher);
+      - multi-dataset (variant sets TRAIN_DATA_YAML): launch_finetune_multi.py
+        with --data-yaml (inlined, ${DATA_DIR} expanded) plus an optional
+        --action-horizon. Its data-YAML rows reference modality `.py` files that
+        must live under the repo's configs/ dir.
+
+    The base model is always passed explicitly (nvidia/GR00T-N1.7-3B): the single
+    launcher requires it and the multi launcher would otherwise default to 2B.
+    """
+    run_log_dir = f"{ckpt_dir}/logs"
+    wandb_project = shlex.quote(_wandb_project())
+    uv_bin_dir = shlex.quote(f"{settings.ddn_user_home}/.local/bin")
+    output_namespace = ckpt_dir.rstrip("/").rsplit("/", 1)[-1]
+
+    data_yaml_rel = (variant.vars.get("TRAIN_DATA_YAML") or "").strip()
+    if data_yaml_rel:
+        # Multi-dataset: inline the variant's data YAML (expand ${DATA_DIR}).
+        if not is_safe_relpath(data_yaml_rel, {".yaml", ".yml"}):
+            raise ValueError(
+                f"variant {variant.name}: TRAIN_DATA_YAML must be a .yaml/.yml file, got {data_yaml_rel!r}"
+            )
+        data_yaml_path = EXPERIMENTS_DIR / variant.name / data_yaml_rel
+        if not data_yaml_path.is_file():
+            raise FileNotFoundError(f"data yaml not found: {data_yaml_path}")
+        data_yaml_text = ensure_trailing_newline(
+            data_yaml_path.read_text()
+            .replace("${DATA_DIR}", settings.datasets_dir)
+            .replace("$DATA_DIR", settings.datasets_dir)
+        )
+        action_horizon = (variant.vars.get("TRAIN_ACTION_HORIZON") or "").strip()
+        action_horizon_arg = f" --action-horizon {action_horizon}" if action_horizon else ""
+        stage_block = f"""cat > /tmp/data_config.yaml <<'YAML_EOF'
+{data_yaml_text}YAML_EOF"""
+        launch_block = f"""uv run $UV_RUN_ARGS torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/launch_finetune_multi.py \\
+    --base-model-path nvidia/GR00T-N1.7-3B \\
+    --data-yaml /tmp/data_config.yaml \\
+    --num-gpus {req.num_gpus} \\
+    --output-dir "$(dirname "$MODEL_OUTPUT_DIR")" \\
+    --global-batch-size {global_batch} \\
+    --learning-rate 1e-4 \\
+    --max-steps {max_steps} \\
+    --save-steps {save_steps} \\
+    --save-total-limit 5 \\
+    --dataloader-num-workers {num_workers} \\
+    --experiment-name "{output_namespace}" \\
+    --use-wandb \\
+    --wandb-project {wandb_project} \\
+    --color-jitter-params brightness 0.2 contrast 0.2 saturation 0.2 hue 0.1 \\
+    $RESUME_FLAG{action_horizon_arg} {train_extra} {user_extra}"""
+    else:
+        # Single-dataset: inline the modality .py and pass one --dataset-path.
+        _, modality_path = resolve_modality_config(variant)
+        modality_text = snapshot.get("modality_text")
+        if not isinstance(modality_text, str):
+            modality_text = modality_path.read_text()
+        modality_text = ensure_trailing_newline(modality_text)
+        dataset_path_arg = f"{settings.datasets_dir}/{names[0]}"
+        stage_block = f"""cat > /tmp/modality_config.py <<'PY_EOF'
+{modality_text}PY_EOF"""
+        launch_block = f"""uv run $UV_RUN_ARGS torchrun --nproc_per_node={req.num_gpus} gr00t/experiment/launch_finetune.py \\
+    --base-model-path nvidia/GR00T-N1.7-3B \\
+    --dataset-path {dataset_path_arg} \\
+    --embodiment-tag NEW_EMBODIMENT \\
+    --modality-config-path /tmp/modality_config.py \\
+    --num-gpus {req.num_gpus} \\
+    --output-dir "$(dirname "$MODEL_OUTPUT_DIR")" \\
+    --global-batch-size {global_batch} \\
+    --learning-rate 1e-4 \\
+    --max-steps {max_steps} \\
+    --save-steps {save_steps} \\
+    --save-total-limit 5 \\
+    --dataloader-num-workers {num_workers} \\
+    --experiment-name "{output_namespace}" \\
+    --use-wandb \\
+    --wandb-project {wandb_project} \\
+    --color-jitter-params brightness 0.2 contrast 0.2 saturation 0.2 hue 0.1 \\
+    $RESUME_FLAG {train_extra} {user_extra}"""
+
+    return f"""\
+set -euo pipefail
+export PATH="{uv_bin_dir}:$HOME/.local/bin:$PATH"
+export WANDB_PROJECT={wandb_project}
+export WANDB_RUN_ID="{job_name}"
+export WANDB_RESUME=allow
+export NO_ALBUMENTATIONS_UPDATE=1
+export TOKENIZERS_PARALLELISM=false
+export OMNI_KIT_ACCEPT_EULA=Y
+{_hf_cache_exports(settings)}
+
+{_uv_bootstrap_block(settings)}
+
+{_repo_runtime_preamble(repo_path, snapshot)}
+UV_RUN_ARGS=""
+if [ -e .venv ]; then
+    UV_RUN_ARGS="--no-sync"
+fi
+
+{_snapshot_preamble(snapshot)}
+mkdir -p {ckpt_dir}
+RUN_LOG_DIR={shlex.quote(run_log_dir)}
+mkdir -p "$RUN_LOG_DIR"
+exec > >(tee -a "$RUN_LOG_DIR/training.log") 2>&1
+
+{stage_block}
+
+RESUME_FLAG=""
+if compgen -G "{ckpt_dir}/checkpoint-*" > /dev/null; then
+    echo "[mlxp] existing checkpoint detected — will resume"
+    RESUME_FLAG="--resume"
+fi
+
+{launch_block}
 
 {_strip_resume_state_block(ckpt_dir, max_steps)}
 """
@@ -1098,7 +1241,7 @@ export GAM_INIT_CKPT={shlex.quote(f"{repo_path}/checkpoints/pretrained-gam.pt")}
 # id==job_name (project pinned to dexjoco) so the backend resolves the run link.
 GAM_CONFIG_YAML=/tmp/gam_config.yaml \\
 GAM_DATA_ROOT={shlex.quote(datasets_dir)} \\
-GAM_RESULTS_DIR={shlex.quote(ckpt_dir)} \\
+GAM_RESULTS_DIR="$MODEL_OUTPUT_DIR" \\
 GAM_NUM_GPUS={req.num_gpus} \\
 GAM_GLOBAL_BATCH_SIZE={global_batch} \\
 GAM_MAX_STEPS={max_steps} \\
@@ -1237,9 +1380,6 @@ cat > {shlex.quote(modality_target)} <<'TEW_MODALITY_EOF'
         eval_exports.append(f"export SUBMIT_EVAL_TASKS={shlex.quote(' '.join(snapshot['eval_tasks']))}")
     if req.eval_overwrite_results:
         eval_exports.append("export SUBMIT_EVAL_OVERWRITE_RESULTS=1")
-    dexjoco_task = (snapshot.get("dexjoco_task") or "").strip() if is_dexjoco else ""
-    if dexjoco_task:
-        eval_exports.append(f"export SUBMIT_DEXJOCO_TASK={shlex.quote(dexjoco_task)}")
 
     # Harness-specific staging + post-stage env, spliced into the heredoc below.
     if is_dexjoco:
@@ -1355,7 +1495,7 @@ def _job_comment(req: MlxpSubmitRequest, variant, snapshot: dict, model: Trainin
 
 def _render_job_yaml(job_id: str, job_name: str, body: str, num_gpus: int, cpu: str, mem: str,
                      wandb_secret: str, node: str, job_class: str, comment: str, train_note: str,
-                     settings: MlxpSettings) -> dict:
+                     settings: MlxpSettings, model_output_dir: str | None = None) -> dict:
     # Per the MLXP guideline: dedicated requires the job-class label AND a
     # hostname-In affinity; queue classes (normal/background) must not pin a
     # node and instead constrain to the team zone via nodeSelector.
@@ -1421,16 +1561,22 @@ def _render_job_yaml(job_id: str, job_name: str, body: str, num_gpus: int, cpu: 
                         "imagePullPolicy": "Always",
                         "command": ["/bin/bash", "-c"],
                         "args": [body],
-                        "env": [{
-                            "name": "WANDB_API_KEY",
-                            "valueFrom": {
-                                "secretKeyRef": {
-                                    "name": wandb_secret,
-                                    "key": "api-key",
-                                    "optional": True,
+                        "env": [
+                            {
+                                "name": "WANDB_API_KEY",
+                                "valueFrom": {
+                                    "secretKeyRef": {
+                                        "name": wandb_secret,
+                                        "key": "api-key",
+                                        "optional": True,
+                                    },
                                 },
                             },
-                        }],
+                            *(
+                                [{"name": "MODEL_OUTPUT_DIR", "value": model_output_dir}]
+                                if model_output_dir else []
+                            ),
+                        ],
                         "volumeMounts": [
                             {"name": "ddn",  "mountPath": settings.ddn_mount},
                             {"name": "dshm", "mountPath": "/dev/shm"},
