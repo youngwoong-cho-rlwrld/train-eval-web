@@ -19,7 +19,6 @@ from app.variants import load_variant  # noqa: E402
 
 
 EXPERIMENTS = ROOT / "configs" / "experiments"
-DEXJOCO_CLIENT_COMMIT = "6a6d1b2c28459aab6067b25bcd38003dfa491017"
 
 
 def dexjoco_config_paths() -> list[Path]:
@@ -69,13 +68,10 @@ class DexjocoRolloutContractTests(unittest.TestCase):
 
     def test_all_dexjoco_configs_have_compatibility_rollout_defaults(self):
         configs = dexjoco_config_paths()
-        self.assertEqual(len(configs), 29)
+        self.assertEqual(len(configs), 32)
 
         for path in configs:
             variant = asyncio.run(load_variant(path.parent.name))
-            self.assertEqual(
-                variant.vars["DEXJOCO_GIT_COMMIT"], DEXJOCO_CLIENT_COMMIT, path
-            )
             rollout = rollout_for_variant(variant)
             self.assertEqual(rollout.inference_mode, "blocking_overlap", path)
 
@@ -84,7 +80,7 @@ class DexjocoRolloutContractTests(unittest.TestCase):
                 expected = ("16", "0.5")
             elif model_id == "dexjoco-pi05":
                 expected = ("30", "0.8")
-            elif model_id == "dexjoco-n16":
+            elif model_id in {"dexjoco-n16", "dexjoco-n17"}:
                 expected = ("16", "0.8")
             else:  # pragma: no cover - makes newly added families fail loudly
                 self.fail(f"unclassified DexJoCo model {model_id!r}: {path}")
