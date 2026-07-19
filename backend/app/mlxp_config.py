@@ -16,18 +16,21 @@ _SETTINGS_DIR = Path.home() / ".train-eval-web"
 _SETTINGS_FILE = _SETTINGS_DIR / "mlxp.json"
 
 
+_DEFAULT_DDN_MOUNT = "/data"
+
+
 def _default_user() -> str:
     return os.environ.get("TRAIN_EVAL_MLXP_USER") or os.environ.get("USER") or "youngwoong"
 
 
-def _defaults_for(user: str | None = None) -> dict[str, Any]:
-    u = user or _default_user()
-    ddn_mount = "/data"
-    ddn_home = f"{ddn_mount}/{u}"
+def _defaults_for(user: str, ddn_mount: str, ddn_home: str) -> dict[str, Any]:
+    """Derived defaults for every field, given the three roots the rest hang
+    off: the job ``user``, the DDN mount, and the per-user DDN home
+    (``{ddn_mount}/{user}`` unless overridden)."""
     return {
-        "user": u,
+        "user": user,
         "namespace": "p-rlwrld",
-        "owner_label": u,
+        "owner_label": user,
         "tool_label": "train-eval-web",
         "default_node": "",
         "gpu_node_prefix": "h200-",
@@ -37,9 +40,9 @@ def _defaults_for(user: str | None = None) -> dict[str, Any]:
         "ddn_user_home": ddn_home,
         "datasets_dir": f"{ddn_home}/datasets",
         # Training outputs go to the org unified checkpoints root (per-user
-        # folder), not the legacy per-user home. The per-user override
-        # TRAIN_EVAL_MLXP_EXPERIMENTS_DIR still wins when set.
-        "experiments_dir": f"{ddn_mount}/rlwrld-unified-checkpoints/{u}/experiments",
+        # folder), not the legacy per-user home. UNIFIED_EXPERIMENTS_DIR (or the
+        # legacy TRAIN_EVAL_MLXP_EXPERIMENTS_DIR) still wins when set.
+        "experiments_dir": f"{ddn_mount}/rlwrld-unified-checkpoints/{user}/experiments",
         "hf_home": f"{ddn_home}/.cache/huggingface",
         "workspace_dir": f"{ddn_home}/workspace",
         "isaac_dir": f"{ddn_home}/workspace/rlwrld_isaac",
@@ -52,12 +55,12 @@ def _defaults_for(user: str | None = None) -> dict[str, Any]:
         "mamba_root_prefix": f"{ddn_home}/micromamba",
         "dexjoco_eval_env": "dexjoco",
         "dexjoco_openpi_env": "openpi",
-        "data_pod_name": f"{u}-data-pod",
+        "data_pod_name": f"{user}-data-pod",
         "ddn_pvc": "ddn-rlwrld-shared",
         "image": "mlxp.kr.ncr.ntruss.com/rlwrld-gpu-base:latest",
         "image_pull_secret": "mlxp-registry",
         "zone": "private-h200-rlwrld-0",
-        "wandb_secret": f"{u}-wandb",
+        "wandb_secret": f"{user}-wandb",
     }
 
 
@@ -96,34 +99,45 @@ class MlxpSettingsUpdate(BaseModel):
     user: str = Field(min_length=1)
 
 
-_ENV_FIELDS = {
-    "TRAIN_EVAL_MLXP_USER": "user",
-    "TRAIN_EVAL_MLXP_NAMESPACE": "namespace",
-    "TRAIN_EVAL_MLXP_OWNER": "owner_label",
-    "TRAIN_EVAL_MLXP_TOOL_LABEL": "tool_label",
-    "TRAIN_EVAL_MLXP_NODE": "default_node",
-    "TRAIN_EVAL_MLXP_GPU_NODE_PREFIX": "gpu_node_prefix",
-    "TRAIN_EVAL_MLXP_GPU_TYPE": "gpu_type",
-    "TRAIN_EVAL_MLXP_GPUS_PER_NODE": "gpus_per_node",
-    "TRAIN_EVAL_MLXP_DDN_MOUNT": "ddn_mount",
-    "TRAIN_EVAL_MLXP_HOME": "ddn_user_home",
-    "TRAIN_EVAL_MLXP_DATASETS_DIR": "datasets_dir",
-    "TRAIN_EVAL_MLXP_EXPERIMENTS_DIR": "experiments_dir",
-    "TRAIN_EVAL_MLXP_HF_HOME": "hf_home",
-    "TRAIN_EVAL_MLXP_WORKSPACE_DIR": "workspace_dir",
-    "TRAIN_EVAL_MLXP_ISAAC_DIR": "isaac_dir",
-    "TRAIN_EVAL_MLXP_DEXJOCO_DIR": "dexjoco_dir",
-    "TRAIN_EVAL_MLXP_MICROMAMBA_BIN": "micromamba_bin",
-    "TRAIN_EVAL_MLXP_MAMBA_ROOT_PREFIX": "mamba_root_prefix",
-    "TRAIN_EVAL_MLXP_DEXJOCO_EVAL_ENV": "dexjoco_eval_env",
-    "TRAIN_EVAL_MLXP_DEXJOCO_OPENPI_ENV": "dexjoco_openpi_env",
-    "TRAIN_EVAL_MLXP_DATA_POD": "data_pod_name",
-    "TRAIN_EVAL_MLXP_DDN_PVC": "ddn_pvc",
-    "TRAIN_EVAL_MLXP_IMAGE": "image",
-    "TRAIN_EVAL_MLXP_IMAGE_PULL_SECRET": "image_pull_secret",
-    "TRAIN_EVAL_MLXP_ZONE": "zone",
-    "TRAIN_EVAL_MLXP_WANDB_SECRET": "wandb_secret",
+# Each settings field resolves from an env var. The primary name follows the
+# slurm cluster-config convention (plain DATA_DIR, ISAAC_DIR, DEXJOCO_DIR, … for
+# concepts shared with kakao/skt; an MLXP_ prefix for MLXP-only concepts). The
+# legacy TRAIN_EVAL_MLXP_* name is still accepted so effective envs saved before
+# this rename keep resolving identically. Priority: primary, then legacy.
+_FIELD_ENV_NAMES: dict[str, tuple[str, str]] = {
+    "user": ("USER", "TRAIN_EVAL_MLXP_USER"),
+    "namespace": ("MLXP_NAMESPACE", "TRAIN_EVAL_MLXP_NAMESPACE"),
+    "owner_label": ("MLXP_OWNER", "TRAIN_EVAL_MLXP_OWNER"),
+    "tool_label": ("MLXP_TOOL_LABEL", "TRAIN_EVAL_MLXP_TOOL_LABEL"),
+    "default_node": ("MLXP_NODE", "TRAIN_EVAL_MLXP_NODE"),
+    "gpu_node_prefix": ("MLXP_GPU_NODE_PREFIX", "TRAIN_EVAL_MLXP_GPU_NODE_PREFIX"),
+    "gpu_type": ("MLXP_GPU_TYPE", "TRAIN_EVAL_MLXP_GPU_TYPE"),
+    "gpus_per_node": ("MLXP_GPUS_PER_NODE", "TRAIN_EVAL_MLXP_GPUS_PER_NODE"),
+    "ddn_mount": ("MLXP_DDN_MOUNT", "TRAIN_EVAL_MLXP_DDN_MOUNT"),
+    "ddn_user_home": ("MLXP_HOME", "TRAIN_EVAL_MLXP_HOME"),
+    "datasets_dir": ("DATA_DIR", "TRAIN_EVAL_MLXP_DATASETS_DIR"),
+    "experiments_dir": ("UNIFIED_EXPERIMENTS_DIR", "TRAIN_EVAL_MLXP_EXPERIMENTS_DIR"),
+    "hf_home": ("HF_HOME", "TRAIN_EVAL_MLXP_HF_HOME"),
+    "workspace_dir": ("WORKSPACE_DIR", "TRAIN_EVAL_MLXP_WORKSPACE_DIR"),
+    "isaac_dir": ("ISAAC_DIR", "TRAIN_EVAL_MLXP_ISAAC_DIR"),
+    "dexjoco_dir": ("DEXJOCO_DIR", "TRAIN_EVAL_MLXP_DEXJOCO_DIR"),
+    "micromamba_bin": ("MICROMAMBA_BIN", "TRAIN_EVAL_MLXP_MICROMAMBA_BIN"),
+    "mamba_root_prefix": ("MAMBA_ROOT_PREFIX", "TRAIN_EVAL_MLXP_MAMBA_ROOT_PREFIX"),
+    "dexjoco_eval_env": ("DEXJOCO_EVAL_ENV", "TRAIN_EVAL_MLXP_DEXJOCO_EVAL_ENV"),
+    "dexjoco_openpi_env": ("DEXJOCO_OPENPI_ENV", "TRAIN_EVAL_MLXP_DEXJOCO_OPENPI_ENV"),
+    "data_pod_name": ("MLXP_DATA_POD", "TRAIN_EVAL_MLXP_DATA_POD"),
+    "ddn_pvc": ("MLXP_DDN_PVC", "TRAIN_EVAL_MLXP_DDN_PVC"),
+    "image": ("MLXP_IMAGE", "TRAIN_EVAL_MLXP_IMAGE"),
+    "image_pull_secret": ("MLXP_IMAGE_PULL_SECRET", "TRAIN_EVAL_MLXP_IMAGE_PULL_SECRET"),
+    "zone": ("MLXP_ZONE", "TRAIN_EVAL_MLXP_ZONE"),
+    "wandb_secret": ("MLXP_WANDB_SECRET", "TRAIN_EVAL_MLXP_WANDB_SECRET"),
 }
+
+# Prefixes considered namespaced-and-safe to read from the process environment.
+# Bare slurm-style names (USER, HF_HOME, DATA_DIR, …) are only honored in the
+# cluster env FILE, never from os.environ, so a stray shell export can't shadow
+# the saved config.
+_PREFIXED = ("MLXP_", "TRAIN_EVAL_MLXP_")
 
 
 def _load_saved() -> dict[str, Any]:
@@ -136,41 +150,52 @@ def _load_saved() -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _env_overrides() -> dict[str, Any]:
-    return _coerce_overrides(os.environ)
-
-
-def _cluster_env_overrides() -> dict[str, Any]:
+def _cluster_env_values() -> dict[str, str]:
     try:
-        values = cluster_settings.parse_env_text(cluster_settings.load_env_text("mlxp"))
+        return cluster_settings.parse_env_text(cluster_settings.load_env_text("mlxp"))
     except FileNotFoundError:
         return {}
-    return _coerce_overrides(values)
 
 
-def _coerce_overrides(values: dict[str, str] | os._Environ[str]) -> dict[str, Any]:
+def _overrides_from(
+    values: dict[str, str] | os._Environ[str], *, allow_plain: bool
+) -> dict[str, Any]:
+    """Resolve field overrides from ``values``. Each field takes the first of
+    its candidate env names present and non-empty. With ``allow_plain`` false,
+    only prefixed names (MLXP_*, TRAIN_EVAL_MLXP_*) are considered."""
     out: dict[str, Any] = {}
-    for env_name, field_name in _ENV_FIELDS.items():
-        raw = values.get(env_name)
-        if raw is None or raw == "":
-            continue
-        if field_name == "gpus_per_node":
-            try:
-                out[field_name] = int(raw)
-            except ValueError:
+    for field_name, names in _FIELD_ENV_NAMES.items():
+        for name in names:
+            if not allow_plain and not name.startswith(_PREFIXED):
                 continue
-        else:
+            raw = values.get(name)
+            if raw is None or raw == "":
+                continue
+            if field_name == "gpus_per_node":
+                try:
+                    out[field_name] = int(raw)
+                except ValueError:
+                    continue
+                break
             out[field_name] = raw
+            break
     return out
 
 
 def get_settings() -> MlxpSettings:
     saved = _load_saved()
-    cluster_env = _cluster_env_overrides()
-    user = str(cluster_env.get("user") or saved.get("user") or _default_user())
-    data = _defaults_for(user)
-    data.update(cluster_env)
-    data.update(_env_overrides())
+    # Cluster env FILE accepts plain slurm-style names; the process environment
+    # only namespaced ones. Process env wins over file, file over derived
+    # defaults — matching the historical defaults < file < env order.
+    overrides = {
+        **_overrides_from(_cluster_env_values(), allow_plain=True),
+        **_overrides_from(os.environ, allow_plain=False),
+    }
+    user = str(overrides.get("user") or saved.get("user") or _default_user())
+    ddn_mount = str(overrides.get("ddn_mount") or _DEFAULT_DDN_MOUNT)
+    ddn_home = str(overrides.get("ddn_user_home") or f"{ddn_mount}/{user}")
+    data = _defaults_for(user, ddn_mount, ddn_home)
+    data.update(overrides)
     return MlxpSettings.model_validate(data)
 
 
