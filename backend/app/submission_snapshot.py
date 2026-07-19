@@ -497,7 +497,7 @@ async def _mlxp_git_run_with_pod(cmd: str, timeout: float) -> tuple[int, str, st
     while pod creation and logs still work. A short-lived pod gives the submit
     preflight the same filesystem view without depending on exec.
     """
-    from .mlxp_config import get_settings
+    from .mlxp_config import get_settings, labels
 
     settings = get_settings()
     pod_name = f"tew-git-{uuid.uuid4().hex[:10]}"
@@ -552,10 +552,7 @@ async def _mlxp_git_run_with_pod(cmd: str, timeout: float) -> tuple[int, str, st
                 "mlx.navercorp.com/zone": settings.zone,
                 "sidecar.istio.io/inject": "false",
             },
-            "labels": {
-                "owner": settings.owner_label,
-                "tool": settings.tool_label,
-            },
+            "labels": labels(settings),
         },
         "spec": {
             "restartPolicy": "Never",

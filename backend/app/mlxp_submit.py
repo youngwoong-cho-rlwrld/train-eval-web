@@ -317,9 +317,9 @@ async def submit_mlxp(req: MlxpSubmitRequest) -> MlxpSubmitResponse:
     )
 
     if req.job_class == "dedicated":
-        node = req.node or settings.default_node
-        if not (node or "").strip():
-            raise ValueError("job_class=dedicated requires a node (request or settings default)")
+        node = req.node or ""
+        if not node.strip():
+            raise ValueError("job_class=dedicated requires a node")
     else:
         # Queue classes leave placement to the MLXP scheduler — never pin.
         node = ""
@@ -1357,7 +1357,7 @@ cat > {shlex.quote(modality_target)} <<'TEW_MODALITY_EOF'
         f"export VARIANT={shlex.quote(variant.name)}",
         f"export SLURM_JOB_ID={shlex.quote(snapshot['job_id'])}",
         f"export SLURM_JOB_NAME={shlex.quote(job_name)}",
-        f"export SUBMIT_PARTITION={shlex.quote(req.node or settings.default_node)}",
+        f"export SUBMIT_PARTITION={shlex.quote(req.node or '')}",
         f"export SUBMIT_EXP_DIR={shlex.quote(exp_dir)}",
         f"export SUBMIT_OUTPUT_NAMESPACE={shlex.quote(output_namespace)}",
         f"export SUBMIT_EVAL_DIR={shlex.quote(eval_dir)}",

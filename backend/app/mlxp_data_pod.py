@@ -10,6 +10,7 @@ from .kubectl_errors import is_kubectl_transport_error
 from .mlxp_config import (
     MlxpSettings,
     get_settings,
+    labels,
 )
 
 def _data_pod_yaml(settings: MlxpSettings) -> str:
@@ -22,8 +23,8 @@ metadata:
     mlx.navercorp.com/zone: {settings.zone}
     sidecar.istio.io/inject: "false"
   labels:
-    owner: {settings.owner_label}
-    tool: {settings.tool_label}
+    owner: {labels(settings)["owner"]}
+    tool: {labels(settings)["tool"]}
 spec:
   restartPolicy: Never
   imagePullSecrets:

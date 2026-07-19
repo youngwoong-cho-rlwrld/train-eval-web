@@ -587,8 +587,7 @@ async def post_submit_config_preview(req: submit.SubmitRequest):
             except ValueError as e:
                 model_repo_error = str(e)
         else:
-            if not node:
-                node = mlxp_config.get_settings().default_node
+            node = node or ""
             try:
                 model_repo_path = mlxp_submit.mlxp_training_repo_path(model)
             except ValueError as e:

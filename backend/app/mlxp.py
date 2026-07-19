@@ -75,17 +75,6 @@ async def list_nodes() -> list[MlxpNode]:
             queued_gpus=queued_gpus[name],
             gpu_type=gpu_type_for_node(name),
         ))
-    if settings.default_node and all(n.name != settings.default_node for n in out):
-        out.append(MlxpNode(
-            name=settings.default_node,
-            gpu_used=0,
-            gpu_total=settings.gpus_per_node,
-            gpu_free=settings.gpus_per_node,
-            queued_jobs=queued_jobs[settings.default_node],
-            queued_gpus=queued_gpus[settings.default_node],
-            gpu_type=gpu_type_for_node(settings.default_node),
-        ))
-        out.sort(key=lambda n: n.name)
     return out
 
 
@@ -133,8 +122,6 @@ async def gpu_queue_snapshot(
     else:
         node_names = set(used)
         node_names.update(pod_node for _, pod_node, *_ in pending if pod_node)
-        if settings.default_node:
-            node_names.add(settings.default_node)
 
     queue = [
         GpuQueueJob(

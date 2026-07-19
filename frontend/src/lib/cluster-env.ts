@@ -22,11 +22,6 @@ const SLURM_ENV_FIELDS: EnvField[] = [
 const MLXP_ENV_FIELDS: EnvField[] = [
   { key: "TRAIN_EVAL_MLXP_USER", description: "MLXP user; derives /data/<user> defaults." },
   { key: "TRAIN_EVAL_MLXP_NAMESPACE", description: "Kubernetes namespace." },
-  { key: "TRAIN_EVAL_MLXP_OWNER", description: "Owner label used to find jobs and pods." },
-  { key: "TRAIN_EVAL_MLXP_TOOL_LABEL", description: "Tool label used to find jobs and pods." },
-  { key: "TRAIN_EVAL_MLXP_NODE", description: "Default GPU node for MLXP jobs." },
-  { key: "TRAIN_EVAL_MLXP_GPU_NODE_PREFIX", description: "GPU node name prefix shown in monitor." },
-  { key: "TRAIN_EVAL_MLXP_GPU_TYPE", description: "GPU type label shown in monitor." },
   { key: "TRAIN_EVAL_MLXP_GPUS_PER_NODE", description: "Total GPU count per MLXP node." },
   { key: "TRAIN_EVAL_MLXP_DDN_MOUNT", description: "Shared DDN mount path." },
   { key: "TRAIN_EVAL_MLXP_HOME", description: "User home directory on DDN." },

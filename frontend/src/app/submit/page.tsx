@@ -184,7 +184,7 @@ export default function SubmitPage() {
   });
   const username = userSettings.data?.username ?? "";
   // Persisted across sessions + synced across pages via useMyMlxpNode.
-  const [mlxpNode, setMlxpNode] = useMyMlxpNode(mlxpSettings.data?.default_node ?? "");
+  const [mlxpNode, setMlxpNode] = useMyMlxpNode();
   const [mlxpJobClass, setMlxpJobClass] = useState<"dedicated" | "normal" | "background">("normal");
   const [extraArgs, setExtraArgs] = useState<string>("");
   const [evalOverwriteResults, setEvalOverwriteResults] = useState<boolean>(false);

@@ -15,6 +15,12 @@ from . import cluster_settings
 _SETTINGS_DIR = Path.home() / ".train-eval-web"
 _SETTINGS_FILE = _SETTINGS_DIR / "mlxp.json"
 
+# This application's identity, written as the `tool` label on every Job/Pod it
+# creates and used to scope job listing selectors. Not user config: changing it
+# would orphan a user's existing jobs from the UI. The `owner` label is always
+# the resolved user.
+TOOL_LABEL = "train-eval-web"
+
 
 _DEFAULT_DDN_MOUNT = "/data"
 
@@ -30,9 +36,6 @@ def _defaults_for(user: str, ddn_mount: str, ddn_home: str) -> dict[str, Any]:
     return {
         "user": user,
         "namespace": "p-rlwrld",
-        "owner_label": user,
-        "tool_label": "train-eval-web",
-        "default_node": "",
         "gpus_per_node": 8,
         "ddn_mount": ddn_mount,
         "ddn_user_home": ddn_home,
@@ -65,11 +68,6 @@ def _defaults_for(user: str, ddn_mount: str, ddn_home: str) -> dict[str, Any]:
 class MlxpSettings(BaseModel):
     user: str = Field(min_length=1)
     namespace: str = Field(min_length=1)
-    owner_label: str = Field(min_length=1)
-    tool_label: str = Field(min_length=1)
-    # Optional legacy pin; queue-class scheduling made a per-user default
-    # node obsolete. Kept for back-compat with saved TRAIN_EVAL_MLXP_NODE.
-    default_node: str = ""
     # Cluster constant (GPUs per H200 node), not user config. Kept because it is
     # non-discoverable under this project's RBAC (`kubectl get nodes` is
     # forbidden); node GPU type and the GPU-node set are derived, not configured.
@@ -106,9 +104,6 @@ class MlxpSettingsUpdate(BaseModel):
 _FIELD_ENV_NAMES: dict[str, tuple[str, str]] = {
     "user": ("USER", "TRAIN_EVAL_MLXP_USER"),
     "namespace": ("MLXP_NAMESPACE", "TRAIN_EVAL_MLXP_NAMESPACE"),
-    "owner_label": ("MLXP_OWNER", "TRAIN_EVAL_MLXP_OWNER"),
-    "tool_label": ("MLXP_TOOL_LABEL", "TRAIN_EVAL_MLXP_TOOL_LABEL"),
-    "default_node": ("MLXP_NODE", "TRAIN_EVAL_MLXP_NODE"),
     "gpus_per_node": ("MLXP_GPUS_PER_NODE", "TRAIN_EVAL_MLXP_GPUS_PER_NODE"),
     "ddn_mount": ("MLXP_DDN_MOUNT", "TRAIN_EVAL_MLXP_DDN_MOUNT"),
     "ddn_user_home": ("MLXP_HOME", "TRAIN_EVAL_MLXP_HOME"),
@@ -204,9 +199,9 @@ def save_user(user: str) -> MlxpSettings:
 
 def labels(settings: MlxpSettings | None = None) -> dict[str, str]:
     s = settings or get_settings()
-    return {"owner": s.owner_label, "tool": s.tool_label}
+    return {"owner": s.user, "tool": TOOL_LABEL}
 
 
 def owner_selector(settings: MlxpSettings | None = None) -> str:
     s = settings or get_settings()
-    return f"owner={s.owner_label},tool={s.tool_label}"
+    return f"owner={s.user},tool={TOOL_LABEL}"
