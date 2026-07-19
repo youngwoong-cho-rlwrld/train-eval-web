@@ -51,7 +51,7 @@ async def list_nodes() -> list[MlxpNode]:
     used: dict[str, int] = defaultdict(int)
     queued_gpus: dict[str, int] = defaultdict(int)
     queued_jobs: dict[str, int] = defaultdict(int)
-    for _, phase, node, gpu_count in _gpu_pod_rows(data, settings.gpu_node_prefix):
+    for _, phase, node, gpu_count in _gpu_pod_rows(data):
         if not node:
             continue
         if phase == "Running":
@@ -61,11 +61,10 @@ async def list_nodes() -> list[MlxpNode]:
             queued_jobs[node] += 1
 
     out: list[MlxpNode] = []
+    # The node set is exactly the nodes hosting GPU-requesting pods (see
+    # _gpu_pod_rows); no node-name prefix filter is needed to exclude
+    # CPU/control-plane nodes.
     for name in sorted(set(used) | set(queued_gpus)):
-        # GPU nodes only. CPU/control-plane nodes show up if we have a data
-        # pod or pipeline pod there; those aren't GPU-relevant.
-        if settings.gpu_node_prefix and not name.startswith(settings.gpu_node_prefix):
-            continue
         u = used[name]
         out.append(MlxpNode(
             name=name,
@@ -74,7 +73,7 @@ async def list_nodes() -> list[MlxpNode]:
             gpu_free=max(0, settings.gpus_per_node - u),
             queued_jobs=queued_jobs[name],
             queued_gpus=queued_gpus[name],
-            gpu_type=gpu_type_for_node(name, settings.gpu_type),
+            gpu_type=gpu_type_for_node(name),
         ))
     if settings.default_node and all(n.name != settings.default_node for n in out):
         out.append(MlxpNode(
@@ -84,7 +83,7 @@ async def list_nodes() -> list[MlxpNode]:
             gpu_free=settings.gpus_per_node,
             queued_jobs=queued_jobs[settings.default_node],
             queued_gpus=queued_gpus[settings.default_node],
-            gpu_type=gpu_type_for_node(settings.default_node, settings.gpu_type),
+            gpu_type=gpu_type_for_node(settings.default_node),
         ))
         out.sort(key=lambda n: n.name)
     return out
@@ -105,7 +104,7 @@ async def gpu_queue_snapshot(
     current_node: str | None = None
     max_time = datetime.max.replace(tzinfo=timezone.utc)
 
-    for pod, phase, pod_node, gpu_count in _gpu_pod_rows(pods_data, settings.gpu_node_prefix):
+    for pod, phase, pod_node, gpu_count in _gpu_pod_rows(pods_data):
         metadata = pod.get("metadata") or {}
         pod_job = pod_job_id(pod)
         if not pod_job:
@@ -152,7 +151,7 @@ async def gpu_queue_snapshot(
     nodes = [
         GpuQueueNode(
             name=name,
-            gpu_type=gpu_type_for_node(name, settings.gpu_type),
+            gpu_type=gpu_type_for_node(name),
             gpu_total=settings.gpus_per_node,
             gpu_used=max(0, min(used[name], settings.gpus_per_node)),
             state="k8s",
@@ -171,17 +170,17 @@ async def gpu_queue_snapshot(
 
 def _gpu_pod_rows(
     data: dict[str, Any],
-    node_prefix: str,
 ) -> list[tuple[dict[str, Any], str, str | None, int]]:
+    """GPU pods in the namespace: a pod is GPU-relevant iff it requests
+    ``nvidia.com/gpu`` > 0. This (not a node-name prefix) is what identifies
+    GPU nodes — the node set is exactly the nodes hosting these pods."""
     rows: list[tuple[dict[str, Any], str, str | None, int]] = []
     for pod in data.get("items", []):
         spec = pod.get("spec") or {}
-        node = spec.get("nodeName") or affinity_node(spec)
-        if node and node_prefix and not node.startswith(node_prefix):
-            continue
         gpu_count = requested_gpus(spec)
         if gpu_count <= 0:
             continue
+        node = spec.get("nodeName") or affinity_node(spec)
         phase = ((pod.get("status") or {}).get("phase") or "").strip()
         rows.append((pod, phase, node, gpu_count))
     return rows

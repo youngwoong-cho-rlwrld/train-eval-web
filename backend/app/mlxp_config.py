@@ -33,8 +33,6 @@ def _defaults_for(user: str, ddn_mount: str, ddn_home: str) -> dict[str, Any]:
         "owner_label": user,
         "tool_label": "train-eval-web",
         "default_node": "",
-        "gpu_node_prefix": "h200-",
-        "gpu_type": "H200",
         "gpus_per_node": 8,
         "ddn_mount": ddn_mount,
         "ddn_user_home": ddn_home,
@@ -72,8 +70,9 @@ class MlxpSettings(BaseModel):
     # Optional legacy pin; queue-class scheduling made a per-user default
     # node obsolete. Kept for back-compat with saved TRAIN_EVAL_MLXP_NODE.
     default_node: str = ""
-    gpu_node_prefix: str = ""
-    gpu_type: str = "GPU"
+    # Cluster constant (GPUs per H200 node), not user config. Kept because it is
+    # non-discoverable under this project's RBAC (`kubectl get nodes` is
+    # forbidden); node GPU type and the GPU-node set are derived, not configured.
     gpus_per_node: int = Field(default=8, ge=1)
     ddn_mount: str = Field(min_length=1)
     ddn_user_home: str = Field(min_length=1)
@@ -110,8 +109,6 @@ _FIELD_ENV_NAMES: dict[str, tuple[str, str]] = {
     "owner_label": ("MLXP_OWNER", "TRAIN_EVAL_MLXP_OWNER"),
     "tool_label": ("MLXP_TOOL_LABEL", "TRAIN_EVAL_MLXP_TOOL_LABEL"),
     "default_node": ("MLXP_NODE", "TRAIN_EVAL_MLXP_NODE"),
-    "gpu_node_prefix": ("MLXP_GPU_NODE_PREFIX", "TRAIN_EVAL_MLXP_GPU_NODE_PREFIX"),
-    "gpu_type": ("MLXP_GPU_TYPE", "TRAIN_EVAL_MLXP_GPU_TYPE"),
     "gpus_per_node": ("MLXP_GPUS_PER_NODE", "TRAIN_EVAL_MLXP_GPUS_PER_NODE"),
     "ddn_mount": ("MLXP_DDN_MOUNT", "TRAIN_EVAL_MLXP_DDN_MOUNT"),
     "ddn_user_home": ("MLXP_HOME", "TRAIN_EVAL_MLXP_HOME"),

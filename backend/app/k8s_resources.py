@@ -92,7 +92,12 @@ def pending_pod_reason(pod: dict[str, Any]) -> str | None:
     return status.get("message") or status.get("reason") or None
 
 
-def gpu_type_for_node(node: str, fallback: str | None) -> str | None:
+def gpu_type_for_node(node: str, fallback: str | None = None) -> str | None:
+    """Infer the accelerator type from the node name (e.g. ``h200-03-w-…`` ->
+    ``H200``). The GPU type is not configured: MLXP node names carry it and
+    `kubectl get nodes` is RBAC-forbidden here. ``fallback`` is only used when
+    the name has no type-like leading token; the display layer treats a null
+    result as "GPU"."""
     prefix = node.split("-", 1)[0].strip()
     if prefix and any(ch.isdigit() for ch in prefix):
         return prefix.upper()

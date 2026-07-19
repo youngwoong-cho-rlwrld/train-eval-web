@@ -268,8 +268,6 @@ export type MlxpSettings = {
   owner_label: string;
   tool_label: string;
   default_node: string;
-  gpu_node_prefix: string;
-  gpu_type: string;
   gpus_per_node: number;
   ddn_mount: string;
   ddn_user_home: string;
